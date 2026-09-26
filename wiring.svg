@@ -1,0 +1,303 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1560" height="1240" viewBox="0 0 1560 1240" font-family="Microsoft YaHei, PingFang SC, Noto Sans CJK SC, Segoe UI, sans-serif">
+<defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#666"/></marker></defs>
+<rect x="0" y="0" width="1560" height="1240" rx="0" fill="#ffffff" stroke="none" stroke-width="1.5"/>
+<text x="30" y="26" font-size="20" text-anchor="start" font-weight="bold" fill="#222">AS5045 + stepper2 闭环台架 — 当前接线图（2026-09-23）</text>
+<text x="30" y="46" font-size="11" text-anchor="start" font-weight="normal" fill="#666">依据：AS5045_enc/README.md、WIRING.md、quadStepper.kicad_sch 网表</text>
+<rect x="1130" y="60" width="400" height="84" rx="6" fill="#fafafa" stroke="#bbb" stroke-width="1.5"/>
+<text x="1140" y="78" font-size="12" text-anchor="start" font-weight="bold" fill="#222">图例</text>
+<line x1="1140" y1="94" x2="1190" y2="94" stroke="#e67e22" stroke-width="3"/>
+<text x="1198" y="98" font-size="11" text-anchor="start" font-weight="normal" fill="#222">粗彩线 = 需要手工插/焊的导线</text>
+<line x1="1140" y1="112" x2="1190" y2="112" stroke="#9aa0a6" stroke-width="1.5"/>
+<text x="1198" y="116" font-size="11" text-anchor="start" font-weight="normal" fill="#222">细灰线 = 载板/套件板上铜皮（插上即通，不用接线）</text>
+<line x1="1140" y1="130" x2="1190" y2="130" stroke="#bbbbbb" stroke-width="1.5" stroke-dasharray="5,4"/>
+<text x="1198" y="134" font-size="11" text-anchor="start" font-weight="normal" fill="#222">虚线 = 固件停用 / 空余</text>
+<rect x="30" y="60" width="330" height="60" rx="6" fill="#f4f4f4" stroke="#444" stroke-width="1.5"/>
+<text x="40" y="80" font-size="14" text-anchor="start" font-weight="bold" fill="#222">PC（PSoC Creator 编程 + 串口终端）</text>
+<text x="40" y="98" font-size="11" text-anchor="start" font-weight="normal" fill="#555">KitProg USB-UART：COM 口 115200 8N1（printf 调试输出）</text>
+<line x1="195" y1="120" x2="195" y2="150" stroke="#444" stroke-width="3"/>
+<text x="202" y="140" font-size="11" text-anchor="start" font-weight="normal" fill="#444">USB</text>
+<rect x="30" y="150" width="330" height="700" rx="6" fill="#eef4ff" stroke="#444" stroke-width="1.5"/>
+<text x="40" y="170" font-size="14" text-anchor="start" font-weight="bold" fill="#222">CY8CKIT-059（PSoC 5LP，BUS_CLK 24 MHz）</text>
+<text x="40" y="188" font-size="11" text-anchor="start" font-weight="normal" fill="#555">插在载板 J1(P2/P12/P1) + J2(P0/P3) 两条 26 脚母座</text>
+<text x="40" y="203" font-size="11" text-anchor="start" font-weight="normal" fill="#555">DPS=Disable → P1[0]/[1]/[3] 当 GPIO；调试靠 printf</text>
+<circle cx="360" cy="260" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="264" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P1[7]  EN2</text>
+<circle cx="360" cy="284" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="288" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P1[6]  M0  (=1)</text>
+<circle cx="360" cy="308" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="312" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P1[5]  M1  (=1)</text>
+<circle cx="360" cy="332" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="336" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P1[4]  M2  (=0)</text>
+<circle cx="360" cy="356" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="360" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P1[2]  RST2</text>
+<circle cx="360" cy="380" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="384" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P12[2] SLEEP2</text>
+<circle cx="360" cy="404" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="408" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P12[3] STEP2</text>
+<circle cx="360" cy="428" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="432" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P12[4] DIR2</text>
+<circle cx="360" cy="452" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="456" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P12[5] nFAULT（内部上拉）</text>
+<circle cx="360" cy="596" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="600" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P12[1] CSn →</text>
+<circle cx="360" cy="620" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="624" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P12[0] CLK →</text>
+<circle cx="360" cy="692" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="696" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P1[3]  DO ←</text>
+<circle cx="360" cy="764" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="768" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P2[7]  EN1  =1</text>
+<circle cx="360" cy="788" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="792" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P2[3]  RST1 =0</text>
+<circle cx="360" cy="812" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="816" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P2[2]  SLEEP1=0</text>
+<text x="40" y="480" font-size="11" text-anchor="start" font-weight="normal" fill="#444">供电：VDD ← KitProg USB 5V（经 D2 二极管）</text>
+<text x="40" y="496" font-size="11" text-anchor="start" font-weight="normal" fill="#444">        与 载板 5V 网（JP1 桥接 → J1-26 VDDIO）并联</text>
+<text x="40" y="512" font-size="11" text-anchor="start" font-weight="normal" fill="#444">共地：J1-25 / J2-2 / J2-26 → 载板 GND</text>
+<text x="40" y="540" font-size="11" text-anchor="start" font-weight="normal" fill="#444">P12[7] 调试 TX → KitProg（板内走线，无需外接）</text>
+<text x="40" y="556" font-size="11" text-anchor="start" font-weight="normal" fill="#444">P12[6] KitProg RX；P1[0]（J12-5）接 NPN，P1[1]（J12-6）空余</text>
+<text x="40" y="652" font-size="11" text-anchor="start" font-weight="normal" fill="#666" font-style="italic">▲ 经 J12 “PB” 排针到 AS5045</text>
+<text x="40" y="736" font-size="11" text-anchor="start" font-weight="normal" fill="#666" font-style="italic">▼ Driver 1 由 hw_init 永久停用（蓝 LED 才能随便闪）</text>
+<rect x="460" y="150" width="600" height="810" rx="6" fill="#f7f7f7" stroke="#444" stroke-width="1.5"/>
+<text x="470" y="172" font-size="14" text-anchor="start" font-weight="bold" fill="#222">四路 DRV8825 载板  quadStepper（JLCPCB W197256DSJ674）</text>
+<text x="470" y="190" font-size="11" text-anchor="start" font-weight="normal" fill="#555">只用 Driver 2 通道；Driver 3/4（P3/P15/P0 侧）空插座</text>
+<rect x="490" y="200" width="260" height="270" rx="6" fill="#ffffff" stroke="#444" stroke-width="1.5"/>
+<text x="500" y="220" font-size="14" text-anchor="start" font-weight="bold" fill="#222">Driver 2 插座（DRV8825）</text>
+<text x="500" y="238" font-size="11" text-anchor="start" font-weight="normal" fill="#555">1/8 微步：M2 M1 M0 = 0 1 1（PSoC 输出）</text>
+<circle cx="490" cy="260" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="264" font-size="12" text-anchor="start" font-weight="normal" fill="#222">EN</text>
+<circle cx="490" cy="284" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="288" font-size="12" text-anchor="start" font-weight="normal" fill="#222">M0</text>
+<circle cx="490" cy="308" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="312" font-size="12" text-anchor="start" font-weight="normal" fill="#222">M1</text>
+<circle cx="490" cy="332" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="336" font-size="12" text-anchor="start" font-weight="normal" fill="#222">M2</text>
+<circle cx="490" cy="356" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="360" font-size="12" text-anchor="start" font-weight="normal" fill="#222">RST</text>
+<circle cx="490" cy="380" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="384" font-size="12" text-anchor="start" font-weight="normal" fill="#222">SLP</text>
+<circle cx="490" cy="404" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="408" font-size="12" text-anchor="start" font-weight="normal" fill="#222">STEP</text>
+<circle cx="490" cy="428" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="432" font-size="12" text-anchor="start" font-weight="normal" fill="#222">DIR</text>
+<circle cx="750" cy="260" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="741" y="264" font-size="12" text-anchor="end" font-weight="normal" fill="#222">VMOT ← VRAW</text>
+<circle cx="750" cy="284" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="741" y="288" font-size="12" text-anchor="end" font-weight="normal" fill="#222">GND</text>
+<circle cx="750" cy="308" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="741" y="312" font-size="12" text-anchor="end" font-weight="normal" fill="#222">B2</text>
+<circle cx="750" cy="332" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="741" y="336" font-size="12" text-anchor="end" font-weight="normal" fill="#222">B1</text>
+<circle cx="750" cy="356" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="741" y="360" font-size="12" text-anchor="end" font-weight="normal" fill="#222">A1</text>
+<circle cx="750" cy="380" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="741" y="384" font-size="12" text-anchor="end" font-weight="normal" fill="#222">A2</text>
+<circle cx="750" cy="404" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="741" y="408" font-size="12" text-anchor="end" font-weight="normal" fill="#222">FAULT</text>
+<circle cx="750" cy="428" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="741" y="432" font-size="12" text-anchor="end" font-weight="normal" fill="#222">GND</text>
+<text x="495" y="462" font-size="10" text-anchor="start" font-weight="normal" fill="#777">VREF 电位器：按 R_sense 设相电流 70~100%</text>
+<rect x="830" y="276" width="120" height="124" rx="6" fill="#ffffff" stroke="#444" stroke-width="1.5"/>
+<text x="840" y="296" font-size="14" text-anchor="start" font-weight="bold" fill="#222">J7 Stepper 2</text>
+<circle cx="830" cy="308" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="312" font-size="12" text-anchor="start" font-weight="normal" fill="#222">1</text>
+<circle cx="830" cy="332" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="336" font-size="12" text-anchor="start" font-weight="normal" fill="#222">2</text>
+<circle cx="830" cy="356" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="360" font-size="12" text-anchor="start" font-weight="normal" fill="#222">3</text>
+<circle cx="830" cy="380" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="384" font-size="12" text-anchor="start" font-weight="normal" fill="#222">4</text>
+<circle cx="950" cy="308" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="312" font-size="12" text-anchor="end" font-weight="normal" fill="#222">B2</text>
+<circle cx="950" cy="332" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="336" font-size="12" text-anchor="end" font-weight="normal" fill="#222">B1</text>
+<circle cx="950" cy="356" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="360" font-size="12" text-anchor="end" font-weight="normal" fill="#222">A1</text>
+<circle cx="950" cy="380" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="384" font-size="12" text-anchor="end" font-weight="normal" fill="#222">A2</text>
+<rect x="830" y="510" width="120" height="200" rx="6" fill="#ffffff" stroke="#444" stroke-width="1.5"/>
+<text x="840" y="530" font-size="14" text-anchor="start" font-weight="bold" fill="#222">J12 PB</text>
+<circle cx="830" cy="548" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="552" font-size="12" text-anchor="start" font-weight="normal" fill="#222">1</text>
+<circle cx="830" cy="572" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="576" font-size="12" text-anchor="start" font-weight="normal" fill="#222">2</text>
+<circle cx="830" cy="596" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="600" font-size="12" text-anchor="start" font-weight="normal" fill="#222">3</text>
+<circle cx="830" cy="620" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="624" font-size="12" text-anchor="start" font-weight="normal" fill="#222">4</text>
+<circle cx="830" cy="644" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="648" font-size="12" text-anchor="start" font-weight="normal" fill="#222">5</text>
+<circle cx="830" cy="668" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="672" font-size="12" text-anchor="start" font-weight="normal" fill="#222">6</text>
+<circle cx="830" cy="692" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="696" font-size="12" text-anchor="start" font-weight="normal" fill="#222">7</text>
+<circle cx="950" cy="548" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="552" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P12_7</text>
+<circle cx="950" cy="572" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="576" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P12_6</text>
+<circle cx="950" cy="596" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="600" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P12_1</text>
+<circle cx="950" cy="620" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="624" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P12_0</text>
+<circle cx="950" cy="644" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="648" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P1_0</text>
+<circle cx="950" cy="668" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="672" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P1_1</text>
+<circle cx="950" cy="692" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="696" font-size="12" text-anchor="end" font-weight="normal" fill="#222">P1_3</text>
+<rect x="830" y="750" width="120" height="80" rx="6" fill="#ffffff" stroke="#444" stroke-width="1.5"/>
+<text x="840" y="770" font-size="14" text-anchor="start" font-weight="bold" fill="#222">J3 5V（J8 同）</text>
+<circle cx="830" cy="788" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="792" font-size="12" text-anchor="start" font-weight="normal" fill="#222">1</text>
+<circle cx="830" cy="812" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="839" y="816" font-size="12" text-anchor="start" font-weight="normal" fill="#222">2</text>
+<circle cx="950" cy="788" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="792" font-size="12" text-anchor="end" font-weight="normal" fill="#222">5V</text>
+<circle cx="950" cy="812" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="941" y="816" font-size="12" text-anchor="end" font-weight="normal" fill="#222">GND</text>
+<rect x="490" y="728" width="260" height="110" rx="6" fill="#fbfbfb" stroke="#999" stroke-width="1.5" stroke-dasharray="6,4"/>
+<text x="500" y="748" font-size="14" text-anchor="start" font-weight="bold" fill="#222">Driver 1 插座 — 固件停用</text>
+<circle cx="490" cy="764" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="768" font-size="12" text-anchor="start" font-weight="normal" fill="#222">EN</text>
+<circle cx="490" cy="788" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="792" font-size="12" text-anchor="start" font-weight="normal" fill="#222">RST</text>
+<circle cx="490" cy="812" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="816" font-size="12" text-anchor="start" font-weight="normal" fill="#222">SLP</text>
+<text x="560" y="768" font-size="11" text-anchor="start" font-weight="normal" fill="#777">= P2[7]  拉高 → 输出关</text>
+<text x="560" y="792" font-size="11" text-anchor="start" font-weight="normal" fill="#777">= P2[3]  拉低 → 复位</text>
+<text x="560" y="816" font-size="11" text-anchor="start" font-weight="normal" fill="#777">= P2[2]  拉低 → 休眠</text>
+<text x="500" y="833" font-size="10" text-anchor="start" font-weight="normal" fill="#777">STEP=P2[1]（蓝 LED）DIR=P2[0]；J6 Stepper 1 空</text>
+<rect x="490" y="862" width="160" height="80" rx="6" fill="#ffffff" stroke="#444" stroke-width="1.5"/>
+<text x="500" y="882" font-size="14" text-anchor="start" font-weight="bold" fill="#222">J5 VRAW 螺丝端子</text>
+<circle cx="490" cy="898" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="902" font-size="12" text-anchor="start" font-weight="normal" fill="#222">1  GND (−)</text>
+<circle cx="490" cy="922" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="499" y="926" font-size="12" text-anchor="start" font-weight="normal" fill="#222">2  VRAW (+)</text>
+<rect x="680" y="862" width="130" height="80" rx="6" fill="#ffffff" stroke="#444" stroke-width="1.5"/>
+<text x="690" y="882" font-size="14" text-anchor="start" font-weight="bold" fill="#222">U2 LM7805</text>
+<text x="690" y="900" font-size="11" text-anchor="start" font-weight="normal" fill="#555">VRAW → 板载 5V 网</text>
+<text x="690" y="915" font-size="11" text-anchor="start" font-weight="normal" fill="#555">D1 红灯 = 5V 指示</text>
+<path d="M650,922 L680,922" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<text x="820" y="890" font-size="10" text-anchor="start" font-weight="normal" fill="#777">5V 网 → J3/J8/TP1、JP1→J1-26</text>
+<text x="820" y="904" font-size="10" text-anchor="start" font-weight="normal" fill="#777">VRAW → 4 个 Driver 插座 VMOT</text>
+<text x="820" y="918" font-size="10" text-anchor="start" font-weight="normal" fill="#777">（各带 10 µF 电解 + 100 nF）</text>
+<rect x="30" y="862" width="330" height="80" rx="6" fill="#f4f4f4" stroke="#444" stroke-width="1.5"/>
+<text x="40" y="882" font-size="14" text-anchor="start" font-weight="bold" fill="#222">电机电源 12–24 V DC（DRV8825 上限 45 V）</text>
+<circle cx="360" cy="898" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="902" font-size="12" text-anchor="end" font-weight="normal" fill="#222">−  GND</text>
+<circle cx="360" cy="922" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="351" y="926" font-size="12" text-anchor="end" font-weight="normal" fill="#222">+  VRAW</text>
+<text x="40" y="934" font-size="11" text-anchor="start" font-weight="normal" fill="#555">README §6：24 V 的高速扭矩明显好于 12 V</text>
+<rect x="1130" y="180" width="400" height="260" rx="6" fill="#f0fff4" stroke="#444" stroke-width="1.5"/>
+<text x="1140" y="200" font-size="14" text-anchor="start" font-weight="bold" fill="#222">42 减速步进电机  YL-42HS60ESIC (L33, 40:1)</text>
+<text x="1140" y="218" font-size="11" text-anchor="start" font-weight="normal" fill="#555">1.8°/整步，200 整步/圈；电机 1 圈 = 输出 9°</text>
+<text x="1140" y="233" font-size="11" text-anchor="start" font-weight="normal" fill="#555">同一线圈两根线接 J7 1-2，另一线圈接 3-4；</text>
+<text x="1140" y="248" font-size="11" text-anchor="start" font-weight="normal" fill="#555">相序接反只会反转 —— 固件上电做 DIR 自学习，不必换线</text>
+<circle cx="1130" cy="308" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="312" font-size="12" text-anchor="start" font-weight="normal" fill="#222">线圈 B</text>
+<circle cx="1130" cy="332" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="336" font-size="12" text-anchor="start" font-weight="normal" fill="#222">线圈 B</text>
+<circle cx="1130" cy="356" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="360" font-size="12" text-anchor="start" font-weight="normal" fill="#222">线圈 A</text>
+<circle cx="1130" cy="380" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="384" font-size="12" text-anchor="start" font-weight="normal" fill="#222">线圈 A</text>
+<text x="1290" y="400" font-size="11" text-anchor="start" font-weight="normal" fill="#444">后轴（转子侧）：径向充磁磁铁 + 42_magnetHolder</text>
+<text x="1290" y="416" font-size="11" text-anchor="start" font-weight="normal" fill="#444">正对 AS5045 芯片中心；磁铁不在减速箱输出轴</text>
+<line x1="1330" y1="440" x2="1330" y2="546" stroke="#666" stroke-width="1.5" marker-end="url(#arr)"/>
+<text x="1340" y="490" font-size="11" text-anchor="start" font-weight="normal" fill="#666">磁场</text>
+<rect x="1130" y="550" width="400" height="380" rx="6" fill="#fff7e6" stroke="#444" stroke-width="1.5"/>
+<text x="1140" y="570" font-size="14" text-anchor="start" font-weight="bold" fill="#222">AS5045 磁编码器（SSOP16 脚号；模块按丝印同名脚接）</text>
+<circle cx="1130" cy="596" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="600" font-size="12" text-anchor="start" font-weight="normal" fill="#222">11  CSn   ← P12[1]</text>
+<circle cx="1130" cy="620" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="624" font-size="12" text-anchor="start" font-weight="normal" fill="#222">10  CLK   ← P12[0]</text>
+<circle cx="1130" cy="644" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="648" font-size="12" text-anchor="start" font-weight="normal" fill="#222"> 9  DO    → P1[3]</text>
+<circle cx="1130" cy="788" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="792" font-size="12" text-anchor="start" font-weight="normal" fill="#222">16  VDD5V ← 5V</text>
+<circle cx="1130" cy="812" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="816" font-size="12" text-anchor="start" font-weight="normal" fill="#222"> 7  VSS   ← GND</text>
+<circle cx="1130" cy="836" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="840" font-size="12" text-anchor="start" font-weight="normal" fill="#222"> 8  Prog_DI ← GND（不做 OTP）</text>
+<circle cx="1130" cy="860" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="864" font-size="12" text-anchor="start" font-weight="normal" fill="#222"> 6  Mode  ← GND（慢速，384 µs）</text>
+<circle cx="1130" cy="884" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="888" font-size="12" text-anchor="start" font-weight="normal" fill="#222">15  VDD3V3 — 2.2~10 µF 到 VSS，勿外接负载</text>
+<circle cx="1130" cy="908" r="3.5" fill="#fff" stroke="#333" stroke-width="1.5"/>
+<text x="1139" y="912" font-size="12" text-anchor="start" font-weight="normal" fill="#222">12 PWM / 1 MagINCn / 2 MagDECn / 3,4,5,13,14 NC：悬空</text>
+<text x="1140" y="676" font-size="11" text-anchor="start" font-weight="normal" fill="#555">12 bit = 4096 LSB/圈；1 LSB = 0.0022 输出度</text>
+<text x="1140" y="692" font-size="11" text-anchor="start" font-weight="normal" fill="#a0522d">输出转 9° 编码器就翻一圈 → 固件多圈累加，不用单圈角度当位置</text>
+<text x="1140" y="716" font-size="11" text-anchor="start" font-weight="normal" fill="#555">Mode 仅能断电改：接 VDD5V = 快速 96 µs，同步改 AS5045_DELAY_US=96</text>
+<text x="1140" y="732" font-size="11" text-anchor="start" font-weight="normal" fill="#555">VDD5V 旁 100 nF；VDD3V3 2.2~10 µF（用现成模块则已自带）</text>
+<text x="1140" y="756" font-size="11" text-anchor="start" font-weight="normal" fill="#555">GND 必须与驱动器 / 电机电源共地</text>
+<path d="M360,260 H490" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,284 H490" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,308 H490" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,332 H490" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,356 H490" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,380 H490" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,404 H490" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,428 H490" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,452 L472,452 L472,492 L776,492 L776,404 L750,404" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<text x="486" y="506" font-size="10" text-anchor="start" font-weight="normal" fill="#777">FAULT1 网 = Driver 1/2 开漏线或，载板无上拉</text>
+<text x="486" y="520" font-size="10" text-anchor="start" font-weight="normal" fill="#777">→ P12[5] 用 PSoC 内部上拉；VMOT 掉电 UVLO 也会拉低</text>
+<path d="M750,308 H950" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M750,332 H950" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M750,356 H950" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M750,380 H950" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,596 H950" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,620 H950" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,692 H950" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M360,764 H490" fill="none" stroke="#bbbbbb" stroke-width="1.5" stroke-linejoin="round" stroke-dasharray="5,4"/>
+<path d="M360,788 H490" fill="none" stroke="#bbbbbb" stroke-width="1.5" stroke-linejoin="round" stroke-dasharray="5,4"/>
+<path d="M360,812 H490" fill="none" stroke="#bbbbbb" stroke-width="1.5" stroke-linejoin="round" stroke-dasharray="5,4"/>
+<path d="M360,898 H490" fill="none" stroke="#222222" stroke-width="3" stroke-linejoin="round"/>
+<path d="M360,922 H490" fill="none" stroke="#d62728" stroke-width="3" stroke-linejoin="round"/>
+<path d="M950,308 H1130" fill="none" stroke="#9467bd" stroke-width="3" stroke-linejoin="round"/>
+<path d="M950,332 H1130" fill="none" stroke="#9467bd" stroke-width="3" stroke-linejoin="round"/>
+<path d="M950,356 H1130" fill="none" stroke="#17becf" stroke-width="3" stroke-linejoin="round"/>
+<path d="M950,380 H1130" fill="none" stroke="#17becf" stroke-width="3" stroke-linejoin="round"/>
+<text x="1005" y="300" font-size="11" text-anchor="middle" font-weight="normal" fill="#555">4 芯电机线</text>
+<path d="M950,596 H1130" fill="none" stroke="#e67e22" stroke-width="3" stroke-linejoin="round"/>
+<path d="M950,620 H1130" fill="none" stroke="#2ca02c" stroke-width="3" stroke-linejoin="round"/>
+<path d="M950,692 H1040 V644 H1130" fill="none" stroke="#1f77b4" stroke-width="3" stroke-linejoin="round"/>
+<text x="1005" y="588" font-size="11" text-anchor="middle" font-weight="normal" fill="#555">3 芯 SSI</text>
+<path d="M950,788 H1130" fill="none" stroke="#d62728" stroke-width="3" stroke-linejoin="round"/>
+<path d="M950,812 L1020,812 L1020,860 L1130,860" fill="none" stroke="#222222" stroke-width="3" stroke-linejoin="round"/>
+<path d="M1020,836 L1130,836" fill="none" stroke="#222222" stroke-width="3" stroke-linejoin="round"/>
+<path d="M1020,812 L1130,812" fill="none" stroke="#222222" stroke-width="3" stroke-linejoin="round"/>
+<circle cx="1020" cy="812" r="3.5" fill="#222222"/>
+<circle cx="1020" cy="836" r="3.5" fill="#222222"/>
+<text x="1005" y="780" font-size="11" text-anchor="middle" font-weight="normal" fill="#555">5V + GND</text>
+<rect x="30" y="990" width="1500" height="220" rx="6" fill="#f8fbf7" stroke="#444" stroke-width="1.5"/>
+<text x="45" y="1014" font-size="16" text-anchor="start" font-weight="bold" fill="#222">已接外部输入（2026-09-23）</text>
+<text x="45" y="1031" font-size="11" text-anchor="start" font-weight="normal" fill="#666">详细针脚、逻辑电平与上电检查见 AS5045_enc/WIRING.md；所有信号的 0V 与 J9 GND 共地。</text>
+<rect x="55" y="1044" width="290" height="142" rx="6" fill="#fff7e6" stroke="#444" stroke-width="1.5"/>
+<text x="70" y="1065" font-size="14" text-anchor="start" font-weight="bold" fill="#222">NPN 开漏传感器</text>
+<text x="70" y="1086" font-size="12" text-anchor="start" font-weight="normal" fill="#7f4f00">棕：传感器额定 V+</text>
+<text x="70" y="1107" font-size="12" text-anchor="start" font-weight="normal" fill="#1f77b4">蓝：0V → J9 GND</text>
+<text x="70" y="1128" font-size="12" text-anchor="start" font-weight="normal" fill="#222">黑：OUT → J12-5 / P1[0]</text>
+<text x="70" y="1149" font-size="12" text-anchor="start" font-weight="normal" fill="#777">粉：不接，绝缘</text>
+<text x="70" y="1171" font-size="10" text-anchor="start" font-weight="normal" fill="#a0522d">P1[0] 必须上拉到已确认的 VDDIO；不得接 12/24V。</text>
+<path d="M345,1124 H410" fill="none" stroke="#222" stroke-width="3" stroke-linejoin="round"/>
+<path d="M345,1103 H410" fill="none" stroke="#1f77b4" stroke-width="3" stroke-linejoin="round"/>
+<rect x="410" y="1044" width="270" height="142" rx="6" fill="#ffffff" stroke="#444" stroke-width="1.5"/>
+<text x="425" y="1065" font-size="14" text-anchor="start" font-weight="bold" fill="#222">载板已用端口</text>
+<text x="425" y="1086" font-size="12" text-anchor="start" font-weight="normal" fill="#222">J12-5 / P1[0]：NPN 黑线</text>
+<text x="425" y="1107" font-size="12" text-anchor="start" font-weight="normal" fill="#222">J12-6 / P1[1]：空余</text>
+<text x="425" y="1128" font-size="12" text-anchor="start" font-weight="normal" fill="#1f77b4">J9：传感器蓝线 + 两个 COM</text>
+<text x="425" y="1149" font-size="11" text-anchor="start" font-weight="normal" fill="#777">J12-1/2：UART；3/4/7：AS5045</text>
+<path d="M680,1078 H745" fill="none" stroke="#2ca02c" stroke-width="3" stroke-linejoin="round"/>
+<path d="M680,1133 H745" fill="none" stroke="#2ca02c" stroke-width="3" stroke-linejoin="round"/>
+<rect x="745" y="1044" width="240" height="142" rx="6" fill="#ffffff" stroke="#444" stroke-width="1.5"/>
+<text x="760" y="1065" font-size="14" text-anchor="start" font-weight="bold" fill="#222">J4 PA（限位输入）</text>
+<text x="760" y="1086" font-size="12" text-anchor="start" font-weight="normal" fill="#222">J4-1 / P0[4] ← 限位 1 NC</text>
+<text x="760" y="1107" font-size="12" text-anchor="start" font-weight="normal" fill="#222">J4-2 / P0[3] ← 限位 2 NC</text>
+<text x="760" y="1128" font-size="12" text-anchor="start" font-weight="normal" fill="#777">J4-3 / P0[2]、J4-4 / P3[2]：空余</text>
+<text x="760" y="1153" font-size="10" text-anchor="start" font-weight="normal" fill="#a0522d">两个输入均设为上拉；正常低，压下/断线高。</text>
+<rect x="1050" y="1044" width="440" height="142" rx="6" fill="#eef4ff" stroke="#444" stroke-width="1.5"/>
+<text x="1065" y="1065" font-size="14" text-anchor="start" font-weight="bold" fill="#222">三端微动开关（NC 失效安全接法）</text>
+<text x="1065" y="1089" font-size="12" text-anchor="start" font-weight="normal" fill="#222">限位 1：COM → J9 GND；NC → J4-1 / P0[4]；NO 悬空绝缘</text>
+<text x="1065" y="1116" font-size="12" text-anchor="start" font-weight="normal" fill="#222">限位 2：COM → J9 GND；NC → J4-2 / P0[3]；NO 悬空绝缘</text>
+<text x="1065" y="1143" font-size="11" text-anchor="start" font-weight="normal" fill="#555">万用表确认：未压 COM-NC 导通；压下 COM-NO 导通。</text>
+<text x="1065" y="1166" font-size="10" text-anchor="start" font-weight="normal" fill="#a0522d">它们是 GPIO 限位，不替代独立硬件急停回路。</text>
+</svg>

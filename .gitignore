@@ -46,3 +46,18 @@ recovered/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Stage-one Windows host and packaged build outputs
+Commissioning/bin/
+Commissioning/obj/
+deliverables/
+__pycache__/
+
+# Local Creator experiments, backups and obsolete preview output
+/creator-native-test-*/
+/creator-pin-backup-*/
+/preview_old.*
+
+# Creator reports and IDE exports are regenerated from the project
+*.cydsn/*_timing.html
+*.cydsn/Export/
