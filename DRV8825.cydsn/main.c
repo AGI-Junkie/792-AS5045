@@ -97,7 +97,14 @@
 #define JOG_ENC_SAMPLE_US           (1000u)
 #define JOG_TICK_US                 (1000u)  /* ramp / deadman / hold tick   */
 #define JOG_HOLD_STEP_MS            (12u)    /* hold correction step spacing */
-#define JOG_CMD_REPEAT_MS           (60u)   /* same command byte again within this = duplicate copy */
+#define JOG_CMD_REPEAT_MS           (60u)
+#define PTP_EPOCH_ANNOUNCE_MS       (250u)  /* re-announce a changed reference epoch this often */
+
+/* Identifies this exact firmware build in every LINK line and in the boot banner.
+ * The STATE line keeps the plain "stage2-v7" token because the host matches it to
+ * select the framed transport.  Bump this on every firmware change so a field log
+ * can answer "was this fix actually flashed?". */
+#define FW_BUILD_ID                 "stage2-v7-absolute-q2"
 
 /* The software UART only accepts odd bytes.  jog.ps1 maps physical R to this
  * otherwise-unused wire byte, because ASCII 'r' (0x72) is even. */
@@ -112,16 +119,13 @@
  * Directions are the real-world keyboard directions confirmed on the bench. */
 #define ARM1_HOME_JOG_DIR            (1)     /* d: approach J4-2 / P0[3]    */
 #define ARM2_HOME_JOG_DIR            (1)     /* Right: approach P1[0] NPN    */
-#define HOME_FAST_RATE_USTEP_S       (2000u)
+#define HOME_FAST_RATE_USTEP_S       (JOG2_RATE_MAX_USTEP_S) /* commissioning: use the slower jog cap */
 #define HOME_SLOW_RATE_USTEP_S       (400u)
-#define HOME_STRAIGHT_RATE_USTEP_S   (2000u)
-#define HOME2_STRAIGHT_RATE_USTEP_S  (2000u) /* match arm1 straight; retain acceleration ramp */
+#define HOME_STRAIGHT_RATE_USTEP_S   (JOG1_RATE_MAX_USTEP_S)
+#define HOME2_STRAIGHT_RATE_USTEP_S  (JOG2_RATE_MAX_USTEP_S) /* retain the successfully tested 600 rate */
 #define HOME_BACKOFF_USTEPS          (64u)
 #define HOME_RELEASE_MAX_USTEPS      (800u)
-#define HOME_SEEK_MAX_USTEPS         (40000u) /* arm2: covers return from 163 deg */
-#define HOME1_SEEK_MAX_USTEPS        (30000u) /* 168.75 deg; includes return from 127 deg straight */
 #define HOME_ACCEL_USTEP_S2         (4000u)
-#define HOME_SLOW_SEEK_MAX_USTEPS    (512u)
 #define HOME_DEBOUNCE_MS             (2u)
 #define HOME_PHASE_TIMEOUT_MS        (120000ul)
 #define HOME_SETTLE_MS               (50u)
@@ -146,14 +150,22 @@
 #endif
 #if PTP_COMMISSIONED && ((PTP_MIN1_CD >= PTP_MAX1_CD) || (PTP_MIN2_CD >= PTP_MAX2_CD) || \
     (PTP_MIN1_CD > 0) || (PTP_MAX1_CD < 0) || (PTP_MIN2_CD > 0) || (PTP_MAX2_CD < 0) || \
-    (PTP_MIN1_CD < -9000) || (PTP_MAX1_CD > 9000) || (PTP_MIN2_CD < -18000) || (PTP_MAX2_CD > 18000))
-#error "PTP requires valid software bounds containing straight zero; arm1 remains within legacy +/-90 deg envelope"
+    (PTP_MIN1_CD < -18000) || (PTP_MAX1_CD > 18000) || (PTP_MIN2_CD < -18000) || (PTP_MAX2_CD > 18000))
+#error "PTP requires valid software bounds within +/-180 deg containing straight zero"
 #endif
 #define PTP_RATE_MAX                 (600u)
 #define PTP_ACCEL                    (800u)
 #define PTP_FRAME_BYTES              (17u)
 #define PTP_FRAME_START              (0xD1u)
 #define PTP_FRAME_END                (0xD3u)
+/* Compact heartbeat: D5 <lo(keys)> <hi(keys)> <lo(crc8)> <hi(crc8)> D7.  Six wire
+ * bytes instead of 36, so one beat costs 5.5 ms of paced writes instead of 35.5 ms.
+ * It carries no sequence and no epoch on purpose: a heartbeat answers "is the host
+ * alive", while every command keeps using the full 17-byte frame with sequence,
+ * epoch and CRC16.  A host that does not know this frame simply never sends it. */
+#define PTP_SHORT_BYTES              (2u)
+#define PTP_SHORT_START              (0xD5u)
+#define PTP_SHORT_END                (0xD7u)
 /* Confirmed by physical homing logs on 2026-09-24: encoder increases at DIR=1.
  * Manual referencing uses this bench calibration, with no automatic probe motion. */
 #define MANUAL_ENC_INC_DIR           (1u)
@@ -201,6 +213,7 @@
 /* ------------------------- fine position loop --------------------------- */
 #define CL_DEADBAND_LSB             (4)      /* 0.35 motor deg, 1.6 ustep    */
 #define CL_NEAR_LSB                 (16)
+#define PTP_FINAL_ERROR_LSB         (228)    /* motion commissioning: about +/-0.50 output deg, not a precision claim */
 #define CL_MID_LSB                  (64)
 #define CL_RATE_NEAR_USTEP_S        (80u)
 #define CL_RATE_MID_USTEP_S         (160u)
@@ -335,11 +348,33 @@
 #define SU_ADVANCE(t0, cy)          (((t0) - (cy)) & 0x00FFFFFFu)
 #define SU_CY_PER_US                (BCLK__BUS_CLK__HZ / 1000000u)
 
+/* Extend the existing free-running 24-bit down-counter without changing pulse
+ * timing. The ISR only counts wraps; foreground stalls do not slow deadlines. */
+static volatile uint32 g_clockWraps;
+CY_ISR(clock_wrap_isr) { g_clockWraps++; }
+static uint32 wall_ms(void)
+{
+    uint32 wraps, current;
+    uint8 ints = CyEnterCriticalSection();
+    wraps = g_clockWraps;
+    current = SU_NOW();
+    if (CY_GET_REG32(CYREG_NVIC_INTR_CTRL_STATE) & 0x04000000u) {
+        /* A wrap occurred while interrupts were masked; count it exactly once. */
+        wraps++;
+        current = SU_NOW();
+    }
+    CyExitCriticalSection(ints);
+    return (uint32)((((uint64_t)wraps << 24) + (0x00FFFFFFu-current)) /
+                    (BCLK__BUS_CLK__HZ / 1000u));
+}
+
 static void su_timer_start(void)
 {
+    g_clockWraps = 0u;
+    (void)CyIntSetSysVector(CY_INT_SYSTICK_IRQN, clock_wrap_isr);
     CY_SET_REG32(CYREG_NVIC_SYSTICK_RELOAD,  0x00FFFFFFu);
     CY_SET_REG32(CYREG_NVIC_SYSTICK_CURRENT, 0u);
-    CY_SET_REG32(CYREG_NVIC_SYSTICK_CTL,     0x05u);
+    CY_SET_REG32(CYREG_NVIC_SYSTICK_CTL,     0x07u);
 }
 
 /* Keep each call below the approximately 0.69 s SysTick wrap at 24 MHz. */
@@ -446,13 +481,16 @@ typedef struct
     uint8 par_ok;
 } as5045_t;
 
+static uint32 g_encIrqMaxCy, g_encRetries, g_encRejected, g_encMaxGapMs, g_followPeakLsb;
 static uint32 as5045_read_raw(void)
 {
     uint32 value = 0u;
     uint8 i;
     uint8 ints;
+    uint32 started, duration;
 
     ints = CyEnterCriticalSection();
+    started = SU_NOW();
     CyPins_ClearPin(PIN_CSN);
     delay_us(2u);
 
@@ -468,7 +506,9 @@ static uint32 as5045_read_raw(void)
     }
 
     CyPins_SetPin(PIN_CSN);
+    duration=SU_ELAPSED(started);
     CyExitCriticalSection(ints);
+    if(duration>g_encIrqMaxCy) { g_encIrqMaxCy=duration; }
     delay_us(2u);
     return (value & FRAME_MASK);
 }
@@ -560,6 +600,7 @@ static uint8 encoder_get_valid(as5045_t *sample)
     uint8 attempt;
     for (attempt = 0u; attempt < ENCODER_READ_RETRIES; attempt++)
     {
+        if(attempt!=0u) { g_encRetries++; }
         as5045_read(sample);
         if (encoder_state_valid(classify(sample)) != 0u) { return 1u; }
         CyDelay(1u);
@@ -568,12 +609,19 @@ static uint8 encoder_get_valid(as5045_t *sample)
 }
 
 /* ====================== multi-turn position tracking ==================== */
+static int32 g_cmdUsteps;       /* net microsteps issued since the origin */
+static int32 g_cmdLsbX100;
+#define ENC_MAX_GAP_MS (100u)
+#define ENC_JUMP_MARGIN_LSB (SLIP_FAIL_LSB)
 typedef struct
 {
     int32  pos;         /* accumulated motor-side position, encoder LSB     */
     uint16 lastAngle;
     uint8  primed;
     uint8  badStreak;
+    uint8  trackingLost;
+    uint32 lastMs;
+    int32 lastCmd;
 } enc_t;
 
 static enc_t g_enc;
@@ -583,6 +631,11 @@ static enc_t g_enc;
 static uint8 enc_sample(void)
 {
     as5045_t s;
+    uint32 now, gap;
+    int32 delta;
+    int64 commanded, position;
+
+    if(g_enc.trackingLost) { g_enc.badStreak=ENC_BAD_LIMIT; return 0u; }
 
     if (encoder_get_valid(&s) == 0u)
     {
@@ -598,8 +651,29 @@ static uint8 enc_sample(void)
     }
     else
     {
-        g_enc.pos += (int32)angle_delta(s.angle, g_enc.lastAngle);
+        now=wall_ms(); gap=now-g_enc.lastMs;
+        if(gap>g_encMaxGapMs) { g_encMaxGapMs=gap; }
+        delta=(int32)angle_delta(s.angle, g_enc.lastAngle);
+        commanded=(int64)g_cmdUsteps-g_enc.lastCmd;
+        if(commanded<0) { commanded=-commanded; }
+        position=(int64)g_enc.pos+delta;
+        /* At the configured maximum 6000 usteps/s, 100 ms plus the margin
+         * stays below half a motor turn. A lost turn cannot be reconstructed. */
+        if(gap>ENC_MAX_GAP_MS ||
+           abs_i32(delta)>(int32)((MOVE_RATE_MAX_USTEP_S*(uint32)LSB_PER_USTEP_X100*(gap+1u))/100000u)+ENC_JUMP_MARGIN_LSB ||
+           abs_i32(delta)>commanded*LSB_PER_USTEP_X100/100+ENC_JUMP_MARGIN_LSB ||
+           position>INT32_MAX || position<INT32_MIN) {
+            g_enc.trackingLost=1u; g_enc.badStreak=ENC_BAD_LIMIT; g_encRejected++;
+            return 0u;
+        }
+        g_enc.pos = (int32)position;
         g_enc.lastAngle = s.angle;
+    }
+    g_enc.lastMs=wall_ms(); g_enc.lastCmd=g_cmdUsteps;
+    {
+        int64 following=(int64)g_cmdLsbX100/100-g_enc.pos;
+        if(following<0) { following=-following; }
+        if((uint64_t)following>g_followPeakLsb) { g_followPeakLsb=(uint32)following; }
     }
     return 1u;
 }
@@ -626,12 +700,12 @@ static uint8 enc_set_origin(void)
     g_enc.pos       = 0;
     g_enc.primed    = 1u;
     g_enc.badStreak = 0u;
+    g_enc.trackingLost=0u;
+    g_enc.lastMs=wall_ms(); g_enc.lastCmd=g_cmdUsteps;
     return 1u;
 }
 
 /* ========================== commanded position ========================== */
-static int32 g_cmdLsbX100;      /* commanded position, hundredths of a LSB  */
-static int32 g_cmdUsteps;       /* net microsteps issued since the origin   */
 
 static int32 cmd_lsb(void)      { return g_cmdLsbX100 / 100; }
 
@@ -639,6 +713,7 @@ static void cmd_reset_to_measured(void)
 {
     g_cmdLsbX100 = g_enc.pos * 100;
     g_cmdUsteps  = lsb_to_usteps(g_enc.pos);
+    g_enc.lastCmd=g_cmdUsteps;
 }
 
 /* commanded - measured, with the AS5045 output delay taken out.
@@ -779,7 +854,7 @@ typedef struct
     uint32 cMin;        /* cruise period = speed cap                        */
     int32  n;           /* >0 accelerating, <0 decelerating                 */
     int32  rest;        /* carried division remainder                       */
-    int32  total;
+    int32  total;       /* 0: accelerate and cruise until an external stop */
     int32  decelStart;
     uint8  cruising;
 } ramp_t;
@@ -821,7 +896,8 @@ static void ramp_advance(ramp_t *r, int32 done)
     int32 denom;
     int32 num;
 
-    if (done >= r->decelStart)
+    if ((r->total == 0) && (r->cruising != 0u)) { return; }
+    if ((r->total > 0) && (done >= r->decelStart))
     {
         if (r->n > 0) { r->n = -(r->total - done); r->rest = 0; }
         else          { r->n++; }
@@ -994,6 +1070,7 @@ static int8 fine_update(int32 targetLsb, int32 *errOut, uint32 *spentMs)
 
 static int8 fine_seek(int32 targetLsb, const char *label)
 {
+    uint32 start = wall_ms();
     uint32 elapsed = 0u;
     uint32 spent = 0u;
     int32 err = 0;
@@ -1006,7 +1083,7 @@ static int8 fine_seek(int32 targetLsb, const char *label)
     {
         rc = fine_update(targetLsb, &err, &spent);
         if (rc < 0) { return rc; }
-        elapsed += spent;
+        elapsed = wall_ms()-start;
         if (rc == FINE_NO_DATA) { continue; }
 
         if (rc == 1)
@@ -1047,6 +1124,7 @@ static int8 fine_seek(int32 targetLsb, const char *label)
 
 static int8 fine_hold(int32 targetLsb, uint32 durationMs, const char *label)
 {
+    uint32 start = wall_ms();
     uint32 elapsed = 0u;
     uint32 lastLog = 0u;
     uint32 spent = 0u;
@@ -1059,7 +1137,7 @@ static int8 fine_hold(int32 targetLsb, uint32 durationMs, const char *label)
     {
         rc = fine_update(targetLsb, &err, &spent);
         if (rc < 0) { return rc; }
-        elapsed += spent;
+        elapsed = wall_ms()-start;
         if (rc == FINE_NO_DATA) { continue; }
 
         if (rc == 0)
@@ -1376,8 +1454,17 @@ static uint32 g_rxRejected;
 static uint8  g_rxLastBad[8];   /* last rejected values, ring          */
 static uint8  g_rxLastBadIdx;
 
+/* Raw byte rejections share telemetry; rejected decoded frames keep their own cause. */
+static void jog_reject_byte(uint8 b)
+{
+    g_rxRejected++;
+    g_rxLastBad[g_rxLastBadIdx] = b;
+    g_rxLastBadIdx = (uint8)((g_rxLastBadIdx + 1u) % 8u);
+}
+
 /* --------------------- non-blocking debug output ------------------------ */
 /* Queue complete messages; feed the interrupt-driven UART without blocking. */
+static void txq_flush_blocking(void) __attribute__((unused));
 #if (USE_DEBUG_UART != 0u)
 #define TXQ_SIZE                    (2048u)
 static char   g_txq[TXQ_SIZE];
@@ -1415,7 +1502,13 @@ static void txq_send_one(void)
 
 static void txq_flush_blocking(void)
 {
-    while (txq_pending() != 0u) { txq_send_one(); }
+    uint32 start = wall_ms();
+    while (txq_pending() != 0u) {
+        if (wall_ms()-start >= 100u) {
+            g_txqTail=g_txqHead; g_txqDropped++; return;
+        }
+        txq_send_one();
+    }
 }
 
 #define JLOG(s)      txq_puts(s)
@@ -1428,7 +1521,7 @@ static void txq_flush_blocking(void)
 static int16 uart_rx_service(void)
 {
     uint16 received = 0u;
-    uint8 overflow, errors;
+    uint8 overflow, errors = 0u;
     int16 result = -1;
     uint8 ints = CyEnterCriticalSection();
     overflow = HostUart_rxBufferOverflow;
@@ -1441,11 +1534,20 @@ static int16 uart_rx_service(void)
             if (overflow || (errors & HostUart_RX_STS_OVERRUN)) { g_rxLate++; }
             if (errors & (HostUart_RX_STS_BREAK | HostUart_RX_STS_PAR_ERROR | HostUart_RX_STS_STOP_ERROR)) { g_rxFraming++; }
             HostUart_ClearRxBuffer();
-            result = -2;
+            result = (!overflow && errors == HostUart_RX_STS_STOP_ERROR) ? -3 : -2;
         }
         else { result = (int16)(received & 0xffu); }
     }
     CyExitCriticalSection(ints);
+    if (result <= -2)
+    {
+        JLOGF("UART RX fault: flags=0x%02X sw_overflow=%u break=%u parity=%u framing=%u overrun=%u\r\n",
+              (unsigned)errors, (unsigned)overflow,
+              (unsigned)((errors & HostUart_RX_STS_BREAK) != 0u),
+              (unsigned)((errors & HostUart_RX_STS_PAR_ERROR) != 0u),
+              (unsigned)((errors & HostUart_RX_STS_STOP_ERROR) != 0u),
+              (unsigned)((errors & HostUart_RX_STS_OVERRUN) != 0u));
+    }
     return result;
 }
 
@@ -1492,6 +1594,7 @@ typedef struct
     uint32 rateStart;
     uint32 accel;           /* ustep/s^2                                   */
     uint32 decel;
+    uint32 rampRemainder;   /* fractional rate increment, per 1 ms tick */
     uint32 periodCy;        /* BUS_CLK cycles between steps at `rate`      */
     uint32 tLastStep;
     int32  usteps;          /* net microsteps since power-up, right = +    */
@@ -1506,7 +1609,8 @@ typedef struct
 
 static jog_axis_t g_arm1;
 static jog_axis_t g_arm2;
-static uint32 g_jogMs;          /* free-running ms counter (tick)        */
+static uint32 g_jogMs;          /* latest monotonic hardware time, not loop ticks */
+static uint32 g_loopMaxMs, g_tickMaxLagMs;
 static uint32 g_lastKeyMs;      /* last valid key byte                   */
 static uint8  g_keysSeen;
 
@@ -1523,6 +1627,14 @@ static uint8  g_directionKnown;
 static uint8  g_homed1;
 static uint8  g_homed2;
 static int32  g_arm1SoftCenter;
+/* Volatile operator settings: boot restores defaults; stop/enable retain them. */
+static int16 g_jointMinCd[2] = { PTP_MIN1_CD, PTP_MIN2_CD };
+static int16 g_jointMaxCd[2] = { PTP_MAX1_CD, PTP_MAX2_CD };
+static uint8 g_limitsAccepted[15];
+static uint16 g_motionRate[2] = { JOG1_RATE_MAX_USTEP_S, JOG2_RATE_MAX_USTEP_S };
+static uint16 g_motionAccel[2] = { JOG1_ACCEL_USTEP_S2, JOG2_ACCEL_USTEP_S2 };
+static uint8 g_ratesAccepted[15];
+static uint32 motion_min(uint32 a, uint32 b) { return a < b ? a : b; }
 
 static struct {
     uint8 active; /* 1 moving, 2 settling */
@@ -1537,13 +1649,31 @@ static struct {
     int8 sign[2];
     uint8 accepted[15];
     ramp_t ramp;
-} g_ptp;
+} g_ptp = { .epoch = 1u };
 static struct {
     uint8 active, count, last;
     uint8 bytes[PTP_FRAME_BYTES];
     uint32 sinceMs, lastMs;
 } g_ptpRx;
+static struct {
+    uint8 active, count, last;
+    uint8 bytes[PTP_SHORT_BYTES];
+    uint32 sinceMs, lastMs;
+} g_shortRx;
+static uint32 g_shortRxOk;      /* accepted compact heartbeats */
 static uint32 g_ptpRxDropped;
+static uint32 g_ptpRxCrc;       /* dropped: CRC mismatch                  */
+static uint32 g_ptpRxShort;     /* dropped: frame ended with too few bytes */
+static uint32 g_ptpRxTimeout;   /* dropped: no terminator within the frame window */
+static uint32 g_ptpEpochRejected; /* control frames refused on a stale epoch */
+static uint32 g_epochAnnounceMs;  /* throttle for the epoch re-announcement */
+static uint8  g_epochAnnounceSeen;
+static uint8 g_uploadRxQuarantine;
+
+/* Heartbeat margin telemetry.  The deadman is only checked while motion is
+ * enabled, so the worst interval is measured over exactly that window and is
+ * reset by ENABLE: it reports "how close did this run come to 250 ms". */
+static uint32 g_keyMaxGapMs;
 
 /* Whole-path preload: no movement until every numbered node is accepted. */
 #define TRAJ_CAPACITY 2048u
@@ -1584,6 +1714,55 @@ static struct {
 static void jog_print_inputs(void);
 static void stage_status(void);
 
+static uint8 host_lease_fresh(void)
+{
+    return g_keysSeen && g_jogMs-g_lastKeyMs<=JOG_DEADMAN_MS;
+}
+
+/* Renewing the lease is deliberately separate from applying a control frame.  The
+ * lease answers "is the host alive", not "is the host on the current reference
+ * epoch"; conflating the two is what made the epoch change at the start of homing
+ * expire the lease and stop the machine. */
+static void host_lease_renew(void)
+{
+    if ((g_keysSeen != 0u) && (g_motionEnabled != 0u))
+    {
+        uint32 gap = g_jogMs - g_lastKeyMs;
+        if (gap > g_keyMaxGapMs) { g_keyMaxGapMs = gap; }
+    }
+    g_lastKeyMs = g_jogMs;
+    g_keysSeen  = 1u;
+}
+
+/* Re-announce the reference epoch while a host is still sending frames for the
+ * previous one.  Homing already publishes a full status, but that line can be
+ * dropped when the transmit queue is full (tx_dropped is non-zero in the field), so
+ * the host needs a cheap, repeated way back into sync.  Throttled, and harmless to
+ * a host that does not know the line. */
+static void ptp_announce_epoch(void)
+{
+    if ((g_epochAnnounceSeen != 0u) && ((g_jogMs - g_epochAnnounceMs) < PTP_EPOCH_ANNOUNCE_MS)) { return; }
+    g_epochAnnounceSeen = 1u; g_epochAnnounceMs = g_jogMs;
+    JLOGF("PTP_EPOCH %lu\r\n", (unsigned long)g_ptp.epoch);
+}
+static uint8 host_input_idle(void)
+{
+    return host_lease_fresh() && g_jogKeysIdle && !g_homeNeedKeyRelease;
+}
+static uint8 axes_idle(void)
+{
+    return !g_arm1.moving && !g_arm2.moving && !g_arm1.want && !g_arm2.want &&
+           !g_arm1.settleMs && !g_arm2.settleMs;
+}
+static uint8 motion_inputs_clear(void)
+{
+    return !FAULT_ACTIVE() && !HARD_LIMIT_ACTIVE();
+}
+static uint8 home_inputs_clear(void)
+{
+    return !ARM1_HOME_ACTIVE() && !ARM2_NPN_ACTIVE();
+}
+
 static void jog_stop_now(jog_axis_t *a)
 {
     a->want = 0;
@@ -1595,18 +1774,20 @@ static void jog_stop_now(jog_axis_t *a)
 
 static void ptp_invalidate(void)
 {
+    if(g_uploadRxQuarantine) { uart_discard_rx(); }
+    g_uploadRxQuarantine=0u;
     g_traj.state=0u; g_traj.count=g_traj.expected=g_traj.index=0u;
     g_ptp.active = 0u; g_ptp.reference = 0u; g_ptp.referenceSource = 0u; g_ptpRx.active = 0u;
     if (++g_ptp.epoch == 0u) { ++g_ptp.epoch; }
 }
 
-/* Shared stop for every motion mode. Keep holding current unless the driver
- * itself faults; never emit correction steps after stop or link loss. */
+/* Protective stops retain holding current unless the driver itself faults.
+ * The explicit operator STOP also disables both drivers at its command entry. */
 static void stage_stop(const char *reason, uint8 driverFault)
 {
-    JLOGF("STOP context: home=%u arm=%u phase_steps=%lu key_age_ms=%lu rx_good=%lu late=%lu rejected=%lu\r\n",
+    JLOGF("STOP context: home=%u arm=%u phase_steps=%lu key_age_ms=%lu key_max_gap_ms=%lu rx_good=%lu late=%lu rejected=%lu\r\n",
           (unsigned)g_home.phase, (unsigned)g_home.arm, (unsigned long)g_home.steps,
-          (unsigned long)(g_jogMs - g_lastKeyMs), (unsigned long)g_rxGood,
+          (unsigned long)(g_jogMs - g_lastKeyMs), (unsigned long)g_keyMaxGapMs, (unsigned long)g_rxGood,
           (unsigned long)g_rxLate, (unsigned long)g_rxRejected);
     jog_stop_now(&g_arm1);
     jog_stop_now(&g_arm2);
@@ -1716,6 +1897,7 @@ static const char *jog_dir_name(int8 s)
 }
 
 /* One microstep, s = +1 right / -1 left.  Never blocks beyond the pulse. */
+static uint8 joint_step_allowed(const jog_axis_t *a, int8 s);
 static void jog_step(jog_axis_t *a, int8 s)
 {
     uint8 lvl = jog_dir_level(a, s);
@@ -1724,7 +1906,7 @@ static void jog_step(jog_axis_t *a, int8 s)
         ((a == &g_arm1) && (s == ARM1_HOME_JOG_DIR) &&
          ARM1_HOME_ACTIVE() && (g_arm1HomeActive == 0u)) ||
         ((a == &g_arm2) && (s == ARM2_HOME_JOG_DIR) &&
-         ARM2_NPN_ACTIVE() && (g_arm2HomeActive == 0u))) { return; }
+         ARM2_NPN_ACTIVE() && (g_arm2HomeActive == 0u)) || !joint_step_allowed(a,s)) { return; }
     if (lvl != a->lastDirLevel)
     {
         pin_write(a->pinDir, lvl);
@@ -1760,6 +1942,20 @@ static uint32 home_straight_steps(uint8 arm)
  * 15 payload bytes: version, seq:u32, epoch:u32, q1:i16, q2:i16, rate:u16 (LE).
  * Followed by CRC16-CCITT (init FFFF), little endian. Angles are centidegrees
  * relative to the verified straight reference; positive is physical LEFT/CCW. */
+/* CRC-8/ATM over the compact heartbeat payload.  One data byte plus one check byte
+ * detects every one- and two-bit error, which is what protects the jog mask. */
+static uint8 ptp_crc8(const uint8 *p, uint8 n)
+{
+    uint8 crc = 0u, i;
+    while (n-- != 0u) {
+        crc ^= *p++;
+        for (i = 0u; i < 8u; i++) {
+            crc = (uint8)(((crc & 0x80u) != 0u) ? (((uint8)(crc << 1)) ^ 0x07u) : (uint8)(crc << 1));
+        }
+    }
+    return crc;
+}
+
 static uint16 ptp_crc(const uint8 *p, uint8 n)
 {
     uint16 crc = 0xFFFFu; uint8 i;
@@ -1777,12 +1973,47 @@ static int32 ptp_offset(uint8 axis, int32 cd)
         (int32)(ARM2_MOTOR_FULLSTEPS_REV * USTEP_DIV * ARM2_GEAR_RATIO_X100 / 100));
     return (int32)((n >= 0) ? (n + 18000) / 36000 : -((-n + 18000) / 36000));
 }
+static int32 ptp_axis_angle_cd(uint8 axis, int32 q1, int32 q2)
+{
+    return axis == 0u ? q1 : q2 - q1; /* q2 is link 2 relative to fixed +X; motor 2 is elbow-relative */
+}
+static int32 ptp_angle_from_counts(uint8 axis, int32 count)
+{
+    int32 steps=g_ptp.origin[axis]-count;
+    int32 revolution=axis==0u ? MOTOR_FULLSTEPS_REV*USTEP_DIV*GEAR_RATIO :
+        ARM2_MOTOR_FULLSTEPS_REV*USTEP_DIV*ARM2_GEAR_RATIO_X100/100;
+    int64 scaled=(int64)steps*36000;
+    return (int32)(scaled>=0 ? (scaled+revolution/2)/revolution : -((-scaled+revolution/2)/revolution));
+}
 static uint8 ptp_counts_in_range(uint8 axis, int32 count)
 {
-    int32 min = (axis == 0u) ? PTP_MIN1_CD : PTP_MIN2_CD;
-    int32 max = (axis == 0u) ? PTP_MAX1_CD : PTP_MAX2_CD;
-    return (count >= g_ptp.origin[axis] - ptp_offset(axis,max) &&
-            count <= g_ptp.origin[axis] - ptp_offset(axis,min)) ? 1u : 0u;
+    int32 q1=ptp_angle_from_counts(0u,axis==0u?count:g_arm1.usteps);
+    int32 q2=q1+ptp_angle_from_counts(1u,axis==1u?count:g_arm2.usteps);
+    int32 value=axis==0u ? q1 : q2;
+    return value>=g_jointMinCd[axis] && value<=g_jointMaxCd[axis];
+}
+static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
+{
+    uint8 axis = (a == &g_arm1) ? 0u : 1u;
+    if(g_home.phase!=HOME_IDLE || !g_directionKnown || !(axis ? g_homed2 : g_homed1)) { return 1u; }
+    /* Homed/manual-reference zero survives switching to jog. Permit retreat from
+     * outside a bound, but never another outward step (including deceleration). */
+    int32 q1=ptp_angle_from_counts(0u,g_arm1.usteps);
+    int32 elbow=ptp_angle_from_counts(1u,g_arm2.usteps);
+    /* Quantized estimates can sit just inside a limit; compare actual counts
+     * with the nearest legal pulse boundary before allowing an outward jog. */
+    if(axis==0u && ((s<0 && a->usteps<=g_ptp.origin[0]-ptp_offset(0u,g_jointMaxCd[0])) ||
+                    (s>0 && a->usteps>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[0])))) return 0u;
+    if(axis==1u && ((s<0 && a->usteps<=g_ptp.origin[1]-ptp_offset(1u,g_jointMaxCd[1]-q1)) ||
+                    (s>0 && a->usteps>=g_ptp.origin[1]-ptp_offset(1u,g_jointMinCd[1]-q1)))) return 0u;
+    if(axis==0u && ((s<0 && g_arm1.usteps<=g_ptp.origin[0]-ptp_offset(0u,g_jointMaxCd[1]-elbow)) ||
+                    (s>0 && g_arm1.usteps>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[1]-elbow)))) return 0u;
+    if(a->hasEnc) {
+        int64 measured=((int64)g_enc.pos-g_arm1SoftCenter)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)*36000;
+        if((s<0 && measured>=(int64)g_jointMaxCd[axis]*ENCODER_CPR*GEAR_RATIO) ||
+           (s>0 && measured<=(int64)g_jointMinCd[axis]*ENCODER_CPR*GEAR_RATIO)) { return 0u; }
+    }
+    return 1u;
 }
 static void traj_status(void)
 {
@@ -1790,12 +2021,83 @@ static void traj_status(void)
           (unsigned)g_traj.state,(unsigned)g_traj.count,(unsigned)g_traj.expected,
           (unsigned)g_traj.index,(unsigned long)g_ptp.sequence,(unsigned long)g_ptp.epoch);
 }
+static uint32 g_controlSequence;
+static void jog_apply_keys(uint8 mask);
+static void stage_enable(void);
+static void jog_home_all(void);
+static void motion_config_status(void);
+
+/* Type 9 shares the control sequence but never changes the reference epoch.
+ * Applying ranges requires a stopped, reference-free stage; ENABLE changes the
+ * epoch before any motion can start. Exact retries only repeat the receipt. */
+static void joint_limits_accept(const uint8 *p)
+{
+    uint32 seq=ptp_u32(p+1);
+    uint16 axis=ptp_u16(p+13);
+    int16 min=(int16)ptp_u16(p+9), max=(int16)ptp_u16(p+11);
+    uint8 rates=(p[0]==10u);
+    uint8 *accepted=rates ? g_ratesAccepted : g_limitsAccepted;
+    if(ptp_u32(p+5)!=g_ptp.epoch) {
+        g_rxRejected++; g_ptpEpochRejected++; ptp_announce_epoch();
+        JLOG("PTP_LIMITS refused: stale epoch\r\n"); return;
+    }
+    if(!seq || axis>1u || (rates ?
+       (min<20 || min>(axis==0u?800:600) || max<100 || max>(axis==0u?20000:12000)) :
+       (min < -18000 || max > 18000 || min>=max || min>0 || max<0))) {
+        g_rxRejected++; JLOG("PTP_LIMITS refused: axis/range\r\n"); return;
+    }
+    if(g_motionEnabled || g_home.phase!=HOME_IDLE || !axes_idle() ||
+       g_arm1.holding || g_arm2.holding || g_ptp.reference || g_ptp.active || g_traj.state) {
+        g_rxRejected++; JLOG("PTP_LIMITS refused: stop and clear reference first\r\n"); return;
+    }
+    if(memcmp(accepted,p,15u)!=0) {
+        if(seq<=g_controlSequence) { g_rxRejected++; JLOG("PTP_LIMITS refused: stale sequence\r\n"); return; }
+        if(rates) {
+            jog_axis_t *a=axis==0u?&g_arm1:&g_arm2;
+            g_motionRate[axis]=(uint16)min; g_motionAccel[axis]=(uint16)max;
+            a->rateMax=(uint32)min; a->rateStart=20u;
+            a->accel=a->decel=(uint32)max; a->rampRemainder=0u;
+        } else { g_jointMinCd[axis]=min; g_jointMaxCd[axis]=max; }
+        g_controlSequence=seq; memcpy(accepted,p,15u);
+    }
+    JLOGF("%s epoch=%lu seq=%lu axis=%u min=%d max=%d\r\n",rates?"PTP_RATES":"PTP_LIMITS",
+          (unsigned long)g_ptp.epoch,(unsigned long)seq,(unsigned)axis,(int)min,(int)max);
+    motion_config_status(); /* configuration ACKs need no full diagnostic burst */
+}
+
+/* A separate sequence lets periodic input leases coexist with contiguous
+ * trajectory nodes, using the same CRC envelope and current reference epoch. */
+static void control_accept(const uint8 *p)
+{
+    uint32 seq=ptp_u32(p+1);
+    uint16 value=ptp_u16(p+13);
+    if(!seq || ptp_u16(p+9) || ptp_u16(p+11) || value>(p[0]==6u?15u:0u)) {
+        g_rxRejected++; return;
+    }
+    if(ptp_u32(p+5)!=g_ptp.epoch) {
+        /* A heartbeat for a previous reference epoch still proves the host is alive,
+         * so it renews the lease.  The jog mask is NOT applied, the sequence is NOT
+         * accepted and no command runs, so a stale host can never start or keep
+         * motion -- but it also can never cause a deadman stop by itself. */
+        g_ptpEpochRejected++; g_rxRejected++;
+        ptp_announce_epoch();
+        if(p[0]==6u) { host_lease_renew(); g_rxGood++; }
+        return;
+    }
+    if(seq<=g_controlSequence) { g_rxRejected++; return; }
+    if(g_uploadRxQuarantine && (p[0]!=6u || value!=0u)) { g_rxRejected++; return; }
+    g_controlSequence=seq;
+    if(p[0]==6u) { jog_apply_keys((uint8)value); }
+    else if(p[0]==7u) { stage_enable(); }
+    else { jog_home_all(); }
+}
+
 static void traj_segment(void)
 {
     uint8 i; jog_axis_t *axes[2]; traj_node_t *n=&g_traj.nodes[g_traj.index];
     axes[0]=&g_arm1; axes[1]=&g_arm2;
     g_ptp.target[0]=g_ptp.origin[0]-ptp_offset(0u,n->q1);
-    g_ptp.target[1]=g_ptp.origin[1]-ptp_offset(1u,n->q2);
+    g_ptp.target[1]=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,n->q1,n->q2));
     for(i=0u;i<2u;i++) {
         int32 d=g_ptp.target[i]-axes[i]->usteps;
         g_ptp.distance[i]=(uint32)abs_i32(d); g_ptp.error[i]=0u;
@@ -1812,7 +2114,7 @@ static uint8 traj_accept(const uint8 *p)
     q[0]=(int16)ptp_u16(p+9); q[1]=(int16)ptp_u16(p+11);
     if (p[0]==2u) {
         if(value<2u || value>TRAJ_CAPACITY) { JLOG("PTP refused: trajectory capacity\r\n"); return 0u; }
-        if(g_arm1.usteps!=g_ptp.origin[0]-ptp_offset(0u,q[0]) || g_arm2.usteps!=g_ptp.origin[1]-ptp_offset(1u,q[1])) {
+        if(g_arm1.usteps!=g_ptp.origin[0]-ptp_offset(0u,q[0]) || g_arm2.usteps!=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,q[0],q[1]))) {
             JLOG("PTP refused: move to trajectory start first\r\n"); return 0u;
         }
         g_traj.nodes[0].q1=q[0]; g_traj.nodes[0].q2=q[1]; g_traj.nodes[0].ms=0u;
@@ -1826,11 +2128,12 @@ static uint8 traj_accept(const uint8 *p)
         }
         previousMs=last->ms ? last->ms : value;
         for(i=0u;i<2u;i++) {
-            int32 d=ptp_offset(i,q[i])-ptp_offset(i,i==0u?last->q1:last->q2);
+            int32 d=ptp_offset(i,ptp_axis_angle_cd(i,q[0],q[1]))-
+                ptp_offset(i,ptp_axis_angle_cd(i,last->q1,last->q2));
             velocity[i]=d*1000/(int32)value;
-            if((uint32)abs_i32(d)*1000u>TRAJ_RATE_MAX*value ||
-               (uint32)abs_i32(velocity[i]-g_traj.velocity[i])*2000u>TRAJ_ACCEL_MAX*((uint32)value+previousMs) ||
-               (g_traj.count+1u==g_traj.expected && (uint32)abs_i32(velocity[i])*2000u>TRAJ_ACCEL_MAX*value)) {
+            if((uint32)abs_i32(d)*1000u>motion_min(TRAJ_RATE_MAX,g_motionRate[i])*value ||
+               (uint32)abs_i32(velocity[i]-g_traj.velocity[i])*2000u>motion_min(TRAJ_ACCEL_MAX,g_motionAccel[i])*((uint32)value+previousMs) ||
+               (g_traj.count+1u==g_traj.expected && (uint32)abs_i32(velocity[i])*2000u>motion_min(TRAJ_ACCEL_MAX,g_motionAccel[i])*value)) {
                 JLOG("PTP refused: trajectory rate/velocity change\r\n"); return 0u;
             }
         }
@@ -1842,7 +2145,7 @@ static uint8 traj_accept(const uint8 *p)
         if(p[0]!=4u || q[0]!=0 || q[1]!=0 || value!=0u || g_traj.state!=2u ||
            g_traj.count!=g_traj.expected || ptp_u32(p+1)!=g_ptp.sequence+1u ||
            g_arm1.usteps!=g_ptp.origin[0]-ptp_offset(0u,g_traj.nodes[0].q1) ||
-           g_arm2.usteps!=g_ptp.origin[1]-ptp_offset(1u,g_traj.nodes[0].q2)) {
+           g_arm2.usteps!=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,g_traj.nodes[0].q1,g_traj.nodes[0].q2))) {
             JLOG("PTP refused: trajectory incomplete/start position\r\n"); return 0u;
         }
         g_traj.state=3u; g_traj.index=1u; g_traj.elapsedCy=0u; g_traj.clock=SU_NOW();
@@ -1857,7 +2160,9 @@ static void ptp_accept(void)
     int32 q1 = (int16)ptp_u16(p+9), q2 = (int16)ptp_u16(p+11);
     uint16 rate = ptp_u16(p+13); uint8 i;
     jog_axis_t *axes[2]; axes[0]=&g_arm1; axes[1]=&g_arm2;
-    if (ptp_crc(p,15u) != ptp_u16(p+15)) { g_ptpRxDropped++; JLOG("PTP RX dropped: CRC\r\n"); return; }
+    if (ptp_crc(p,15u) != ptp_u16(p+15)) { g_ptpRxDropped++; g_ptpRxCrc++; JLOG("PTP RX dropped: CRC\r\n"); return; }
+    if (p[0]==9u || p[0]==10u) { joint_limits_accept(p); return; }
+    if (p[0]>=6u && p[0]<=8u) { control_accept(p); return; }
     if (p[0] < 1u || p[0] > 5u) { JLOG("PTP refused: version\r\n"); return; }
     if (!PTP_COMMISSIONED) { JLOG("PTP refused: commissioning lock\r\n"); return; }
     if(p[0]==5u && g_ptp.reference && seq==g_ptp.sequence && memcmp(g_ptp.accepted,p,15u)==0) {
@@ -1869,10 +2174,8 @@ static void ptp_accept(void)
     }
     if (seq == 0u || seq <= g_ptp.sequence) { JLOG("PTP refused: stale sequence\r\n"); return; }
     if (!g_motionEnabled || (p[0]!=5u && (!g_homed1 || !g_homed2 || !g_directionKnown)) || !g_arm1.hasEnc ||
-        g_home.phase != HOME_IDLE || g_ptp.active || (p[0]==1u && (g_traj.state==1u || g_traj.state==2u)) || !g_keysSeen || !g_jogKeysIdle || g_homeNeedKeyRelease ||
-        g_jogMs-g_lastKeyMs > JOG_DEADMAN_MS || g_arm1.moving || g_arm2.moving ||
-        g_arm1.want || g_arm2.want || g_arm1.settleMs || g_arm2.settleMs ||
-        FAULT_ACTIVE() || HARD_LIMIT_ACTIVE() || ARM1_HOME_ACTIVE() || ARM2_NPN_ACTIVE()) {
+        g_home.phase != HOME_IDLE || g_ptp.active || (p[0]==1u && (g_traj.state==1u || g_traj.state==2u)) ||
+        !host_input_idle() || !axes_idle() || !motion_inputs_clear() || !home_inputs_clear()) {
         JLOG("PTP refused: not homed/idle/healthy\r\n"); return;
     }
     if(p[0]==5u) {
@@ -1891,7 +2194,7 @@ static void ptp_accept(void)
         JLOG("MANUAL REF OK: operator declares current pose q1=q2=0 straight; no motion; NOT sensor homed\r\n");
         stage_status(); return;
     }
-    if (q1 < PTP_MIN1_CD || q1 > PTP_MAX1_CD || q2 < PTP_MIN2_CD || q2 > PTP_MAX2_CD || (p[0]==1u && (rate < 100u || rate > PTP_RATE_MAX)) ||
+    if (q1 < g_jointMinCd[0] || q1 > g_jointMaxCd[0] || q2 < g_jointMinCd[1] || q2 > g_jointMaxCd[1] || (p[0]==1u && (rate < 20u || rate > PTP_RATE_MAX)) ||
         !ptp_counts_in_range(0u,g_arm1.usteps) || !ptp_counts_in_range(1u,g_arm2.usteps)) {
         JLOG("PTP refused: joint range/rate\r\n"); return;
     }
@@ -1899,11 +2202,12 @@ static void ptp_accept(void)
     jog_stop_now(&g_arm1); jog_stop_now(&g_arm2);
     if(p[0]!=1u) {
         if(!traj_accept(p)) { return; }
+        if(p[0]==4u) { g_uploadRxQuarantine=0u; } /* only a validated RUN ends upload isolation */
         g_ptp.sequence=seq; memcpy(g_ptp.accepted,p,15u); traj_status(); return;
     }
     g_traj.state=0u; g_traj.count=g_traj.expected=g_traj.index=0u;
     g_ptp.target[0]=g_ptp.origin[0]-ptp_offset(0u,q1);
-    g_ptp.target[1]=g_ptp.origin[1]-ptp_offset(1u,q2);
+    g_ptp.target[1]=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,q1,q2));
     for(i=0u;i<2u;i++) {
         int32 delta=g_ptp.target[i]-axes[i]->usteps;
         g_ptp.distance[i]=(uint32)abs_i32(delta); g_ptp.error[i]=0u;
@@ -1912,27 +2216,83 @@ static void ptp_accept(void)
     g_ptp.total=(g_ptp.distance[0]>g_ptp.distance[1])?g_ptp.distance[0]:g_ptp.distance[1];
     g_ptp.done=0u; g_ptp.sequence=seq; memcpy(g_ptp.accepted,p,15u);
     g_ptp.sinceMs=g_jogMs; g_ptp.lastStep=SU_NOW();
-    ramp_init(&g_ptp.ramp,(int32)g_ptp.total,rate,PTP_ACCEL);
+    {
+        uint32 accel=PTP_ACCEL;
+        for(i=0u;i<2u;i++) if(g_ptp.distance[i]) {
+            rate=(uint16)motion_min(rate,g_motionRate[i]);
+            accel=motion_min(accel,g_motionAccel[i]);
+        }
+        ramp_init(&g_ptp.ramp,(int32)g_ptp.total,rate,accel);
+        /* Configured low accelerations need a longer first-step interval than
+         * the legacy 60 ms floor; stays below one SysTick wrap. */
+        g_ptp.ramp.c0=motion_min(600000u,956000u/isqrt32(accel));
+        if(g_ptp.ramp.c0<g_ptp.ramp.cMin)g_ptp.ramp.c0=g_ptp.ramp.cMin;
+        g_ptp.ramp.c=g_ptp.ramp.c0;
+    }
     g_ptp.periodUs=g_ptp.ramp.c; g_ptp.active=1u;
     JLOGF("PTP accepted seq=%lu target1=%ld target2=%ld rate=%u\r\n",(unsigned long)seq,(long)g_ptp.target[0],(long)g_ptp.target[1],(unsigned)rate);
     stage_status();
 }
+/* A compact heartbeat renews the motion lease with the keys it carries.  It has no
+ * sequence and no epoch, so it can never start a command; the CRC8 only has to
+ * protect the jog mask. */
+static void ptp_accept_short(void)
+{
+    uint8 keys = g_shortRx.bytes[0];
+    if (ptp_crc8(g_shortRx.bytes, 1u) != g_shortRx.bytes[1]) {
+        g_ptpRxDropped++; g_ptpRxCrc++; JLOG("PTP RX dropped: short CRC\r\n"); return;
+    }
+    if (keys > 15u) { g_rxRejected++; return; }
+    if (g_uploadRxQuarantine && (keys != 0u)) { g_rxRejected++; return; }
+    g_shortRxOk++;
+    jog_apply_keys(keys);
+}
+
 static uint8 ptp_receive(uint8 b)
 {
     uint8 nibble, expected;
     if (b == PTP_FRAME_START) {
+        g_shortRx.active=0u;
         g_ptpRx.active=1u; g_ptpRx.count=0u; g_ptpRx.last=0u;
         g_ptpRx.sinceMs=g_ptpRx.lastMs=g_jogMs; return 1u;
     }
+    if (b == PTP_SHORT_START) {
+        g_ptpRx.active=0u;
+        g_shortRx.active=1u; g_shortRx.count=0u; g_shortRx.last=0u;
+        g_shortRx.sinceMs=g_shortRx.lastMs=g_jogMs; return 1u;
+    }
+    if (b == PTP_SHORT_END) {
+        if (g_shortRx.active==1u && g_shortRx.count==PTP_SHORT_BYTES*2u) {
+            g_shortRx.active=0u; ptp_accept_short();
+        } else {
+            if (g_shortRx.active) { g_ptpRxDropped++; g_ptpRxShort++; JLOGF("PTP RX dropped: short nibbles=%u/4\r\n",(unsigned)g_shortRx.count); }
+            g_shortRx.active=0u;
+        }
+        return 1u;
+    }
     if (b == PTP_FRAME_END) {
+        g_shortRx.active=0u;
         if (g_ptpRx.active==1u && g_ptpRx.count==PTP_FRAME_BYTES*2u) { g_ptpRx.active=0u; ptp_accept(); }
         else {
-            if(g_ptpRx.active) { g_ptpRxDropped++; JLOGF("PTP RX dropped: incomplete nibbles=%u/34\r\n",(unsigned)g_ptpRx.count); }
+            if(g_ptpRx.active) { g_ptpRxDropped++; g_ptpRxShort++; JLOGF("PTP RX dropped: incomplete nibbles=%u/34\r\n",(unsigned)g_ptpRx.count); }
             g_ptpRx.active=0u;
         }
         return 1u;
     }
     if ((b & 0xC1u)==0x81u) {
+        /* Both frames use the same alternating low/high nibble ranges, so the
+         * duplicate-copy rule stays sound for either: adjacent wire bytes can only
+         * be equal when they are the two copies of one byte. */
+        if (g_shortRx.active==1u) {
+            if (b == g_shortRx.last) { g_shortRx.lastMs=g_jogMs; return 1u; }
+            expected=(uint8)((g_shortRx.count & 1u)<<5);
+            if (g_shortRx.count>=PTP_SHORT_BYTES*2u) { g_shortRx.active=2u; return 1u; }
+            if ((b & 0x20u)!=expected) { return 1u; }
+            nibble=(uint8)((b>>1)&15u);
+            if ((g_shortRx.count & 1u)==0u) { g_shortRx.bytes[g_shortRx.count/2u]=nibble; }
+            else { g_shortRx.bytes[g_shortRx.count/2u] |= (uint8)(nibble<<4); }
+            g_shortRx.last=b; g_shortRx.count++; g_shortRx.lastMs=g_jogMs; return 1u;
+        }
         if (g_ptpRx.active!=1u) { return 1u; }
         if (b == g_ptpRx.last) { g_ptpRx.lastMs=g_jogMs; return 1u; }
         expected=(uint8)((g_ptpRx.count & 1u)<<5);
@@ -1943,32 +2303,38 @@ static uint8 ptp_receive(uint8 b)
         else { g_ptpRx.bytes[g_ptpRx.count/2u] |= (uint8)(nibble<<4); }
         g_ptpRx.last=b; g_ptpRx.count++; g_ptpRx.lastMs=g_jogMs; return 1u;
     }
-    if (g_ptpRx.active) { return 1u; } /* ignore noise until delimiter/timeout; never decode payload as C/R */
+    if (g_ptpRx.active || g_shortRx.active) { return 1u; } /* ignore noise until delimiter/timeout; never decode payload as C/R */
     return 0u;
 }
 /* Piecewise joint-linear timed DDA, no rest/restart at ordinary nodes.
  * ponytail: bounded velocity changes between chords, not jerk-continuous motion;
  * validate low-speed tracking on hardware before increasing these caps. */
+static uint8 coordinated_step(const char *failure)
+{
+    uint8 i;
+    jog_axis_t *axes[2]; axes[0]=&g_arm1; axes[1]=&g_arm2;
+    for(i=0u;i<2u;i++) {
+        g_ptp.error[i]+=g_ptp.distance[i];
+        if(g_ptp.error[i]>=g_ptp.total) {
+            int32 before=axes[i]->usteps;
+            g_ptp.error[i]-=g_ptp.total; jog_step(axes[i],g_ptp.sign[i]);
+            if(axes[i]->usteps!=before+g_ptp.sign[i]) { stage_stop(failure,FAULT_ACTIVE()); return 0u; }
+        }
+    }
+    g_ptp.done++;
+    return 1u;
+}
 static void traj_service(void)
 {
-    uint8 i; uint32 now=SU_NOW();
+    uint32 now=SU_NOW();
     uint32 duration=(uint32)g_traj.nodes[g_traj.index].ms*1000u*SU_CY_PER_US;
-    jog_axis_t *axes[2]; axes[0]=&g_arm1; axes[1]=&g_arm2;
     g_traj.elapsedCy+=(g_traj.clock-now)&0x00FFFFFFu; g_traj.clock=now;
     if(g_traj.elapsedCy>duration+20000u*SU_CY_PER_US) { stage_stop("trajectory timing overrun",0u); return; }
     if(g_ptp.done<g_ptp.total) {
         uint32 due=(uint32)((int64)(g_ptp.done+1u)*duration/g_ptp.total);
         if(g_traj.elapsedCy<due || SU_ELAPSED(g_ptp.lastStep)<1667u*SU_CY_PER_US) { return; }
         g_ptp.lastStep=SU_NOW();
-        for(i=0u;i<2u;i++) {
-            g_ptp.error[i]+=g_ptp.distance[i];
-            if(g_ptp.error[i]>=g_ptp.total) {
-                int32 before=axes[i]->usteps;
-                g_ptp.error[i]-=g_ptp.total; jog_step(axes[i],g_ptp.sign[i]);
-                if(axes[i]->usteps!=before+g_ptp.sign[i]) { stage_stop("trajectory pulse blocked",FAULT_ACTIVE()); return; }
-            }
-        }
-        g_ptp.done++;
+        if(!coordinated_step("trajectory pulse blocked")) { return; }
     }
     if(g_ptp.done==g_ptp.total && g_traj.elapsedCy>=duration) {
         g_traj.elapsedCy-=duration;
@@ -1978,7 +2344,6 @@ static void traj_service(void)
 }
 static void ptp_service(void)
 {
-    uint8 i; jog_axis_t *axes[2]; axes[0]=&g_arm1; axes[1]=&g_arm2;
     if (!g_ptp.active) { return; }
     if (!g_motionEnabled || !g_ptp.reference || !g_keysSeen || g_jogMs-g_lastKeyMs>JOG_DEADMAN_MS) { stage_stop("PTP heartbeat/reference lost",0u); return; }
     if (FAULT_ACTIVE()) { stage_stop("PTP nFAULT",1u); return; }
@@ -1988,27 +2353,20 @@ static void ptp_service(void)
     if (abs_i32(cmd_lsb()-g_enc.pos)>=SLIP_FAIL_LSB) { stage_stop("PTP encoder following error",0u); return; }
     if (g_ptp.active==2u) {
         if (g_jogMs-g_ptp.settleMs<HOME_SETTLE_MS) { return; }
-        if (!enc_sample() || abs_i32(cmd_lsb()-g_enc.pos)>CL_NEAR_LSB ||
+        if (!enc_sample() || abs_i32(cmd_lsb()-g_enc.pos)>PTP_FINAL_ERROR_LSB ||
             g_arm1.usteps!=g_ptp.target[0] || g_arm2.usteps!=g_ptp.target[1]) { stage_stop("PTP final position mismatch",0u); return; }
         g_ptp.active=0u;
         if(g_traj.state==3u) { g_traj.state=4u; }
-        JLOGF("PTP done seq=%lu; arm1 encoder checked, arm2 commanded only\r\n",(unsigned long)g_ptp.sequence);
+        JLOGF("PTP done seq=%lu; arm1 encoder checked, arm2 commanded only; error_lsb=%ld final_limit_lsb=%d\r\n",
+              (unsigned long)g_ptp.sequence,(long)(cmd_lsb()-g_enc.pos),PTP_FINAL_ERROR_LSB);
         stage_status(); return;
     }
     if(g_traj.state==3u) { traj_service(); return; }
     if (g_ptp.done>=g_ptp.total) { g_ptp.active=2u; g_ptp.settleMs=g_jogMs; return; }
     if (SU_ELAPSED(g_ptp.lastStep)<g_ptp.periodUs*SU_CY_PER_US) { return; }
     g_ptp.lastStep=SU_NOW(); /* no catch-up bursts after a late service */
-    for(i=0u;i<2u;i++) {
-        g_ptp.error[i]+=g_ptp.distance[i];
-        if (g_ptp.error[i]>=g_ptp.total) {
-            int32 before=axes[i]->usteps;
-            g_ptp.error[i]-=g_ptp.total;
-            jog_step(axes[i],g_ptp.sign[i]);
-            if (axes[i]->usteps!=before+g_ptp.sign[i]) { stage_stop("PTP pulse blocked",FAULT_ACTIVE()); return; }
-        }
-    }
-    g_ptp.done++; ramp_advance(&g_ptp.ramp,(int32)g_ptp.done); g_ptp.periodUs=g_ptp.ramp.c;
+    if(!coordinated_step("PTP pulse blocked")) { return; }
+    ramp_advance(&g_ptp.ramp,(int32)g_ptp.done); g_ptp.periodUs=g_ptp.ramp.c;
 }
 
 /* Non-blocking home: one phase transition or pulse per service call.
@@ -2038,17 +2396,22 @@ static void home_enter(home_phase_t phase)
                                        HOME2_STRAIGHT_RATE_USTEP_S) : HOME_FAST_RATE_USTEP_S);
     distance = (phase == HOME_RELEASE) ? HOME_RELEASE_MAX_USTEPS :
                ((phase == HOME_BACKOFF) ? HOME_BACKOFF_USTEPS :
-                ((phase == HOME_SLOW) ? HOME_SLOW_SEEK_MAX_USTEPS :
-                 ((phase == HOME_STRAIGHT) ? home_straight_steps(g_home.arm) :
-                  ((g_home.arm == 1u) ? HOME1_SEEK_MAX_USTEPS : HOME_SEEK_MAX_USTEPS))));
-    ramp_init(&g_home.ramp, (int32)distance, rate, HOME_ACCEL_USTEP_S2);
+                ((phase == HOME_STRAIGHT) ? home_straight_steps(g_home.arm) : 0u));
+    rate=motion_min(rate,g_motionRate[g_home.arm-1u]);
+    {
+        uint32 accel=motion_min(HOME_ACCEL_USTEP_S2,g_motionAccel[g_home.arm-1u]);
+        ramp_init(&g_home.ramp, (int32)distance, rate, accel);
+        g_home.ramp.c0=motion_min(600000u,956000u/isqrt32(accel));
+        if(g_home.ramp.c0<g_home.ramp.cMin)g_home.ramp.c0=g_home.ramp.cMin;
+        g_home.ramp.c=g_home.ramp.c0;
+    }
     g_home.periodUs = g_home.ramp.c;
-    JLOGF("HOME arm%u phase=%u %s\r\n", (unsigned)g_home.arm, (unsigned)phase,
+    JLOGF("HOME arm%u phase=%u %s rate=%lu usteps/s\r\n", (unsigned)g_home.arm, (unsigned)phase,
           (phase == HOME_RELEASE) ? "release sensor" :
           (phase == HOME_BACKOFF) ? "extra backoff" :
           (phase == HOME_FAST) ? "fast touch" :
           (phase == HOME_SLOW) ? "slow touch" :
-          (phase == HOME_STRAIGHT) ? "move away from home to straight" : "settle and verify");
+          (phase == HOME_STRAIGHT) ? "move away from home to straight" : "settle and verify", (unsigned long)rate);
     if (phase == HOME_STRAIGHT)
     { JLOGF("HOME arm%u straight target: dir=%d pulses=%lu rate=%lu usteps/s (commanded)\r\n",
             (unsigned)g_home.arm, (int)g_home.direction, (unsigned long)distance,
@@ -2094,11 +2457,8 @@ static uint8 home_set_zero(jog_axis_t *a)
 static void jog_home_all(void)
 {
     if ((g_motionEnabled == 0u) || (g_arm1.hasEnc == 0u) ||
-        (g_keysSeen == 0u) || ((g_jogMs - g_lastKeyMs) > JOG_DEADMAN_MS) ||
-        (g_jogKeysIdle == 0u) || (g_homeNeedKeyRelease != 0u) ||
-        (g_arm1.moving != 0) || (g_arm2.moving != 0) ||
-        (g_arm1.settleMs != 0u) || (g_arm2.settleMs != 0u) ||
-        (g_home.phase != HOME_IDLE) || g_ptp.active || FAULT_ACTIVE() || HARD_LIMIT_ACTIVE())
+        !host_input_idle() || !axes_idle() ||
+        (g_home.phase != HOME_IDLE) || g_ptp.active || !motion_inputs_clear())
     {
         JLOG("HOME refused: enable with C, keep host alive and release all motion keys\r\n");
         return;
@@ -2112,6 +2472,7 @@ static void jog_home_all(void)
     g_homed2 = 0u;
     g_homeNeedKeyRelease = 1u;
     home_start_axis(1u);
+    stage_status(); /* Publish the new epoch before the 250 ms heartbeat deadline. */
 }
 
 static void home_service(void)
@@ -2128,7 +2489,8 @@ static void home_service(void)
     if (HARD_LIMIT_ACTIVE()) { jog_limit_stop(); return; }
     if ((g_keysSeen == 0u) || ((g_jogMs - g_lastKeyMs) > JOG_DEADMAN_MS))
     { stage_stop("HOME host heartbeat timeout", 0u); return; }
-    if ((g_jogMs - g_home.sinceMs) >= HOME_PHASE_TIMEOUT_MS)
+    if ((g_home.phase != HOME_FAST) && (g_home.phase != HOME_SLOW) &&
+        ((g_jogMs - g_home.sinceMs) >= HOME_PHASE_TIMEOUT_MS))
     { stage_stop("HOME phase time limit", 0u); return; }
 
     a = (g_home.arm == 1u) ? &g_arm1 : &g_arm2;
@@ -2253,11 +2615,9 @@ static void home_service(void)
     }
     else
     {
-        maxSteps = (g_home.phase == HOME_RELEASE) ? HOME_RELEASE_MAX_USTEPS :
-                   ((g_home.phase == HOME_SLOW) ? HOME_SLOW_SEEK_MAX_USTEPS :
-                    ((g_home.arm == 1u) ? HOME1_SEEK_MAX_USTEPS : HOME_SEEK_MAX_USTEPS));
+        maxSteps = (g_home.phase == HOME_RELEASE) ? HOME_RELEASE_MAX_USTEPS : 0u;
     }
-    if (g_home.steps >= maxSteps)
+    if ((maxSteps != 0u) && (g_home.steps >= maxSteps))
     { stage_stop("HOME travel limit: sensor missing or stuck", 0u); return; }
     if (SU_ELAPSED(g_home.lastStep) >= (g_home.periodUs * SU_CY_PER_US))
     {
@@ -2269,18 +2629,40 @@ static void home_service(void)
     }
 }
 
+static void motion_config_status(void)
+{
+    JLOGF("PTP_STATE lock=%u ref=%u active=%u epoch=%lu seq=%lu min1=%d max1=%d min2=%d max2=%d\r\n",
+          (unsigned)!PTP_COMMISSIONED,(unsigned)g_ptp.reference,(unsigned)g_ptp.active,
+          (unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,
+          (int)g_jointMinCd[0],(int)g_jointMaxCd[0],(int)g_jointMinCd[1],(int)g_jointMaxCd[1]);
+    JLOGF("MOTION_RATES epoch=%lu r1=%u r2=%u a1=%u a2=%u\r\n",(unsigned long)g_ptp.epoch,
+          (unsigned)g_motionRate[0],(unsigned)g_motionRate[1],(unsigned)g_motionAccel[0],(unsigned)g_motionAccel[1]);
+}
+
 static void stage_status(void)
 {
-    JLOGF("STATE fw=stage2-v6 enabled=%u home=%u homed1=%u homed2=%u fault=%u enc=%u dir=%u\r\n",
+    JLOGF("STATE fw=stage2-v7 enabled=%u home=%u homed1=%u homed2=%u fault=%u enc=%u dir=%u\r\n",
           (unsigned)g_motionEnabled, (unsigned)g_home.phase,
           (unsigned)g_homed1, (unsigned)g_homed2, (unsigned)g_jogFaulted,
           (unsigned)(g_arm1.hasEnc && (g_enc.badStreak == 0u)), (unsigned)g_directionKnown);
-    JLOGF("PTP_STATE lock=%u ref=%u active=%u epoch=%lu seq=%lu min1=%d max1=%d min2=%d max2=%d\r\n",
-          (unsigned)!PTP_COMMISSIONED,(unsigned)g_ptp.reference,(unsigned)g_ptp.active,
-          (unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,PTP_MIN1_CD,PTP_MAX1_CD,PTP_MIN2_CD,PTP_MAX2_CD);
+    JLOGF("CONTROL seq=%lu\r\n",(unsigned long)g_controlSequence);
+    motion_config_status();
+    JLOGF("PTP_CHECK final_lsb=%d follow_lsb=%d\r\n",PTP_FINAL_ERROR_LSB,SLIP_FAIL_LSB);
     traj_status();
-    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u\r\n",
-          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped);
+    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 q2_absolute=1\r\n",
+          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID);
+    /* Frame loss by cause: rx_error only sees UART-level faults, so a frame that
+     * simply arrives short must be counted here or it stays invisible. */
+    JLOGF("PTP_RX short_ok=%lu drop_crc=%lu drop_short=%lu drop_timeout=%lu rejected=%lu epoch_rejected=%lu last_rejected_byte=0x%02X\r\n",
+          (unsigned long)g_shortRxOk, (unsigned long)g_ptpRxCrc, (unsigned long)g_ptpRxShort, (unsigned long)g_ptpRxTimeout,
+          (unsigned long)g_rxRejected, (unsigned long)g_ptpEpochRejected,
+          (unsigned)g_rxLastBad[(g_rxLastBadIdx + 7u) % 8u]);
+    JLOGF("TIMING loop_max_ms=%lu tick_lag_max_ms=%lu clock=hardware wdt=256-384ms key_age_ms=%lu key_max_gap_ms=%lu\r\n",
+          (unsigned long)g_loopMaxMs,(unsigned long)g_tickMaxLagMs,
+          (unsigned long)(g_keysSeen ? (g_jogMs - g_lastKeyMs) : 0u),(unsigned long)g_keyMaxGapMs);
+    JLOGF("ENC_DIAG irq_max_us=%lu retries=%lu rejected=%lu gap_max_ms=%lu follow_peak_lsb=%lu\r\n",
+          (unsigned long)(g_encIrqMaxCy/SU_CY_PER_US),(unsigned long)g_encRetries,
+          (unsigned long)g_encRejected,(unsigned long)g_encMaxGapMs,(unsigned long)g_followPeakLsb);
     /* One coherent, low-rate sample, no extra encoder transactions. Positive = CCW.
      * e1 is motor encoder LSB relative to the reference; arm2 is commanded only. */
     JLOGF("TELEM t=%lu epoch=%lu seq=%lu ref=%u source=%u p1=%ld p2=%ld e1=%ld err=%ld inputs=%u drops=%lu\r\n",
@@ -2297,9 +2679,7 @@ static void stage_enable(void)
 {
     if (g_motionEnabled != 0u) { JLOG("ENABLE: already enabled\r\n"); return; }
     ptp_invalidate();
-    if ((g_keysSeen == 0u) || ((g_jogMs - g_lastKeyMs) > JOG_DEADMAN_MS) ||
-        (g_jogKeysIdle == 0u) || (g_homeNeedKeyRelease != 0u) ||
-        FAULT_ACTIVE() || HARD_LIMIT_ACTIVE())
+    if (!host_input_idle() || !motion_inputs_clear())
     { JLOG("ENABLE refused: fresh idle heartbeat and clear nFAULT/P0[4] required\r\n"); return; }
     if (enc_set_origin() == 0u)
     { g_arm1.hasEnc = 0u; JLOG("ENABLE refused: encoder invalid; inspect E diagnostics\r\n"); return; }
@@ -2317,6 +2697,7 @@ static void stage_enable(void)
     g_jogFaulted = 0u;
     g_limitStop = 0u;
     g_motionEnabled = 1u;
+    g_keyMaxGapMs = 0u;
     cmd_reset_to_measured();
     JLOG("ENABLE OK: no automatic movement; low-speed jog or R for home; Space stops\r\n");
     stage_status();
@@ -2447,9 +2828,16 @@ static void jog_axis_tick(jog_axis_t *a)
         want = 0;
     }
 
-    /* Soft limit around the calibrated straight position: refuse further out,
-     * always allow coming back. */
-    if ((a->hasEnc != 0u) && (g_directionKnown != 0u) && (want != 0))
+    /* Calibrated jog shares the PTP bounds and per-step guard. Before a straight
+     * reference exists, retain the old encoder-relative jog guard. */
+    if (g_directionKnown && (a==&g_arm1 ? g_homed1 : g_homed2) && want!=0)
+    {
+        if(!joint_step_allowed(a,want)) {
+            if(!a->limitHit) { JLOGF("%s: configured joint limit, %s refused\r\n",a->name,jog_dir_name(want)); }
+            a->limitHit=1u; want=0;
+        } else { a->limitHit=0u; }
+    }
+    else if ((a->hasEnc != 0u) && (g_directionKnown != 0u) && (want != 0))
     {
         int8  e     = jog_enc_sign(a, want);
         int32 limit = out_deg10_to_lsb(SOFT_LIMIT_OUT_DEG10);
@@ -2478,6 +2866,7 @@ static void jog_axis_tick(jog_axis_t *a)
             a->moving   = want;
             a->rate     = a->rateStart;
             a->rateCap  = a->rateMax;
+            a->rampRemainder=0u;
             a->peakSlip = 0;
             a->derates  = 0u;
             a->holding  = 0u;
@@ -2495,12 +2884,17 @@ static void jog_axis_tick(jog_axis_t *a)
     }
     else if (want == a->moving)
     {
-        a->rate += a->accel / (1000000u / JOG_TICK_US);
+        a->rampRemainder+=a->accel;
+        a->rate += a->rampRemainder / (1000000u / JOG_TICK_US);
+        a->rampRemainder %= (1000000u / JOG_TICK_US);
         if (a->rate > a->rateCap) { a->rate = a->rateCap; }
     }
     else
     {
-        uint32 dec = a->decel / (1000000u / JOG_TICK_US);
+        uint32 dec;
+        a->rampRemainder+=a->decel;
+        dec=a->rampRemainder / (1000000u / JOG_TICK_US);
+        a->rampRemainder %= (1000000u / JOG_TICK_US);
         if (a->rate > (a->rateStart + dec))
         {
             a->rate -= dec;
@@ -2624,18 +3018,8 @@ static void jog_print_inputs(void)
 static uint8  g_lastCmd;
 static uint32 g_lastCmdMs;
 
-static void jog_handle_byte(uint8 b)
+static void jog_apply_keys(uint8 mask)
 {
-    if (b == JOG_CMD_STOP)
-    {
-        g_ptpRx.active=0u;
-        if ((g_motionEnabled != 0u) || (g_home.phase != HOME_IDLE))
-        { stage_stop("operator stop", 0u); }
-        return;
-    }
-    if ((b & 0xE1u) == 0x41u)                       /* 0x41 | mask << 1    */
-    {
-        uint8 mask = (uint8)((b >> 1) & 0x0Fu);
         if (mask != 0u) {
             if (g_ptp.active) { stage_stop("jog key pressed during PTP",0u); }
             else if (g_ptp.reference) { ptp_invalidate(); }
@@ -2654,13 +3038,28 @@ static void jog_handle_byte(uint8 b)
             g_arm1.want = jog_want_from_bits(mask & 0x01u, mask & 0x02u);
             g_arm2.want = jog_want_from_bits(mask & 0x04u, mask & 0x08u);
         }
-        g_lastKeyMs = g_jogMs;
-        g_keysSeen  = 1u;
+        host_lease_renew();
         g_rxGood++;
+}
+
+static void jog_handle_byte(uint8 b)
+{
+    if (b == JOG_CMD_STOP)
+    {
+        g_ptpRx.active=g_shortRx.active=0u;
+        /* Also release after a protective stop, when enabled is already zero.
+         * Do not latch a driver fault: a fresh idle lease can enable again. */
+        stepper1_disable();
+        stepper2_disable();
+        if ((g_motionEnabled != 0u) || (g_home.phase != HOME_IDLE))
+        { stage_stop("operator stop; drivers OFF", 0u); }
+        else { ptp_invalidate(); g_keysSeen=0u; stage_status(); }
         return;
     }
-
+    /* Legacy neutral can release inputs, but never renew the motion lease. */
+    if (b==0x41u) { g_arm1.want=g_arm2.want=0; return; }
     if (ptp_receive(b)) { return; }
+    if(g_uploadRxQuarantine) { jog_reject_byte(b); return; }
     /* The host sends each legacy command three times; act on the first copy. */
     if ((b == g_lastCmd) && ((g_jogMs - g_lastCmdMs) < JOG_CMD_REPEAT_MS))
     {
@@ -2673,21 +3072,13 @@ static void jog_handle_byte(uint8 b)
     switch (b)
     {
         case JOG_CMD_ENABLE:
-            stage_enable();
+        case JOG_CMD_HOME:
+            jog_reject_byte(b);
+            JLOG("CONTROL refused: v7 requires framed enable/home/jog\r\n");
             break;
         case '1':
         case '3':
             JLOG("Direction inversion disabled in stage1; use calibrated physical DIR settings\r\n");
-            break;
-        case JOG_CMD_HOME:
-            if (g_homeNeedKeyRelease != 0u)
-            {
-                JLOG("HOME: release all motion keys first\r\n");
-            }
-            else
-            {
-                jog_home_all();
-            }
             break;
         case 'i':
             jog_print_inputs();
@@ -2728,33 +3119,40 @@ static void jog_handle_byte(uint8 b)
             break;
         default:
             g_lastCmd = 0u;
-            g_rxRejected++;
-            g_rxLastBad[g_rxLastBadIdx] = b;
-            g_rxLastBadIdx = (uint8)((g_rxLastBadIdx + 1u) % 8u);
+            jog_reject_byte(b);
             break;
     }
+}
+
+static void jog_update_time(void)
+{
+    g_jogMs=wall_ms();
+    if (g_ptpRx.active && (g_jogMs-g_ptpRx.lastMs>250u || g_jogMs-g_ptpRx.sinceMs>2000u)) {
+        g_ptpRx.active=0u; g_ptpRxDropped++; g_ptpRxTimeout++; JLOG("PTP RX dropped: frame timeout\r\n");
+    }
+    if (g_shortRx.active && (g_jogMs-g_shortRx.lastMs>250u || g_jogMs-g_shortRx.sinceMs>2000u)) {
+        g_shortRx.active=0u; g_ptpRxDropped++; g_ptpRxTimeout++;
+    }
+    if (g_motionEnabled == 0u) { return; }
+    if ((g_keysSeen == 0u) || ((g_jogMs - g_lastKeyMs) > JOG_DEADMAN_MS))
+    { stage_stop("DEADMAN host heartbeat timeout", 0u); return; }
 }
 
 static void jog_tick(void)
 {
     static uint32 lastStatus;
-    g_jogMs += JOG_TICK_US / 1000u;
-    if (g_ptpRx.active && (g_jogMs-g_ptpRx.lastMs>250u || g_jogMs-g_ptpRx.sinceMs>2000u)) {
-        g_ptpRx.active=0u; g_ptpRxDropped++; JLOG("PTP RX dropped: frame timeout\r\n");
-    }
+    jog_update_time();
     if ((g_jogMs - lastStatus) >= JOG_STATUS_MS)
     { lastStatus = g_jogMs; stage_status(); }
     if (g_motionEnabled == 0u) { return; }
-    if ((g_keysSeen == 0u) || ((g_jogMs - g_lastKeyMs) > JOG_DEADMAN_MS))
-    { stage_stop("DEADMAN host heartbeat timeout", 0u); return; }
     if (jog_safety_blocked() != 0u) { return; }
     if (g_home.phase != HOME_IDLE || g_ptp.active) { return; }
     jog_axis_tick(&g_arm1);
     jog_axis_tick(&g_arm2);
 }
 
-/* Any UART corruption invalidates queued motion and requires explicit re-enable.
- * No control code runs in an ISR; stale buffered enable/home bytes are discarded. */
+/* A pure framing error can retry a healthy, stationary upload. Other receive
+ * faults and every error during motion still invalidate the coordinate reference. */
 static void jog_rx_service(void)
 {
     uint8 i;
@@ -2762,10 +3160,22 @@ static void jog_rx_service(void)
     {
         int16 b = uart_rx_service();
         if (b == -1) { break; }
-        if (b == -2)
+        if (b <= -2)
         {
-            g_keysSeen = 0u;
             g_ptpRxDropped++;
+            if(b==-3 && (g_traj.state==1u || g_traj.state==2u) && !g_ptp.active &&
+               g_home.phase==HOME_IDLE && g_motionEnabled && g_ptp.reference &&
+               g_homed1 && g_homed2 && g_directionKnown && !g_jogFaulted && !g_limitStop &&
+               host_input_idle() && axes_idle() && !g_arm1.holding && !g_arm2.holding &&
+               g_arm1.hasEnc && !g_enc.badStreak && abs_i32(cmd_lsb()-g_enc.pos)<SLIP_FAIL_LSB &&
+               motion_inputs_clear() && home_inputs_clear() &&
+               ptp_counts_in_range(0u,g_arm1.usteps) && ptp_counts_in_range(1u,g_arm2.usteps)) {
+                g_uploadRxQuarantine=1u; g_ptpRx.active=2u; g_ptpRx.count=0u;
+                g_ptpRx.sinceMs=g_ptpRx.lastMs=g_jogMs;
+                JLOG("TRAJ RX framing discarded; awaiting retry; reference and committed nodes retained\r\n");
+                break;
+            }
+            g_keysSeen = 0u;
             stage_stop("UART receive error/overflow; buffered commands discarded", 0u);
             break;
         }
@@ -2778,6 +3188,7 @@ static void jog_run(uint8 encOk)
 {
     uint32 tTick;
     uint32 tEnc;
+    uint32 loopAt;
 
 
     jog_axis_init(&g_arm1, "arm1", PIN_STEP2, PIN_DIR2, 1u, encOk,
@@ -2790,20 +3201,30 @@ static void jog_run(uint8 encOk)
                   JOG2_ACCEL_USTEP_S2, JOG2_DECEL_USTEP_S2);
 
     /* No startup enable, direction probe, return-to-origin, or holding steps. */
-    DBG("\r\nSTAGE2 v6 hardware UART: both drivers disabled, reference unset; use home or explicit manual straight reference\r\n");
-    DBG("INPUT MAP: HOME1=J4-2/P0[3], GLOBAL=J4-1/P0[4], HOME2=NPN/P1[0]\r\n");
-    DBG("C = explicit enable/recheck; R = home; Space/Esc = latched stop\r\n");
+    JLOG("\r\nSTAGE2 v7 framed control: both drivers disabled, reference unset; use home or explicit manual straight reference\r\n");
+    JLOG("INPUT MAP: HOME1=J4-2/P0[3], GLOBAL=J4-1/P0[4], HOME2=NPN/P1[0]\r\n");
+    JLOG("C = explicit enable/recheck; R = home; Space/Esc = latched stop\r\n");
     jog_print_inputs();
     stage_status();
     jog_print_help();
-    txq_flush_blocking();
+    /* Drain startup output in the foreground loop so encoder sampling starts now. */
 
     /* Never execute commands buffered during the power-on self-test. */
     uart_discard_rx();
     tTick = SU_NOW();
     tEnc  = SU_NOW();
+    g_jogMs=wall_ms();
+    loopAt=g_jogMs;
+    CyILO_Start1K();
+    CyWdtStart(CYWDT_128_TICKS, CYWDT_LPMODE_NOCHANGE);
     for (;;)
     {
+        uint32 loopNow=wall_ms();
+        if(loopNow-loopAt>g_loopMaxMs) { g_loopMaxMs=loopNow-loopAt; }
+        loopAt=loopNow;
+        /* Check the elapsed deadline BEFORE consuming queued heartbeats or
+         * emitting another pulse. No motion catch-up after a stalled loop. */
+        jog_update_time();
         /* Bound RX work so a host flood cannot starve motion or deadman. */
         jog_rx_service();
 
@@ -2818,7 +3239,9 @@ static void jog_run(uint8 encOk)
 
         if (SU_ELAPSED(tTick) >= JOG_TICK_CY)
         {
-            tTick = SU_ADVANCE(tTick, JOG_TICK_CY);
+            uint32 lag=SU_ELAPSED(tTick)/(1000u*SU_CY_PER_US);
+            if(lag>g_tickMaxLagMs) { g_tickMaxLagMs=lag; }
+            tTick = SU_NOW();
             jog_tick();
         }
 
@@ -2850,6 +3273,7 @@ static void jog_run(uint8 encOk)
         {
             txq_send_one();
         }
+        CyWdtClear(); /* Only a completed foreground iteration feeds the watchdog. */
     }
 }
 

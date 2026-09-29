@@ -6,12 +6,23 @@ public readonly record struct ExecutionNode(JointPose Pose, ushort Milliseconds)
 public sealed class ExecutionTrajectory
 {
     public ExecutionNode[] Nodes { get; }
+    public TimedTrajectory Timing { get; }
     public double Duration => Nodes.Sum(n => n.Milliseconds) / 1000.0;
     public ExecutionTrajectory(TimedTrajectory preview, JointLimits limits)
     {
-        var r = preview.Rates;
-        var timed = new TimedTrajectory(preview.Path, new PlanningRates(Math.Min(r.Feed, 5),
-            Math.Min(r.V1, 2), Math.Min(r.V2, 1.5), Math.Min(r.A1, 2), Math.Min(r.A2, 1.5)));
+        var profile = MotionProfile.From(preview.Rates);
+        Timing = new TimedTrajectory(preview.Path, profile.DrawingRates(preview.Rates.Feed));
+        // Quantized pulse chords must pass the real device bounds as well as IK.
+        // Slow the same visible time plan when quantization needs extra margin.
+        for (int attempt=0; ; attempt++) {
+            try { Nodes=Build(Timing,limits,profile); return; }
+            catch (ArgumentException ex) when(attempt<12 && (ex.Message.Contains("脉冲速度") || ex.Message.Contains("弦线近似"))) {
+                Timing.Stretch(1.15);
+            }
+        }
+    }
+    private static ExecutionNode[] Build(TimedTrajectory timed, JointLimits limits, MotionProfile profile)
+    {
         var nodes = new List<ExecutionNode> { new(PtpProtocol.Quantize(timed.At(0).Pose), 0) };
         int previousTime = 0;
         for (int piece = 1; piece < timed.StopTimes.Length; piece++)
@@ -43,13 +54,21 @@ public sealed class ExecutionTrajectory
             if (nodes.Count >= 2048) throw new ArgumentException("执行轨迹超过 2048 点容量。");
             nodes.Add(new(nodes[^1].Pose, 50));
         }
-        Nodes = nodes.ToArray(); Validate(Nodes, limits);
+        var result=nodes.ToArray(); Validate(result, limits, profile); return result;
+    }
+    public static int Counts(int axis, JointPose pose)
+    {
+        var wire = PtpProtocol.Quantize(pose);
+        return Counts(axis, axis == 0 ? wire.Q1 : wire.Q2 - wire.Q1);
     }
     public static int Counts(int axis, double angle) => (int)Math.Round(
         Math.Round(angle * 100, MidpointRounding.AwayFromZero) * (axis == 0 ? 64000 : 81696) / 36000,
         MidpointRounding.AwayFromZero);
-    private static JointPose PulsePose(JointPose p) => new(Counts(0, p.Q1) * 360.0 / 64000, Counts(1, p.Q2) * 360.0 / 81696);
-    public static void Validate(ExecutionNode[] nodes, JointLimits limits)
+    private static JointPose PulsePose(JointPose p) {
+        double q1=Counts(0,p)*360.0/64000;
+        return new(q1,q1+Counts(1,p)*360.0/81696);
+    }
+    public static void Validate(ExecutionNode[] nodes, JointLimits limits, MotionProfile? profile = null)
     {
         if (nodes.Length is < 2 or > 2048 || nodes[0].Milliseconds != 0)
             throw new ArgumentException("执行轨迹容量或首点无效。");
@@ -59,17 +78,18 @@ public sealed class ExecutionTrajectory
             var n = nodes[i];
             if (!double.IsFinite(n.Pose.Q1) || !double.IsFinite(n.Pose.Q2) ||
                 Math.Abs(n.Pose.Q1) > 180 || Math.Abs(n.Pose.Q2) > 180 || !limits.Contains(n.Pose))
-                throw new ArgumentException($"第 {i+1} 点超出固件范围：q1={n.Pose.Q1:F2}°，q2={n.Pose.Q2:F2}°；允许 q1 [{limits.Min1:F2},{limits.Max1:F2}]°、q2 [{limits.Min2:F2},{limits.Max2:F2}]°。请缩小或移动图形。");
+                throw new ArgumentException($"第 {i+1} 点超出当前关节范围：q1={n.Pose.Q1:F2}°，q2={n.Pose.Q2:F2}°；允许 q1 [{limits.Min1:F2},{limits.Max1:F2}]°、q2 [{limits.Min2:F2},{limits.Max2:F2}]°。请调整图形或关节范围。");
             if (i == 0) continue;
             int dt = n.Milliseconds, previousDt = i == 1 ? dt : nodes[i - 1].Milliseconds;
             if (dt is < 50 or > 500 || (totalMs += dt) > 600000) throw new ArgumentException("执行时间无效。");
             for (int axis = 0; axis < 2; axis++)
             {
-                int d = Counts(axis, axis == 0 ? n.Pose.Q1 : n.Pose.Q2) -
-                    Counts(axis, axis == 0 ? nodes[i - 1].Pose.Q1 : nodes[i - 1].Pose.Q2);
+                int maxRate = profile is { } p ? Math.Min(600,axis==0?p.R1:p.R2) : 600;
+                int maxAccel = profile is { } a ? Math.Min(800,axis==0?a.A1:a.A2) : 800;
+                int d = Counts(axis, n.Pose) - Counts(axis, nodes[i - 1].Pose);
                 int velocity = d * 1000 / dt;
-                if (Math.Abs(d) * 1000 > 600 * dt || Math.Abs(velocity - previousVelocity[axis]) * 2000 > 800 * (dt + previousDt) ||
-                    (i == nodes.Length - 1 && Math.Abs(velocity) * 2000 > 800 * dt))
+                if (Math.Abs(d) * 1000 > maxRate * dt || Math.Abs(velocity - previousVelocity[axis]) * 2000 > maxAccel * (dt + previousDt) ||
+                    (i == nodes.Length - 1 && Math.Abs(velocity) * 2000 > maxAccel * dt))
                     throw new ArgumentException("执行轨迹超过脉冲速度或相邻段速度变化上限；请降低速度。");
                 previousVelocity[axis] = velocity;
             }
@@ -77,6 +97,9 @@ public sealed class ExecutionTrajectory
     }
     public static void SelfTest()
     {
+        if (Counts(0,new JointPose(30,60))!=Counts(0,30) || Counts(1,new JointPose(30,60))!=Counts(1,30) ||
+            Counts(1,new JointPose(0.006,0.014))!=0)
+            throw new InvalidOperationException("Absolute q2 was not converted from wire-quantized link angles to elbow travel");
         var limits = new JointLimits(-90, 90, -160, 160);
         foreach (var shape in new[] { DrawingShape.Line, DrawingShape.Rectangle, DrawingShape.Circle })
         {
@@ -84,7 +107,14 @@ public sealed class ExecutionTrajectory
                 shape == DrawingShape.Line ? 250 : 10, shape == DrawingShape.Circle ? 0 : 20, 0, limits);
             var plan = new ExecutionTrajectory(new TimedTrajectory(path, new PlanningRates(20, 5, 3, 10, 6)), limits);
             if (plan.Nodes.Length < 2 || plan.Duration <= 0) throw new InvalidOperationException("Execution plan missing");
+            var slow=new ExecutionTrajectory(new TimedTrajectory(path,new PlanningRates(1,1,1,1,1)),limits);
+            Validate(slow.Nodes,limits,MotionProfile.From(new PlanningRates(1,1,1,1,1)));
+            if(slow.Duration<=plan.Duration || slow.Timing.Rates.Feed!=1 || slow.Timing.Path!=path)
+                throw new InvalidOperationException("Global rates did not affect every shape");
         }
+        var circle=DrawingTrajectory.Create(new PlanarArm(180,176.38),DrawingShape.Circle,260,0,40,0,0,limits);
+        double Time(double v2)=>new ExecutionTrajectory(new TimedTrajectory(circle,new PlanningRates(40,8,v2,15,13)),limits).Duration;
+        if(Time(2.3)>=Time(1.8)) throw new InvalidOperationException("Hidden 1.5 degree/s clamp still overrides global q2 speed");
         static void Reject(ExecutionNode[] nodes, JointLimits range)
         {
             try { Validate(nodes, range); } catch (ArgumentException) { return; }

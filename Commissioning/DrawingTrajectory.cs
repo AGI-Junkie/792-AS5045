@@ -12,15 +12,15 @@ public sealed class DrawingTrajectory
 {
     public DrawingSample[] Samples { get; }
     public double Length => Samples[^1].Distance;
-    public bool NearSingularity => Samples.Any(s => Math.Abs(Math.Sin(s.Pose.Q2 * Math.PI / 180)) < 0.05);
+    public bool NearSingularity { get; }
     public PlanarArm Model { get; }
     public JointLimits? Limits { get; }
     public DrawingShape Shape { get; }
     public int Branch { get; }
     internal int[] Stops { get; }
     internal Point? CircleCenter { get; }
-    private DrawingTrajectory(PlanarArm model, JointLimits? limits, DrawingShape shape, int branch, DrawingSample[] samples, int[] stops, Point? center)
-    { Model = model; Limits = limits; Shape = shape; Branch = branch; Samples = samples; Stops = stops; CircleCenter = center; }
+    private DrawingTrajectory(PlanarArm model, JointLimits? limits, DrawingShape shape, int branch, DrawingSample[] samples, int[] stops, Point? center, bool nearSingularity)
+    { Model = model; Limits = limits; Shape = shape; Branch = branch; Samples = samples; Stops = stops; CircleCenter = center; NearSingularity = nearSingularity; }
 
     public static DrawingTrajectory Create(PlanarArm model, DrawingShape shape, double x, double y,
         double a, double b, int branch, JointLimits? limits = null)
@@ -90,15 +90,73 @@ public sealed class DrawingTrajectory
             JointPose pose = poses[Math.Min(branch, poses.Length - 1)];
             if (i > 0)
             {
-                // Keep q1 continuous through atan2's -180/+180 boundary, never jump a whole turn.
-                double previous = samples[i - 1].Pose.Q1;
-                pose = pose with { Q1 = pose.Q1 + 360 * Math.Round((previous - pose.Q1) / 360) };
+                // Keep both absolute link angles continuous through the -180/+180 boundary.
+                double previous1 = samples[i - 1].Pose.Q1, previous2 = samples[i - 1].Pose.Q2;
+                pose = pose with {
+                    Q1 = pose.Q1 + 360 * Math.Round((previous1 - pose.Q1) / 360),
+                    Q2 = pose.Q2 + 360 * Math.Round((previous2 - pose.Q2) / 360)
+                };
             }
             if (limits is { } range && !range.Contains(pose))
-                throw new ArgumentException($"第 {i + 1} 个采样点超出填写的关节范围：q1={pose.Q1:F2}°，q2={pose.Q2:F2}°。");
+                throw new ArgumentException($"第 {i + 1} 个采样点超出规划范围：q1={pose.Q1:F2}°，q2={pose.Q2:F2}°；允许 q1 [{range.Min1:F2},{range.Max1:F2}]°、q2 [{range.Min2:F2},{range.Max2:F2}]°。红区、规划与设备执行共用当前关节范围，请调整图形或关节范围。");
             samples[i] = new DrawingSample(distance, point, pose);
         }
-        return new DrawingTrajectory(model, limits, shape, branch, samples, stops.ToArray(), shape == DrawingShape.Circle ? new Point(x, y) : null);
+        bool nearSingularity = samples.Any(s => Math.Abs(Math.Sin((s.Pose.Q2 - s.Pose.Q1) * Math.PI / 180)) < 0.05);
+        void CheckBetween(double t, int first, int last)
+        {
+            if (t <= 0 || t >= 1) return; // endpoints were checked above
+            Point target = shape == DrawingShape.Circle ? new Point(x + a * Math.Cos(2 * Math.PI * t), y + a * Math.Sin(2 * Math.PI * t)) :
+                samples[first].Target + (samples[last].Target - samples[first].Target) * t;
+            var poses = model.Inverse(target.X, target.Y);
+            var pose = poses[Math.Min(branch, poses.Length - 1)];
+            int reference = (int)Math.Round(first + (last - first) * t);
+            pose = pose with {
+                Q1 = pose.Q1 + 360 * Math.Round((samples[reference].Pose.Q1 - pose.Q1) / 360),
+                Q2 = pose.Q2 + 360 * Math.Round((samples[reference].Pose.Q2 - pose.Q2) / 360)
+            };
+            nearSingularity |= Math.Abs(Math.Sin((pose.Q2 - pose.Q1) * Math.PI / 180)) < 0.05;
+            if (limits is { } range && !range.Contains(pose))
+                throw new ArgumentException($"图形在采样点之间超出当前关节范围：q1={pose.Q1:F6}°，q2={pose.Q2:F6}°；请调整图形或关节范围。");
+        }
+        if (shape == DrawingShape.Circle)
+        {
+            double centerRadius = Math.Sqrt(x * x + y * y), centerAngle = Math.Atan2(y, x);
+            void CheckAngle(double angle) => CheckBetween((angle / (2 * Math.PI) % 1 + 1) % 1, 0, samples.Length - 1);
+            // Absolute q1/q2 extrema occur when the other link is radial to the circle.
+            foreach (double link in new[] { model.L2, model.L1 })
+            foreach (double offset in new[] { a - link, a + link })
+            {
+                if (centerRadius == 0 || offset == 0) continue;
+                double other = link == model.L2 ? model.L1 : model.L2;
+                double cosine = (other * other - centerRadius * centerRadius - offset * offset) / (2 * centerRadius * offset);
+                if (cosine < -1 || cosine > 1) continue;
+                double angle = Math.Acos(cosine);
+                CheckAngle(centerAngle - angle); CheckAngle(centerAngle + angle);
+            }
+        }
+        else for (int piece = 0; piece < stops.Count - 1; piece++)
+        {
+            int first = stops[piece], last = stops[piece + 1];
+            Vector start = (Vector)samples[first].Target, delta = samples[last].Target - samples[first].Target;
+            double squared = delta.LengthSquared;
+            CheckBetween(-Vector.Multiply(start, delta) / squared, first, last);
+            // Each link-angle extremum has the other link perpendicular to the segment.
+            foreach (double link in new[] { model.L2, model.L1 })
+            {
+                double other = link == model.L2 ? model.L1 : model.L2;
+                Vector normal = new Vector(-delta.Y, delta.X) * (link / Math.Sqrt(squared));
+                foreach (double sign in new[] { -1.0, 1.0 })
+                {
+                    Vector offset = start + normal * sign;
+                    double middle = -Vector.Multiply(offset, delta) / squared;
+                    double remainder = other * other - (offset + delta * middle).LengthSquared;
+                    if (remainder < 0) continue;
+                    double half = Math.Sqrt(remainder / squared);
+                    CheckBetween(middle - half, first, last); CheckBetween(middle + half, first, last);
+                }
+            }
+        }
+        return new DrawingTrajectory(model, limits, shape, branch, samples, stops.ToArray(), shape == DrawingShape.Circle ? new Point(x, y) : null, nearSingularity);
     }
 
     internal const string CsvMetadataHeader = "kind,shape,l1_mm,l2_mm,branch,limits_status,q1_min_deg,q1_max_deg,q2_min_deg,q2_max_deg";
@@ -146,7 +204,7 @@ public sealed class DrawingTrajectory
         Check(Math.Abs(Create(model, DrawingShape.Rectangle, 200, 0, 30, 40, 0).Length - 140) < 1e-8);
         var wrap = Create(model, DrawingShape.Circle, 0, 0, 200, 0, 0);
         Check(Math.Abs(wrap.Samples[^1].Pose.Q1 - wrap.Samples[0].Pose.Q1 - 360) < 1e-6);
-        Check(wrap.Samples.Zip(wrap.Samples.Skip(1)).All(p => Math.Abs(p.Second.Pose.Q1 - p.First.Pose.Q1) < 2));
+        Check(wrap.Samples.Zip(wrap.Samples.Skip(1)).All(p => Math.Abs(p.Second.Pose.Q1 - p.First.Pose.Q1) < 2 && Math.Abs(p.Second.Pose.Q2 - p.First.Pose.Q2) < 2));
         // Reachable endpoints can hide an unreachable interior, even within one 1 mm segment.
         Reject(() => Create(model, DrawingShape.Line, -20, 0, 20, 0, 0));
         Reject(() => Create(model, DrawingShape.Line, -0.1, 3.6199, 0.1, 3.6199, 0));
@@ -160,6 +218,16 @@ public sealed class DrawingTrajectory
         Reject(() => Create(model, DrawingShape.Circle, 0, 0, 200, 0, 0, new JointLimits(-180, 180, -179, 179)));
         var limited = Create(model, DrawingShape.Line, 220, 0, 250, 20, 0, new JointLimits(-90, 90, 0, 160));
         Check(limited.ToCsv().Contains("samples_checked,-90,90,0,160"));
+        // Endpoint/sample checks alone miss these interior joint extrema.
+        double endQ2 = model.Inverse(-0.4, 200)[0].Q2, middleQ2 = model.Inverse(0, 200)[0].Q2;
+        Reject(() => Create(model, DrawingShape.Line, -0.4, 200, 0.4, 200, 0, new JointLimits(-179, 179, 0, (endQ2 + middleQ2) / 2)));
+        Reject(() => Create(model, DrawingShape.Rectangle, -0.4, 200, 0.8, 0.2, 0, new JointLimits(-179, 179, 0, (endQ2 + middleQ2) / 2)));
+        var circle = Create(model, DrawingShape.Circle, 260, 0, 50, 0, 0);
+        double circleMin1 = -Math.Acos((model.L1 * model.L1 + 260 * 260 - Math.Pow(model.L2 + 50, 2)) / (2 * model.L1 * 260)) * 180 / Math.PI;
+        double circleMax2 = model.Inverse(210, 0)[0].Q2;
+        Reject(() => Create(model, DrawingShape.Circle, 260, 0, 50, 0, 0, new JointLimits((circleMin1 + circle.Samples.Min(s => s.Pose.Q1)) / 2, 135, 0, 155)));
+        Reject(() => Create(model, DrawingShape.Circle, 260, 0, 50, 0, 0, new JointLimits(-135, 135, 0, (circleMax2 + circle.Samples.Max(s => s.Pose.Q2)) / 2)));
+        Check(Create(model, DrawingShape.Circle, 260, 0, 50, 0, 0, new JointLimits(circleMin1 - 1e-7, 135, 0, circle.Samples.Max(s => s.Pose.Q2) + 1)).Samples.Length == circle.Samples.Length);
         var oldCulture = CultureInfo.CurrentCulture;
         try { CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("de-DE"); Check(limited.ToCsv().Contains(",176.38,")); }
         finally { CultureInfo.CurrentCulture = oldCulture; }

@@ -4,6 +4,8 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
+using System.Windows.Threading;
+using Path = System.Windows.Shapes.Path;
 
 namespace TwoLinkCommissioning;
 
@@ -12,11 +14,12 @@ public sealed partial class XYPreviewPanel
     private Point cameraCenter, dragFrom, dragCenter, dragTo;
     private double pixelsPerMm = 1;
     private bool cameraReady, autoFit = true, dragging, boxDrag;
-    private readonly CheckBox armLayer = new() { Content = "预览连杆", ToolTip="显示离线预览姿态，不代表实测姿态。", Margin = new Thickness(8,8,4,4) };
     private readonly CheckBox liveLayer = new() { Content = "命令位置", IsChecked = true, Margin = new Thickness(8,8,4,4) };
+    private readonly CheckBox unreachableLayer = new() { Content = "不可达区域", IsChecked = true, Margin = new Thickness(8,8,4,4) };
     private readonly Button boxTool = new() { Content = "框选", ToolTip = "点击后在画布上拖出矩形，放大选区；仅改变视图。" };
     private readonly TextBlock pointerInfo = new() { FontSize = 11, Foreground = WorkbenchTheme.Muted, IsHitTestVisible = false };
     private bool boxMode;
+    private readonly DispatcherTimer viewportRedrawTimer = new(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(33) };
     private Rect Plot => new(48, 16, Math.Max(1, canvas.ActualWidth - 68), Math.Max(1, canvas.ActualHeight - 64));
     private Point ToScreen(Point p) => new(Plot.Left + Plot.Width / 2 + (p.X-cameraCenter.X)*pixelsPerMm,
         Plot.Top + Plot.Height / 2 - (p.Y-cameraCenter.Y)*pixelsPerMm);
@@ -35,9 +38,12 @@ public sealed partial class XYPreviewPanel
         Action("−", "缩小视图", () => ZoomAt(ToScreen(cameraCenter), 1/1.3));
         Action("＋", "放大视图；也可滚轮缩放。", () => ZoomAt(ToScreen(cameraCenter), 1.3));
         boxTool.Click += (_,_) => { boxMode = !boxMode; UpdateBoxTool(); }; bar.Children.Add(boxTool);
-        armLayer.Checked += (_,_) => RedrawViewport(); armLayer.Unchecked += (_,_) => RedrawViewport();
+        unreachableLayer.ToolTip = "透明红色＝按当前关节范围与连杆长度算出的不可达区域。\n留空使用默认 q1 [−30°, +30°]、q2 [−60°, +60°]；填写后按你的范围实时更新。\n红区、规划与设备执行使用同一范围；设备确认同步后才允许运动。红色边界是栅格近似，鼠标位置使用精确逆解检查。";
+        unreachableLayer.Checked += (_,_) => { overlayUnreachable = true; RedrawViewport(); };
+        unreachableLayer.Unchecked += (_,_) => { overlayUnreachable = false; RedrawViewport(); };
+        bar.Children.Add(unreachableLayer);
         liveLayer.Checked += (_,_) => RedrawViewport(); liveLayer.Unchecked += (_,_) => RedrawViewport();
-        bar.Children.Add(armLayer); bar.Children.Add(liveLayer);
+        bar.Children.Add(liveLayer);
         return bar;
     }
     private void UpdateBoxTool()
@@ -48,8 +54,31 @@ public sealed partial class XYPreviewPanel
         boxTool.BorderBrush = boxMode ? WorkbenchTheme.Teal : WorkbenchTheme.Line;
         canvas.Cursor = boxMode ? Cursors.Cross : Cursors.Hand;
     }
+    private string PointerHint => overlayLimits is null || !overlayUnreachable ? "滚轮缩放 · 拖动平移 · 单位 mm"
+        : "滚轮缩放 · 拖动平移 · 单位 mm · 红色＝按当前关节范围不可达";
+    private string PointerReach(Point world)
+    {
+        if(overlayLimits is null || !overlayUnreachable) return "";
+        try { return Reachability(Model).IsReachable(world) ? " · 可达" : " · 不可达（红色区域）"; }
+        catch(ArgumentException) { return ""; }
+    }
+    // Preview ranges are user editable; firmware restrictions remain separate execution gates.
+    private ReachabilityMask Reachability(PlanarArm model)
+    {
+        var limits = PreviewLimits();
+        if(reachability is null || !reachability.Matches(model,limits)) {
+            reachability = ReachabilityMask.Build(model, limits);
+        }
+        return reachability;
+    }
+    private bool SampleReachable(PlanarArm model, Point target)
+    {
+        try { return Reachability(model).IsReachable(target); } catch(ArgumentException) { return true; }
+    }
     private void InitializeViewport()
     {
+        viewportRedrawTimer.Tick += (_,_) => RedrawViewport();
+        Unloaded += (_,_) => viewportRedrawTimer.Stop();
         canvas.Cursor = Cursors.Hand;
         System.Windows.Automation.AutomationProperties.SetName(canvas,"轨迹视图：滚轮缩放，拖动平移，框选按钮放大局部；不控制机械臂运动。");
         canvas.MouseWheel += (_,e) => { if(cameraReady && !dragging) ZoomAt(e.GetPosition(canvas),Math.Pow(1.2,e.Delta/120.0)); e.Handled=true; };
@@ -63,9 +92,9 @@ public sealed partial class XYPreviewPanel
             if(dragging) {
                 dragTo=new Point(Math.Clamp(p.X,Plot.Left,Plot.Right),Math.Clamp(p.Y,Plot.Top,Plot.Bottom));
                 if(!boxDrag) PanFrom(dragCenter,p-dragFrom);
-                RedrawViewport();
+                RequestViewportRedraw();
             }
-            if(cameraReady) { var world=ToWorld(p); pointerInfo.Text=$"鼠标 X {world.X:F2}  Y {world.Y:F2} mm"; }
+            if(cameraReady) { var world=ToWorld(p); pointerInfo.Text=$"鼠标 X {world.X:F2}  Y {world.Y:F2} mm"+PointerReach(world); }
         };
         canvas.MouseUp += (_,e) => {
             if(!dragging) return;
@@ -73,20 +102,20 @@ public sealed partial class XYPreviewPanel
             dragging=false; canvas.ReleaseMouseCapture(); boxMode=false; UpdateBoxTool(); RedrawViewport(); e.Handled=true;
         };
         canvas.LostMouseCapture += (_,_) => { dragging=false; boxMode=false; UpdateBoxTool(); RedrawViewport(); };
-        canvas.MouseLeave += (_,_) => { if(!dragging) pointerInfo.Text="滚轮缩放 · 拖动平移 · 单位 mm"; };
+        canvas.MouseLeave += (_,_) => { if(!dragging) pointerInfo.Text=PointerHint; };
         canvas.SizeChanged += (_,_) => { if(autoFit) cameraReady=false; };
     }
     internal void FitView(bool detail)
     {
         detailView=detail; cameraReady=false; autoFit=true;
-        armLayer.IsChecked=!detail; boxMode=false; UpdateBoxTool(); RedrawViewport();
+        boxMode=false; UpdateBoxTool(); RedrawViewport();
     }
     private void ZoomAt(Point anchor, double factor)
     {
         if(!cameraReady || !double.IsFinite(factor) || factor<=0) return;
         var before=ToWorld(anchor);
         pixelsPerMm=Math.Clamp(pixelsPerMm*factor,0.05,4000);
-        cameraCenter+=before-ToWorld(anchor); autoFit=false; RedrawViewport();
+        cameraCenter+=before-ToWorld(anchor); autoFit=false; RequestViewportRedraw();
     }
     private void FitSelection(Rect selected)
     {
@@ -99,24 +128,33 @@ public sealed partial class XYPreviewPanel
     {
         cameraCenter=center+new Vector(-screenDelta.X/pixelsPerMm,screenDelta.Y/pixelsPerMm); autoFit=false;
     }
+    private void RequestViewportRedraw()
+    {
+        if (!viewportRedrawTimer.IsEnabled) viewportRedrawTimer.Start();
+    }
     private void RedrawViewport()
     {
-        if(timing is not null) DrawSample();
-        else if(pointTarget is {} pose) {
-            var model=Model; var tip=model.Forward(pose).Tip;
-            Draw(model,pose,tip.X,tip.Y,planningLimits is null || planningLimits.Value.Contains(pose));
+        viewportRedrawTimer.Stop();
+        try {
+            if(overlayLimits is null) { canvas.Children.Clear(); return; }
+            if(timing is not null) DrawSample();
+            else if(pointTarget is {} pose) {
+                var model=Model; var tip=model.Forward(pose).Tip;
+                Draw(model,pose,tip.X,tip.Y,planningLimits is null || planningLimits.Value.Contains(pose), Reachability(model).IsReachable(tip));
+            } else Draw(Model,default,0,0,true,false,showPreview:false);
         }
+        catch(ArgumentException) { canvas.Children.Clear(); }
     }
     private static double GridStep(double requested)
     {
         double power=Math.Pow(10,Math.Floor(Math.Log10(requested))), n=requested/power;
         return (n<1.5?1:n<3.5?2:n<7.5?5:10)*power;
     }
-    private void Draw(PlanarArm model, JointPose pose, double tx, double ty, bool inRange)
+    private void Draw(PlanarArm model, JointPose pose, double tx, double ty, bool inRange, bool reachable, bool showPreview = true)
     {
         canvas.Children.Clear();
         if(canvas.ActualWidth<100 || canvas.ActualHeight<100) return;
-        bool detail=detailView;
+        bool detail=detailView && showPreview;
         if(!cameraReady) {
             Rect bounds=new(-model.OuterRadius,-model.OuterRadius,model.OuterRadius*2,model.OuterRadius*2);
             if(detail) {
@@ -136,14 +174,33 @@ public sealed partial class XYPreviewPanel
             var circle=new Ellipse { Width=radius*2,Height=radius*2,Stroke=stroke,Fill=fill,StrokeThickness=1.5 };
             Canvas.SetLeft(circle,p.X-radius); Canvas.SetTop(circle,p.Y-radius); host.Children.Add(circle);
         }
+        static void Arc(Canvas host, Point center, double radius, Brush stroke, double thickness=1.5) {
+            var arc=new Path { Stroke=stroke, StrokeThickness=thickness, IsHitTestVisible=false };
+            var figure=new PathFigure { StartPoint=new Point(center.X-radius,center.Y), IsClosed=true };
+            figure.Segments.Add(new ArcSegment(new Point(center.X+radius,center.Y),new Size(radius,radius),0,radius*2>=900, SweepDirection.Clockwise,true));
+            figure.Segments.Add(new ArcSegment(new Point(center.X-radius,center.Y),new Size(radius,radius),0,radius*2>=900, SweepDirection.Clockwise,true));
+            var geometry=new PathGeometry(); geometry.Figures.Add(figure); arc.Data=geometry; host.Children.Add(arc);
+        }
         static void Label(Canvas host,string text,Point p,Brush? color=null,double size=11) {
             var label=new TextBlock { Text=text,Foreground=color??WorkbenchTheme.Muted,FontSize=size,IsHitTestVisible=false };
             Canvas.SetLeft(label,p.X); Canvas.SetTop(label,p.Y); host.Children.Add(label);
         }
         var origin=ToScreen(new Point());
+        if(overlayUnreachable && overlayLimits is not null) {
+            var mask=Reachability(model);
+            var topLeft=ToScreen(new Point(-mask.ViewRadius,mask.ViewRadius));
+            double side=mask.ViewRadius*2*pixelsPerMm;
+            var bounds=new Rect(topLeft,new Size(side,side));
+            // Outside the bitmap's world square is unreachable too, including when panning away from the arm.
+            plot.Children.Add(new Path { IsHitTestVisible=false, Fill=WorkbenchTheme.Brush("#38B42338"),
+                Data=new CombinedGeometry(GeometryCombineMode.Exclude,new RectangleGeometry(Plot),new RectangleGeometry(bounds)) });
+            var image=new Image { Source=mask.Bitmap, Width=side, Height=side, Stretch=Stretch.Fill, IsHitTestVisible=false };
+            RenderOptions.SetBitmapScalingMode(image,BitmapScalingMode.NearestNeighbor);
+            Canvas.SetLeft(image,topLeft.X); Canvas.SetTop(image,topLeft.Y); plot.Children.Add(image);
+        }
         if(!detail) {
-            Circle(plot,origin,model.OuterRadius*pixelsPerMm,WorkbenchTheme.Line,WorkbenchTheme.Brush("#F5F8FC"));
-            Circle(plot,origin,model.InnerRadius*pixelsPerMm,WorkbenchTheme.Line,Brushes.White);
+            Arc(plot,origin,model.OuterRadius*pixelsPerMm,WorkbenchTheme.Brush("#8FB42338"));
+            if(model.InnerRadius*pixelsPerMm>1.5) Arc(plot,origin,model.InnerRadius*pixelsPerMm,WorkbenchTheme.Brush("#8FB42338"));
         }
         double step=GridStep(65/pixelsPerMm);
         var low=ToWorld(new Point(Plot.Left,Plot.Bottom)); var high=ToWorld(new Point(Plot.Right,Plot.Top));
@@ -164,21 +221,33 @@ public sealed partial class XYPreviewPanel
             var poly=new Polyline { Stroke=WorkbenchTheme.Teal,StrokeThickness=2.4 };
             foreach(var s in path.Samples) poly.Points.Add(ToScreen(s.Target)); plot.Children.Add(poly);
             var start=ToScreen(path.Samples[0].Target); Circle(plot,start,5,WorkbenchTheme.Teal,Brushes.White);
-            Label(plot,"起点",start+new Vector(9,6),WorkbenchTheme.Teal);
-            int i=Math.Max(1,path.Samples.Length/4); var end=ToScreen(path.Samples[i].Target); var delta=end-ToScreen(path.Samples[i-1].Target);
-            if(delta.Length>0.001) { delta.Normalize(); var side=new Vector(-delta.Y,delta.X);
-                Line(plot,end,end-delta*10+side*4,WorkbenchTheme.Teal,2); Line(plot,end,end-delta*10-side*4,WorkbenchTheme.Teal,2); }
+            bool closed=(path.Samples[^1].Target-path.Samples[0].Target).Length<=0.01;
+            Label(plot,closed?"起点 / 收笔点":"起点",start+new Vector(9,6),WorkbenchTheme.Teal);
+            for(int segment=0; segment<path.Stops.Length-1; segment++) {
+                int i=path.Shape==DrawingShape.Circle?Math.Max(1,path.Samples.Length/4):
+                    Math.Max(path.Stops[segment]+1,(path.Stops[segment]+path.Stops[segment+1])/2);
+                var end=ToScreen(path.Samples[i].Target); var delta=end-ToScreen(path.Samples[i-1].Target);
+                if(delta.Length>0.001) { delta.Normalize(); var side=new Vector(-delta.Y,delta.X);
+                    Line(plot,end,end-delta*10+side*4,WorkbenchTheme.Teal,2); Line(plot,end,end-delta*10-side*4,WorkbenchTheme.Teal,2); }
+                if(path.Shape==DrawingShape.Rectangle && segment<3) {
+                    var corner=ToScreen(path.Samples[path.Stops[segment+1]].Target);
+                    Circle(plot,corner,3,WorkbenchTheme.Teal,Brushes.White);
+                    var diagonal=ToScreen(path.Samples[path.Stops[2]].Target)-start;
+                    if(Math.Abs(diagonal.X)>120 && Math.Abs(diagonal.Y)>55)
+                        Label(plot,$"角 {segment+1} · 停顿",corner+new Vector(segment==2?-82:7,-20),WorkbenchTheme.Teal);
+                }
+            }
             if((path.Samples[^1].Target-path.Samples[0].Target).Length>0.01) {
-                var finish=ToScreen(path.Samples[^1].Target); Circle(plot,finish,4,WorkbenchTheme.Teal,WorkbenchTheme.Teal); Label(plot,"终点",finish+new Vector(8,6));
+                var finish=ToScreen(path.Samples[^1].Target); Circle(plot,finish,4,WorkbenchTheme.Teal,WorkbenchTheme.Teal); Label(plot,"终点",finish+new Vector(8,-22));
             }
         }
         var (elbow,tip)=model.Forward(pose);
-        if(armLayer.IsChecked==true) {
-            var color=inRange?WorkbenchTheme.Blue:WorkbenchTheme.Red;
+        var color=inRange?WorkbenchTheme.Blue:WorkbenchTheme.Red;
+        if(showPreview) {
             Line(plot,origin,ToScreen(elbow),color,detail?1.5:4,detail); Line(plot,ToScreen(elbow),ToScreen(tip),color,detail?1.5:4,detail);
             Circle(plot,origin,5,color,Brushes.White); Circle(plot,ToScreen(elbow),5,color,Brushes.White);
+            Circle(plot,ToScreen(new Point(tx,ty)),5,reachable?WorkbenchTheme.Brush("#C66B05"):WorkbenchTheme.Red,reachable?WorkbenchTheme.Brush("#FFCC66"):WorkbenchTheme.Brush("#FFC9C9"));
         }
-        Circle(plot,ToScreen(new Point(tx,ty)),5,WorkbenchTheme.Brush("#C66B05"),WorkbenchTheme.Brush("#FFCC66"));
         if(liveLayer.IsChecked==true && startFeedback is {Referenced:true} live) {
             var p=ToScreen(model.Forward(live.Command).Tip);
             Line(plot,p-new Vector(8,0),p+new Vector(8,0),Brushes.MediumVioletRed,2);
@@ -187,7 +256,8 @@ public sealed partial class XYPreviewPanel
         Label(canvas,"─ 规划轨迹",new Point(Plot.Left,Plot.Bottom+29),WorkbenchTheme.Teal);
         Label(canvas,"● 预览点",new Point(Plot.Left+88,Plot.Bottom+29),WorkbenchTheme.Brush("#A35600"));
         Label(canvas,"＋ 命令估算 XY（非实测）",new Point(Plot.Left+164,Plot.Bottom+29),Brushes.MediumVioletRed);
-        pointerInfo.Text=string.IsNullOrEmpty(pointerInfo.Text)?"滚轮缩放 · 拖动平移 · 单位 mm":pointerInfo.Text;
+        Label(canvas,"■ 不可达区域（按当前关节范围）",new Point(Plot.Left+332,Plot.Bottom+29),WorkbenchTheme.Brush("#8FB42338"));
+        pointerInfo.Text=string.IsNullOrEmpty(pointerInfo.Text)?PointerHint:pointerInfo.Text;
         Canvas.SetLeft(pointerInfo,Plot.Left+8); Canvas.SetTop(pointerInfo,Plot.Top+6); canvas.Children.Add(pointerInfo);
         // The overview remains a context view; its pose is the offline preview, never measured XY.
         if(detail && canvas.ActualWidth>560 && canvas.ActualHeight>280) {
@@ -237,9 +307,18 @@ public sealed partial class XYPreviewPanel
         if((cameraCenter-(c+new Vector(-37/scale,-21/scale))).Length>1e-8) throw new InvalidOperationException("Pan axis conversion failed");
         ZoomAt(anchor,1e12); if(pixelsPerMm!=4000) throw new InvalidOperationException("Upper zoom bound failed");
         ZoomAt(anchor,1e-12); if(pixelsPerMm!=0.05) throw new InvalidOperationException("Lower zoom bound failed");
-        FitView(false); FitView(true);
-        if(requests!=0 || armLayer.IsChecked==true || GridStep(4)!=5) throw new InvalidOperationException("Viewport separation failed");
-        PointMoveRequested-=CountPoint; TrajectoryRequested-=CountPath; SetStartFeedback(null);
+        foreach(bool detail in new[] { false, true }) {
+            FitView(detail);
+            var plot=canvas.Children.OfType<Canvas>().First();
+            var links=plot.Children.OfType<Line>().Count(line=>line.Stroke==WorkbenchTheme.Blue || line.Stroke==WorkbenchTheme.Red);
+            var strokes=plot.Children.OfType<Path>().Count(shape=>shape.Stroke is not null);
+            var fills=plot.Children.OfType<Path>().Count(shape=>shape.Fill is not null);
+            int images=plot.Children.OfType<Image>().Count();
+            if(links!=2 || strokes!=(detail?0:2) || fills!=1 || images!=1)
+                throw new InvalidOperationException($"Preview links/不可达区域层不符：detail={detail} links={links} strokes={strokes} fills={fills} images={images}");
+        }
+        if(requests!=0 || GridStep(4)!=5) throw new InvalidOperationException("Viewport separation failed");
+        PointMoveRequested-=CountPoint; TrajectoryRequested-=CountPath; SetStartFeedback(null); FitView(false);
     }
     internal void CheckViewportLayout()
     {

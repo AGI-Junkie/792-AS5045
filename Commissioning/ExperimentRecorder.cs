@@ -10,7 +10,12 @@ public sealed record TelemetrySample(uint Milliseconds, uint Epoch, uint Sequenc
     int Steps1, int Steps2, int Encoder1, int Slip, int Inputs, uint Drops)
 {
     private static readonly Regex Pattern = new(@"^TELEM t=(\d+) epoch=(\d+) seq=(\d+) ref=([01]) source=([012]) p1=(-?\d+) p2=(-?\d+) e1=(-?\d+) err=(-?\d+) inputs=(\d+) drops=(\d+)$", RegexOptions.CultureInvariant);
-    public JointPose Command => new(Steps1 * 360.0 / 64000, Steps2 * 360.0 / 81696);
+    public JointPose Command {
+        get {
+            double q1=Steps1*360.0/64000;
+            return new(q1,q1+Steps2*360.0/81696);
+        }
+    }
     public double Measured1 => Encoder1 * 360.0 / (4096 * 40);
     public double Error1 => Measured1 - Command.Q1;
     public string ReferenceName => Source == 2 ? "人工伸直零位" : Source == 1 ? "开关回零" : "未建立";
@@ -56,7 +61,7 @@ public sealed class ExperimentRecorder : IDisposable
         int time = 0;
         for (int i = 0; i < nodes.Length; i++) {
             time += nodes[i].Milliseconds;
-            plan.AppendLine(FormattableString.Invariant($"{i},{time},{nodes[i].Pose.Q1:F2},{nodes[i].Pose.Q2:F2},{ExecutionTrajectory.Counts(0,nodes[i].Pose.Q1)},{ExecutionTrajectory.Counts(1,nodes[i].Pose.Q2)}"));
+            plan.AppendLine(FormattableString.Invariant($"{i},{time},{nodes[i].Pose.Q1:F2},{nodes[i].Pose.Q2:F2},{ExecutionTrajectory.Counts(0,nodes[i].Pose)},{ExecutionTrajectory.Counts(1,nodes[i].Pose)}"));
         }
         File.WriteAllText(Path.Combine(DirectoryPath, "plan.csv"), plan.ToString(), new UTF8Encoding(true));
         csv = new StreamWriter(Path.Combine(DirectoryPath, "feedback.csv"), false, new UTF8Encoding(true)) { AutoFlush = true };
@@ -66,7 +71,7 @@ public sealed class ExperimentRecorder : IDisposable
     {
         if (finished || !s.Referenced || s.Epoch != Epoch) return;
         var command = model.Forward(s.Command).Tip;
-        var hybrid = model.Forward(new(s.Measured1, s.Command.Q2)).Tip;
+        var hybrid = model.Forward(new(s.Measured1, s.Measured1 + s.Command.Q2 - s.Command.Q1)).Tip;
         csv.WriteLine(FormattableString.Invariant($"{DateTime.UtcNow:O},{s.Milliseconds},{s.Epoch},{s.Sequence},{phase},{segment},{s.Command.Q1:F6},{s.Measured1:F6},{s.Error1:F6},{s.Command.Q2:F6},,{command.X:F6},{command.Y:F6},{hybrid.X:F6},{hybrid.Y:F6},{s.Slip},{s.Inputs},{s.Drops}"));
         Samples++;
         if(phase is "point" or "drawing") { MotionSamples++; squares += s.Error1 * s.Error1; Peak = Math.Max(Peak, Math.Abs(s.Error1)); }
@@ -86,7 +91,7 @@ public sealed class ExperimentRecorder : IDisposable
     public static void SelfTest()
     {
         var s = TelemetrySample.Parse("TELEM t=500 epoch=9 seq=3 ref=1 source=2 p1=1600 p2=-1600 e1=4096 err=-2 inputs=0 drops=3")!;
-        if (s is null || s.Command.Q1 != 9 || s.Measured1 != 9 || s.Error1 != 0 || s.ReferenceName != "人工伸直零位") throw new Exception("Telemetry units/sign invalid");
+        if (s is null || s.Command.Q1 != 9 || Math.Abs(s.Command.Q2-(9-1600*360.0/81696))>1e-8 || s.Measured1 != 9 || s.Error1 != 0 || s.ReferenceName != "人工伸直零位") throw new Exception("Telemetry units/sign invalid");
         if (TelemetrySample.Parse("TELEM t=0 epoch=0 seq=0 ref=1 source=0 p1=0 p2=0 e1=0 err=0 inputs=16 drops=0") is not null) throw new Exception("Malformed telemetry accepted");
         string root = Path.Combine(Path.GetTempPath(), "arm-recorder-" + Guid.NewGuid().ToString("N"));
         try {

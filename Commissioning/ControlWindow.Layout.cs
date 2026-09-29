@@ -21,7 +21,7 @@ public sealed partial class ControlWindow
     private string? lastExperimentDirectory;
     private void BuildLayout()
     {
-        Title = "Two-Link Studio · 轨迹工作台 · v5 UI3";
+        Title = "Two-Link Studio · 轨迹工作台 · v7 全局运动参数";
         Width = 1380; Height = 930; MinWidth = 1100; MinHeight = 760;
         FontFamily = new FontFamily("Microsoft YaHei UI, Segoe UI"); FontSize = 13;
         Background = WorkbenchTheme.Background; Foreground = WorkbenchTheme.Ink;
@@ -44,6 +44,7 @@ public sealed partial class ControlWindow
         sideTabs.Items.Add(new TabItem { Header = "图形参数", Content = xyPreview.ParameterContent });
         var deviceControls = new StackPanel { Margin = new Thickness(2) };
         sideTabs.Items.Add(new TabItem { Header = "设备 / 回零", Content = new ScrollViewer { Content = deviceControls, VerticalScrollBarVisibility = ScrollBarVisibility.Auto } });
+        xyPreview.ParametersSaved += () => { sideTabs.SelectedIndex=1; Append("HOST parameters saved and applied: " + xyPreview.SettingsDescription); };
         var connection = new StackPanel(); connection.Children.Add(WorkbenchTheme.Text("设备连接",14));
         var row = new WrapPanel(); ports.Width = 117; row.Children.Add(ports);
         var refresh = MakeButton("刷新"); refresh.Click += (_,_) => RefreshPorts(); row.Children.Add(refresh); connection.Children.Add(row);
@@ -58,11 +59,12 @@ public sealed partial class ControlWindow
         manualReference.Click += (_,_) => RequestManualReference();
         manualReference.ToolTip = "先人工把两杆沿 +X 摆直，再确认 q1=q2=0；只建立坐标，不驱动电机。";
         ToolTipService.SetShowOnDisabled(manualReference,true);
-        preparation.Children.Add(enable); preparation.Children.Add(manualReference); preparation.Children.Add(home);
+        preparation.Children.Add(enable); preparation.Children.Add(manualReference);
+        preparation.Children.Add(home);
         preparation.Children.Add(WorkbenchTheme.Text("可人工摆直确认，也可开关回零。\n人工确认时两杆必须已伸直。",12,WorkbenchTheme.Muted));
         var jogging = new WrapPanel(); preparation.Children.Add(jogging);
         AddJog(jogging,"arm1 ← A",1); AddJog(jogging,"arm1 D →",2); AddJog(jogging,"arm2 ←",4); AddJog(jogging,"arm2 →",8);
-        preparation.Children.Add(WorkbenchTheme.Text("点动按住即走，松开停止；运动时切换窗口会停止。",12,WorkbenchTheme.Muted));
+        preparation.Children.Add(WorkbenchTheme.Text("点动松开或切换窗口即停；回零和轨迹可在后台继续。",12,WorkbenchTheme.Muted));
         deviceControls.Children.Add(preparation);
         var device = new StackPanel(); device.Children.Add(WorkbenchTheme.Text("设备状态",16));
         state.FontSize = 13; state.Margin = new Thickness(3,5,3,5); device.Children.Add(state);

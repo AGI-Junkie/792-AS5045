@@ -1,5 +1,7 @@
 <#
-  jog.ps1 - hold-to-move keyboard jog for the AS5045_enc firmware
+  LEGACY ONLY: stage2-v7 requires the matching WPF host; this script cannot
+  enable, home or jog v7. Raw STOP remains available.
+  jog.ps1 - hold-to-move keyboard jog for the legacy AS5045_enc firmware
   (KEYBOARD_JOG=1 in DRV8825.cydsn\main.c).
 
     a / d          arm1 (42 motor, stepper2) left / right

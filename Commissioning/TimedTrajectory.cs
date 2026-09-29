@@ -18,6 +18,12 @@ public sealed class TimedTrajectory
     public double Length => distances[^1];
     private readonly double[] distances;
     private const double Rad = Math.PI / 180;
+    internal void Stretch(double factor)
+    {
+        if (!double.IsFinite(factor) || factor < 1 || Duration * factor > 599)
+            throw new ArgumentException("满足设备上限后的规划超过 600 秒，请缩短路径或调整参数。");
+        for (int i=1; i<StopTimes.Length; i++) StopTimes[i] *= factor;
+    }
 
     public TimedTrajectory(DrawingTrajectory path, PlanningRates rates)
     {
@@ -35,9 +41,9 @@ public sealed class TimedTrajectory
                 var state = EvaluatePiece(piece, i / 1000.0, 1);
                 duration = Math.Max(duration, state.Speed / rates.Feed);
                 duration = Math.Max(duration, Math.Abs(state.Velocity.Q1) / rates.V1);
-                duration = Math.Max(duration, Math.Abs(state.Velocity.Q2) / rates.V2);
+                duration = Math.Max(duration, Math.Abs(state.Velocity.Q2 - state.Velocity.Q1) / rates.V2);
                 duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q1) / rates.A1));
-                duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q2) / rates.A2));
+                duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q2 - state.Acceleration.Q1) / rates.A2));
             }
             if (!double.IsFinite(duration) || StopTimes[piece] + duration * 1.05 > 600)
                 throw new ArgumentException("离线规划超过 600 秒或接近数值奇异点；请调整图形或规划参数。");
@@ -74,21 +80,22 @@ public sealed class TimedTrajectory
         var poses = Path.Model.Inverse(target.X, target.Y);
         JointPose pose = poses[Math.Min(Path.Branch, poses.Length - 1)];
         int reference = (int)Math.Round(Path.Stops[piece] + (Path.Stops[piece + 1] - Path.Stops[piece]) * u);
-        pose = pose with { Q1 = pose.Q1 + 360 * Math.Round((Path.Samples[reference].Pose.Q1 - pose.Q1) / 360) };
+        pose = pose with {
+            Q1 = pose.Q1 + 360 * Math.Round((Path.Samples[reference].Pose.Q1 - pose.Q1) / 360),
+            Q2 = pose.Q2 + 360 * Math.Round((Path.Samples[reference].Pose.Q2 - pose.Q2) / 360)
+        };
         if (Path.Limits is { } limits && !limits.Contains(pose))
             throw new ArgumentException("时间规划采样点超出填写的关节范围，请调整图形或分支。");
-        double q1 = pose.Q1 * Rad, sum = (pose.Q1 + pose.Q2) * Rad;
+        double q1 = pose.Q1 * Rad, q2 = pose.Q2 * Rad;
         double c1 = Path.Model.L1 * Math.Cos(q1), s1 = Path.Model.L1 * Math.Sin(q1);
-        double c2 = Path.Model.L2 * Math.Cos(sum), s2 = Path.Model.L2 * Math.Sin(sum);
-        double j11 = -s1 - s2, j12 = -s2, j21 = c1 + c2, j22 = c2;
-        double determinant = Path.Model.L1 * Path.Model.L2 * Math.Sin(pose.Q2 * Rad);
-        if (Math.Abs(Math.Sin(pose.Q2 * Rad)) < 1e-6) throw new ArgumentException("时间规划经过奇异位形。");
-        Vector Solve(Vector value) => new((value.X * j22 - j12 * value.Y) / determinant,
-            (j11 * value.Y - value.X * j21) / determinant);
+        double c2 = Path.Model.L2 * Math.Cos(q2), s2 = Path.Model.L2 * Math.Sin(q2);
+        double determinant = Path.Model.L1 * Path.Model.L2 * Math.Sin(q2 - q1);
+        if (Math.Abs(Math.Sin(q2 - q1)) < 1e-6) throw new ArgumentException("时间规划经过奇异位形。");
+        Vector Solve(Vector value) => new((value.X * c2 + s2 * value.Y) / determinant,
+            (-s1 * value.Y - value.X * c1) / determinant);
         Vector first = Solve(dp);
-        double combined = first.X + first.Y;
-        Vector second = Solve(ddp + new Vector(c1 * first.X * first.X + c2 * combined * combined,
-            s1 * first.X * first.X + s2 * combined * combined));
+        Vector second = Solve(ddp + new Vector(c1 * first.X * first.X + c2 * first.Y * first.Y,
+            s1 * first.X * first.X + s2 * first.Y * first.Y));
         Vector velocity = first * (du / Rad), acceleration = (second * (du * du) + first * ddu) / Rad;
         return new TimedPose(z * duration, PieceLength(piece) * u, target, pose,
             new JointPose(velocity.X, velocity.Y), new JointPose(acceleration.X, acceleration.Y), dp.Length * du);
@@ -109,7 +116,7 @@ public sealed class TimedTrajectory
     {
         static string N(double v) => v.ToString("G17", CultureInfo.InvariantCulture);
         var csv = new StringBuilder(DrawingTrajectory.CsvMetadataHeader +
-            ",timing_status,feed_limit_mm_s,q1_speed_limit_deg_s,q2_speed_limit_deg_s,q1_accel_limit_deg_s2,q2_accel_limit_deg_s2,time_s,path_mm,x_mm,y_mm,q1_deg,q2_deg,q1_speed_deg_s,q2_speed_deg_s,q1_accel_deg_s2,q2_accel_deg_s2,tip_speed_mm_s\r\n");
+            ",timing_status,feed_limit_mm_s,motor1_speed_limit_deg_s,motor2_speed_limit_deg_s,motor1_accel_limit_deg_s2,motor2_accel_limit_deg_s2,time_s,path_mm,x_mm,y_mm,q1_deg,q2_deg,q1_speed_deg_s,q2_speed_deg_s,q1_accel_deg_s2,q2_accel_deg_s2,tip_speed_mm_s\r\n");
         string metadata = Path.CsvMetadata + $",sampled_estimate,{N(Rates.Feed)},{N(Rates.V1)},{N(Rates.V2)},{N(Rates.A1)},{N(Rates.A2)},";
         // Include exact corners/endpoints as well as the nominal 20 ms export grid.
         var times = new SortedSet<double>(StopTimes);
@@ -146,8 +153,8 @@ public sealed class TimedTrajectory
             {
                 var s = motion.At(motion.Duration * i / 3000);
                 Check((model.Forward(s.Pose).Tip - s.Target).Length < 1e-6, "FK");
-                Check(Math.Abs(s.Velocity.Q1) <= rates.V1 && Math.Abs(s.Velocity.Q2) <= rates.V2 && s.Speed <= rates.Feed, "speed limits");
-                Check(Math.Abs(s.Acceleration.Q1) <= rates.A1 && Math.Abs(s.Acceleration.Q2) <= rates.A2, "acceleration limits");
+                Check(Math.Abs(s.Velocity.Q1) <= rates.V1 && Math.Abs(s.Velocity.Q2 - s.Velocity.Q1) <= rates.V2 && s.Speed <= rates.Feed, "speed limits");
+                Check(Math.Abs(s.Acceleration.Q1) <= rates.A1 && Math.Abs(s.Acceleration.Q2 - s.Acceleration.Q1) <= rates.A2, "acceleration limits");
             }
             // Independently differentiate returned joint positions to verify derivative formulas.
             double t = motion.StopTimes[1] * 0.37, dt = 0.0001;

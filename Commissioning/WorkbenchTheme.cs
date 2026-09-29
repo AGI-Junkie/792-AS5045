@@ -34,6 +34,15 @@ internal static class WorkbenchTheme
           </Style>
           <Style TargetType="TextBox"><Setter Property="FontSize" Value="13"/><Setter Property="Foreground" Value="#172B4D"/><Setter Property="BorderBrush" Value="#CBD5E5"/><Setter Property="Padding" Value="7,5"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="SelectionBrush" Value="#B2CBFF"/></Style>
           <Style TargetType="ComboBox"><Setter Property="FontSize" Value="13"/><Setter Property="MinHeight" Value="32"/><Setter Property="Padding" Value="5"/><Setter Property="VerticalContentAlignment" Value="Center"/></Style>
+          <!-- The default determinate bar also animates its glow. Keep rendering finite so input and heartbeats can run. -->
+          <Style TargetType="ProgressBar">
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ProgressBar">
+              <Grid>
+                <Border x:Name="PART_Track" Background="{TemplateBinding Background}"/>
+                <Border x:Name="PART_Indicator" HorizontalAlignment="Left" Background="{TemplateBinding Foreground}"/>
+              </Grid>
+            </ControlTemplate></Setter.Value></Setter>
+          </Style>
           <Style TargetType="TabItem">
             <Setter Property="Padding" Value="14,9"/><Setter Property="FontSize" Value="13"/><Setter Property="Foreground" Value="#172B4D"/>
             <Setter Property="Background" Value="Transparent"/>
