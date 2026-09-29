@@ -699,6 +699,13 @@ public sealed partial class ControlWindow : Window
         var window = new ControlWindow { selfTesting = true };
         static void Check(bool condition, [System.Runtime.CompilerServices.CallerArgumentExpression(nameof(condition))] string? expression = null)
         { if (!condition) throw new InvalidOperationException("UI state check failed: " + expression); }
+        // CanPoint also needs the device to report rates equal to the request and telemetry matching the
+        // reference epoch AND sequence (HandleTelemetry drops anything else), as real firmware does periodically.
+        void Arm(int epoch, uint seq = 0) {
+            var r = window.xyPreview.RequestedProfile!.Value;
+            window.TestLine($"MOTION_RATES epoch={epoch} r1={r.R1} r2={r.R2} a1={r.A1} a2={r.A2}");
+            window.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=1 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+        }
         Check(!window.enable.IsEnabled && !window.home.IsEnabled);
         window.TestLine("STATE fw=stage2-v6 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
         Check(window.hardwareUart && window.supportsTelemetry && window.supportsPacketRetry && !window.enabled);
@@ -758,6 +765,10 @@ public sealed partial class ControlWindow : Window
         window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=-6000 max1=6000 min2=-9000 max2=9000");
         Check(!window.CanPoint); // matching limits cannot override missing q2 capability
         window.TestLine("LINK fw=stage2-v7-absolute-q2 q2_absolute=1 motion_rates=1");
+        Check(!window.CanPoint); // the device has not confirmed the requested rates yet
+        { var r = window.xyPreview.RequestedProfile!.Value; window.TestLine($"MOTION_RATES epoch=7 r1={r.R1} r2={r.R2} a1={r.A1} a2={r.A2}"); }
+        Check(!window.CanPoint); // no telemetry for this reference yet
+        window.TestLine("TELEM t=10 epoch=7 seq=0 ref=1 source=1 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
         Check(window.CanPoint);
         window.RequestPoint(new JointPose(1.25, -2.5));
         Check(window.pendingPoint==1 && window.pointWire.Count==36 && !window.CanPoint && !window.home.IsEnabled);
@@ -765,6 +776,7 @@ public sealed partial class ControlWindow : Window
         window.TestLine("PTP_STATE lock=0 ref=1 active=1 epoch=7 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000");
         Check(!window.CanPoint && !window.home.IsEnabled);
         window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        Arm(7, 1);
         Check(window.CanPoint);
         // Compact re-announcement: the firmware repeats this after a reference epoch
         // change, so the host must adopt the new epoch without a full status block.
@@ -784,6 +796,7 @@ public sealed partial class ControlWindow : Window
         Check(window.manualReferencePending && window.pointWire.Count == 36 && !window.CanManualReference);
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
         window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        Arm(21, manualSeq);
         Check(window.CanPoint && !window.manualReferencePending && window.pointWire.Count == 0);
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
         window.RequestPoint(new JointPose(-21.95, 44.37));

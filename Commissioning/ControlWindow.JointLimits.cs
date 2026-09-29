@@ -27,7 +27,7 @@ public sealed partial class ControlWindow
     private bool LimitsReady => compatible && framedControl && supportsAbsoluteQ2 && xyPreview.RequestedLimits is { } wanted && reportedLimits == wanted &&
         RatesReady && limitAxis < 0 && !limitsAwaitingState;
 
-    private string LimitsStatus => !supportsAbsoluteQ2 ? "固件 q2 坐标约定不匹配：需 stage2-v7-absolute-q2 固件；运动已锁定。" :
+    private string LimitsStatus => !supportsAbsoluteQ2 ? "固件 q2 坐标约定不匹配：请更新为 stage2-v7-absolute-q2 固件；运动已锁定。" :
         xyPreview.RequestedProfile is null ? "机构尺寸或全局速度无效，请检查设置。" :
         !supportsMotionRates ? "全局速度需要本包 global1 固件；请更新固件后重新连接。" :
         xyPreview.RequestedLimits is null ? "关节范围输入无效；请填写 ±180° 内、包含零位的有效范围（最多两位小数）。" :

@@ -345,7 +345,7 @@ static void rates_test(const char *t) {
         packetType=1;
     } else if(!strcmp(t,"rates_ptp") && PTP_COMMISSIONED) {
         packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;
-        ptp_send(2,g_ptp.epoch,100,100,600,0);
+        ptp_send(2,g_ptp.epoch,100,200,600,0); /* absolute q2: elbow = 100 cd, so both motors move and the axis-2 rate applies */
         assert(g_ptp.active && g_ptp.ramp.cMin==step_period_us(150) && g_ptp.ramp.c0>=55000);
     }
     (void)t;
@@ -451,7 +451,7 @@ static void ptp_test(const char *t) {
         if(!strcmp(t,"ptp_final_over_limit"))error=229;
         if(!strcmp(t,"ptp_final_following"))error=328;
         ptp_send(1,epoch,-1437,2904,600,0);assert(g_ptp.active==1);
-        for(i=0;i<16000&&g_ptp.active==1&&g_motionEnabled;i++)cycle(1);
+        for(i=0;i<24000&&g_ptp.active==1&&g_motionEnabled;i++)cycle(1); /* elbow now travels q2-q1 = 43.41 deg, about 17.2 s at 600 usteps/s */
         assert(g_motionEnabled&&g_ptp.active==2&&g_arm1.usteps==g_ptp.target[0]&&g_arm2.usteps==g_ptp.target[1]);
         simAngleOverride=(g_enc.lastAngle+cmd_lsb()-g_enc.pos-error+4096)&4095;
         if(!strcmp(t,"ptp_final_counts"))g_arm2.usteps--;
@@ -471,7 +471,7 @@ static void ptp_test(const char *t) {
         if(!strcmp(t,"ptp_fast_stall"))simStall=1;
         ptp_send(1,epoch,-1437,2904,600,0);
         assert(g_ptp.active);
-        for(i=0;i<16000&&g_ptp.active&&g_motionEnabled;i++) {
+        for(i=0;i<24000&&g_ptp.active&&g_motionEnabled;i++) {
             cycle(1);
             assert(simDriverSwitches==switches); // Completion and protective stops retain driver power.
         }
@@ -479,7 +479,7 @@ static void ptp_test(const char *t) {
             assert_stopped();txq_flush_blocking();assert(strstr(simLog,"PTP encoder following error"));return;
         }
         assert(g_motionEnabled&&!g_ptp.active&&g_ptp.reference);
-        assert(g_jogMs-started<16000 && g_arm1.usteps==start1-ptp_offset(0,-1437) && g_arm2.usteps==start2-ptp_offset(1,2904-(-1437)));
+        assert(g_jogMs-started<24000 && g_arm1.usteps==start1-ptp_offset(0,-1437) && g_arm2.usteps==start2-ptp_offset(1,2904-(-1437)));
         jog_handle_byte(JOG_CMD_STOP);assert_stopped();
         assert(simDriverSwitches==switches+6u && simPins[PIN_EN1] && simPins[PIN_EN2]);
         puts("PTP 600: power stable through completion; operator STOP releases both drivers");return;
@@ -716,7 +716,7 @@ static void traj_test(const char *t) {
     for(i=1;i<=4;i++) {
         int16 q=(i==1?10:(i==2?20:(i==3?10:0)));
         if(!strcmp(t,"traj_dwell"))q=0;
-        traj_send(3,++seq,q,(int16)-q,250);
+        traj_send(3,++seq,q,0,250); /* q2 is the absolute link angle (elbow = q2 - q1): (q,0) moves the elbow by -q, as (q,-q) did when q2 was elbow-relative */
         assert(g_traj.count==i+1);
     }
     assert(g_traj.state==2&&!g_ptp.active&&p1==simPulse1&&p2==simPulse2);
