@@ -26,3 +26,5 @@
 本次修改文件：`DRV8825.cydsn/main.c`、`Commissioning/App.cs`、`tests/test_stage1.py`、`README.md`、`WIRING.md`、`STAGE1_ACCEPTANCE.md`，新增本说明。修改前文件与收到的日志备份在 `recovered/home-fix-before-20260924-185552`，旧发布目录保持可用。
 
 后续平均采样修正（2026-09-24）：arm1 慢碰后停稳 50 ms，再以至少 1 ms 间隔读取 12 个有效角度，按跨零相对角取平均建立原点。采样不阻塞主循环，传感器释放或编码器失效会停止。45 项模拟检查通过；PSoC Creator 编译成功、无警告，Flash 17856 字节、SRAM 4233 字节。arm2 自动伸直仍待用户提供方向与位移，尚未实现。
+
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。

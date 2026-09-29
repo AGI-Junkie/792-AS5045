@@ -1,5 +1,7 @@
 # v6 起点提速与按钮反馈
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 本页保留起点提速与按钮反馈的历史交付记录。当前放宽终点验收的固件包见 [WORKBENCH_MOTION_FIRST.md](WORKBENCH_MOTION_FIRST.md)，须烧录才生效；当前主机也可继续配合使用。
 
 当前包：`deliverables/stage2-workbench-v6-approach-fast`，标题含“v6 起点提速与按钮反馈”。关闭旧上位机，运行本包 `host/TwoLinkCommissioning.exe`，保留完整 host 文件夹。本次只更新上位机，无需烧录；兼容当前 v6 固件。原 200 速度的 `stage2-workbench-v6-button-feedback` 保留作对照。

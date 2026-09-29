@@ -1,5 +1,7 @@
 # v6 先跑通动作：放宽终点验收
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 当前包：`deliverables/stage2-workbench-v6-motion-first`。本次改变的是固件，须用 PSoC Creator 打开当前 `DRV8825.cywrk` Build/Program，或烧入本包 `firmware.hex`。只更新上位机不会改变终点容差。当前 600 起点速度的上位机可继续使用；本包也带完整 `host` 文件夹，保留按钮视觉反馈、分段发送和后台自动运行。
 
 按用户要求，终点验收从 16 LSB（arm1 输出角约 ±0.035°）改为独立的 `PTP_FINAL_ERROR_LSB=228`（约 ±0.50°）。起点接近与整条图形结束共用该检查，因此两处同时放宽。旧精调算法的 `CL_NEAR_LSB=16` 不变，后续可独立调整终点验收参数。

@@ -1,5 +1,7 @@
 # 阶段二 A：XY 预览与标定输入
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 后续图形与轨迹版本见 [STAGE2_TRAJECTORY.md](STAGE2_TRAJECTORY.md)。最新上位机目录为 `deliverables/stage2-trajectory/host`；下面保留单点预览初版记录与坐标约定。
 
 阶段一由用户于 2026-09-24 确认阶段性验收通过。预览首发只更新上位机。后续用户要求暂将展开偏移增加为 arm1 127° / arm2 163°，当前交付改为 `deliverables/stage2-offset`，该偏移修正需要重新烧入当前源码或同目录 firmware.hex，仍沿用 v3 协议。旧版发布目录保留。

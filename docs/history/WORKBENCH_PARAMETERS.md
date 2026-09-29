@@ -1,5 +1,7 @@
 # v6 后台运行、参数应用与完整轨迹检查
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 当前固件交付 `deliverables/stage2-workbench-v6-motion-first` 将终点验收放宽至约 ±0.50°，须烧录才生效；步骤见 [WORKBENCH_MOTION_FIRST.md](WORKBENCH_MOTION_FIRST.md)。下文保留此前上位机与参数工作流记录，现有 600 速度上位机可以继续使用。
 
 当前交付目录：`deliverables/stage2-workbench-v6-approach-fast`。关闭旧上位机，运行本包 `host/TwoLinkCommissioning.exe`，保留完整 host 文件夹；标题含“v6 起点提速与按钮反馈”。可配合当前 v6 固件使用，无需重新烧录。用户最新确认双轴移动时外接电源灯已稳定，保留当前驱动电流设置，起点采用固件现有 600 上限；原 200 版 `stage2-workbench-v6-button-feedback` 保留。最新按钮反馈及供电证据见 [WORKBENCH_BUTTON_FEEDBACK.md](WORKBENCH_BUTTON_FEEDBACK.md)，此前分段发送和可选诊断固件见 [WORKBENCH_UART_RECOVERY.md](WORKBENCH_UART_RECOVERY.md)。历史交付保留。

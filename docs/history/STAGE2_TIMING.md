@@ -1,5 +1,7 @@
 # 阶段二 C：离线时间规划与屏幕回放
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 运行 `deliverables/stage2-timing/host/TwoLinkCommissioning.exe`，保留完整 host 文件夹。本次不修改固件、不需要重新烧录，兼容 stage1-v3。全部新增功能可在不连接串口、不上电时使用。
 
 ## 操作

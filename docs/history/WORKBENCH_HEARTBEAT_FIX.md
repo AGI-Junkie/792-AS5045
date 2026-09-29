@@ -1,5 +1,7 @@
 # v6 回零心跳修复与低速复测历史记录
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 本页记录历史低速复测交付 `deliverables/stage2-workbench-v6-home-slow`，其上位机标题含“v6 回零心跳修复”，失焦会取消自动动作。该包的回零降速由 `firmware.hex` 实现，只换上位机不会改变速度；以下复测步骤和数据针对这个历史版本。
 
 后台运行修复包 `deliverables/stage2-workbench-v6-background` 保留。当前串口与确认反馈包见 [WORKBENCH_UART_RECOVERY.md](WORKBENCH_UART_RECOVERY.md)：切窗或最小化不会取消回零、起点移动、上传及轨迹执行；失焦仅释放手动点动，回焦不会自动恢复点动。关闭、断连、真实超时和主动停止仍会结束动作。Space / Esc 仅在上位机窗口有焦点时有效，不是系统全局快捷键。参数及可选 arm2 提速复测见 [WORKBENCH_PARAMETERS.md](WORKBENCH_PARAMETERS.md)。

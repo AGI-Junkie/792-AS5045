@@ -1,5 +1,7 @@
 # v6 串口分段发送与人工零位反馈
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 本页记录 `deliverables/stage2-workbench-v6-uart-recovery`，标题含“v6 串口与确认反馈修复”。该包保留，分段发送可配合目前的 v6 固件使用，无需先烧录。当前上位机包及用户要求的按钮视觉反馈调整见 [WORKBENCH_BUTTON_FEEDBACK.md](WORKBENCH_BUTTON_FEEDBACK.md)，下文保留当次实现和验证记录。
 
 ## 本次报警

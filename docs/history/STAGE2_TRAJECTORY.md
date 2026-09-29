@@ -1,5 +1,7 @@
 # 阶段二 B：图形选择、轨迹检查与规划数据导出
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 后续时间规划与回放版见 [STAGE2_TIMING.md](STAGE2_TIMING.md)，最新上位机为 `deliverables/stage2-timing/host`。下文保留几何预览版的记录与检查边界。
 
 运行 `deliverables/stage2-trajectory/host/TwoLinkCommissioning.exe`，保留完整 host 文件夹。需要 .NET 10 Desktop Runtime（当前电脑已有）。本版只更新上位机，无需烧录；仍兼容 stage1-v3。保留原有控制、回零、停止、日志及单点预览。

@@ -1,5 +1,7 @@
 # 人工建立坐标参考：不强制回零
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 新版 `stage2-v3` 固件和 `deliverables/stage2-manual-reference/host` 上位机增加 **“人工确认：当前位置为伸直零位”**。开关回零仍可选择，试验不必执行它。
 
 1. 用 PSoC Creator 打开当前 `DRV8825.cywrk`，Build/Program；也可烧录本交付的 `firmware.hex`。旧 stage2-v2 不支持人工参考指令。

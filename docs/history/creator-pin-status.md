@@ -6,6 +6,8 @@ The two old software-only serial symbols are excluded with CY_REMOVE=true and na
 
 The following section records the pin-only baseline before the UART migration.
 
+
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
 # Creator Pins Status - 2026-09-26
 
 Project: `G:\792\AS5045_enc\DRV8825.cydsn`.

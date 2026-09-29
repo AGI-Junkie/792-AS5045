@@ -1,5 +1,7 @@
 # v7 控制与计时加固
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 当前交付目录由根目录 RELEASE_VERSION 指定：deliverables/stage2-workbench-v7-global-motion。
 运行 powershell -ExecutionPolicy Bypass -File .\build-release.ps1 完成离线构建、自检和清单生成。
 源码唯一入口为本仓库 DRV8825.cywrk / DRV8825.cydsn/main.c；父目录其他 Creator 工程和旧交付不参与本包构建。
