@@ -417,7 +417,7 @@ public sealed partial class XYPreviewPanel : UserControl
         try {
             execution = new ExecutionTrajectory(timing, range);
             timing = execution.Timing;
-            executionInfo.Text = $"低速执行计划 · {execution.Nodes.Length} 点 · {execution.Duration:F2} 秒 · 每轴 ≤600 微步/秒";
+            executionInfo.Text = $"低速执行计划 · {execution.Nodes.Length} 点 · {execution.Duration:F2} 秒 · 每轴 ≤{DeviceContract.PlanRateMax} 微步/秒";
         } catch (ArgumentException ex) { executionInfo.Text = "执行检查未通过：" + ex.Message; }
     }
     private void UpdatePointButton()

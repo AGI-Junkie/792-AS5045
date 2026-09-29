@@ -11,7 +11,8 @@ import sys
 root = Path(__file__).resolve().parents[1]
 host_plan = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.startswith('--host-plan=')), None)
 host_control = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.startswith('--host-control=')), None)
-sys.argv = [a for a in sys.argv if not a.startswith(('--host-plan=', '--host-control='))]
+emit_c = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.startswith('--emit-c=')), None)
+sys.argv = [a for a in sys.argv if not a.startswith(('--host-plan=', '--host-control=', '--emit-c='))]
 source = (root / 'DRV8825.cydsn/main.c').read_text(encoding='utf-8')
 
 def replace_once(text, old, new):
@@ -777,6 +778,149 @@ static void manual_test(const char *t) {
     assert(g_motionEnabled&&!g_ptp.active&&g_ptp.reference);
     assert(g_arm1.usteps==12345-ptp_offset(0,20)&&g_arm2.usteps==-23456-ptp_offset(1,10));
 }
+/* ---- fuzz: random events against the firmware's own loop pieces.  After every simulated millisecond the machine
+ * must be coherent (one mode at a time, nothing runs while disabled, a reference implies homed axes, ...) and
+ * no step pulse may be emitted while disabled or while nFAULT / the hard limit was already active. ---- */
+static uint32 fuzzS; static unsigned fuzzOp, fuzzSeed;
+static unsigned fuzzCov[6]; /* enable, stop, manual/home reference, ptp done, traj done, home done */
+static uint8 fuzzKeys, fuzzHb=1;
+static int16 fuzzQ1, fuzzQ2; static int fuzzClean;
+static uint32 fuzz_rnd(uint32 n) { fuzzS=fuzzS*1664525u+1013904223u; return (fuzzS>>12)%n; }
+static int16 fuzz_q(int lo, int hi) { return (int16)(lo+(int)fuzz_rnd((uint32)(hi-lo+1))); }
+#define FZ(c) do { if(!(c)) { fprintf(stderr,"fuzz seed=%u op=%u: %s\n",fuzzSeed,fuzzOp,#c); assert(0); } } while(0)
+static void fuzz_invariants(void) {
+    FZ(g_motionEnabled || (g_home.phase==HOME_IDLE && !g_ptp.active && g_traj.state!=3u && !g_ptp.reference && !g_homed1 && !g_homed2));
+    FZ(!(g_home.phase!=HOME_IDLE && g_ptp.active));
+    FZ(!(g_ptp.active && (g_arm1.want || g_arm2.want)));
+    FZ(!(g_home.phase!=HOME_IDLE && (g_arm1.want || g_arm2.want)));
+    FZ(g_traj.state!=3u || g_ptp.active);
+    FZ(!g_ptp.active || (g_ptp.reference && g_motionEnabled));
+    FZ(!g_ptp.reference || (g_homed1 && g_homed2 && g_directionKnown));
+    FZ(!g_ptp.reference || g_ptp.active || (ptp_counts_in_range(0u,g_arm1.usteps) && ptp_counts_in_range(1u,g_arm2.usteps)));
+}
+static struct { uint8 en, ref, ptp, tr; home_phase_t ph; } fz;
+static char fuzzReason[16][40]; static unsigned fuzzReasonN[16];
+static void fuzz_note_stop(void) {
+    const char *e=NULL, *nx; char r[40]; unsigned i,n;
+    for(nx=strstr(simLog,"STOP: "); nx; nx=strstr(nx+1,"STOP: ")) e=nx;
+    if(!e) return;
+    e+=6; for(n=0; n<sizeof(r)-1u && e[n] && e[n]!=';' && e[n]!=13; n++) r[n]=e[n]; r[n]=0;
+    for(i=0; i<16u && fuzzReason[i][0]; i++) if(!strcmp(fuzzReason[i],r)) { fuzzReasonN[i]++; return; }
+    if(i<16u) { strcpy(fuzzReason[i],r); fuzzReasonN[i]=1u; }
+}
+static void fuzz_observe(void) {
+    fuzzCov[0]+=(!fz.en && g_motionEnabled); fuzzCov[1]+=(fz.en && !g_motionEnabled);
+    fuzzCov[2]+=(!fz.ref && g_ptp.reference);
+    fuzzCov[3]+=(fz.ptp && !g_ptp.active && g_motionEnabled && fz.tr!=3u && g_traj.state!=3u && g_traj.state!=4u);
+    fuzzCov[4]+=(fz.tr==3u && g_traj.state==4u);
+    fuzzCov[5]+=(fz.ph!=HOME_IDLE && g_home.phase==HOME_IDLE && g_homed1 && g_homed2);
+    if(fz.en && !g_motionEnabled) fuzz_note_stop();
+    if(!fz.ref && g_ptp.reference) fuzzQ1=fuzzQ2=0;
+    if(fz.tr==3u && g_traj.state==4u && g_traj.count) { fuzzQ1=g_traj.nodes[g_traj.count-1u].q1; fuzzQ2=g_traj.nodes[g_traj.count-1u].q2; }
+    fz.en=g_motionEnabled; fz.ref=g_ptp.reference; fz.ptp=g_ptp.active; fz.tr=g_traj.state; fz.ph=g_home.phase;
+}
+static void fuzz_run(unsigned n) {
+    while(n--) {
+        unsigned p1=simPulse1, p2=simPulse2; uint8 en=g_motionEnabled;
+        int hazard=simFault||simLimit; uint32 epoch=g_ptp.epoch, cseq=g_controlSequence;
+        int32 u1=g_arm1.usteps, u2=g_arm2.usteps; int s1=simStep1, s2=simStep2, stall=simStall;
+        home_phase_t ph0=g_home.phase; uint8 arm0=g_home.arm;
+        if(simLogN>900000u) { simLogN=0; simLog[0]=0; }
+        if(fuzzHb && g_jogMs-g_lastKeyMs>=40u) sim_keys(fuzzKeys);
+        cycle(0);
+        if(simPulse1!=p1 || simPulse2!=p2) FZ(en && !hazard);
+        /* Position bookkeeping: what the firmware counts must be what the (unstalled) motors did; homing re-bases the counters. */
+        if(g_home.phase==ph0 && g_home.arm==arm0) {
+            FZ(g_arm2.usteps-u2==simStep2-s2);
+            if(!stall && !simStall) FZ(g_arm1.usteps-u1==simStep1-s1);
+        }
+        /* Whatever the motor does (including a stall), the arm1 following error stays bounded while the firmware is still
+         * enabled: either it is small, or the firmware has already stopped. */
+        if(g_motionEnabled && g_directionKnown && g_arm1.hasEnc && !g_enc.badStreak)
+            FZ(abs_i32(cmd_lsb()-g_enc.pos) < SLIP_FAIL_LSB+64);
+        FZ(g_ptp.epoch>=epoch && g_controlSequence>=cseq);
+        fuzz_invariants();
+        fuzz_observe();
+    }
+}
+static void fuzz_send(uint8 type, uint32 seq, int16 a, int16 b, uint16 v) {
+    uint32 epoch=(fuzzClean||fuzz_rnd(12))?g_ptp.epoch:g_ptp.epoch-1u; uint32 mode=fuzzClean?99u:fuzz_rnd(24);
+    if(!fuzzClean && !fuzz_rnd(10) && seq>2u) seq-=2u;
+    packetType=type; ptp_send(seq,epoch,a,b,v,mode==0?1:(mode==1?2:(mode==2?3:0))); packetType=1u;
+    txq_flush_blocking();
+}
+static void fuzz_goal(void) {
+    /* Happy-path step for the current state, so the noise below has deep states to disturb. */
+    fuzzClean=1;
+    if(!g_motionEnabled) {
+        if(fuzz_rnd(2)) { simFault=0; simLimit=0; simBadEncoder=0; simStall=0; }
+        simHome1Mode=simHome2Mode=0; fuzzKeys=0; fuzzHb=1u; sim_keys(0);
+        fuzz_run(fuzz_rnd(3)?1u:60u);
+        fuzz_send(7,g_controlSequence+1u,0,0,0);
+    } else if(g_home.phase!=HOME_IDLE || g_ptp.active) {
+        fuzz_run(1u+fuzz_rnd(fuzz_rnd(3)?2000u:8000u));
+    } else if(!g_ptp.reference) {
+        fuzzKeys=0; fuzzHb=1u; sim_keys(0);
+        if(fuzz_rnd(4)) fuzz_send(5,g_ptp.sequence+1u,0,0,0); else fuzz_send(8,g_controlSequence+1u,0,0,0);
+    } else if(g_traj.state==1u) {
+        fuzz_send(3,g_ptp.sequence+1u,(int16)(fuzzQ1+fuzz_q(-4,4)),(int16)(fuzzQ2+fuzz_q(-4,4)),(uint16)fuzz_q(100,500));
+    } else if(g_traj.state==2u) {
+        fuzz_send(4,g_ptp.sequence+1u,0,0,0);
+    } else if(fuzz_rnd(3)==0) {
+        fuzz_send(2,g_ptp.sequence+1u,fuzzQ1,fuzzQ2,(uint16)fuzz_q(3,6));
+    } else {
+        int16 q1=fuzz_q(g_jointMinCd[0]-20,g_jointMaxCd[0]+20), q2=fuzz_q(g_jointMinCd[1]-20,g_jointMaxCd[1]+20);
+        uint32 before=g_ptp.sequence;
+        fuzz_send(1,g_ptp.sequence+1u,q1,q2,(uint16)fuzz_q(20,600));
+        if(g_ptp.sequence!=before) { fuzzQ1=q1; fuzzQ2=q2; }
+    }
+    fuzzClean=0;
+}
+static void fuzz_test(uint32 seed) {
+    fuzzSeed=seed; fuzzS=seed*2654435761u+12345u;
+    for(fuzzOp=0; fuzzOp<6000u; fuzzOp++) {
+        uint32 pseq=g_ptp.sequence+1u, cseq=g_controlSequence+1u;
+        if(fuzz_rnd(100) < (((fuzzOp/250u)&1u) ? 55u : 100u)) { fuzz_goal(); fuzz_invariants(); fuzz_observe(); continue; } /* quiet epochs let long moves finish */
+        switch(fuzz_rnd(30)) {
+        case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 7: fuzz_run(1u+fuzz_rnd(fuzz_rnd(10)==0?4000u:80u)); break;
+        case 8: fuzzKeys=(uint8)fuzz_rnd(16); sim_keys(fuzzKeys); break;
+        case 9: fuzzKeys=0; sim_keys(0); break;
+        case 10: if(fuzz_rnd(3)==0) {
+                jog_handle_byte(JOG_CMD_STOP);
+                FZ(!g_motionEnabled && simPins[PIN_EN1] && simPins[PIN_EN2]);
+            } break;
+        case 11: fuzz_send(7,cseq,0,0,0); break;
+        case 12: fuzz_send(8,cseq,0,0,0); break;
+        case 13: fuzz_send(5,pseq,0,0,0); fuzzQ1=fuzzQ2=0; break;
+        case 14: case 15: {
+                int16 q1=fuzz_q(g_jointMinCd[0]-150,g_jointMaxCd[0]+150), q2=fuzz_q(g_jointMinCd[1]-150,g_jointMaxCd[1]+150);
+                uint32 before=g_ptp.sequence;
+                fuzz_send(1,pseq,q1,q2,(uint16)fuzz_q(15,610));
+                if(g_ptp.sequence!=before) { fuzzQ1=q1; fuzzQ2=q2; }
+            } break;
+        case 16: fuzz_send(2,pseq,fuzzQ1,fuzzQ2,(uint16)fuzz_q(2,6)); break;
+        case 17: case 18: fuzz_send(3,pseq,(int16)(fuzzQ1+fuzz_q(-4,4)),(int16)(fuzzQ2+fuzz_q(-4,4)),(uint16)fuzz_q(100,500)); break;
+        case 19: fuzz_send(4,pseq,0,0,0); break;
+        case 20: if(fuzz_rnd(3)==0) fuzzHb^=1u; else fuzzHb=1u; break;
+        case 21: if(!fuzz_rnd(6)) simFault=!simFault; else if(fuzz_rnd(3)==0) simFault=0;
+                 if(!fuzz_rnd(8)) simLimit=!simLimit; else if(fuzz_rnd(3)==0) simLimit=0; break;
+        case 22: simHome1Mode=(int)fuzz_rnd(3)-1; simHome2Mode=(int)fuzz_rnd(3)-1; if(fuzz_rnd(2)) simHome1Mode=simHome2Mode=0; break;
+        case 23: simBadEncoder=!fuzz_rnd(12) ? !simBadEncoder : (fuzz_rnd(3)==0 ? 0 : simBadEncoder);
+                 simStall=!fuzz_rnd(12) ? !simStall : (fuzz_rnd(3)==0 ? 0 : simStall); break;
+        case 24: sim_uart_push(0x41); HostUart_errorStatus=(uint8)(1u<<fuzz_rnd(5)); jog_rx_service(); break;
+        case 25: {
+                uint8 ax=(uint8)fuzz_rnd(2), rates=(uint8)fuzz_rnd(2);
+                if(rates) fuzz_send(10,cseq,fuzz_q(19,ax?610:810),fuzz_q(90,ax?12100:20100),ax);
+                else fuzz_send(9,cseq,fuzz_q(-6000,100),fuzz_q(-100,6000),ax);
+            } break;
+        default: fuzz_run(1u+fuzz_rnd(20u)); break;
+        }
+        fuzz_invariants();
+        fuzz_observe();
+    }
+    printf("FUZZ enable=%u stop=%u ref=%u ptp=%u traj=%u home=%u\n",fuzzCov[0],fuzzCov[1],fuzzCov[2],fuzzCov[3],fuzzCov[4],fuzzCov[5]);
+    { unsigned i; for(i=0; i<16u && fuzzReason[i][0]; i++) printf("FUZZSTOP %u %s\n",fuzzReasonN[i],fuzzReason[i]); }
+}
 int main(int argc,char **argv) {
     const char *t=argv[1]; unsigned i, p1, p2;
     assert(argc==2);
@@ -799,13 +943,23 @@ int main(int argc,char **argv) {
     }
     if(!strcmp(t,"reverse_polarity")||!strcmp(t,"ptp_reverse")) simPolarity=-1;
     /* Operator aligned the links before power/enable; sensors remain at their real offsets. */
-    if(!strcmp(t,"traj_manual_plan")) {simStep1=400-22577;simStep2=120-36990;}
+    if(!strcmp(t,"traj_manual_plan") || !strncmp(t,"fuzz_",5)) {simStep1=400-22577;simStep2=120-36990;}
     /* Logged circle endpoint: q1=-14.37 deg, q2=+29.04 deg from straight. */
     if(!strcmp(t,"home_from_drawing")) {simStep1=400-22577+2555;simStep2=120-36990-6590;}
     if(!strcmp(t,"home_active_at_start")) simStep1=450;
     if(!strcmp(t,"home_from_arm2_range") || !strcmp(t,"home_long_stop"))
         simStep2=120-36990-13616; /* +60 deg: farthest commissioned arm2 pose */
     setup();
+    if(!strncmp(t,"fuzz_",5)){fuzz_test((uint32)atoi(t+5));puts(t);return 0;}
+    if(!strcmp(t,"link_capabilities")) {
+        /* The LINK line is the only carrier of the host's compatibility contract (docs/PROTOCOL.md section 6). */
+        char proto[24]; simLogN=0; simLog[0]=0;
+        stage_status(); txq_flush_blocking();
+        sprintf(proto," proto=%u",(unsigned)PROTO_VERSION);
+        assert(strstr(simLog,"STATE fw=stage2-v7 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
+        assert(strstr(simLog," short_hb=1") && strstr(simLog," joint_limits=1") && strstr(simLog," motion_rates=1") && strstr(simLog," q2_absolute=1"));
+        puts(t);return 0;
+    }
     if(!strncmp(t,"limits_",7)){limits_test(t);puts(t);return 0;}
     if(!strncmp(t,"rates_",6)){rates_test(t);puts(t);return 0;}
     if(!strncmp(t,"operator_stop_",14)) {
@@ -1261,7 +1415,7 @@ int main(int argc,char **argv) {
 cases = ['boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
          'missing_sensor','stuck_sensor','missing_npn','stalled_motor','reject_moving',
          'fault','limit','encoder_loss','jog_cancels','sensor_bounce']
-cases += ['startup_stiction','home_low_speed_tracking','home_following_stall','jog_slip_follow','jog_slip_stall']
+cases += ['startup_stiction','home_low_speed_tracking','home_following_stall','jog_slip_follow','jog_slip_stall','link_capabilities']
 cases += ['boot_tx_backlog','rejected_byte_status','operator_stop_reenable','operator_stop_after_protection','operator_stop_after_fault']
 cases += ['limits_'+n for n in ['configure','retry','invalid','busy','enabled']]
 cases += ['rates_config','rates_jog','rates_home']
@@ -1299,11 +1453,25 @@ ptp_cases += ['ptp_telemetry']
 ptp_cases += ['traj_'+name for name in ['success','dwell','duplicate','capacity','wrong_start','partial','order','range','rate','time','accel',
     'upload_stop','upload_jog','upload_timeout','crc','ptp_busy','stop','fault','limit','home1','npn','encoder','timeout','overrun','uart_upload','uart_run']]
 ptp_cases += ['manual_'+name for name in ['success','duplicate','stop','old_epoch','disabled','moving','busy','upload','sensor','fault','encoder','timeout','stale','payload','crc']]
+ptp_cases += ['fuzz_%d' % n for n in range(1, 7)]   # the gate's share; long campaigns: --emit-c=DIR and run fuzz_<seed> in parallel
 if host_plan is not None: ptp_cases += ['traj_host_plan','traj_manual_plan','traj_host_plan_offset','traj_host_plan_rx_retry']
 if len(sys.argv)>1:
     cases=[c for c in cases if c in sys.argv[1:]]
     ptp_cases=[c for c in ptp_cases if c in sys.argv[1:]]
     assert cases or ptp_cases, 'No matching test cases'
+fuzz_sums = {}
+fuzz_stops = {}
+def fuzz_total(profile, stdout):
+    for line in stdout.splitlines():
+        if line.startswith('FUZZ '):
+            sums = fuzz_sums.setdefault(profile, {})
+            for item in line.split()[1:]:
+                key, value = item.split('=')
+                sums[key] = sums.get(key, 0) + int(value)
+        elif line.startswith('FUZZSTOP '):
+            _, count, reason = line.split(' ', 2)
+            stops = fuzz_stops.setdefault(profile, {})
+            stops[reason] = stops.get(reason, 0) + int(count)
 vcvars = Path(r'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat')
 assert vcvars.exists(), f'Install Visual Studio C++ tools: {vcvars}'
 with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
@@ -1312,12 +1480,17 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     if host_control is not None: (tmp/'host-control.bin').write_bytes(host_control.read_bytes())
     for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h']:
         (tmp/name).write_text('',encoding='ascii')
+    if emit_c is not None:
+        emit_c.mkdir(parents=True, exist_ok=True)
+        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h']: (emit_c/name).write_text('',encoding='ascii')
+        (emit_c/'check.c').write_text(pin_defs+'\n'+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
+        print('wrote', emit_c/'check.c'); sys.exit(0)
     (tmp/'check.c').write_text(pin_defs+'\n'+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
     (tmp/'build.cmd').write_text(f'@echo off\ncall "{vcvars}" >nul\ncl /nologo /TC /std:c11 /W3 /DPTP_COMMISSIONED=0 /I"{tmp}" "{tmp / "check.c"}" /Fe:"{tmp / "check.exe"}" /Fo:"{tmp / "check.obj"}"\n',encoding='utf-8')
     result=subprocess.run(['cmd','/c',str(tmp/'build.cmd')],cwd=tmp,capture_output=True,text=True,errors='replace')
     if result.returncode: raise RuntimeError(result.stdout+result.stderr)
     for case in cases:
-        result=subprocess.run([str(tmp/'check.exe'),case],cwd=tmp,capture_output=True,text=True,errors='replace',timeout=20)
+        result=subprocess.run([str(tmp/'check.exe'),case],cwd=tmp,capture_output=True,text=True,errors='replace',timeout=(120 if case.startswith('fuzz_') else 20))
         assert result.returncode==0, f'{case}: {result.stdout}\n{result.stderr}'
         print('PASS',case)
     # Protocol regression profile uses artificial ranges only in the mock executable.
@@ -1326,8 +1499,9 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     result=subprocess.run(['cmd','/c',str(tmp/'build.cmd')],cwd=tmp,capture_output=True,text=True,errors='replace')
     if result.returncode: raise RuntimeError(result.stdout+result.stderr)
     for case in ptp_cases:
-        result=subprocess.run([str(tmp/'check.exe'),case],cwd=tmp,capture_output=True,text=True,errors='replace',timeout=20)
+        result=subprocess.run([str(tmp/'check.exe'),case],cwd=tmp,capture_output=True,text=True,errors='replace',timeout=(120 if case.startswith('fuzz_') else 20))
         assert result.returncode==0, f'{case}: {result.stdout}\n{result.stderr}'
+        fuzz_total('simulated-unlock',result.stdout)
         print('PASS simulated-unlock',case)
     # Build the exact delivery defaults as a third profile, with no macro overrides.
     build = replace_once((tmp/'build.cmd').read_text(encoding='utf-8'), defines, '')
@@ -1335,7 +1509,13 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     result=subprocess.run(['cmd','/c',str(tmp/'build.cmd')],cwd=tmp,capture_output=True,text=True,errors='replace')
     if result.returncode: raise RuntimeError(result.stdout+result.stderr)
     for case in ptp_cases:
-        result=subprocess.run([str(tmp/'check.exe'),case],cwd=tmp,capture_output=True,text=True,errors='replace',timeout=20)
+        result=subprocess.run([str(tmp/'check.exe'),case],cwd=tmp,capture_output=True,text=True,errors='replace',timeout=(120 if case.startswith('fuzz_') else 20))
         assert result.returncode==0, f'delivery {case}: {result.stdout}\n{result.stderr}'
+        fuzz_total('delivery-default',result.stdout)
         print('PASS delivery-default',case)
+for profile, sums in fuzz_sums.items():
+    print('fuzz coverage', profile, ' '.join(f'{k}={v}' for k, v in sums.items()))
+    for reason, count in sorted(fuzz_stops.get(profile, {}).items(), key=lambda kv: -kv[1]): print(f'  stop x{count}: {reason}')
+    # a fuzz run that never reached a mode proves nothing about it
+    if len(sys.argv)==1: assert all(v > 0 for v in sums.values()) and len(sums)==6, f'fuzz did not reach every mode: {sums}'
 print(f'{len(cases)+2*len(ptp_cases)} actual-C simulation cases passed; hardware validation still required.')

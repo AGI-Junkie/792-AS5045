@@ -5,7 +5,8 @@ namespace TwoLinkCommissioning;
 public sealed partial class ControlWindow
 {
     private bool supportsJointLimits, limitsAwaitingState;
-    private bool supportsAbsoluteQ2;
+    private bool protocolMatches;      // the firmware's proto=<n> equals DeviceContract.ProtocolVersion
+    private int protocolVersion;       // proto=<n> from the last LINK line, 0 when absent
     private bool supportsMotionRates;
     private MotionProfile? reportedProfile;
     private byte limitType=9;
@@ -24,12 +25,12 @@ public sealed partial class ControlWindow
     private static readonly Regex RatesPattern = new(@"^MOTION_RATES epoch=(\d+) r1=(\d+) r2=(\d+) a1=(\d+) a2=(\d+)$", RegexOptions.CultureInvariant);
     private bool RatesReady => xyPreview.RequestedProfile is { } p && reportedProfile == p;
 
-    private bool LimitsReady => compatible && framedControl && supportsAbsoluteQ2 && xyPreview.RequestedLimits is { } wanted && reportedLimits == wanted &&
+    private bool LimitsReady => compatible && framedControl && protocolMatches && xyPreview.RequestedLimits is { } wanted && reportedLimits == wanted &&
         RatesReady && limitAxis < 0 && !limitsAwaitingState;
 
-    private string LimitsStatus => !supportsAbsoluteQ2 ? "固件 q2 坐标约定不匹配：请更新为 stage2-v7-absolute-q2 固件；运动已锁定。" :
+    private string LimitsStatus => !protocolMatches ? $"固件协议版本不匹配（固件 proto={(protocolVersion == 0 ? "无" : protocolVersion.ToString())}，上位机需要 proto={DeviceContract.ProtocolVersion}）：请更新固件，并使用同一交付里的固件与上位机；运动已锁定。" :
         xyPreview.RequestedProfile is null ? "机构尺寸或全局速度无效，请检查设置。" :
-        !supportsMotionRates ? "全局速度需要本包 global1 固件；请更新固件后重新连接。" :
+        !supportsMotionRates ? "固件没有声明全局速度支持（motion_rates=1）；请更新固件后重新连接。" :
         xyPreview.RequestedLimits is null ? "关节范围输入无效；请填写 ±180° 内、包含零位的有效范围（最多两位小数）。" :
         limitSyncError.Length > 0 ? limitSyncError :
         reportedLimits is null ? "等待设备确认关节范围；确认范围前不能使能或运动。" :
@@ -78,7 +79,8 @@ public sealed partial class ControlWindow
         var v=new uint[5];
         if(!m.Success) return;
         for(int i=0;i<5;i++) if(!uint.TryParse(m.Groups[i+1].Value,out v[i])) return;
-        if(v[0]!=reportedEpoch || v[1]<20 || v[1]>800 || v[2]<20 || v[2]>600 || v[3]<100 || v[3]>20000 || v[4]<100 || v[4]>12000) return;
+        if(v[0]!=reportedEpoch || v[1]<DeviceContract.RateMin || v[1]>DeviceContract.Arm1RateMax || v[2]<DeviceContract.RateMin || v[2]>DeviceContract.Arm2RateMax ||
+           v[3]<DeviceContract.AccelMin || v[3]>DeviceContract.Arm1AccelMax || v[4]<DeviceContract.AccelMin || v[4]>DeviceContract.Arm2AccelMax) return;
         reportedProfile=new((int)v[1],(int)v[2],(int)v[3],(int)v[4]);
         lock(wireSync) {
             if(limitType==10 && limitAxis>=0 && limitAcknowledged && v[0]==limitEpoch && reportedProfile.Value.Axis(limitAxis)==limitBounds) {
@@ -109,7 +111,7 @@ public sealed partial class ControlWindow
         {
             if (limitAxis >= 0 && limitEpoch != reportedEpoch) CancelLimitSync(requireState: true);
             if (LimitsReady) { limitSyncError = ""; return; }
-            if (!compatible || !supportsAbsoluteQ2 || !framedControl || !supportsJointLimits || enabled || homing || stopPending ||
+            if (!compatible || !protocolMatches || !framedControl || !supportsJointLimits || enabled || homing || stopPending ||
                 PointBusy || waitingStopEpoch || reportedEpoch == 0) return;
             if (limitAxis >= 0) {
                 if (pendingControlType is 9 or 10 || (now - limitRequestedAt).TotalSeconds < 1) return;
@@ -172,7 +174,7 @@ public sealed partial class ControlWindow
             Check(!w.LimitsReady && !w.enable.IsEnabled && w.limitAxis < 0 && w.LimitsStatus.Contains("更新"), "unsupported mismatched firmware was accepted");
             w.TestLine("LINK uart=hw baud=115200 fw=stage2-v7-limits1 short_hb=0 joint_limits=1");
             Check(!w.LimitsReady && !w.enable.IsEnabled && w.limitAxis < 0, "legacy firmware accepted new q2 convention");
-            w.TestLine("LINK uart=hw baud=115200 fw=stage2-v7-absolute-q2 short_hb=0 joint_limits=1 q2_absolute=1");
+            w.TestLine($"LINK uart=hw baud=115200 fw=stage2-v7-absolute-q2 short_hb=0 joint_limits=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion}");
             Check(w.limitAxis == 0 && !w.enable.IsEnabled, "first axis was not queued while disabled");
             var first = SendConfig(); uint firstSeq = w.limitSequence;
             Check(firstSeq > 1 && w.controlSequence == firstSeq, "configuration sequence was reserved before its preceding heartbeat");

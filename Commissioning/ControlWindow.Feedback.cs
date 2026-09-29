@@ -104,7 +104,7 @@ public sealed partial class ControlWindow
         void Ready(uint epoch=4, uint seq=1) {
             w.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
             w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch={epoch} seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000");
-            if(!w.supportsAbsoluteQ2) w.TestLine("LINK fw=stage2-v7-absolute-q2 q2_absolute=1 motion_rates=1");
+            if(!w.protocolMatches) w.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
             w.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
         }
         Ready(); Check(w.CanPoint && w.AtStart(new(0,0)) && !w.AtStart(new(1,0)));
@@ -118,7 +118,7 @@ public sealed partial class ControlWindow
         Ready(7,5); w.RequestPoint(new(1,1)); w.Disconnect("test unplug"); Check(w.pendingPoint==0 && w.pointWire.Count==0 && !w.CanPoint && !w.compatible);
         w.TestLine("STATE fw=stage2-v7 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
         w.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=5 min1=-3000 max1=3000 min2=-6000 max2=6000");
-        w.TestLine("LINK fw=stage2-v7-absolute-q2 q2_absolute=1 motion_rates=1");
+        w.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
         w.RequestEnable(); Check(w.pendingControl=="使能" && !w.enable.IsEnabled && !w.home.IsEnabled);
         w.CheckControlTimeout(w.controlRequestedAt.AddSeconds(3)); Check(w.pendingControl is null && w.lastStop.Text.Contains("未收到确认"));
         Ready(8,6); w.RequestHome(); Check(w.pendingControl=="回零" && !w.manualReference.IsEnabled);

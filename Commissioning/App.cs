@@ -27,6 +27,17 @@ public sealed class App : Application
             }
             catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
         }
+        // Line-quality experiment against a real firmware on a serial port; see docs/UART_DIAGNOSIS.md.
+        int stress = Array.IndexOf(args, "--uart-stress");
+        if (stress >= 0) return UartStress.Run(args[(stress + 1)..]);
+        // The release gate compares these numbers with main.c (see DeviceContract.cs).
+        int contract = Array.IndexOf(args, "--print-contract");
+        if (contract >= 0)
+        {
+            if (contract + 1 >= args.Length) return 2;
+            File.WriteAllLines(args[contract + 1], DeviceContract.Lines());
+            return 0;
+        }
         new App().Run(new ControlWindow(restoreParameters: true));
         return 0;
     }
@@ -175,7 +186,7 @@ public sealed partial class ControlWindow : Window
             lastHeartbeatSent = 0;
             ResetWireSession();
             lastFirmwareBuild = "unknown";
-            supportsAbsoluteQ2 = false;
+            protocolMatches = false; protocolVersion = 0;
             ResetControlTransport();
             hardwareUart = false;
             pending.Clear(); compatible = enabled = homing = false; stopPending = true;
@@ -369,7 +380,11 @@ public sealed partial class ControlWindow : Window
             supportsShortHeartbeat = compact;
             supportsMotionRates = line.Split(' ').Contains("motion_rates=1");
             supportsJointLimits = line.Split(' ').Contains("joint_limits=1");
-            supportsAbsoluteQ2 = line.Split(' ').Contains("q2_absolute=1") && lastFirmwareBuild == "stage2-v7-absolute-q2";
+            // Compatibility is the numeric wire-contract version, not the build id: a new build with the same
+            // contract stays usable, and a changed contract is refused even if the build id did not change.
+            protocolVersion = line.Split(' ').Where(w => w.StartsWith("proto=", StringComparison.Ordinal))
+                .Select(w => int.TryParse(w[6..], out int v) ? v : 0).FirstOrDefault();
+            protocolMatches = protocolVersion == DeviceContract.ProtocolVersion;
             UpdateControls();
         }
         else if (line.StartsWith("PTP done ")) {
@@ -456,7 +471,7 @@ public sealed partial class ControlWindow : Window
         var m = TrajectoryPattern.Match(line); var values = new uint[6];
         bool valid = m.Success;
         for (int i = 0; valid && i < 6; i++) valid = uint.TryParse(m.Groups[i + 1].Value, out values[i]);
-        if (!valid || values[1] > 2048 || values[2] > 2048 || values[3] > values[1]) {
+        if (!valid || values[1] > DeviceContract.TrajCapacity || values[2] > DeviceContract.TrajCapacity || values[3] > values[1]) {
             if (uploading is not null || executing) { Append("HOST malformed trajectory status"); Stop(); }
             return;
         }
@@ -490,9 +505,9 @@ public sealed partial class ControlWindow : Window
             double steps=Math.Max(d1*MotionProfile.StepsPerDegree(0),d2*MotionProfile.StepsPerDegree(1));
             // Link 2 moves by d(q1)+d(elbow); use a conservative Cartesian travel bound.
             double lengthBound=((model.L1+model.L2)*d1+model.L2*d2)*Math.PI/180;
-            double rate=Math.Min(600,Math.Min(profile.R1,profile.R2));
+            double rate=Math.Min(DeviceContract.PlanRateMax,Math.Min(profile.R1,profile.R2));
             if(lengthBound>0) rate=Math.Min(rate,rates.Feed*steps/lengthBound);
-            if(rate<20) throw new ArgumentException("当前位置到目标的末端限速需要低于设备 20 微步/s 下限；请提高末端速度或分段移动。");
+            if(rate<DeviceContract.RateMin) throw new ArgumentException($"当前位置到目标的末端限速需要低于设备 {DeviceContract.RateMin} 微步/s 下限；请提高末端速度或分段移动。");
             StartExperiment("point",pointSequence+1,[new(pose,0)]);
             pendingPoint = ++pointSequence; pointRequestedAt = DateTime.UtcNow;
             QueuePointPacket(PtpProtocol.Encode(pendingPoint, ptp.Epoch, pose,(ushort)Math.Floor(rate)));
@@ -632,7 +647,7 @@ public sealed partial class ControlWindow : Window
         ResetWireSession();
         ResetControlTransport();
         CancelLimitSync();
-        reportedLimits = null; reportedProfile = null; supportsJointLimits = supportsMotionRates = supportsAbsoluteQ2 = limitsAwaitingState = false; reportedProfile=null; limitSyncError = "";
+        reportedLimits = null; reportedProfile = null; supportsJointLimits = supportsMotionRates = protocolMatches = limitsAwaitingState = false; protocolVersion = 0; reportedProfile=null; limitSyncError = "";
         lock (wireSync) { reportedEpoch = 0; waitingStopEpoch = false; }
         framedControl = false; heartbeatTimer.Interval = TimeSpan.FromMilliseconds(40);
         InvalidateManualReferenceFeedback();
@@ -677,9 +692,9 @@ public sealed partial class ControlWindow : Window
         try
         {
             heartbeatReport.Append(BackgroundMotionSelfTest()).Append(HeartbeatSchedulingSelfTest())
-                .Append(ReferenceIdleReplaySelfTest()).Append(PreviewInteractionReplaySelfTest())
-                .Append(UploadReplaySelfTest())
-                .Append(ReferenceReplaySelfTest(false, true)).Append(ReferenceReplaySelfTest(true, true));
+                .Append(WithLeaseRetry(ReferenceIdleReplaySelfTest)).Append(WithLeaseRetry(PreviewInteractionReplaySelfTest))
+                .Append(WithLeaseRetry(UploadReplaySelfTest))
+                .Append(WithLeaseRetry(() => ReferenceReplaySelfTest(false, true))).Append(WithLeaseRetry(() => ReferenceReplaySelfTest(true, true)));
         }
         finally
         {
@@ -690,6 +705,7 @@ public sealed partial class ControlWindow : Window
         DrawingTrajectory.SelfTest();
         TimedTrajectory.SelfTest();
         PtpProtocol.SelfTest();
+        UartStress.SelfTest();
         ControlTransportSelfTest(snapshotPath);
         ShortHeartbeatSelfTest();
         ExecutionTrajectory.SelfTest();
@@ -764,7 +780,7 @@ public sealed partial class ControlWindow : Window
         Check(!window.CanPoint);
         window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=-6000 max1=6000 min2=-9000 max2=9000");
         Check(!window.CanPoint); // matching limits cannot override missing q2 capability
-        window.TestLine("LINK fw=stage2-v7-absolute-q2 q2_absolute=1 motion_rates=1");
+        window.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
         Check(!window.CanPoint); // the device has not confirmed the requested rates yet
         { var r = window.xyPreview.RequestedProfile!.Value; window.TestLine($"MOTION_RATES epoch=7 r1={r.R1} r2={r.R2} a1={r.A1} a2={r.A2}"); }
         Check(!window.CanPoint); // no telemetry for this reference yet

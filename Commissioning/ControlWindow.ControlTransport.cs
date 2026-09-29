@@ -343,7 +343,7 @@ public sealed partial class ControlWindow
                 Check(frames[^1].Length == 6 && window.ptp is null && !window.enable.IsEnabled,
                     "heartbeat did not resume independently of motion/range confirmation");
                 window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=10 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000");
-                window.TestLine("LINK fw=stage2-v7-absolute-q2 q2_absolute=1 motion_rates=1 short_hb=1");
+                window.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1 short_hb=1");
                 window.RequestEnable();
                 Check(window.pendingControlType == 7, "confirmed range did not permit enable");
                 window.lastTelemetryAt = DateTime.UtcNow.AddSeconds(-3);
@@ -401,7 +401,7 @@ public sealed partial class ControlWindow
             window.TestLine("STATE fw=stage2-v7 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
             window.TestLine("CONTROL seq=9");
             window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=1 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000");
-            window.TestLine("LINK fw=stage2-v7-absolute-q2 q2_absolute=1 motion_rates=1");
+            window.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
             if (!window.framedControl || !window.hardwareUart || window.heartbeatTimer.Interval.TotalMilliseconds != 8)
                 throw new InvalidOperationException("v7 transport not selected");
             window.pendingControlType = 7;
@@ -463,7 +463,7 @@ public sealed partial class ControlWindow
             window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=4 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000");
             if (window.supportsShortHeartbeat)
                 throw new InvalidOperationException("Compact heartbeat selected without a capability line");
-            window.TestLine("LINK uart=hw baud=115200 rx_overflow=0 rx_error=0 tx_dropped=0 fw=stage2-v7-absolute-q2 short_hb=1 q2_absolute=1");
+            window.TestLine($"LINK uart=hw baud=115200 rx_overflow=0 rx_error=0 tx_dropped=0 fw=stage2-v7-absolute-q2 short_hb=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion}");
             if (!window.supportsShortHeartbeat)
                 throw new InvalidOperationException("Compact heartbeat capability not detected");
             var wire = new List<byte>();

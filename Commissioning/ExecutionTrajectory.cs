@@ -35,8 +35,8 @@ public sealed class ExecutionTrajectory
                 int ms = (int)Math.Round(time * 1000);
                 var pose = PtpProtocol.Quantize(timed.At(time).Pose);
                 int dt = ms - previousTime;
-                if (dt is < 50 or > 500 || nodes.Count >= 2048)
-                    throw new ArgumentException("执行轨迹超出 2048 点容量或时间间隔范围；请缩短路径。");
+                if (dt is < DeviceContract.TrajNodeMinMs or > DeviceContract.TrajNodeMaxMs || nodes.Count >= DeviceContract.TrajCapacity)
+                    throw new ArgumentException($"执行轨迹超出 {DeviceContract.TrajCapacity} 点容量或时间间隔范围；请缩短路径。");
                 // Sample the Cartesian chord error after pulse quantization. This is a
                 // planning tolerance, not a claim about measured pen tracking accuracy.
                 var from = PulsePose(nodes[^1].Pose); var to = PulsePose(pose);
@@ -51,8 +51,8 @@ public sealed class ExecutionTrajectory
                 nodes.Add(new(pose, (ushort)dt)); previousTime = ms;
             }
             // Explicit dwell at rectangle corners and at the final endpoint.
-            if (nodes.Count >= 2048) throw new ArgumentException("执行轨迹超过 2048 点容量。");
-            nodes.Add(new(nodes[^1].Pose, 50));
+            if (nodes.Count >= DeviceContract.TrajCapacity) throw new ArgumentException($"执行轨迹超过 {DeviceContract.TrajCapacity} 点容量。");
+            nodes.Add(new(nodes[^1].Pose, DeviceContract.TrajNodeMinMs));
         }
         var result=nodes.ToArray(); Validate(result, limits, profile); return result;
     }
@@ -62,15 +62,15 @@ public sealed class ExecutionTrajectory
         return Counts(axis, axis == 0 ? wire.Q1 : wire.Q2 - wire.Q1);
     }
     public static int Counts(int axis, double angle) => (int)Math.Round(
-        Math.Round(angle * 100, MidpointRounding.AwayFromZero) * (axis == 0 ? 64000 : 81696) / 36000,
+        Math.Round(angle * 100, MidpointRounding.AwayFromZero) * (axis == 0 ? DeviceContract.Arm1StepsPerRev : DeviceContract.Arm2StepsPerRev) / 36000,
         MidpointRounding.AwayFromZero);
     private static JointPose PulsePose(JointPose p) {
-        double q1=Counts(0,p)*360.0/64000;
-        return new(q1,q1+Counts(1,p)*360.0/81696);
+        double q1=Counts(0,p)*360.0/DeviceContract.Arm1StepsPerRev;
+        return new(q1,q1+Counts(1,p)*360.0/DeviceContract.Arm2StepsPerRev);
     }
     public static void Validate(ExecutionNode[] nodes, JointLimits limits, MotionProfile? profile = null)
     {
-        if (nodes.Length is < 2 or > 2048 || nodes[0].Milliseconds != 0)
+        if (nodes.Length is < 2 or > DeviceContract.TrajCapacity || nodes[0].Milliseconds != 0)
             throw new ArgumentException("执行轨迹容量或首点无效。");
         int[] previousVelocity = [0, 0]; int totalMs = 0;
         for (int i = 0; i < nodes.Length; i++)
@@ -81,11 +81,11 @@ public sealed class ExecutionTrajectory
                 throw new ArgumentException($"第 {i+1} 点超出当前关节范围：q1={n.Pose.Q1:F2}°，q2={n.Pose.Q2:F2}°；允许 q1 [{limits.Min1:F2},{limits.Max1:F2}]°、q2 [{limits.Min2:F2},{limits.Max2:F2}]°。请调整图形或关节范围。");
             if (i == 0) continue;
             int dt = n.Milliseconds, previousDt = i == 1 ? dt : nodes[i - 1].Milliseconds;
-            if (dt is < 50 or > 500 || (totalMs += dt) > 600000) throw new ArgumentException("执行时间无效。");
+            if (dt is < DeviceContract.TrajNodeMinMs or > DeviceContract.TrajNodeMaxMs || (totalMs += dt) > DeviceContract.TrajTotalMaxMs) throw new ArgumentException("执行时间无效。");
             for (int axis = 0; axis < 2; axis++)
             {
-                int maxRate = profile is { } p ? Math.Min(600,axis==0?p.R1:p.R2) : 600;
-                int maxAccel = profile is { } a ? Math.Min(800,axis==0?a.A1:a.A2) : 800;
+                int maxRate = profile is { } p ? Math.Min(DeviceContract.PlanRateMax,axis==0?p.R1:p.R2) : DeviceContract.PlanRateMax;
+                int maxAccel = profile is { } a ? Math.Min(DeviceContract.PlanAccelMax,axis==0?a.A1:a.A2) : DeviceContract.PlanAccelMax;
                 int d = Counts(axis, n.Pose) - Counts(axis, nodes[i - 1].Pose);
                 int velocity = d * 1000 / dt;
                 if (Math.Abs(d) * 1000 > maxRate * dt || Math.Abs(velocity - previousVelocity[axis]) * 2000 > maxAccel * (dt + previousDt) ||

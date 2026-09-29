@@ -25,6 +25,8 @@ def analyse(text):
     info.append("固件 " + (", ".join(fw) if fw else "（日志里没有 fw= 标识）"))
     if not fw:
         warns.append("日志里没有固件版本标识，无法确认测的是哪一版")
+    protos = sorted(set(re.findall(r"proto=(\d+)", text)))
+    info.append("协议 proto " + (", ".join(protos) if protos else "（日志里没有 proto=，固件早于协议版本号）"))
 
     stops = [s.strip() for s in re.findall(r"STOP: ([^;\r\n]+)", text)]
     protective = [s for s in stops if not s.startswith("operator stop")]
@@ -75,13 +77,13 @@ def report(name, text):
 
 def self_test():
     base = [
-        "[10:00:00.000] LINK uart=hw baud=115200 rx_overflow=3 rx_error=129 tx_dropped=5 fw=stage2-v7-x short_hb=1",
+        "[10:00:00.000] LINK uart=hw baud=115200 rx_overflow=3 rx_error=129 tx_dropped=5 fw=stage2-v7-x short_hb=1 proto=1",
         "[10:00:00.500] TIMING loop_max_ms=4 tick_lag_max_ms=3 clock=hardware wdt=256-384ms key_age_ms=1 key_max_gap_ms=183",
         "[10:00:01.000] ENABLE OK: no automatic movement",
         "[10:00:02.000] TIMING loop_max_ms=4 tick_lag_max_ms=3 clock=hardware wdt=256-384ms key_age_ms=1 key_max_gap_ms=61",
         "[10:00:03.000] PTP done seq=2; arm1 encoder checked, arm2 commanded only; error_lsb=-47 final_limit_lsb=228",
         "[10:00:03.100] TRAJ_STATE state=4 count=3 total=3 index=3 seq=4 epoch=2",
-        "[10:00:04.000] LINK uart=hw baud=115200 rx_overflow=3 rx_error=129 tx_dropped=5 fw=stage2-v7-x short_hb=1",
+        "[10:00:04.000] LINK uart=hw baud=115200 rx_overflow=3 rx_error=129 tx_dropped=5 fw=stage2-v7-x short_hb=1 proto=1",
         "[10:00:05.000] STOP: operator stop; drivers OFF",
     ]
     def verdict(*extra, replace=None):

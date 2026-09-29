@@ -13,7 +13,7 @@ public sealed record PtpState(bool Locked, bool Referenced, int Active, uint Epo
         var values = new int[4];
         for (int i = 0; i < 4; i++) if (!int.TryParse(m.Groups[i + 6].Value, out values[i])) return null;
         bool locked = m.Groups[1].Value == "1";
-        if (!locked && (values[0] < -18000 || values[1] > 18000 || values[2] < -18000 || values[3] > 18000 ||
+        if (!locked && (values[0] < -DeviceContract.JointLimitCdMax || values[1] > DeviceContract.JointLimitCdMax || values[2] < -DeviceContract.JointLimitCdMax || values[3] > DeviceContract.JointLimitCdMax ||
             values[0] >= values[1] || values[2] >= values[3] || values[0] > 0 || values[1] < 0 || values[2] > 0 || values[3] < 0)) return null;
         return new PtpState(locked, m.Groups[2].Value == "1", int.Parse(m.Groups[3].Value), epoch, seq,
             new JointLimits(values[0] / 100.0, values[1] / 100.0, values[2] / 100.0, values[3] / 100.0));
@@ -57,17 +57,17 @@ public static class PtpProtocol
                 (byte)(0x81 | ((crc & 15) << 1)), (byte)(0xa1 | (((crc >> 4) & 15) << 1)), 0xd7];
     }
 
-    public static byte[] Encode(uint sequence, uint epoch, JointPose pose, ushort rate = 600)
+    public static byte[] Encode(uint sequence, uint epoch, JointPose pose, ushort rate = DeviceContract.PlanRateMax)
     {
         if (sequence == 0 || epoch == 0 || !double.IsFinite(pose.Q1) || !double.IsFinite(pose.Q2) ||
-            Math.Abs(pose.Q1) > 180 || Math.Abs(pose.Q2) > 180 || rate is < 20 or > 600)
+            Math.Abs(pose.Q1) > 180 || Math.Abs(pose.Q2) > 180 || rate is < DeviceContract.RateMin or > DeviceContract.PlanRateMax)
             throw new ArgumentException("单点目标/序号/速度无效。");
         return EncodePacket(1, sequence, epoch, pose, rate);
     }
     public static byte[] EncodePacket(byte type, uint sequence, uint epoch, JointPose pose, ushort value)
     {
         if (type is < 1 or > 10 || sequence == 0 || epoch == 0 || !double.IsFinite(pose.Q1) ||
-            !double.IsFinite(pose.Q2) || Math.Abs(pose.Q1) > 180 || Math.Abs(pose.Q2) > (type==10?200:180))
+            !double.IsFinite(pose.Q2) || Math.Abs(pose.Q1) > 180 || Math.Abs(pose.Q2) > (type==10?DeviceContract.Arm1AccelMax/100.0:180))
             throw new ArgumentException("运动数据包无效。");
         if (type is >= 6 and <= 8 && (pose.Q1 != 0 || pose.Q2 != 0 || value > (type == 6 ? 15 : 0)))
             throw new ArgumentException("控制数据包无效。");

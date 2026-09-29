@@ -20,8 +20,8 @@ public sealed class TimedTrajectory
     private const double Rad = Math.PI / 180;
     internal void Stretch(double factor)
     {
-        if (!double.IsFinite(factor) || factor < 1 || Duration * factor > 599)
-            throw new ArgumentException("满足设备上限后的规划超过 600 秒，请缩短路径或调整参数。");
+        if (!double.IsFinite(factor) || factor < 1 || Duration * factor > DeviceContract.TrajTotalMaxMs / 1000.0 - 1)
+            throw new ArgumentException($"满足设备上限后的规划超过 {DeviceContract.TrajTotalMaxMs / 1000} 秒，请缩短路径或调整参数。");
         for (int i=1; i<StopTimes.Length; i++) StopTimes[i] *= factor;
     }
 
@@ -45,8 +45,8 @@ public sealed class TimedTrajectory
                 duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q1) / rates.A1));
                 duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q2 - state.Acceleration.Q1) / rates.A2));
             }
-            if (!double.IsFinite(duration) || StopTimes[piece] + duration * 1.05 > 600)
-                throw new ArgumentException("离线规划超过 600 秒或接近数值奇异点；请调整图形或规划参数。");
+            if (!double.IsFinite(duration) || StopTimes[piece] + duration * 1.05 > DeviceContract.TrajTotalMaxMs / 1000.0)
+                throw new ArgumentException($"离线规划超过 {DeviceContract.TrajTotalMaxMs / 1000} 秒或接近数值奇异点；请调整图形或规划参数。");
             StopTimes[piece + 1] = StopTimes[piece] + duration * 1.05;
             distances[piece + 1] = distances[piece] + PieceLength(piece);
         }

@@ -59,7 +59,7 @@ public sealed partial class ControlWindow
             window.TestLine($"TELEM t={49000 + batches * 500} epoch=2 seq={statusSequence} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, plan.Nodes[0].Pose)} p2={ExecutionTrajectory.Counts(1, plan.Nodes[0].Pose)} e1=0 err=0 inputs=0 drops=0");
             // Advertise the compact heartbeat so the replay exercises the configuration
             // that actually ships, not a legacy one.
-            window.TestLine("LINK uart=hw baud=115200 rx_overflow=0 rx_error=0 tx_dropped=0 fw=stage2-v7-absolute-q2 short_hb=1 motion_rates=1 joint_limits=1 q2_absolute=1");
+            window.TestLine($"LINK uart=hw baud=115200 rx_overflow=0 rx_error=0 tx_dropped=0 fw=stage2-v7-absolute-q2 short_hb=1 motion_rates=1 joint_limits=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion}");
             batches++;
         }
         void Write(byte[] data, int offset, int count)
@@ -193,6 +193,7 @@ public sealed partial class ControlWindow
             double[] accepted = timeline.Where((_, i) => i != drop).ToArray();
             double lostGap = accepted.Zip(accepted.Skip(1), (a, b) => b - a).Max();
             string report = $"v7 real upload: {received} nodes + RUN ACK, {clock.Elapsed.TotalSeconds:F1} s, {batches} status/telemetry batches, raw log/feedback views, log trimmed={trimmed}, visible static progress checks={progressChecks}; complete heartbeat max gap={longest:F1} ms (first={heartbeatTimes[0]:F1} ms); dropped complete heartbeat #{drop}, receive max gap={lostGap:F1} ms; receive callback={longestReceive:F1} ms; UI lease max gap={longestLease:F1} ms; beats={heartbeatTimes.Count}.";
+            if (longestLease >= KeyStaleMs) report += $" WARN: UI lease gap {longestLease:F0} ms >= {KeyStaleMs:F0} ms (a held key would be released).";
             report += $"\nRUN fully sent at {runSent:F1} ms, ACK handled at {runAck:F1} ms; {heartbeatTimes.Count - completedAtBeat} real heartbeats after completion.";
             foreach (int i in Enumerable.Range(0, heartbeatTimes.Count)
                 .OrderByDescending(i => timeline[i + 1] - timeline[i]).Take(5)) {
@@ -203,6 +204,7 @@ public sealed partial class ControlWindow
                 report += $"\nHB#{i + 1} at {timeline[i + 1]:F1}ms: gap={timeline[i + 1] - timeline[i]:F1}ms, node={schedule.Node}, run={schedule.Run}, writer gap={schedule.Gap:F1}ms, max UI lease gap={schedule.LeaseGap:F1}ms, GC deltas={schedule.G0 - before.Item1}/{schedule.G1 - before.Item2}/{schedule.G2 - before.Item3}; frames [{frames}].";
             }
             if (longest >= 125 || lostGap >= 250) throw new InvalidOperationException(report);
+            if (longestLease >= LeaseStopMs) throw new LeaseGapException(report);
             Require(window.logCharacters == window.log.Text.Length, "log length drifted after append/trim");
             // The saved log has to state the configuration and the run's worst case on
             // its own, so a field log can be read without asking the operator anything.

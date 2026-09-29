@@ -12,11 +12,11 @@ public sealed record TelemetrySample(uint Milliseconds, uint Epoch, uint Sequenc
     private static readonly Regex Pattern = new(@"^TELEM t=(\d+) epoch=(\d+) seq=(\d+) ref=([01]) source=([012]) p1=(-?\d+) p2=(-?\d+) e1=(-?\d+) err=(-?\d+) inputs=(\d+) drops=(\d+)$", RegexOptions.CultureInvariant);
     public JointPose Command {
         get {
-            double q1=Steps1*360.0/64000;
-            return new(q1,q1+Steps2*360.0/81696);
+            double q1=Steps1*360.0/DeviceContract.Arm1StepsPerRev;
+            return new(q1,q1+Steps2*360.0/DeviceContract.Arm2StepsPerRev);
         }
     }
-    public double Measured1 => Encoder1 * 360.0 / (4096 * 40);
+    public double Measured1 => Encoder1 * 360.0 / (DeviceContract.EncoderCounts * DeviceContract.Arm1GearRatio);
     public double Error1 => Measured1 - Command.Q1;
     public string ReferenceName => Source == 2 ? "人工伸直零位" : Source == 1 ? "开关回零" : "未建立";
     public static TelemetrySample? Parse(string line)
@@ -91,7 +91,7 @@ public sealed class ExperimentRecorder : IDisposable
     public static void SelfTest()
     {
         var s = TelemetrySample.Parse("TELEM t=500 epoch=9 seq=3 ref=1 source=2 p1=1600 p2=-1600 e1=4096 err=-2 inputs=0 drops=3")!;
-        if (s is null || s.Command.Q1 != 9 || Math.Abs(s.Command.Q2-(9-1600*360.0/81696))>1e-8 || s.Measured1 != 9 || s.Error1 != 0 || s.ReferenceName != "人工伸直零位") throw new Exception("Telemetry units/sign invalid");
+        if (s is null || s.Command.Q1 != 9 || Math.Abs(s.Command.Q2-(9-1600*360.0/DeviceContract.Arm2StepsPerRev))>1e-8 || s.Measured1 != 9 || s.Error1 != 0 || s.ReferenceName != "人工伸直零位") throw new Exception("Telemetry units/sign invalid");
         if (TelemetrySample.Parse("TELEM t=0 epoch=0 seq=0 ref=1 source=0 p1=0 p2=0 e1=0 err=0 inputs=16 drops=0") is not null) throw new Exception("Malformed telemetry accepted");
         string root = Path.Combine(Path.GetTempPath(), "arm-recorder-" + Guid.NewGuid().ToString("N"));
         try {

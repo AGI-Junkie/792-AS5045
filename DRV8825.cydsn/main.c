@@ -74,6 +74,12 @@
  * can answer "was this fix actually flashed?". */
 #define FW_BUILD_ID                 "stage2-v7-absolute-q2"
 
+/* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
+ * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
+ * above can change freely.  Bump it (and the host constant) whenever a frame format, a field's meaning,
+ * the sequence/epoch rules or the coordinate convention changes. */
+#define PROTO_VERSION               (1u)
+
 /* The software UART only accepts odd bytes.  jog.ps1 maps physical R to this
  * otherwise-unused wire byte, because ASCII 'r' (0x72) is even. */
 #define JOG_CMD_HOME                 (0x71u)
@@ -105,6 +111,22 @@
 #define ARM2_MOTOR_FULLSTEPS_REV     (200)   /* Anaheim 11YPG302S-LW4-R51, 1.8 deg */
 #define ARM2_GEAR_RATIO_X100         (5106)  /* maker R51 table: 51.06:1, direct drive */
 
+/* Numbers the host has to agree on.  Commissioning/DeviceContract.cs holds the same values and
+ * build-release.ps1 compares the two, so change them together or the release build fails. */
+#define CFG_RATE_MIN                 (20)     /* configurable jog/home/PTP rate range, microsteps/s    */
+#define CFG_RATE_MAX_AXIS1           (800)
+#define CFG_RATE_MAX_AXIS2           (600)
+#define CFG_ACCEL_MIN                (100)    /* configurable acceleration range, microsteps/s^2       */
+#define CFG_ACCEL_MAX_AXIS1          (20000)
+#define CFG_ACCEL_MAX_AXIS2          (12000)
+#define CFG_JOINT_CD_MAX             (18000)  /* joint limits stay within +/-180 deg (0.01 deg units)  */
+#define TRAJ_NODE_MIN_MS             (50u)    /* one trajectory segment, milliseconds                  */
+#define TRAJ_NODE_MAX_MS             (500u)
+#define TRAJ_TOTAL_MAX_MS            (600000u)
+_Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS2 &&
+               JOG1_ACCEL_USTEP_S2 <= CFG_ACCEL_MAX_AXIS1 && JOG2_ACCEL_USTEP_S2 <= CFG_ACCEL_MAX_AXIS2,
+               "default jog rate/acceleration exceeds the range the host may configure");
+
 /* User-authorized low-speed trial. These are provisional software bounds,
  * NOT measured mechanical limits. Homing and all runtime protections still apply. */
 #ifndef PTP_COMMISSIONED
@@ -118,7 +140,7 @@
 #endif
 #if PTP_COMMISSIONED && ((PTP_MIN1_CD >= PTP_MAX1_CD) || (PTP_MIN2_CD >= PTP_MAX2_CD) || \
     (PTP_MIN1_CD > 0) || (PTP_MAX1_CD < 0) || (PTP_MIN2_CD > 0) || (PTP_MAX2_CD < 0) || \
-    (PTP_MIN1_CD < -18000) || (PTP_MAX1_CD > 18000) || (PTP_MIN2_CD < -18000) || (PTP_MAX2_CD > 18000))
+    (PTP_MIN1_CD < -CFG_JOINT_CD_MAX) || (PTP_MAX1_CD > CFG_JOINT_CD_MAX) || (PTP_MIN2_CD < -CFG_JOINT_CD_MAX) || (PTP_MAX2_CD > CFG_JOINT_CD_MAX))
 #error "PTP requires valid software bounds within +/-180 deg containing straight zero"
 #endif
 #define PTP_RATE_MAX                 (600u)
@@ -1494,8 +1516,9 @@ static void joint_limits_accept(const uint8 *p)
         JLOG("PTP_LIMITS refused: stale epoch\r\n"); return;
     }
     if(!seq || axis>1u || (rates ?
-       (min<20 || min>(axis==0u?800:600) || max<100 || max>(axis==0u?20000:12000)) :
-       (min < -18000 || max > 18000 || min>=max || min>0 || max<0))) {
+       (min<CFG_RATE_MIN || min>(axis==0u?CFG_RATE_MAX_AXIS1:CFG_RATE_MAX_AXIS2) ||
+        max<CFG_ACCEL_MIN || max>(axis==0u?CFG_ACCEL_MAX_AXIS1:CFG_ACCEL_MAX_AXIS2)) :
+       (min < -CFG_JOINT_CD_MAX || max > CFG_JOINT_CD_MAX || min>=max || min>0 || max<0))) {
         g_rxRejected++; JLOG("PTP_LIMITS refused: axis/range\r\n"); return;
     }
     if(g_motionEnabled || g_home.phase!=HOME_IDLE || !axes_idle() ||
@@ -1575,7 +1598,7 @@ static uint8 traj_accept(const uint8 *p)
     } else if(p[0]==3u) {
         traj_node_t *last=&g_traj.nodes[g_traj.count ? g_traj.count-1u : 0u];
         if(g_traj.state!=1u || g_traj.count>=g_traj.expected || ptp_u32(p+1)!=g_ptp.sequence+1u ||
-           value<50u || value>500u || g_traj.durationMs+value>600000u) {
+           value<TRAJ_NODE_MIN_MS || value>TRAJ_NODE_MAX_MS || g_traj.durationMs+value>TRAJ_TOTAL_MAX_MS) {
             JLOG("PTP refused: trajectory order/time\r\n"); return 0u;
         }
         previousMs=last->ms ? last->ms : value;
@@ -1646,7 +1669,7 @@ static void ptp_accept(void)
         JLOG("MANUAL REF OK: operator declares current pose q1=q2=0 straight; no motion; NOT sensor homed\r\n");
         stage_status(); return;
     }
-    if (q1 < g_jointMinCd[0] || q1 > g_jointMaxCd[0] || q2 < g_jointMinCd[1] || q2 > g_jointMaxCd[1] || (p[0]==1u && (rate < 20u || rate > PTP_RATE_MAX)) ||
+    if (q1 < g_jointMinCd[0] || q1 > g_jointMaxCd[0] || q2 < g_jointMinCd[1] || q2 > g_jointMaxCd[1] || (p[0]==1u && (rate < (uint32)CFG_RATE_MIN || rate > PTP_RATE_MAX)) ||
         !ptp_counts_in_range(0u,g_arm1.usteps) || !ptp_counts_in_range(1u,g_arm2.usteps)) {
         JLOG("PTP refused: joint range/rate\r\n"); return;
     }
@@ -2101,8 +2124,8 @@ static void stage_status(void)
     motion_config_status();
     JLOGF("PTP_CHECK final_lsb=%d follow_lsb=%d\r\n",PTP_FINAL_ERROR_LSB,SLIP_FAIL_LSB);
     traj_status();
-    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 q2_absolute=1\r\n",
-          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID);
+    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 q2_absolute=1 proto=%u\r\n",
+          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)PROTO_VERSION);
     /* Frame loss by cause: rx_error only sees UART-level faults, so a frame that
      * simply arrives short must be counted here or it stays invisible. */
     JLOGF("PTP_RX short_ok=%lu drop_crc=%lu drop_short=%lu drop_timeout=%lu rejected=%lu epoch_rejected=%lu last_rejected_byte=0x%02X\r\n",

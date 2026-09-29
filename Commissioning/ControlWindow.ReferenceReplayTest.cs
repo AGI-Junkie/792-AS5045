@@ -9,6 +9,19 @@ namespace TwoLinkCommissioning;
 public sealed partial class ControlWindow
 {
     // Real referenced-idle rendering and log trimming, with no serial port or motor commands.
+    // A UI stall of LeaseStopMs or more stops the machine in the field, so the replays fail on it.  One long stall can also
+    // come from the test machine (antivirus scan, a background build), so a lease-only failure is run once more and the
+    // gate fails only if it repeats; the first stall stays in the report.
+    private sealed class LeaseGapException(string report) : InvalidOperationException(report);
+    private static string WithLeaseRetry(Func<string> replay)
+    {
+        try { return replay(); }
+        catch (LeaseGapException first)
+        {
+            string again = replay();
+            return again + $" NOTE: attempt 1 stalled the UI past {LeaseStopMs:F0} ms and did not repeat: {first.Message}";
+        }
+    }
     private static string ReferenceIdleReplaySelfTest() => ReferenceReplaySelfTest(false);
     private static string PreviewInteractionReplaySelfTest() => ReferenceReplaySelfTest(true);
     private static string ReferenceReplaySelfTest(bool interaction, bool framed = false)
@@ -105,8 +118,11 @@ public sealed partial class ControlWindow
             if (writerFailure is not null) throw writerFailure;
             longest = Math.Max(longest, clock.Elapsed.TotalMilliseconds - last);
             string report = $"{(framed ? "v7 complete control frames" : "v6 timer")} referenced {(interaction ? "editing/viewport" : "idle")} ({duration / 1000} s, {batch} batches, {inputs} input callbacks, hidden/feedback/log views, log trimmed={trimmed}): heartbeat max gap={longest:F1} ms; input callback={longestInput:F1} ms; receive callback={longestReceive:F1} ms; UI lease max gap={longestLease:F1} ms; slowest line={slowestLine} {longestLine:F1} ms; beats={beats}.";
+            // A lease gap of LeaseStopMs makes the writer stop heartbeating (a real stop); KeyStaleMs already releases held keys.
+            if (longestLease >= KeyStaleMs) report += $" WARN: UI lease gap {longestLease:F0} ms >= {KeyStaleMs:F0} ms (a held key would be released).";
             if (beats < (framed ? duration/200 : 50) || longest >= 250 || (!interaction && !trimmed))
                 throw new InvalidOperationException(report);
+            if (longestLease >= LeaseStopMs) throw new LeaseGapException(report);
 
             return report + "\nNo serial port opened; no motor commands sent.\n";
         }

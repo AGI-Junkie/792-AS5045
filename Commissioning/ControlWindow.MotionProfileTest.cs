@@ -21,10 +21,13 @@ public sealed partial class ControlWindow
             State();Range();
             Check(!w.enable.IsEnabled,"missing speed status enabled movement");
             w.HandleLine("LINK fw=stage2-v7-limits1 joint_limits=1 short_hb=1");
-            Check(!w.enable.IsEnabled && w.LimitsStatus.Contains("absolute-q2"),"old firmware silently ignored absolute q2");
+            Check(!w.enable.IsEnabled && w.LimitsStatus.Contains("proto"),"old firmware without proto= silently accepted");
             w.HandleLine("LINK fw=stage2-v7-global1 joint_limits=1 motion_rates=1 short_hb=1");
             Check(!w.LimitsReady && !w.enable.IsEnabled, "old global1 firmware silently accepted relative q2");
-            w.HandleLine("LINK fw=stage2-v7-absolute-q2 joint_limits=1 motion_rates=1 short_hb=1 q2_absolute=1");
+            w.HandleLine($"LINK fw=stage2-v7-absolute-q2 joint_limits=1 motion_rates=1 short_hb=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion + 1}");
+            Check(!w.LimitsReady && !w.enable.IsEnabled && w.LimitsStatus.Contains("proto"), "a firmware with another protocol version was accepted");
+            // Only the protocol version decides compatibility; a different build id with the same contract is fine.
+            w.HandleLine($"LINK fw=stage2-v7-other-build joint_limits=1 motion_rates=1 short_hb=1 proto={DeviceContract.ProtocolVersion}");
             var wanted=w.xyPreview.RequestedProfile!.Value;
             var actual=new MotionProfile(800,600,20000,12000);
             Rates(actual);Check(w.limitType==10 && w.limitAxis==0 && !w.LimitsReady,"axis0 speed request missing");
