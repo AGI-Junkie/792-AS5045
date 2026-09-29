@@ -61,3 +61,6 @@ __pycache__/
 # Creator reports and IDE exports are regenerated from the project
 *.cydsn/*_timing.html
 *.cydsn/Export/
+
+# Hardware-tested firmware builds are archived on purpose (see releases/README.md)
+!releases/**/*.hex
