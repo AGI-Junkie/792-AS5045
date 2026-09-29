@@ -19,30 +19,6 @@ def replace_once(text, old, new):
     assert count == 1, f'Simulation hook expected one match, got {count}: {old!r}'
     return text.replace(old, new, 1)
 
-def replace_body(text, signature, body):
-    assert text.count(signature + '\n{') == 1, f'Ambiguous simulation function: {signature}'
-    start = text.index(signature + '\n{') + len(signature) + 1
-    depth = 1
-    end = start + 1
-    while depth:
-        depth += (text[end] == '{') - (text[end] == '}')
-        end += 1
-    return text[:start] + '{\n' + body + '\n}' + text[end:]
-
-source = replace_body(source, 'static uint32 as5045_read_raw(void)', 'return mock_frame();')
-source = replace_once(source, 'static void jog_run(uint8 encOk)\n{',
-                        'static void jog_run(uint8 encOk)\n{\n if(!simRxActive){simBoot = encOk; return;}\n if(simPtpWireN)goto sim_loop_ready;')
-loop_start = source.index('static void jog_run(uint8 encOk)\n{')
-loop_end = source.index('/* ================================= main', loop_start)
-loop = replace_once(source[loop_start:loop_end], 'for (;;)\n    {',
-    'for (;;)\n    {\n if(simRxActive && simClock-simRxBase>=24000000u*2u)return;')
-loop = replace_once(loop, '\n    tTick = SU_NOW();', '\nsim_loop_ready:\n    if(simPtpWireN)simRxBase=simClock;\n    tTick = SU_NOW();')
-source = source[:loop_start] + loop + source[loop_end:]
-source = replace_once(source, 'static void home_service(void)\n{',
-    'static void home_service(void)\n{\n if(simRxActive)simClock+=24u*20u; /* modeled work latency */')
-source = replace_once(source, 'int main(void)', 'int firmware_main(void)')
-source = replace_once(source, 'static void jog_handle_byte(uint8 b)\n{',
-    'static void jog_handle_byte(uint8 b)\n{\n if(simPtpWireN && simPtpReceivedN<256)simPtpReceived[simPtpReceivedN++]=b;')
 pins = sorted(set(re.findall(r'CYREG_PRT\d+_PC\d+', source)))
 pin_defs = '\n'.join(f'#define {pin} {i}' for i, pin in enumerate(pins))
 
@@ -86,7 +62,7 @@ static void sim_tick_sync(void) {
 }
 static uint8 mock_critical_enter(void){uint8 old=(uint8)simInts;sim_tick_sync();simInts=0;return old;}
 static void mock_critical_exit(uint8 old){simInts=old;sim_tick_sync();}
-static int simPins[128], simStep1, simStep2, simBoot, simBadEncoder;
+static int simPins[128], simStep1, simStep2, simBadEncoder;
 static int simFault, simLimit, simHome1Mode, simHome2Mode, simStall, simPolarity=1, simStiction;
 static int simHome1At=400, simHome2At=120;
 static int simRateLimited; static uint32 simLastMotorPulse;
@@ -98,8 +74,11 @@ static int simEncoderBias;
 static unsigned simPulse1, simPulse2;
 static unsigned simDriverSwitches;
 static char simLog[1048576]; static unsigned simLogN;
+/* SysTick read cost: the coarse 1 us keeps busy-wait loops fast, but inside an SSI frame (CSn low) the firmware
+ * busy-waits on it for ~115 us, so a read costs 0.25 us there and the frame lasts as long as the real one. */
+static unsigned simRegCost=24;
 static uint32 mock_reg(uint32 reg) {
-    simClock+=24;sim_tick_sync();
+    simClock+=simRegCost;sim_tick_sync();
     if(reg==CYREG_NVIC_INTR_CTRL_STATE)return simTickPending?0x04000000u:0;
     return (uint32)(0xffffffu-(simClock-simClockBase))&0xffffffu;
 }
@@ -140,7 +119,8 @@ static void HostUart_Start(void){simUartStarted=1;}
 static unsigned HostUart_GetRxBufferSize(void){sim_uart_fill();return simUartCount;}
 static uint16 HostUart_GetByte(void){
     uint16 b=(uint16)HostUart_errorStatus<<8;HostUart_errorStatus=0;
-    if(simUartCount){b|=simUartRx[simUartTail++%256];simUartCount--;}
+    if(simUartCount){b|=simUartRx[simUartTail++%256];simUartCount--;
+        if(simPtpWireN && simPtpReceivedN<256)simPtpReceived[simPtpReceivedN++]=(uint8)b;}
     return b;
 }
 static void HostUart_ClearRxBuffer(void){simUartHead=simUartTail=simUartCount=0;HostUart_rxBufferOverflow=0;}
@@ -152,7 +132,6 @@ static void HostUart_PutChar(uint8 b){
 }
 static uint32 mock_frame(void) {
     uint32 angle, frame, bits, parity=0;
-    if(simRxActive)simClock+=24u*115u;
     if(simBadEncoder) return 0;
     angle=(uint32)(1000+(int64)simStep1*simPolarity*256/100+simEncoderBias)&4095u;
     if(simAngleOverride>=0)angle=(uint32)simAngleOverride;
@@ -160,7 +139,10 @@ static uint32 mock_frame(void) {
     for(bits=frame; bits; bits>>=1) parity^=bits&1;
     return frame|parity;
 }
+/* AS5045 at pin level: CSn falling latches a frame, every CLK rising edge while CSn is low presents the next bit, MSB first. */
+static uint32 simSsiFrame; static int simSsiBits;
 static int mock_read(int pin) {
+    if(pin==CYREG_PRT1_PC3) return (simSsiBits>=1 && simSsiBits<=18 && ((simSsiFrame>>(18-simSsiBits))&1u))?16:0;
     if(pin==CYREG_PRT12_PC5) return simFault?0:16;
     if(pin==CYREG_PRT0_PC4) return simLimit?16:0;
     if(pin==CYREG_PRT0_PC3) return (simHome1Mode<0?0:(simHome1Mode>0?1:simStep1>=simHome1At))?16:0;
@@ -168,6 +150,10 @@ static int mock_read(int pin) {
     return simPins[pin];
 }
 static void mock_set(int pin,int value) {
+    if(pin==CYREG_PRT12_PC1 && value!=simPins[pin]) {
+        if(!value){simSsiFrame=mock_frame();simSsiBits=0;simRegCost=6;} else simRegCost=24;
+    }
+    if(pin==CYREG_PRT12_PC0 && value && !simPins[pin] && !simPins[CYREG_PRT12_PC1])simSsiBits++;
     if(value!=simPins[pin] && (pin==CYREG_PRT1_PC7 || pin==CYREG_PRT12_PC2 || pin==CYREG_PRT1_PC2 ||
         pin==CYREG_PRT2_PC7 || pin==CYREG_PRT2_PC2 || pin==CYREG_PRT2_PC3))simDriverSwitches++;
     if(value && !simPins[pin]) {
@@ -232,18 +218,18 @@ static void cycle(int heartbeat) {
     } else simClock+=24000u;
     jog_update_time();
     if(heartbeat && (g_jogMs-g_lastKeyMs>=40u)) sim_keys(0);
-    if(g_arm1.hasEnc) {
-        if(!enc_sample() && g_enc.badStreak>=ENC_BAD_LIMIT) {
-            g_arm1.hasEnc=0; stage_stop("encoder lost",0);
-        }
-    }
+    if(g_arm1.hasEnc)service_encoder();
     jog_tick();
-    if(!jog_safety_blocked()) {
-        if(g_home.phase!=HOME_IDLE) home_service();
-        else if(g_ptp.active) ptp_service();
-        else {jog_axis_service(&g_arm1); jog_axis_service(&g_arm2);}
-    }
+    service_motion();
     txq_flush_blocking();
+}
+/* The real foreground loop for 2 s of simulated time. init=1 also runs the firmware's own axis set-up and banner;
+ * init=0 keeps the axes and enable state that setup() prepared (used when a wire image is already loaded). */
+static void sim_run(int init) {
+    if(init)app_init(1);
+    app_start();
+    if(!init)simRxBase=simClock;
+    while(simClock-simRxBase<24000000u*2u)app_poll();
 }
 static void run_until(home_phase_t phase, int arm) {
     unsigned i;
@@ -518,7 +504,7 @@ static void ptp_test(const char *t) {
         ptp_send(1,epoch,logged?-2195:125,logged?4437:-250,200,4);
         simRxActive=1;simRxOffset=(uint32)atoi(t+(logged?16:9))*24u;
         simLogN=0;simLog[0]=0;
-        jog_run(1);
+        sim_run(0);
         if(!g_ptp.active||g_ptp.sequence!=1){fprintf(stderr,"%s\nRX:",simLog);for(i=0;i<simPtpReceivedN;i++)fprintf(stderr,"%02X ",simPtpReceived[i]);}
         assert(g_motionEnabled&&g_ptp.active&&g_ptp.sequence==1&&g_ptp.done>0);
         return;
@@ -692,7 +678,7 @@ static void traj_test(const char *t) {
     if(!strcmp(t,"traj_uart_upload") || !strcmp(t,"traj_uart_upload_paced")) {
         if(!strcmp(t,"traj_uart_upload_paced"))simUartChunk=8;
         packetType=3;ptp_send(2,g_ptp.epoch,10,-10,250,4);packetType=1;
-        simRxActive=1;simRxOffset=137u*24u;jog_run(1);
+        simRxActive=1;simRxOffset=137u*24u;sim_run(0);
         assert(g_motionEnabled&&g_traj.count==2&&!g_ptp.active&&p1==simPulse1&&p2==simPulse2);return;
     }
     if(!strcmp(t,"traj_partial") || !strcmp(t,"traj_order") || !strcmp(t,"traj_range") ||
@@ -724,7 +710,7 @@ static void traj_test(const char *t) {
     if(!strcmp(t,"traj_uart_run") || !strcmp(t,"traj_uart_run_paced")) {
         if(!strcmp(t,"traj_uart_run_paced"))simUartChunk=8;
         packetType=4;ptp_send(++seq,g_ptp.epoch,0,0,0,4);packetType=1;
-        simRxActive=1;simRxOffset=499u*24u;jog_run(1);
+        simRxActive=1;simRxOffset=499u*24u;sim_run(0);
         if(!g_motionEnabled||g_traj.state!=4)fprintf(stderr,"%s\n",simLog);
         assert(g_motionEnabled&&!g_ptp.active&&g_traj.state==4&&g_arm1.usteps==origin1&&g_arm2.usteps==origin2);
         assert(simPulse1-p1==72&&simPulse2-p2==90);return;
@@ -797,7 +783,7 @@ int main(int argc,char **argv) {
     if(!strcmp(t,"boot_tx_backlog")) {
         hw_init();assert(enc_set_origin());
         simRxActive=1;simRxBase=simClock;simUartTxBusyUntil=simClock+120u*24000u;
-        jog_run(1);
+        sim_run(1);
         assert(!g_motionEnabled && !simPulse1 && !simPulse2);
         assert(g_arm1.hasEnc && !g_enc.trackingLost && g_encMaxGapMs<10u);
         assert(simWdtFeeds>1000u && strstr(simLog,"STAGE2 v7 framed control"));
@@ -805,7 +791,7 @@ int main(int argc,char **argv) {
     }
     if(!strcmp(t,"boot") || !strcmp(t,"boot_bad") || !strcmp(t,"boot_limit")) {
         simBadEncoder=!strcmp(t,"boot_bad"); simLimit=!strcmp(t,"boot_limit");
-        firmware_main();
+        app_boot();
         assert(!simPulse1 && !simPulse2 && !g_motionEnabled);
         assert(simPins[PIN_EN1] && simPins[PIN_EN2]);
         assert(strstr(simLog,(simBadEncoder||simLimit)?"SELFTEST BLOCKED":"SELFTEST PASS"));
@@ -1140,6 +1126,23 @@ int main(int argc,char **argv) {
         assert(g_motionEnabled && g_home.phase==HOME_FAST && g_home.steps>40000u);
         jog_handle_byte(JOG_CMD_STOP);assert_stopped();puts(t);return 0;
     }
+    if(!strcmp(t,"jog_slip_follow") || !strcmp(t,"jog_slip_stall")) {
+        /* Jog arm1 right after homing.  Through cycle() the encoder result reaches the firmware's own
+         * slip check: a motor that follows stays quiet, a stalled one first derates, then stops. */
+        for(i=0;i<250000 && g_home.phase!=HOME_IDLE && g_motionEnabled;i++)cycle(1);
+        assert(g_motionEnabled && g_homed1 && g_homed2 && g_directionKnown);
+        cycle(1);sim_keys(0);
+        if(!strcmp(t,"jog_slip_stall"))simStall=1;
+        p1=simPulse1;
+        for(i=0;i<3000 && g_motionEnabled;i++) {if(g_jogMs-g_lastKeyMs>=40u)sim_keys(2);cycle(0);}
+        if(!strcmp(t,"jog_slip_follow")) {
+            assert(g_motionEnabled && simPulse1-p1>200 && !g_arm1.derates && g_arm1.peakSlip<SLIP_WARN_LSB);
+        } else {
+            assert_stopped();
+            assert(strstr(simLog,"SLIP WARN") && strstr(simLog,"jog encoder following error"));
+        }
+        puts(t);return 0;
+    }
     if(!strcmp(t,"home_following_stall")) {
         for(i=0;i<5000 && g_motionEnabled && !g_directionKnown;i++)cycle(1);
         assert(g_motionEnabled && g_directionKnown && g_home.phase==HOME_FAST);
@@ -1179,7 +1182,7 @@ int main(int argc,char **argv) {
     }
     if(!strncmp(t,"uart_load_",10)) {
         simRxActive=1;simRxBase=simClock;simRxOffset=(uint32)atoi(t+10)*24u;
-        jog_run(1);
+        sim_run(1);
         if(!g_motionEnabled)fprintf(stderr,"%s\n",simLog);
         assert(g_motionEnabled && g_rxGood>15 && !strstr(simLog,"heartbeat timeout"));
         puts(t);return 0;
@@ -1258,7 +1261,7 @@ int main(int argc,char **argv) {
 cases = ['boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
          'missing_sensor','stuck_sensor','missing_npn','stalled_motor','reject_moving',
          'fault','limit','encoder_loss','jog_cancels','sensor_bounce']
-cases += ['startup_stiction','home_low_speed_tracking','home_following_stall']
+cases += ['startup_stiction','home_low_speed_tracking','home_following_stall','jog_slip_follow','jog_slip_stall']
 cases += ['boot_tx_backlog','rejected_byte_status','operator_stop_reenable','operator_stop_after_protection','operator_stop_after_fault']
 cases += ['limits_'+n for n in ['configure','retry','invalid','busy','enabled']]
 cases += ['rates_config','rates_jog','rates_home']
@@ -1309,7 +1312,7 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     if host_control is not None: (tmp/'host-control.bin').write_bytes(host_control.read_bytes())
     for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h']:
         (tmp/name).write_text('',encoding='ascii')
-    (tmp/'check.c').write_text(pin_defs+'\n'+mock+'\n'+source+'\n'+harness,encoding='utf-8')
+    (tmp/'check.c').write_text(pin_defs+'\n'+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
     (tmp/'build.cmd').write_text(f'@echo off\ncall "{vcvars}" >nul\ncl /nologo /TC /std:c11 /W3 /DPTP_COMMISSIONED=0 /I"{tmp}" "{tmp / "check.c"}" /Fe:"{tmp / "check.exe"}" /Fo:"{tmp / "check.obj"}"\n',encoding='utf-8')
     result=subprocess.run(['cmd','/c',str(tmp/'build.cmd')],cwd=tmp,capture_output=True,text=True,errors='replace')
     if result.returncode: raise RuntimeError(result.stdout+result.stderr)

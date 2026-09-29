@@ -2461,8 +2461,8 @@ static void jog_print_help(void)
 static void jog_print_inputs(void)
 {
     JLOGF("INPUTS: J4-1/P0[4]=%u J4-2/P0[3]=%u NPN/P1[0]=%u nFAULT=%u\r\n",
-          (unsigned)(CyPins_ReadPin(CYREG_PRT0_PC4) != 0u),
-          (unsigned)(CyPins_ReadPin(CYREG_PRT0_PC3) != 0u),
+          (unsigned)(CyPins_ReadPin(PIN_LIMIT2) != 0u),
+          (unsigned)(CyPins_ReadPin(PIN_LIMIT1) != 0u),
           (unsigned)(CyPins_ReadPin(PIN_ARM2_NPN) != 0u),
           (unsigned)(CyPins_ReadPin(PIN_FAULT) != 0u));
 }
@@ -2635,14 +2635,40 @@ static void jog_rx_service(void)
     }
 }
 
-static void jog_run(uint8 encOk) __attribute__((noreturn));
-static void jog_run(uint8 encOk)
+/* Foreground loop, split into pieces so the offline tests run this exact code
+ * instead of a hand-copied loop: app_init() axes + banner, app_start() timers +
+ * watchdog, app_poll() one pass. service_motion() and service_encoder() are the
+ * parts the tests also call between their own simulated-time steps. */
+static uint32 g_loopTick;   /* SU_NOW() at the last 1 ms housekeeping tick */
+static uint32 g_loopEnc;    /* SU_NOW() at the last encoder sample         */
+static uint32 g_loopAt;     /* wall_ms() at the start of the previous pass */
+
+static void service_motion(void)
 {
-    uint32 tTick;
-    uint32 tEnc;
-    uint32 loopAt;
+    if (jog_safety_blocked() != 0u) { return; }
+    if (g_home.phase != HOME_IDLE) { home_service(); }
+    else if (g_ptp.active) { ptp_service(); }
+    else { jog_axis_service(&g_arm1); jog_axis_service(&g_arm2); }
+}
 
+static void service_encoder(void)
+{
+    if (enc_sample() == 0u)
+    {
+        if (g_enc.badStreak >= ENC_BAD_LIMIT)
+        {
+            g_arm1.hasEnc = 0u;
+            stage_stop("encoder lost; automatic open-loop fallback disabled", 0u);
+        }
+    }
+    else if ((g_motionEnabled != 0u) && (g_home.phase == HOME_IDLE))
+    {
+        jog_slip_check(&g_arm1);
+    }
+}
 
+static void app_init(uint8 encOk)
+{
     jog_axis_init(&g_arm1, "arm1", PIN_STEP2, PIN_DIR2, 1u, encOk,
                   ARM1_LEFT_DIR_LEVEL,
                   JOG1_RATE_MAX_USTEP_S, JOG1_RATE_START_USTEP_S,
@@ -2663,74 +2689,70 @@ static void jog_run(uint8 encOk)
 
     /* Never execute commands buffered during the power-on self-test. */
     uart_discard_rx();
-    tTick = SU_NOW();
-    tEnc  = SU_NOW();
-    g_jogMs=wall_ms();
-    loopAt=g_jogMs;
+}
+
+static void app_start(void)
+{
+    g_loopTick = SU_NOW();
+    g_loopEnc  = SU_NOW();
+    g_jogMs    = wall_ms();
+    g_loopAt   = g_jogMs;
     CyILO_Start1K();
     CyWdtStart(CYWDT_128_TICKS, CYWDT_LPMODE_NOCHANGE);
-    for (;;)
+}
+
+static void app_poll(void)
+{
+    uint32 loopNow = wall_ms();
+    if (loopNow - g_loopAt > g_loopMaxMs) { g_loopMaxMs = loopNow - g_loopAt; }
+    g_loopAt = loopNow;
+    /* Check the elapsed deadline BEFORE consuming queued heartbeats or
+     * emitting another pulse. No motion catch-up after a stalled loop. */
+    jog_update_time();
+    /* Bound RX work so a host flood cannot starve motion or deadman. */
+    jog_rx_service();
+
+    service_motion();
+
+    jog_rx_service();
+
+    if (SU_ELAPSED(g_loopTick) >= JOG_TICK_CY)
     {
-        uint32 loopNow=wall_ms();
-        if(loopNow-loopAt>g_loopMaxMs) { g_loopMaxMs=loopNow-loopAt; }
-        loopAt=loopNow;
-        /* Check the elapsed deadline BEFORE consuming queued heartbeats or
-         * emitting another pulse. No motion catch-up after a stalled loop. */
-        jog_update_time();
-        /* Bound RX work so a host flood cannot starve motion or deadman. */
-        jog_rx_service();
-
-        if (jog_safety_blocked() == 0u)
-        {
-            if (g_home.phase != HOME_IDLE) { home_service(); }
-            else if (g_ptp.active) { ptp_service(); }
-            else { jog_axis_service(&g_arm1); jog_axis_service(&g_arm2); }
-        }
-
-        jog_rx_service();
-
-        if (SU_ELAPSED(tTick) >= JOG_TICK_CY)
-        {
-            uint32 lag=SU_ELAPSED(tTick)/(1000u*SU_CY_PER_US);
-            if(lag>g_tickMaxLagMs) { g_tickMaxLagMs=lag; }
-            tTick = SU_NOW();
-            jog_tick();
-        }
-
-        /* Encoder: about once per ms, in a gap between steps.  If no gap
-         * appears for 5 ms take the sample anyway (one late step). */
-        if ((g_arm1.hasEnc != 0u) && (SU_ELAPSED(tEnc) >= JOG_ENC_SAMPLE_CY))
-        {
-            if ((jog_slot_free(JOG_ENC_READ_US) != 0u) ||
-                (SU_ELAPSED(tEnc) >= (5u * JOG_ENC_SAMPLE_CY)))
-            {
-                tEnc = SU_NOW();
-                if (enc_sample() == 0u)
-                {
-                    if (g_enc.badStreak >= ENC_BAD_LIMIT)
-                    {
-                        g_arm1.hasEnc = 0u;
-                        stage_stop("encoder lost; automatic open-loop fallback disabled", 0u);
-                    }
-                }
-                else
-                {
-                    if ((g_motionEnabled != 0u) && (g_home.phase == HOME_IDLE))
-                    { jog_slip_check(&g_arm1); }
-                }
-            }
-        }
-
-        if ((txq_pending() != 0u) && (jog_slot_free(JOG_TX_BYTE_US) != 0u))
-        {
-            txq_send_one();
-        }
-        CyWdtClear(); /* Only a completed foreground iteration feeds the watchdog. */
+        uint32 lag = SU_ELAPSED(g_loopTick) / (1000u * SU_CY_PER_US);
+        if (lag > g_tickMaxLagMs) { g_tickMaxLagMs = lag; }
+        g_loopTick = SU_NOW();
+        jog_tick();
     }
+
+    /* Encoder: about once per ms, in a gap between steps.  If no gap
+     * appears for 5 ms take the sample anyway (one late step). */
+    if ((g_arm1.hasEnc != 0u) && (SU_ELAPSED(g_loopEnc) >= JOG_ENC_SAMPLE_CY))
+    {
+        if ((jog_slot_free(JOG_ENC_READ_US) != 0u) ||
+            (SU_ELAPSED(g_loopEnc) >= (5u * JOG_ENC_SAMPLE_CY)))
+        {
+            g_loopEnc = SU_NOW();
+            service_encoder();
+        }
+    }
+
+    if ((txq_pending() != 0u) && (jog_slot_free(JOG_TX_BYTE_US) != 0u))
+    {
+        txq_send_one();
+    }
+    CyWdtClear(); /* Only a completed foreground iteration feeds the watchdog. */
+}
+
+static void jog_run(uint8 encOk) __attribute__((noreturn));
+static void jog_run(uint8 encOk)
+{
+    app_init(encOk);
+    app_start();
+    for (;;) { app_poll(); }
 }
 
 /* ================================= main ================================= */
-int main(void)
+static uint8 app_boot(void)
 {
     as5045_t sample;
     uint8 code = ST_DO_LOW;
@@ -2766,7 +2788,12 @@ int main(void)
          (unsigned)(CyPins_ReadPin(PIN_LIMIT1) != 0u), (unsigned)(CyPins_ReadPin(PIN_ARM2_NPN) != 0u));
     DBG("SELFTEST is electrical status only: motor power/motion and switch wiring need bench verification\r\n");
     cmd_reset_to_measured();
-    jog_run(encOk);
+    return encOk;
+}
+
+int main(void)
+{
+    jog_run(app_boot());
     return 0;
 }
 
