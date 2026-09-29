@@ -7,6 +7,10 @@ public readonly record struct JointLimits(double Min1, double Max1, double Min2,
 {
     public bool Contains(JointPose p) => p.Q1 >= Min1 - 1e-8 && p.Q1 <= Max1 + 1e-8 &&
                                          p.Q2 >= Min2 - 1e-8 && p.Q2 <= Max2 + 1e-8;
+    // q2 is the absolute link angle, so motor 2 (the elbow) travels q2 - q1. Firmware bounds only the two
+    // boxes; the elbow range they imply is [Min2 - Max1, Max2 - Min1] (measured on the real firmware C).
+    public double ElbowMin => Min2 - Max1;
+    public double ElbowMax => Max2 - Min1;
 }
 
 // Angles in degrees from the fixed +X zero direction: q1 is link 1, q2 is link 2.

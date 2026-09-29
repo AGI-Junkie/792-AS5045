@@ -193,6 +193,7 @@ public sealed partial class XYPreviewPanel : UserControl
         controls.Children.Add(ranges);
         controls.Children.Add(WorkbenchTheme.Text("留空用默认值 · 修改后红色区域实时更新",11,WorkbenchTheme.Muted));
         controls.Children.Add(rangeState);
+        controls.Children.Add(BuildElbowRulePanel());
         var speeds = new WrapPanel(); AddField(speeds,"末端 mm/s",feed); AddField(speeds,"电机1 °/s",v1); AddField(speeds,"电机2 (q2−q1) °/s",v2); AddField(speeds,"电机1 °/s²",acc1); AddField(speeds,"电机2 (q2−q1) °/s²",acc2); advanced.Children.Add(speeds);
         advanced.Children.Add(WorkbenchTheme.Text("全局：杆长用于全部图形、命令 XY 与记录；关节速度/加速度用于绘图、定位、点动和回零。末端 mm/s 用于 XY 绘制与定位，不用于未建立坐标的回零。",12,WorkbenchTheme.Muted));
         advanced.Children.Add(speedState);
@@ -257,6 +258,7 @@ public sealed partial class XYPreviewPanel : UserControl
         return "关节范围 / °：q1、q2 两个关节角的规划范围（两轴逆时针为正，0° 为两杆伸直的零位）。\n" +
             "· q1 ＝ arm1：主动臂（经 40:1 减速箱、带 AS5045 编码器反馈）。\n" +
             "· q2 ＝ arm2 相对固定 +X 零方向的夹角；第二轴电机实际转角为 q2−q1（无编码器反馈）。\n" +
+            "· 因此 q2 范围不直接限制肘：肘可达 [q2 最小−q1 最大, q2 最大−q1 最小]，固件不检查，见下方“肘行程”图（红色＝违反你设的安全行程 E）。\n" +
             "· 不确定哪个是哪个：按住点动 \"arm1 ← / D →\" 看状态栏，或轻推对应杆件，读数变化的那一路就是它。\n" +
             "· 每个输入框留空时使用对应默认值：q1 ∈ [−30°, +30°]，q2 ∈ [−60°, +60°]。\n" +
             "· 填写后以你填的值为准：" + EnteredEnvelope() + "。\n" +
@@ -283,6 +285,7 @@ public sealed partial class XYPreviewPanel : UserControl
             : firmwareLimits is null ? "红区与规划使用上方范围；设备确认后才能运动。"
             : requested == firmwareLimits && deviceLimitsConfirmed ? "设备已确认：红区、规划、执行范围一致。"
             : "设备范围尚未同步；运动已锁定。\n" + deviceMoveReason + "\n设备当前：" + Envelope(firmwareLimits);
+        RefreshElbowRule();
     }
     private void RefreshOverlayLimits()
     {
@@ -334,7 +337,7 @@ public sealed partial class XYPreviewPanel : UserControl
         if (updating) return;
         parametersDirty = false;
         cameraReady = false; autoFit = true; operationError=null;
-        RefreshOverlayLimits(); RefreshRangeHelp();
+        RefreshOverlayLimits(); CaptureElbowPath(); RefreshRangeHelp();
         pointTarget = null; movePoint.IsEnabled = false; execution = null; execute.IsEnabled = false; executionInfo.Clear();
         PausePlayback(); trajectory = null; timing = null;
         export.IsEnabled = cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = false;
@@ -561,6 +564,7 @@ public sealed partial class XYPreviewPanel : UserControl
     {
         ReachabilityMask.SelfTest();
         UnifiedLimitsSelfTest();
+        ElbowRuleSelfTest();
         var panel = new XYPreviewPanel();
         panel.ViewportSelfTest();
         if(panel.detailView) throw new InvalidOperationException("中间视图默认必须是全臂视图");
@@ -742,6 +746,7 @@ public sealed partial class XYPreviewPanel : UserControl
             var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(image));
             using var stream = File.Create(snapshotPath); png.Save(stream);
             File.WriteAllText(System.IO.Path.ChangeExtension(snapshotPath, ".csv"), panel.timing!.ToCsv(), new UTF8Encoding(true));
+            RenderElbowRuleSnapshots(Path.GetDirectoryName(snapshotPath)!);
             // Render every supported shape through the same controls and planner.
             panel.SetStartFeedback(null);
             panel.SetPointMoveState(false,null,"离线预览；未连接设备。",true);
