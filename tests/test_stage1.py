@@ -33,7 +33,7 @@ source = replace_body(source, 'static uint32 as5045_read_raw(void)', 'return moc
 source = replace_once(source, 'static void jog_run(uint8 encOk)\n{',
                         'static void jog_run(uint8 encOk)\n{\n if(!simRxActive){simBoot = encOk; return;}\n if(simPtpWireN)goto sim_loop_ready;')
 loop_start = source.index('static void jog_run(uint8 encOk)\n{')
-loop_end = source.index('/* ================================ demo', loop_start)
+loop_end = source.index('/* ================================= main', loop_start)
 loop = replace_once(source[loop_start:loop_end], 'for (;;)\n    {',
     'for (;;)\n    {\n if(simRxActive && simClock-simRxBase>=24000000u*2u)return;')
 loop = replace_once(loop, '\n    tTick = SU_NOW();', '\nsim_loop_ready:\n    if(simPtpWireN)simRxBase=simClock;\n    tTick = SU_NOW();')

@@ -1,59 +1,31 @@
 /* ========================================================================
- * AS5045 + DRV8825 stepper2: dual-track closed-loop stepper
+ * AS5045 + DRV8825: two-joint arm firmware (stage2-v7)
  * Target: CY8CKIT-059 (PSoC 5LP) @ 24 MHz BUS_CLK, GPIO + UDB host UART.
  *
- * MECHANICS: 42 mm 1.8 deg stepper on DRV2 / stepper2, driving a 40:1
+ * MECHANICS: arm1 = 42 mm 1.8 deg stepper on DRV2 / stepper2 behind a 40:1
  * gearbox.  The AS5045 magnet sits on the MOTOR REAR SHAFT, so the encoder
- * measures the rotor, not the gearbox output.
+ * measures the rotor, not the gearbox output.  arm2 = 28 mm stepper on DRV1 /
+ * stepper1 (51.06:1), open loop.
  *
- *   1 output degree  = 40 motor degrees = 455.1 encoder LSB
+ *   1 output degree  = 40 motor degrees = 455.1 encoder LSB      (arm1)
  *   1 microstep(1/8) = 0.225 motor deg  = 2.56 LSB = 0.005625 output degree
  *   9 output degrees = one full motor turn -> the single-turn AS5045 WRAPS.
  *
- * Because of that 9-degree wrap, position is tracked MULTI-TURN: every sample
- * accumulates the shortest circular delta into a signed 32-bit counter.  The
- * raw 12-bit angle is never used as a position by itself.
+ * Because of that 9-degree wrap, arm1 position is tracked MULTI-TURN: every
+ * sample accumulates the shortest circular delta into a signed 32-bit counter.
+ * The raw 12-bit angle is never used as a position by itself.
  *
- * ------------------------------ ARCHITECTURE -----------------------------
- * Two position tracks are maintained in the same unit (encoder LSB):
- *
- *   commanded  g_cmdLsbX100/100 : advanced by 2.56 LSB per issued microstep
- *   measured   g_enc.pos        : multi-turn accumulation of AS5045 samples
- *
- * A move runs in two phases:
- *
- *   1. move_fast()  - trapezoidal accel/decel ramp (AVR446 integer
- *      recurrence) emits microsteps at up to MOVE_RATE_MAX_USTEP_S while
- *      sampling the encoder every SLIP_SAMPLE_EVERY_USTEPS.  slip =
- *      commanded - measured, corrected for the AS5045 output delay.
- *          slip >= SLIP_WARN_LSB (1.5 full steps, 31 LSB)  -> halve the speed
- *                                                             cap, keep going
- *          slip >= SLIP_FAIL_LSB (4 electrical cycles, 328) -> abort the move
- *      Losing steps is NOT a stop condition; it derates and continues.
- *
- *   2. fine_seek()  - the original one-microstep-at-a-time position loop,
- *      now on the multi-turn position, trims the residue into +/-4 LSB.
- *
- * move_to_lsb() wraps both: on abort it waits (STILL ENERGIZED - it never
- * coasts, see recover_pause), halves the speed cap and retries the whole
- * move from the measured position.  Only after MOVE_MAX_ATTEMPTS does it
- * give up.  Because the commanded track is re-derived from the encoder at
- * every attempt, lost steps never accumulate anywhere.
- *
- * KEYBOARD JOG (KEYBOARD_JOG=1, default): hold-to-move jogging of both
- * joints from a PC keyboard, see the "keyboard jog" section below.
- * Stage1: static self-test leaves BOTH drivers disabled; C enables after
- * rechecking inputs, R requests interruptible homing, Space/Esc stops.
- * No automatic startup movement or automatic recovery from faults.
- *   arm1 = 42 motor on stepper2 (AS5045 closed track)   keys a / d
- *   arm2 = 28 motor on stepper1 (open loop)              keys Left / Right
- *
- * DEMO (KEYBOARD_JOG=0): forward +DEMO_OUTPUT_DEG10 output degrees, hold,
- * reverse to -DEMO_OUTPUT_DEG10, hold, repeat.  Peak slip is printed per move.
- *
- * !!! Before running, make sure the joint really has +/-DEMO_OUTPUT_DEG10
- * !!! of free travel.  The default is +/-30 output degrees = 6.7 motor turns
- * !!! per leg.  There is a 3 second countdown before the first move.
+ * WHAT RUNS: one foreground loop (jog_run); no interrupt drives the motors.
+ *   - Every motion needs a live host lease (deadman); the watchdog is fed only
+ *     by a complete loop; encoder tracking loss latches until an explicit enable.
+ *   - Keyboard jog with velocity ramps, homing (a state machine), PTP moves and
+ *     preloaded timed trajectories.  All step pulses go through jog_step(), which
+ *     applies the fault, limit, sensor and joint-range checks.
+ *   - arm1 keeps two tracks in encoder LSB: COMMANDED (2.56 LSB per issued
+ *     microstep) and MEASURED (multi-turn AS5045).  slip = commanded - measured:
+ *     SLIP_WARN_LSB halves the speed cap, SLIP_FAIL_LSB stops.
+ *   - stage_stop() invalidates the coordinate reference.  Every stop needs an
+ *     explicit re-enable; nothing recovers automatically.
  *
  * LIMITS: single-turn absolute means multi-turn position is lost at power
  * off; encoder on the rotor cannot see gearbox backlash, so output-side
@@ -73,10 +45,6 @@
 #define USE_DEBUG_UART              (1u)     /* P12[7], 115200 8N1          */
 #define PARITY_STRICT               (1u)
 #define ENCODER_SELFTEST_MS         (5000u)
-
-/* 1 = hold-to-move keyboard jog of both joints (host script jog.ps1 on the
- * KitProg COM port); 0 = the +/-DEMO_OUTPUT_DEG10 back-and-forth demo. */
-#define KEYBOARD_JOG                (1u)
 
 /* Physical directions confirmed on the bench: left DIR=0 for both axes.
  * Encoder polarity is learned only during manually requested homing.
@@ -170,38 +138,21 @@
  * Manual referencing uses this bench calibration, with no automatic probe motion. */
 #define MANUAL_ENC_INC_DIR           (1u)
 
-/* Open-loop hardware diagnostic: rotate forever and dump raw AS5045 frames.
- * Set to 1 only when checking magnet mounting; 0 runs the closed loop. */
-#define CONTINUOUS_ROTATION_DIAGNOSTIC (0u)
-#define DIAG_DIR_LEVEL              (1u)
-#define DIAG_RATE_USTEP_S           (2000u)
-#define DIAG_LOG_EVERY_USTEPS       (20u)
-
 /* ------------------------------ mechanics ------------------------------- */
 #define GEAR_RATIO                  (40)     /* 42 motor + 40:1 gearbox      */
 #define MOTOR_FULLSTEPS_REV         (200)
 #define USTEP_DIV                   (8u)     /* DRV8825 M2/M1/M0 microstep   */
 
-/* --------------------------- demo trajectory ---------------------------- */
-#define DEMO_OUTPUT_DEG10           (300)    /* +/- 30.0 output degrees      */
-#define DEMO_HOLD_MS                (1500u)
-#define DEMO_ARM_COUNTDOWN_S        (3u)
-
-/* ---------------------------- fast move ramp ---------------------------- */
+/* -------------------- encoder tracking bound, rotor settle -------------- */
 #define MOVE_RATE_MAX_USTEP_S       (6000u)  /* 225 motor rpm = 33.8 out deg/s */
-#define MOVE_RATE_MIN_USTEP_S       (400u)   /* floor after derating         */
-#define MOVE_ACCEL_USTEP_S2         (30000u) /* ~0.2 s to top speed          */
 #define MOVE_SETTLE_MS              (30u)    /* let the rotor stop ringing   */
-#define FAST_MOVE_MIN_USTEPS        (40)     /* below this, trim only        */
 
 /* ------------------------- slip (lost step) limits ---------------------- */
 /* 1 full step = 20.48 LSB. Pull-out is 2 full steps (90 deg electrical) =
  * 41 LSB, so the warning sits at 75% of the torque limit. */
 #define SLIP_WARN_LSB               (31)     /* 1.5 full steps = 2.70 deg    */
 #define SLIP_FAIL_LSB               (328)    /* 4 electrical cycles = 28.8   */
-#define ELEC_CYCLE_LSB              (82)     /* 4 full steps = 7.2 motor deg */
 #define PULLOUT_LSB                 (41)     /* 2 full steps, for reporting  */
-#define SLIP_SAMPLE_EVERY_USTEPS    (8u)
 #define SLIP_DERATE_MAX             (3u)     /* speed cap can drop 8x        */
 
 /* AS5045 output delay. MODE low/open = slow mode, 2.61 kHz / 384 us.
@@ -210,28 +161,16 @@
 #define AS5045_DELAY_US             (384)
 #define LAG_COMPENSATION            (1u)
 
-/* ------------------------- fine position loop --------------------------- */
+/* ------------------ hold deadband, final-position check ----------------- */
 #define CL_DEADBAND_LSB             (4)      /* 0.35 motor deg, 1.6 ustep    */
-#define CL_NEAR_LSB                 (16)
 #define PTP_FINAL_ERROR_LSB         (228)    /* motion commissioning: about +/-0.50 output deg, not a precision claim */
-#define CL_MID_LSB                  (64)
-#define CL_RATE_NEAR_USTEP_S        (80u)
-#define CL_RATE_MID_USTEP_S         (160u)
-#define CL_RATE_FAR_USTEP_S         (300u)
-#define CL_SETTLE_SAMPLES           (20u)    /* 20 x 5 ms = 100 ms in band   */
-#define CL_SEEK_TIMEOUT_MS          (4000u)
-#define CL_PROGRESS_WINDOW_USTEPS   (16u)
-#define CL_PROGRESS_MIN_LSB         (8)      /* must shrink 0.70 motor deg   */
 
 /* ---------------------------- safety limits ----------------------------- */
 #define SOFT_LIMIT_OUT_DEG10        (900)    /* +/- 90 output degrees        */
-#define MOVE_MAX_ATTEMPTS           (3u)
-#define RECOVER_PAUSE_MS            (250u)
 #define ENC_BAD_LIMIT               (5u)     /* consecutive unusable samples */
 
 /* --------------------------- direction probe ---------------------------- */
 #define DIR_PROBE_USTEPS            (16u)    /* 3.6 motor deg = 0.09 out deg */
-#define DIR_PROBE_RATE_USTEP_S      (200u)
 #define DIR_PROBE_MIN_LSB           (16)
 #define HOME_PROBE_MAX_USTEPS       (64u)
 #define HOME_PROBE_SETTLE_US        (20000u)
@@ -279,12 +218,6 @@
  * advanced with 32-bit integer adds and never drifts. */
 #define LSB_PER_USTEP_X100          ((int32)((ENCODER_CPR * 100) / USTEPS_PER_REV))
 
-/* Sampling must be fast enough that the rotor never moves half a turn
- * (2048 LSB) between two samples, otherwise the wrap direction is ambiguous. */
-#if (SLIP_SAMPLE_EVERY_USTEPS > 700u)
-    #error "SLIP_SAMPLE_EVERY_USTEPS too large: multi-turn wrap becomes ambiguous"
-#endif
-
 /* -------------------------- register-level pins ------------------------- */
 /* AS5045 serial interface, verified by the bring-up firmware. */
 #define PIN_CSN                     CYREG_PRT12_PC1  /* P12[1] -> AS5045 CSn */
@@ -327,25 +260,11 @@
 #define HARD_LIMIT_ACTIVE()         (CyPins_ReadPin(PIN_LIMIT2) != 0u)
 #define ARM2_NPN_ACTIVE()           (CyPins_ReadPin(PIN_ARM2_NPN) == 0u)
 
-#define LED_ON()                    CyPins_SetPin(PIN_LED)
-#define LED_OFF()                   CyPins_ClearPin(PIN_LED)
 #define FAULT_ACTIVE()              (CyPins_ReadPin(PIN_FAULT) == 0u)
-
-/* ------------------------------ result codes ---------------------------- */
-#define MV_OK                       (0)
-#define MV_ENCODER                  (-1)     /* encoder unusable            */
-#define MV_FAULT                    (-2)     /* DRV8825 nFAULT              */
-#define MV_SLIP                     (-3)     /* slip past SLIP_FAIL_LSB     */
-#define MV_TIMEOUT                  (-4)
-#define MV_STALL                    (-5)     /* corrections make no progress*/
-#define MV_GAVEUP                   (-6)     /* retries exhausted           */
-#define MV_LIMIT                    (-7)     /* target outside soft limits  */
 
 /* ------------------------------- timebase ------------------------------- */
 #define SU_NOW()                    (CY_GET_REG32(CYREG_NVIC_SYSTICK_CURRENT))
 #define SU_ELAPSED(t0)              (((t0) - SU_NOW()) & 0x00FFFFFFu)
-/* SysTick counts DOWN, so "t0 plus N cycles" is t0 minus N. */
-#define SU_ADVANCE(t0, cy)          (((t0) - (cy)) & 0x00FFFFFFu)
 #define SU_CY_PER_US                (BCLK__BUS_CLK__HZ / 1000000u)
 
 /* Extend the existing free-running 24-bit down-counter without changing pulse
@@ -382,15 +301,6 @@ static void delay_us(uint32 us)
 {
     uint32 t0 = SU_NOW();
     uint32 target = us * SU_CY_PER_US;
-    while (SU_ELAPSED(t0) < target) { }
-}
-
-/* Busy-wait until periodUs have passed since t0. Work done between the two
- * calls is absorbed into the same window instead of stretching the step.
- * UART reception is interrupt-buffered independently of this wait. */
-static void wait_until_period(uint32 t0, uint32 periodUs)
-{
-    uint32 target = periodUs * SU_CY_PER_US;
     while (SU_ELAPSED(t0) < target) { }
 }
 
@@ -613,6 +523,10 @@ static int32 g_cmdUsteps;       /* net microsteps issued since the origin */
 static int32 g_cmdLsbX100;
 #define ENC_MAX_GAP_MS (100u)
 #define ENC_JUMP_MARGIN_LSB (SLIP_FAIL_LSB)
+/* The rotor must never move half a turn (2048 LSB) between two accepted samples, or the wrap direction is
+ * ambiguous: the fastest configured rate over the longest accepted gap, plus the jump margin, has to fit. */
+_Static_assert((MOVE_RATE_MAX_USTEP_S * ENC_MAX_GAP_MS / 1000u) * LSB_PER_USTEP_X100 / 100 + ENC_JUMP_MARGIN_LSB < ENCODER_CPR / 2,
+               "multi-turn wrap becomes ambiguous: lower MOVE_RATE_MAX_USTEP_S or ENC_MAX_GAP_MS");
 typedef struct
 {
     int32  pos;         /* accumulated motor-side position, encoder LSB     */
@@ -807,40 +721,6 @@ static void pulse_step_pin(uint32 pinPC, uint8 idleHigh)
     pin_write(pinPC, idleHigh);
 }
 
-/* Emit the STEP pulse only. The caller owns the inter-step delay so that an
- * encoder read can be hidden inside the same window. */
-static uint8 step_pulse_begin(uint8 dirLevel)
-{
-    if (FAULT_ACTIVE() || HARD_LIMIT_ACTIVE() ||
-        ((ARM1_HOME_ACTIVE()) && (g_arm1HomeActive == 0u))) { return 0u; }
-    if (dirLevel != g_last_dir_level)
-    {
-        pin_write(PIN_DIR2, dirLevel);
-        delay_us(DIR_SETUP_US);
-        g_last_dir_level = dirLevel;
-    }
-
-    pulse_step_pin(PIN_STEP2, 1u);
-    return 1u;
-}
-
-static uint8 dir_level_for(int8 sign)
-{
-    return (sign > 0) ? g_encIncDir : (uint8)(g_encIncDir == 0u);
-}
-
-/* Blocking single microstep: pulse, advance the commanded track, wait. */
-static uint8 step_signed(int8 sign, uint32 periodUs)
-{
-    uint32 t0 = SU_NOW();
-
-    if (step_pulse_begin(dir_level_for(sign)) == 0u) { return 0u; }
-    g_cmdLsbX100 += (int32)sign * LSB_PER_USTEP_X100;
-    g_cmdUsteps  += sign;
-    wait_until_period(t0, periodUs);
-    return 1u;
-}
-
 /* ========================= trapezoidal ramp ============================= */
 /* AVR446 integer recurrence: c0 = 0.676e6 * sqrt(2/a) us, then
  * c(n+1) = c(n) - (2*c(n) + rest)/(4n+1). One divide per microstep, no
@@ -931,380 +811,6 @@ static void ramp_advance(ramp_t *r, int32 done)
     if (r->c > r->c0) { r->c = r->c0; r->rest = 0; }
 }
 
-/* Slip response: halve the speed cap without breaking the decel ramp. */
-static void ramp_derate(ramp_t *r)
-{
-    uint32 floorPeriod = step_period_us(MOVE_RATE_MIN_USTEP_S);
-
-    r->cMin <<= 1;
-    if (r->cMin > floorPeriod) { r->cMin = floorPeriod; }
-    if (r->cMin > r->c0)       { r->cMin = r->c0; }
-    if (r->c < r->cMin)        { r->c = r->cMin; r->rest = 0; }
-}
-
-/* =========================== fast profiled move ========================= */
-/* Runs deltaUsteps at up to rateCap while watching commanded - measured.
- * Lost steps derate the move instead of stopping it. */
-static int8 move_fast(int32 deltaUsteps, uint32 rateCap, int32 *peakSlip)
-{
-    ramp_t r;
-    int32 total   = abs_i32(deltaUsteps);
-    int8  sign    = (deltaUsteps < 0) ? (int8)-1 : (int8)1;
-    uint8 dirLvl  = dir_level_for(sign);
-    int32 done    = 0;
-    int32 worst   = 0;
-    int32 slip;
-    uint32 since  = 0u;
-    uint32 t0;
-    uint8 derated = 0u;
-    uint8 logged  = 0u;
-
-    if (peakSlip != NULL) { *peakSlip = 0; }
-    if (total == 0) { return MV_OK; }
-
-    ramp_init(&r, total, rateCap, MOVE_ACCEL_USTEP_S2);
-
-    while (done < total)
-    {
-        t0 = SU_NOW();
-
-        if (step_pulse_begin(dirLvl) == 0u) { return MV_FAULT; }
-        g_cmdLsbX100 += (int32)sign * LSB_PER_USTEP_X100;
-        g_cmdUsteps  += sign;
-        done++;
-        since++;
-
-        if ((since >= SLIP_SAMPLE_EVERY_USTEPS) || (done == total))
-        {
-            since = 0u;
-            if (enc_sample() == 0u)
-            {
-                if (g_enc.badStreak >= ENC_BAD_LIMIT) { return MV_ENCODER; }
-            }
-            else
-            {
-                slip = abs_i32(slip_lsb(sign, r.c));
-                if (slip > worst)
-                {
-                    worst = slip;
-                    if (peakSlip != NULL) { *peakSlip = worst; }
-                }
-
-                if (slip >= SLIP_FAIL_LSB)
-                {
-                    DBGF("SLIP FAIL: %ld lsb = %ld elec cycles at ustep %ld/%ld\r\n",
-                         (long)slip, (long)(slip / ELEC_CYCLE_LSB),
-                         (long)done, (long)total);
-                    return MV_SLIP;
-                }
-                if ((slip >= SLIP_WARN_LSB) && (derated < SLIP_DERATE_MAX))
-                {
-                    ramp_derate(&r);
-                    derated++;
-                    if (logged < 3u)
-                    {
-                        /* Costs about 5 ms of dwell; a longer dwell can
-                         * never make a stepper lose sync, so this is safe. */
-                        DBGF("SLIP WARN: %ld lsb, cap -> %lu ustep/s\r\n",
-                             (long)slip, (unsigned long)(1000000ul / r.cMin));
-                        logged++;
-                    }
-                }
-            }
-        }
-
-        ramp_advance(&r, done);
-        wait_until_period(t0, r.c);
-    }
-    return MV_OK;
-}
-
-/* ========================= fine position loop =========================== */
-static uint32 fine_period_us(int32 absError)
-{
-    if (absError > CL_MID_LSB)  { return step_period_us(CL_RATE_FAR_USTEP_S); }
-    if (absError > CL_NEAR_LSB) { return step_period_us(CL_RATE_MID_USTEP_S); }
-    return step_period_us(CL_RATE_NEAR_USTEP_S);
-}
-
-/* Return 1 = inside the deadband, 0 = one correction microstep issued,
- * 2 = no usable measurement this round, negative = fail-safe.  Code 2 is
- * distinct so that a single bad frame cannot poison the progress window. */
-#define FINE_NO_DATA                (2)
-
-static int8 fine_update(int32 targetLsb, int32 *errOut, uint32 *spentMs)
-{
-    int32 err;
-    int32 absErr;
-    uint32 period;
-    int8 sign;
-
-    if (FAULT_ACTIVE()) { return MV_FAULT; }
-
-    if (enc_sample() == 0u)
-    {
-        if (g_enc.badStreak >= ENC_BAD_LIMIT) { return MV_ENCODER; }
-        *spentMs = 1u;
-        return FINE_NO_DATA;
-    }
-
-    err = targetLsb - g_enc.pos;
-    *errOut = err;
-    absErr = abs_i32(err);
-
-    if (absErr <= CL_DEADBAND_LSB)
-    {
-        LED_ON();
-        CyDelay(5u);
-        *spentMs = 5u;
-        return 1;
-    }
-
-    LED_OFF();
-    sign = (err > 0) ? (int8)1 : (int8)-1;
-    period = fine_period_us(absErr);
-    if (step_signed(sign, period) == 0u) { return MV_FAULT; }
-    *spentMs = (period + 999u) / 1000u;
-    return 0;
-}
-
-static int8 fine_seek(int32 targetLsb, const char *label)
-{
-    uint32 start = wall_ms();
-    uint32 elapsed = 0u;
-    uint32 spent = 0u;
-    int32 err = 0;
-    int32 windowStart = 0;
-    uint8 settled = 0u;
-    uint8 pulses = 0u;
-    int8 rc;
-
-    while (elapsed < CL_SEEK_TIMEOUT_MS)
-    {
-        rc = fine_update(targetLsb, &err, &spent);
-        if (rc < 0) { return rc; }
-        elapsed = wall_ms()-start;
-        if (rc == FINE_NO_DATA) { continue; }
-
-        if (rc == 1)
-        {
-            settled++;
-            pulses = 0u;
-            if (settled >= CL_SETTLE_SAMPLES)
-            {
-                DBGF("  TRIM %s ok: err=%ld lsb (%s%ld.%02ld out-deg) in ~%lu ms\r\n",
-                     label, (long)err,
-                     DEG_SGN(lsb_to_out_deg100(err)),
-                     DEG_INT(lsb_to_out_deg100(err)),
-                     DEG_FRC(lsb_to_out_deg100(err)),
-                     (unsigned long)elapsed);
-                return MV_OK;
-            }
-        }
-        else
-        {
-            settled = 0u;
-            if (pulses == 0u) { windowStart = abs_i32(err); }
-            pulses++;
-            if (pulses >= CL_PROGRESS_WINDOW_USTEPS)
-            {
-                if ((abs_i32(err) + CL_PROGRESS_MIN_LSB) >= windowStart)
-                {
-                    DBGF("  TRIM %s stalled: err=%ld lsb not shrinking\r\n",
-                         label, (long)err);
-                    return MV_STALL;
-                }
-                pulses = 0u;
-            }
-        }
-    }
-    DBGF("  TRIM %s timeout: err=%ld lsb\r\n", label, (long)err);
-    return MV_TIMEOUT;
-}
-
-static int8 fine_hold(int32 targetLsb, uint32 durationMs, const char *label)
-{
-    uint32 start = wall_ms();
-    uint32 elapsed = 0u;
-    uint32 lastLog = 0u;
-    uint32 spent = 0u;
-    int32 err = 0;
-    int32 windowStart = 0;
-    uint8 pulses = 0u;
-    int8 rc;
-
-    while (elapsed < durationMs)
-    {
-        rc = fine_update(targetLsb, &err, &spent);
-        if (rc < 0) { return rc; }
-        elapsed = wall_ms()-start;
-        if (rc == FINE_NO_DATA) { continue; }
-
-        if (rc == 0)
-        {
-            if (pulses == 0u) { windowStart = abs_i32(err); }
-            pulses++;
-            if (pulses >= CL_PROGRESS_WINDOW_USTEPS)
-            {
-                if ((abs_i32(err) + CL_PROGRESS_MIN_LSB) >= windowStart)
-                {
-                    return MV_STALL;
-                }
-                pulses = 0u;
-            }
-        }
-        else
-        {
-            pulses = 0u;
-        }
-
-        if ((elapsed - lastLog) >= 750u)
-        {
-            DBGF("  HOLD %s: err=%ld lsb\r\n", label, (long)err);
-            lastLog = elapsed;
-        }
-    }
-    return MV_OK;
-}
-
-/* ======================== move with slip recovery ======================= */
-/* Deliberately does NOT drop nENBL: coasting a gravity-loaded arm is worse
- * than a stalled winding, and nRESET must stay high or the DRV8825 indexer
- * snaps back to its home phase and yanks the rotor up to 2 full steps. */
-static void recover_pause(void)
-{
-    uint32 i;
-    for (i = 0u; i < (RECOVER_PAUSE_MS / 10u); i++)
-    {
-        CyDelay(10u);
-        (void)enc_sample();
-    }
-}
-
-static int8 move_to_lsb(int32 targetLsb, const char *label)
-{
-    uint32 rateCap = MOVE_RATE_MAX_USTEP_S;
-    uint8 attempt;
-    int32 limit = out_deg10_to_lsb(SOFT_LIMIT_OUT_DEG10);
-
-    if (abs_i32(targetLsb) > limit) { return MV_LIMIT; }
-
-    for (attempt = 0u; attempt < MOVE_MAX_ATTEMPTS; attempt++)
-    {
-        int32 deltaLsb;
-        int32 deltaUsteps;
-        int32 peak = 0;
-        int8 rc;
-
-        if (FAULT_ACTIVE()) { return MV_FAULT; }
-        if (enc_sample() == 0u)
-        {
-            if (g_enc.badStreak >= ENC_BAD_LIMIT) { return MV_ENCODER; }
-        }
-
-        /* Re-derive the commanded track from the measurement so that steps
-         * lost on a previous attempt cannot accumulate anywhere. */
-        cmd_reset_to_measured();
-
-        deltaLsb    = targetLsb - g_enc.pos;
-        deltaUsteps = lsb_to_usteps(deltaLsb);
-
-        if (abs_i32(deltaUsteps) > FAST_MOVE_MIN_USTEPS)
-        {
-            rc = move_fast(deltaUsteps, rateCap, &peak);
-            if ((rc == MV_FAULT) || (rc == MV_ENCODER)) { return rc; }
-
-            CyDelay(MOVE_SETTLE_MS);
-            (void)enc_sample();
-
-            if (rc == MV_SLIP)
-            {
-                rateCap >>= 1;
-                if (rateCap < MOVE_RATE_MIN_USTEP_S)
-                {
-                    rateCap = MOVE_RATE_MIN_USTEP_S;
-                }
-                DBGF("  RETRY %s: attempt %u at %lu ustep/s\r\n",
-                     label, (unsigned)(attempt + 2u), (unsigned long)rateCap);
-                recover_pause();
-                continue;
-            }
-
-            DBGF("  FAST %s: %ld usteps, peak slip %ld lsb (%ld%% of pull-out)\r\n",
-                 label, (long)deltaUsteps, (long)peak,
-                 (long)((peak * 100) / PULLOUT_LSB));
-        }
-
-        rc = fine_seek(targetLsb, label);
-        if (rc == MV_OK) { return MV_OK; }
-        if ((rc == MV_FAULT) || (rc == MV_ENCODER)) { return rc; }
-
-        rateCap >>= 1;
-        if (rateCap < MOVE_RATE_MIN_USTEP_S) { rateCap = MOVE_RATE_MIN_USTEP_S; }
-        DBGF("  RETRY %s: trim rc=%d, attempt %u at %lu ustep/s\r\n",
-             label, (int)rc, (unsigned)(attempt + 2u), (unsigned long)rateCap);
-        recover_pause();
-    }
-    return MV_GAVEUP;
-}
-
-static int8 move_to_out_deg10(int32 deg10, const char *label)
-{
-    int32 target = out_deg10_to_lsb(deg10);
-
-    DBGF("MOVE %s -> %s%ld.%ld out-deg (%ld lsb, %ld motor turns)\r\n",
-         label, ((deg10 < 0) ? "-" : ""),
-         (long)(abs_i32(deg10) / 10), (long)(abs_i32(deg10) % 10),
-         (long)target, (long)(target / ENCODER_CPR));
-    return move_to_lsb(target, label);
-}
-
-/* ============================ direction probe =========================== */
-/* Learn which DIR level increases the AS5045 count. 16 microsteps is
- * 3.6 motor degrees = 0.09 output degrees, so the arm barely twitches. */
-static int8 direction_probe(int32 *probeDelta) __attribute__((unused));
-static int8 direction_probe(int32 *probeDelta)
-{
-    int32 before;
-    uint32 period = step_period_us(DIR_PROBE_RATE_USTEP_S);
-    uint8 i;
-
-    if (enc_sample() == 0u) { return MV_ENCODER; }
-    before = g_enc.pos;
-
-    for (i = 0u; i < DIR_PROBE_USTEPS; i++)
-    {
-        uint32 t0 = SU_NOW();
-        if (step_pulse_begin(1u) == 0u) { return MV_FAULT; }
-        wait_until_period(t0, period);
-    }
-    CyDelay(20u);
-    if (enc_sample() == 0u) { return MV_ENCODER; }
-
-    *probeDelta = g_enc.pos - before;
-    if (abs_i32(*probeDelta) < DIR_PROBE_MIN_LSB)  { return MV_STALL; }
-    if (abs_i32(*probeDelta) > SLIP_FAIL_LSB)      { return MV_SLIP; }
-
-    g_encIncDir = (*probeDelta > 0) ? 1u : 0u;
-    g_last_dir_level = 1u;
-    return MV_OK;
-}
-
-/* ============================== fail-safe =============================== */
-static void stop_forever(const char *reason, int8 code)
-{
-    stepper2_disable();
-    stepper1_disable();
-    LED_OFF();
-    DBGF("STOP: %s rc=%d; both steppers disabled (arm is no longer held)\r\n",
-         reason, (int)code);
-    for (;;)
-    {
-        LED_ON();  CyDelay(120u);
-        LED_OFF(); CyDelay(880u);
-    }
-}
-
 /* --------------------------- hardware setup ----------------------------- */
 static void hw_init(void)
 {
@@ -1345,60 +851,6 @@ static void hw_init(void)
     CyGlobalIntEnable;
 #endif
     su_timer_start();
-}
-
-/* Open-loop motor/encoder diagnostic. Encoder state is reported but never
- * used to permit, stop or steer motion. Only the driver's nFAULT can stop it.
- * The fixed direction means the mechanism must be free to rotate forever. */
-static void continuous_rotation_diagnostic(void)
-{
-    as5045_t sample;
-    uint8 code;
-    uint32 stepCount = 0u;
-    uint32 period = step_period_us(DIAG_RATE_USTEP_S);
-    int32 deg100;
-
-    DBG("\r\n=== stepper2 continuous rotation + AS5045 raw monitor ===\r\n");
-    DBGF("OPEN LOOP: DIR=%u ustep=1/%u rate=%u ustep/s; encoder does not gate motion\r\n",
-         (unsigned)DIAG_DIR_LEVEL, (unsigned)USTEP_DIV,
-         (unsigned)DIAG_RATE_USTEP_S);
-
-    if (FAULT_ACTIVE())
-    {
-        stop_forever("diagnostic start blocked by DRV8825 nFAULT", MV_FAULT);
-    }
-    stepper2_enable();
-    if (FAULT_ACTIVE())
-    {
-        stop_forever("diagnostic enable caused DRV8825 nFAULT", MV_FAULT);
-    }
-
-    for (;;)
-    {
-        uint32 t0 = SU_NOW();
-        if (step_pulse_begin(DIAG_DIR_LEVEL) == 0u)
-        {
-            stop_forever("DRV8825 nFAULT during continuous rotation", MV_FAULT);
-        }
-        stepCount++;
-
-        if ((stepCount % DIAG_LOG_EVERY_USTEPS) == 0u)
-        {
-            as5045_read(&sample);
-            code = classify(&sample);
-            deg100 = ((int32)sample.angle * 36000) / ENCODER_CPR;
-            DBGF("ROT n=%lu raw=0x%05lX ang=%u (%ld.%02ld deg) OCF=%u COF=%u "
-                 "LIN=%u INC=%u DEC=%u PAR=%u(%s) state=%s\r\n",
-                 (unsigned long)stepCount, (unsigned long)sample.raw,
-                 (unsigned)sample.angle,
-                 (long)(deg100 / 100), (long)(deg100 % 100),
-                 (unsigned)sample.ocf, (unsigned)sample.cof,
-                 (unsigned)sample.lin, (unsigned)sample.mag_inc,
-                 (unsigned)sample.mag_dec, (unsigned)sample.par,
-                 (sample.par_ok != 0u) ? "ok" : "BAD", state_name(code));
-        }
-        wait_until_period(t0, period);
-    }
 }
 
 /* ============================ keyboard jog ============================== */
@@ -3183,7 +2635,7 @@ static void jog_rx_service(void)
     }
 }
 
-static void jog_run(uint8 encOk) __attribute__((noreturn, unused));
+static void jog_run(uint8 encOk) __attribute__((noreturn));
 static void jog_run(uint8 encOk)
 {
     uint32 tTick;
@@ -3277,52 +2729,6 @@ static void jog_run(uint8 encOk)
     }
 }
 
-/* ================================ demo ================================== */
-static void demo_run(void) __attribute__((unused));
-static void demo_run(void)
-{
-    uint32 cycle = 0u;
-    int8 rc;
-
-    DBGF("\r\nDEMO: forward +%ld.%ld then reverse -%ld.%ld output degrees, "
-         "%lu ms hold at each end.\r\n",
-         (long)(DEMO_OUTPUT_DEG10 / 10), (long)(DEMO_OUTPUT_DEG10 % 10),
-         (long)(DEMO_OUTPUT_DEG10 / 10), (long)(DEMO_OUTPUT_DEG10 % 10),
-         (unsigned long)DEMO_HOLD_MS);
-    DBGF("Each leg is %ld motor turns. CHECK THE JOINT HAS THAT TRAVEL. "
-         "Starting in %u s...\r\n",
-         (long)((out_deg10_to_lsb(2 * DEMO_OUTPUT_DEG10)) / ENCODER_CPR),
-         (unsigned)DEMO_ARM_COUNTDOWN_S);
-    {
-        uint32 s;
-        for (s = DEMO_ARM_COUNTDOWN_S; s > 0u; s--)
-        {
-            DBGF("  %lu...\r\n", (unsigned long)s);
-            LED_ON();  CyDelay(500u);
-            LED_OFF(); CyDelay(500u);
-        }
-    }
-
-    for (;;)
-    {
-        cycle++;
-
-        /* ---------------------------- forward ---------------------------- */
-        DBGF("\r\nCYCLE %lu FORWARD\r\n", (unsigned long)cycle);
-        rc = move_to_out_deg10(DEMO_OUTPUT_DEG10, "fwd");
-        if (rc != MV_OK) { stop_forever("forward move failed", rc); }
-        rc = fine_hold(out_deg10_to_lsb(DEMO_OUTPUT_DEG10), DEMO_HOLD_MS, "fwd");
-        if (rc != MV_OK) { stop_forever("fault while holding the forward end", rc); }
-
-        /* ---------------------------- reverse ---------------------------- */
-        DBGF("\r\nCYCLE %lu REVERSE\r\n", (unsigned long)cycle);
-        rc = move_to_out_deg10(-DEMO_OUTPUT_DEG10, "rev");
-        if (rc != MV_OK) { stop_forever("reverse move failed", rc); }
-        rc = fine_hold(out_deg10_to_lsb(-DEMO_OUTPUT_DEG10), DEMO_HOLD_MS, "rev");
-        if (rc != MV_OK) { stop_forever("fault while holding the reverse end", rc); }
-    }
-}
-
 /* ================================= main ================================= */
 int main(void)
 {
@@ -3336,11 +2742,6 @@ int main(void)
 
     hw_init();
     CyDelay(200u);  /* MODE floating/LOW needs at most 80 ms until OCF=1. */
-
-    if (CONTINUOUS_ROTATION_DIAGNOSTIC != 0u)
-    {
-        continuous_rotation_diagnostic();
-    }
 
     DBG("\r\nSELFTEST START: static inputs and AS5045, both drivers disabled\r\n");
     for (count = 0u; count < ENCODER_SELFTEST_MS / 50u; count++)
@@ -3365,19 +2766,7 @@ int main(void)
          (unsigned)(CyPins_ReadPin(PIN_LIMIT1) != 0u), (unsigned)(CyPins_ReadPin(PIN_ARM2_NPN) != 0u));
     DBG("SELFTEST is electrical status only: motor power/motion and switch wiring need bench verification\r\n");
     cmd_reset_to_measured();
-#if (KEYBOARD_JOG != 0u)
     jog_run(encOk);
-#else
-    {
-        int32 probeDelta;
-        if (!encOk || FAULT_ACTIVE() || HARD_LIMIT_ACTIVE())
-        { stop_forever("demo preflight failed", MV_ENCODER); }
-        stepper2_enable();
-        if (direction_probe(&probeDelta) != MV_OK)
-        { stop_forever("demo direction probe failed", MV_ENCODER); }
-        demo_run();
-    }
-#endif
     return 0;
 }
 
