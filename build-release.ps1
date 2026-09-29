@@ -15,10 +15,15 @@ if ($running) { throw 'Close the host from this output directory before rebuildi
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Push-Location -LiteralPath $repo
 try {
-    $sources = @('DRV8825.cydsn\main.c','DRV8825.cydsn\DRV8825.cyprj','DRV8825.cydsn\DRV8825.cydwr','DRV8825.cydsn\TopDesign\TopDesign.cysch','Commissioning\Commissioning.csproj','tests\test_stage1.py','build-release.ps1','verify-creator-pins.ps1','RELEASE_VERSION','WORKBENCH_HARDENING.md','RUN_REVIEW_20260929.md')
+    $sources = @('DRV8825.cydsn\main.c','DRV8825.cydsn\DRV8825.cyprj','DRV8825.cydsn\DRV8825.cydwr','DRV8825.cydsn\TopDesign\TopDesign.cysch','Commissioning\Commissioning.csproj','tests\test_stage1.py','build-release.ps1','verify-creator-pins.ps1','RELEASE_VERSION','README.md','CHANGELOG.md','docs\PROTOCOL.md','docs\STATE_MODEL.md','docs\UART_DIAGNOSIS.md','docs\history\RUN_REVIEW_20260929.md','tools\check-log.py')
     $sources += Get-ChildItem -LiteralPath Commissioning -Filter '*.cs' | ForEach-Object { 'Commissioning\' + $_.Name }
     $sourceHashes = @{}
     foreach ($source in $sources) { $sourceHashes[$source] = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash }
+    # Numbers are read from main.c itself (macro value, trailing 'u' dropped) for the contract check and the report.
+    $mainText = Get-Content -LiteralPath 'DRV8825.cydsn\main.c' -Raw
+    function Def([string]$name) {
+        ([regex]::Match($mainText, '(?m)^#define\s+' + [regex]::Escape($name) + '\s+\(?"?(-?[A-Za-z0-9_.-]+)"?\)?').Groups[1].Value) -replace 'u$', ''
+    }
     foreach ($reportName in @('BUILD_REPORT.txt','SHA256SUMS.txt','SOURCE_SHA256SUMS.txt')) {
         $reportPath=Join-Path $dest $reportName
         if (Test-Path -LiteralPath $reportPath) { Remove-Item -LiteralPath $reportPath }
@@ -30,6 +35,35 @@ try {
     Write-Host 'Publishing host...'
     dotnet publish Commissioning/Commissioning.csproj -c Release -r win-x64 --self-contained false -o (Join-Path $dest 'host') --nologo *> (Join-Path $dest 'host-build.log')
     if ($LASTEXITCODE -ne 0) { throw "Host build failed; see $dest\host-build.log" }
+    Write-Host 'Checking the numbers shared with the firmware...'
+    $contractFile = Join-Path $dest 'contract.txt'
+    $process = Start-Process -FilePath (Join-Path $dest 'host\TwoLinkCommissioning.exe') -ArgumentList @('--print-contract', ('"' + $contractFile + '"')) -WindowStyle Hidden -Wait -PassThru
+    if ($process.ExitCode -ne 0) { throw 'Host contract dump failed.' }
+    # DeviceContract.cs name -> the main.c macros that must hold the same value.
+    $shared = [ordered]@{
+        FullStepsPerRev = 'MOTOR_FULLSTEPS_REV', 'ARM2_MOTOR_FULLSTEPS_REV'; Microsteps = 'USTEP_DIV'; Arm1GearRatio = 'GEAR_RATIO'
+        Arm2GearRatioX100 = 'ARM2_GEAR_RATIO_X100'; EncoderCounts = 'ENCODER_CPR'; RateMin = 'CFG_RATE_MIN'
+        Arm1RateMax = 'CFG_RATE_MAX_AXIS1'; Arm2RateMax = 'CFG_RATE_MAX_AXIS2'; AccelMin = 'CFG_ACCEL_MIN'
+        Arm1AccelMax = 'CFG_ACCEL_MAX_AXIS1'; Arm2AccelMax = 'CFG_ACCEL_MAX_AXIS2'
+        PlanRateMax = 'PTP_RATE_MAX', 'TRAJ_RATE_MAX'; PlanAccelMax = 'PTP_ACCEL', 'TRAJ_ACCEL_MAX'; HomeSlowRate = 'HOME_SLOW_RATE_USTEP_S'
+        TrajCapacity = 'TRAJ_CAPACITY'; TrajNodeMinMs = 'TRAJ_NODE_MIN_MS'; TrajNodeMaxMs = 'TRAJ_NODE_MAX_MS'
+        TrajTotalMaxMs = 'TRAJ_TOTAL_MAX_MS'; JointLimitCdMax = 'CFG_JOINT_CD_MAX'; DeadmanMs = 'JOG_DEADMAN_MS'; ProtocolVersion = 'PROTO_VERSION'
+    }
+    $hostValues = @{}
+    foreach ($line in Get-Content -LiteralPath $contractFile) { $name, $value = $line -split '=', 2; $hostValues[$name] = [int]$value }
+    $mismatch = @()
+    foreach ($name in $shared.Keys) {
+        foreach ($macro in $shared[$name]) {
+            if ([int](Def $macro) -ne $hostValues[$name]) { $mismatch += "$name=$($hostValues[$name]) but main.c $macro=$(Def $macro)" }
+        }
+    }
+    if ($hostValues['Arm1StepsPerRev'] -ne [int](Def 'MOTOR_FULLSTEPS_REV') * [int](Def 'USTEP_DIV') * [int](Def 'GEAR_RATIO')) { $mismatch += 'Arm1StepsPerRev differs from main.c' }
+    if ($hostValues['Arm2StepsPerRev'] -ne [int](Def 'ARM2_MOTOR_FULLSTEPS_REV') * [int](Def 'USTEP_DIV') * [int](Def 'ARM2_GEAR_RATIO_X100') / 100) { $mismatch += 'Arm2StepsPerRev differs from main.c' }
+    $unchecked = @($hostValues.Keys | Where-Object { -not $shared.Contains($_) -and $_ -notin @('Arm1StepsPerRev', 'Arm2StepsPerRev') })
+    if ($unchecked) { $mismatch += "not compared with main.c: $($unchecked -join ', ')" }
+    if ($mismatch) { throw ("Host and firmware disagree on shared numbers:" + [Environment]::NewLine + ($mismatch -join [Environment]::NewLine)) }
+    $contractLine = "Host/firmware contract: $($hostValues.Count) shared numbers (DeviceContract.cs) agree with main.c."
+    Write-Host $contractLine
     Write-Host 'Testing UI, protocol, planner, recorder; rendering offline screenshots...'
     $snapshot = Join-Path $dest 'preview.png'
     $process = Start-Process -FilePath (Join-Path $dest 'host\TwoLinkCommissioning.exe') -ArgumentList @('--self-test','--snapshot',('"' + $snapshot + '"')) -WindowStyle Hidden -Wait -PassThru
@@ -43,27 +77,45 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "$shape execution checks failed." }
     }
     Copy-Item -LiteralPath 'DRV8825.cydsn\CortexM3\ARM_GCC_541\Debug\DRV8825.hex' -Destination (Join-Path $dest 'firmware.hex')
-    Copy-Item -LiteralPath 'WORKBENCH_HARDENING.md' -Destination (Join-Path $dest 'README.md')
-    Copy-Item -LiteralPath 'RUN_REVIEW_20260929.md' -Destination (Join-Path $dest 'RUN_REVIEW_20260929.md')
+    Copy-Item -LiteralPath 'README.md' -Destination (Join-Path $dest 'README.md')
+    Copy-Item -LiteralPath 'CHANGELOG.md' -Destination (Join-Path $dest 'CHANGELOG.md')
+    if (Test-Path -LiteralPath (Join-Path $dest 'docs')) { Remove-Item -LiteralPath (Join-Path $dest 'docs') -Recurse -Force }
+    Copy-Item -LiteralPath 'docs' -Destination (Join-Path $dest 'docs') -Recurse
+    New-Item -ItemType Directory -Force -Path (Join-Path $dest 'tools') | Out-Null
+    Copy-Item -LiteralPath 'tools\check-log.py' -Destination (Join-Path $dest 'tools')
+    # Facts only: everything below is read from the sources or from this run's own logs, so it cannot go stale.
+    function Deg([string]$name) { [math]::Round([int](Def $name) / 100.0, 2) }
+    $describe = 'unknown'; $branch = 'unknown'; $hwTags = 'none'
+    try {
+        $describe = (git describe --tags --always --dirty | Out-String).Trim()
+        $branch = (git rev-parse --abbrev-ref HEAD | Out-String).Trim()
+        $tags = @(git tag --points-at HEAD | Where-Object { $_ -like 'hw-tested/*' })
+        if ($tags.Count) { $hwTags = $tags -join ', ' }
+    } catch { }
+    # Creator only prints its size lines when it actually links, so read the ELF itself.
+    $sizes = (& (Join-Path (Split-Path $Creator) 'cyelftool.exe') -S 'DRV8825.cydsn\CortexM3\ARM_GCC_541\Debug\DRV8825.elf' | Out-String)
+    $flashBytes = [regex]::Match($sizes, 'code:(\d+)').Groups[1].Value; $sramBytes = [regex]::Match($sizes, 'sram:(\d+)').Groups[1].Value
+    $hexHash = (Get-FileHash -LiteralPath (Join-Path $dest 'firmware.hex') -Algorithm SHA256).Hash.Substring(0, 16).ToLower()
     $report = @(
         "Two-Link Studio $release build - $(Get-Date -Format o)",
-        'Creator 4.4 ARM GCC 5.4 Debug firmware; .NET 10 Windows WPF Release host.',
-        'PTP_COMMISSIONED=1; boot defaults q1 +/-30, q2 +/-60 degrees. Host synchronizes user limits while disabled; motion is gated until both axes match. Range fields use 0.01 degree precision, within +/-180 and containing zero.',
-        'Global motion settings require stage2-v7-global1: per-axis rates/acceleration acknowledged while disabled. Preview/CSV/plot share timing; jog/home/PTP obey the configured profile and existing mode caps.',
-        'HostUart: UDB UART 115200 8N1, RX P12[6], TX P12[7], 256-byte RX/TX interrupt buffers.',
-        'v7 host writes two copies of each byte with >=0.5 ms spacing; firmware deduplicates them into one frame. Data and command frames are 36 wire bytes; the compact heartbeat (D5..D7, advertised by short_hb=1) is 6 wire bytes. Frames are written by one dedicated thread; a heartbeat follows each data frame and idle spacing is >=20 ms after a completed heartbeat.',
-        'CRC + control sequence/epoch protect enable, home and input leases; raw STOP remains immediate.',
-        'Hardware monotonic deadlines, 250 ms deadman, 256-384 ms foreground-fed watchdog; no pulse catch-up.',
-        'Encoder gap/jump/overflow latches position invalid until explicit enable establishes a new origin.',
+        "Source: git $describe on branch $branch (hw-tested tag on this commit: $hwTags)",
+        "Firmware: FW_BUILD_ID=$(Def 'FW_BUILD_ID'), PROTO_VERSION=$(Def 'PROTO_VERSION'), firmware.hex sha256=$hexHash..., code $flashBytes of 262144 bytes, SRAM $sramBytes of 65536 bytes (cyelftool -S)",
+        'Toolchain: Creator 4.4 ARM GCC 5.4 Debug firmware; .NET 10 Windows WPF Release host.',
+        "Defaults in main.c: PTP_COMMISSIONED=$(Def 'PTP_COMMISSIONED'); boot joint ranges q1 $(Deg 'PTP_MIN1_CD')..$(Deg 'PTP_MAX1_CD'), q2 $(Deg 'PTP_MIN2_CD')..$(Deg 'PTP_MAX2_CD') degrees (software bounds, not measured mechanical limits); deadman $(Def 'JOG_DEADMAN_MS') ms.",
+        'HostUart: UDB UART 115200 8N1, RX P12[6], TX P12[7], 256-byte RX/TX interrupt buffers (checked by verify-creator-pins.ps1).',
+        'Protocol, frame formats and state model: docs/PROTOCOL.md and docs/STATE_MODEL.md (in this folder).',
+        (Get-Content (Join-Path $dest 'pin-checks.log') | Where-Object { $_ -like 'PASS:*' }),
+        $contractLine,
         'Host self-test passed: guards, parameter roundtrip, recording, numerical planning, UI snapshots.',
-        (Get-Content (Join-Path $dest 'heartbeat-tests.txt') | Where-Object { $_ -like 'v7 real upload:*' }),
-        (Get-Content (Join-Path $dest 'firmware-tests.log') -Tail 1),
+        (Get-Content (Join-Path $dest 'heartbeat-tests.txt') | Where-Object { $_ -match 'UI lease max gap' }),
+        (Get-Content (Join-Path $dest 'firmware-tests.log') | Where-Object { $_ -like 'fuzz coverage*' -or $_ -like '*actual-C simulation cases passed*' }),
         ('Line: ' + (Get-Content (Join-Path $dest 'line-tests.log') -Tail 1)),
         ('Rectangle: ' + (Get-Content (Join-Path $dest 'rectangle-tests.log') -Tail 1)),
-        'No serial connection, programming, or real motor movement performed.',
+        'No serial connection, programming, or real motor movement performed by this build.',
         'Screenshots contain explicitly marked simulated data, not hardware evidence.',
         'Arm2 and pen XY are not measured; real-machine acceptance and calibration remain with operator.'
     )
+    $report = @($report | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
     foreach ($source in $sources) {
         if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $sourceHashes[$source]) {
             throw "Source changed during build: $source. Rebuild before using this package."
