@@ -1,7 +1,7 @@
 namespace TwoLinkCommissioning;
 
 // Integer pulse limits are the shared host/firmware settings. Mode caps remain
-// those already commissioned: jog 800/600, home <= phase cap, PTP/plot 600/800.
+// set in DeviceContract: jog/home keep their own lower caps, PTP/plot use PlanRateMax/PlanAccelMax.
 public readonly record struct MotionProfile(int R1, int R2, int A1, int A2)
 {
     public static double StepsPerDegree(int axis) => (axis == 0 ? DeviceContract.Arm1StepsPerRev : DeviceContract.Arm2StepsPerRev) / 360.0;
@@ -21,5 +21,4 @@ public readonly record struct MotionProfile(int R1, int R2, int A1, int A2)
     public PlanningRates DrawingRates(double feed) => new(feed, Math.Min(R1,DeviceContract.PlanRateMax)/StepsPerDegree(0),
         Math.Min(R2,DeviceContract.PlanRateMax)/StepsPerDegree(1), Math.Min(A1,DeviceContract.PlanAccelMax)/StepsPerDegree(0), Math.Min(A2,DeviceContract.PlanAccelMax)/StepsPerDegree(1));
     public JointPose Axis(int axis) => axis == 0 ? new(R1/100.0,A1/100.0) : new(R2/100.0,A2/100.0);
-    public string Description => $"点动上限电机1 {R1/StepsPerDegree(0):F2}、电机2（q2−q1） {R2/StepsPerDegree(1):F2} °/s；绘图/定位另限每轴 {DeviceContract.PlanRateMax} 微步/s、{DeviceContract.PlanAccelMax} 微步/s²；回零慢碰另限 {DeviceContract.HomeSlowRate} 微步/s。";
 }

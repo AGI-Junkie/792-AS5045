@@ -72,7 +72,8 @@ public static class PtpProtocol
         if (type is >= 6 and <= 8 && (pose.Q1 != 0 || pose.Q2 != 0 || value > (type == 6 ? 15 : 0)))
             throw new ArgumentException("控制数据包无效。");
         if (type == 9 && pose != Quantize(pose)) throw new ArgumentException("关节范围最多保留两位小数。");
-        if (type == 10 && (value>1 || pose!=Quantize(pose) || pose.Q1<0.2 || pose.Q1>(value==0?8:6) || pose.Q2<1 || pose.Q2>(value==0?200:120)))
+        if (type == 10 && (value>1 || pose!=Quantize(pose) || pose.Q1<0.2 || pose.Q1>(value==0?DeviceContract.Arm1RateMax:DeviceContract.Arm2RateMax)/100.0 ||
+                        pose.Q2<1 || pose.Q2>(value==0?DeviceContract.Arm1AccelMax:DeviceContract.Arm2AccelMax)/100.0))
             throw new ArgumentException("设备速度配置无效。");
         pose = Quantize(pose);
         if (type == 9 && (value > 1 || pose.Q1 >= pose.Q2 || pose.Q1 > 0 || pose.Q2 < 0))
@@ -105,7 +106,7 @@ public static class PtpProtocol
         Check(BinaryPrimitives.ReadUInt32LittleEndian(decoded.AsSpan(5)) == 7);
         Check(BinaryPrimitives.ReadInt16LittleEndian(decoded.AsSpan(9)) == -125);
         Check(BinaryPrimitives.ReadInt16LittleEndian(decoded.AsSpan(11)) == 250);
-        Check(BinaryPrimitives.ReadUInt16LittleEndian(decoded.AsSpan(13)) == 600);
+        Check(BinaryPrimitives.ReadUInt16LittleEndian(decoded.AsSpan(13)) == DeviceContract.PlanRateMax);
         Check(BinaryPrimitives.ReadUInt16LittleEndian(decoded.AsSpan(15)) == Crc(decoded.AsSpan(0, 15)));
         Check(PtpState.Parse("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=-6000 max1=6000 min2=-9000 max2=9000") is { Locked: false, Referenced: true });
         Check(PtpState.Parse("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=0 max1=0 min2=0 max2=0") is null);

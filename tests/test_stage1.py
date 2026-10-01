@@ -297,7 +297,7 @@ static void rates_test(const char *t) {
     jog_handle_byte(JOG_CMD_STOP);short_send(0,0);txq_flush_blocking();
     seq=g_controlSequence+1u;epoch=g_ptp.epoch;
     packetType=10;
-    ptp_send(seq,epoch,19,500,0,0);ptp_send(seq,epoch,801,500,0,0);
+    ptp_send(seq,epoch,19,500,0,0);ptp_send(seq,epoch,2501,500,0,0);
     ptp_send(seq,epoch,200,99,0,0);ptp_send(seq,epoch,200,20001,0,0);
     ptp_send(seq,epoch-1u,200,500,0,0);
     assert(g_motionRate[0]==800 && g_controlSequence<seq);
@@ -528,7 +528,7 @@ static void ptp_test(const char *t) {
         assert(!g_ptp.active&&!g_ptp.reference&&!g_ptpRx.active);assert_stopped();return;
     }
     if(!strcmp(t,"ptp_stale_epoch")||!strcmp(t,"ptp_range")||!strcmp(t,"ptp_rate")) {
-        ptp_send(1,!strcmp(t,"ptp_stale_epoch")?epoch-1:epoch,!strcmp(t,"ptp_range")?7000:125,-250,!strcmp(t,"ptp_rate")?601:200,0);
+        ptp_send(1,!strcmp(t,"ptp_stale_epoch")?epoch-1:epoch,!strcmp(t,"ptp_range")?7000:125,-250,!strcmp(t,"ptp_rate")?2501:200,0);
         assert(!g_ptp.active&&p1==simPulse1&&p2==simPulse2);return;
     }
     ptp_send(1,epoch,target1,target2,200,0);assert(g_ptp.active&&g_ptp.sequence==1);
@@ -619,8 +619,21 @@ static void traj_rx_fault(const char *t) {
     assert(g_ptp.sequence==seq&&g_traj.count==count&&!g_ptp.active); /* corrupt retry cannot commit or RUN */
     simPtpWireN=0; /* later valid packets exercise the original sequence/CRC path */
 }
+/* The real host disables, sets both axes' rates (type 10) and only then enables. Host plans are built for the
+ * configured speeds, so a fixture that leaves the boot defaults (800/600) rejects them as "rate/velocity change". */
+static void host_rates_config(void) {
+    unsigned axis; uint32 epoch;
+    jog_handle_byte(JOG_CMD_STOP);short_send(0,0);txq_flush_blocking();
+    epoch=g_ptp.epoch;packetType=10;
+    for(axis=0;axis<2;axis++)
+        ptp_send(g_controlSequence+1u,epoch,axis?CFG_RATE_MAX_AXIS2:CFG_RATE_MAX_AXIS1,axis?CFG_ACCEL_MAX_AXIS2:CFG_ACCEL_MAX_AXIS1,axis,0);
+    packetType=1;txq_flush_blocking();
+    assert(g_motionRate[0]==CFG_RATE_MAX_AXIS1&&g_motionRate[1]==CFG_RATE_MAX_AXIS2);
+    stage_enable();assert(g_motionEnabled);
+}
 static void traj_test(const char *t) {
     unsigned i,p1,p2; int32 origin1,origin2; uint32 seq=1;
+    if(!strncmp(t,"traj_host_plan",14)||!strcmp(t,"traj_manual_plan")) host_rates_config();
     if(!strcmp(t,"traj_manual_plan")) {traj_send(5,seq++,0,0,0);assert(!simPulse1&&!simPulse2);}
     else jog_home_all();
     for(i=0;i<250000&&g_home.phase!=HOME_IDLE&&g_motionEnabled;i++)cycle(1);

@@ -89,6 +89,7 @@ public sealed partial class ControlWindow : Window
     private string experimentPhase = "idle";
     private static string ExperimentRoot => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "Experiments");
     private ExecutionTrajectory? uploading;
+    private ExecutionTrajectory? uploaded;   // complete plan the device holds, waiting for 执行图形
     private int uploadNext, trajectoryIndex, trajectoryTotal;
     private bool supportsTrajectory, executing;
     private uint trajectoryEpoch, trajectoryRunSequence;
@@ -109,6 +110,7 @@ public sealed partial class ControlWindow : Window
         heartbeatTimer.Tick += OnHeartbeatTick;
         xyPreview.PointMoveRequested += RequestPoint;
         xyPreview.TrajectoryRequested += RequestTrajectory;
+        xyPreview.ExecuteRequested += RequestExecute;
         xyPreview.LimitsChanged += OnLimitsChanged;
         PreviewKeyDown += OnKeyDown; PreviewKeyUp += OnKeyUp;
         Deactivated += (_, _) => {
@@ -121,7 +123,7 @@ public sealed partial class ControlWindow : Window
         RefreshPorts(); UpdateControls();
     }
 
-    private static Button MakeButton(string title) => new() { Content = title, Margin = new Thickness(4), Padding = new Thickness(12, 8, 12, 8), MinHeight = 38 };
+    private static Button MakeButton(string title) => new() { Content = title, Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), MinHeight = 28 };
     private void AddJog(Panel row, string title, int bit)
     {
         var button = MakeButton(title); WorkbenchTheme.Primary(button); jogButtons.Add(button); row.Children.Add(button);
@@ -160,7 +162,7 @@ public sealed partial class ControlWindow : Window
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Referenced: true, Epoch: > 0 } &&
         (DateTime.UtcNow - lastPtpAt).TotalSeconds < 2 && (!supportsTelemetry ||
         telemetry is { Referenced: true, Inputs: 0 } && telemetry.Epoch == ptp.Epoch && (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2);
-    private bool CanManualReference => LimitsReady && supportsManualReference && compatible && enabled && hardwareReady && !homing && !stopPending && !PointBusy &&
+    private bool CanManualReference => LimitsReady && supportsManualReference && compatible && enabled && hardwareReady && !homing && !stopPending && !PointBusy && uploaded is null &&
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Epoch: > 0 } &&
         (DateTime.UtcNow - lastPtpAt).TotalSeconds < 2;
     private bool CanJog => LimitsReady && compatible && enabled && !homing && !stopPending && !PointBusy && IsActive && (DateTime.UtcNow - lastStateAt).TotalSeconds < 2;
@@ -182,6 +184,7 @@ public sealed partial class ControlWindow : Window
             recording = new StreamWriter(path, false, new UTF8Encoding(false)) { AutoFlush = true };
             logPath.Text = "日志自动保存：" + path;
             serial = new SerialPort(port, 115200, Parity.None, 8, StopBits.One) { WriteTimeout = 100, ReadTimeout = 10, DtrEnable = false, RtsEnable = false };
+            serial.DataReceived += (_, _) => WakeSerialPump();
             serial.Open(); openedAt = DateTime.UtcNow; lastStateAt = DateTime.MinValue;
             lastHeartbeatSent = 0;
             ResetWireSession();
@@ -247,20 +250,33 @@ public sealed partial class ControlWindow : Window
             PublishHeartbeatLease();
         });
     }
+    private void PumpSerial()
+    {
+        if (serial is not { IsOpen: true }) return;
+        pending.Append(serial.ReadExisting());
+        string text = pending.ToString(); int end;
+        while ((end = text.IndexOf('\n')) >= 0)
+        {
+            HandleLine(text[..end].TrimEnd('\r')); text = text[(end + 1)..];
+        }
+        pending.Clear();
+        if (text.Length <= 4096) pending.Append(text);
+        else Append("HOST discarded oversized/unterminated serial line");
+    }
+    // Each trajectory node waits for its ACK, so a 40 ms poll adds ~20 ms per node. Read as soon as bytes
+    // arrive (still on the UI thread); the Tick keeps polling as the fallback if the driver never raises this.
+    private int pumpQueued;
+    private void WakeSerialPump()
+    {
+        if (Interlocked.Exchange(ref pumpQueued, 1) == 1) return;
+        Dispatcher.BeginInvoke(DispatcherPriority.Input, () => { Volatile.Write(ref pumpQueued, 0); SafeAction(PumpSerial); });
+    }
     private void Tick()
     {
         SafeAction(() =>
         {
             if (serial is not { IsOpen: true }) throw new IOException("串口已关闭");
-            pending.Append(serial.ReadExisting());
-            string text = pending.ToString(); int end;
-            while ((end = text.IndexOf('\n')) >= 0)
-            {
-                HandleLine(text[..end].TrimEnd('\r')); text = text[(end + 1)..];
-            }
-            pending.Clear();
-            if (text.Length <= 4096) pending.Append(text);
-            else Append("HOST discarded oversized/unterminated serial line");
+            PumpSerial();
             RetryPendingPoint(DateTime.UtcNow);
             CheckControlTimeout(DateTime.UtcNow);
             CheckTelemetryTimeout(DateTime.UtcNow);
@@ -435,7 +451,8 @@ public sealed partial class ControlWindow : Window
     private void ShowDeviceState()
     {
         if (!stopPending && manualReferencePending) { state.Text = "正在确认人工伸直零位；此指令不驱动电机。"; return; }
-        if (!stopPending && uploading is not null) { state.Text = $"轨迹上传：{Math.Min(uploadNext, uploading.Nodes.Length)} / {uploading.Nodes.Length} 点；等待确认，上传时不运动"; return; }
+        if (!stopPending && uploading is not null) { state.Text = uploadNext >= uploading.Nodes.Length ? "正在启动图形执行；等待设备确认" : $"轨迹上传：{Math.Min(uploadNext, uploading.Nodes.Length)} / {uploading.Nodes.Length} 点；等待确认，上传时不运动"; return; }
+        if (!stopPending && uploaded is not null) { state.Text = $"图形已上传（{uploaded.Nodes.Length} 点，未运动）；落笔后点“执行图形”"; return; }
         if (!stopPending && executing) { state.Text = $"图形执行：{trajectoryIndex} / {trajectoryTotal} 段\narm2 为命令步数；末端位置未实测。"; return; }
         state.Text = stopPending ? "停止已请求，等待固件确认" : PointBusy ?
             (ptp is { Active: 2 } ? "XY 单点：停稳并检查到位" : ptp is { Active: 1 } ? "XY 单点：双轴协调移动中" : "XY 单点：等待固件接收") +
@@ -449,9 +466,18 @@ public sealed partial class ControlWindow : Window
             if (!AtStart(plan.Nodes[0].Pose)) { lastStop.Text = "尚未确认到达这条轨迹的起点。请先低速移到起点，等待到位反馈，再执行。"; UpdateControls(); return; }
             if ((ulong)pointSequence + (uint)plan.Nodes.Length + 1 > uint.MaxValue) throw new InvalidOperationException("运动序号用尽，请重启设备后回零。");
             StartExperiment("trajectory",pointSequence+1,plan.Nodes);
-            uploading = plan; uploadNext = 0; trajectoryEpoch = ptp.Epoch; uploadStartedAt = DateTime.UtcNow;
+            uploading = plan; uploaded = null; uploadNext = 0; trajectoryEpoch = ptp.Epoch; uploadStartedAt = DateTime.UtcNow;
             xyPreview.PausePlayback();
             Append($"HOST trajectory upload start nodes={plan.Nodes.Length} duration={plan.Duration:F3}s; no automatic approach");
+            SendNextTrajectoryPacket();
+        });
+    }
+    private void RequestExecute()
+    {
+        if (uploaded is not { } plan || !CanPoint || ptp is null || ptp.Epoch != trajectoryEpoch || !AtStart(plan.Nodes[0].Pose)) return;
+        SafeAction(() => {
+            uploading = plan; uploaded = null; uploadNext = plan.Nodes.Length;
+            Append("HOST trajectory run requested; the device checks the start position again");
             SendNextTrajectoryPacket();
         });
     }
@@ -485,7 +511,12 @@ public sealed partial class ControlWindow : Window
             }
             pendingPoint = 0; lock (wireSync) { pointWire.Clear(); }
             if (run) { uploading = null; executing = true; }
-            else { uploadNext++; SendNextTrajectoryPacket(); }
+            else if (++uploadNext == plan.Nodes.Length) {
+                // Fully loaded: the device holds the plan and does not move until the operator asks for RUN.
+                uploading = null; uploaded = plan;
+                Append("HOST trajectory upload complete; waiting for the operator to start it (no automatic run)");
+            }
+            else SendNextTrajectoryPacket();
         }
         if (executing && seq == trajectoryRunSequence && epoch == trajectoryEpoch) {
             if (mode is not (3 or 4) || count != total || total < 2) { Stop(); return; }
@@ -496,23 +527,16 @@ public sealed partial class ControlWindow : Window
     }
     private void RequestPoint(JointPose pose)
     {
-        if (!CanPoint || ptp is null || !ptp.Limits.Contains(PtpProtocol.Quantize(pose))) return;
+        if (!CanPoint || uploaded is not null || ptp is null || !ptp.Limits.Contains(PtpProtocol.Quantize(pose))) return;
         SafeAction(() => {
             if (pointSequence == uint.MaxValue) throw new InvalidOperationException("PTP 序号用尽，请重启设备后重新建立坐标参考。");
             if (xyPreview.RequestedProfile is not { } profile || telemetry is null) return;
-            var rates=xyPreview.RequestedRates; var model=xyPreview.Model;
-            double d1=Math.Abs(pose.Q1-telemetry.Command.Q1), d2=Math.Abs((pose.Q2-pose.Q1)-(telemetry.Command.Q2-telemetry.Command.Q1));
-            double steps=Math.Max(d1*MotionProfile.StepsPerDegree(0),d2*MotionProfile.StepsPerDegree(1));
-            // Link 2 moves by d(q1)+d(elbow); use a conservative Cartesian travel bound.
-            double lengthBound=((model.L1+model.L2)*d1+model.L2*d2)*Math.PI/180;
             double rate=Math.Min(DeviceContract.PlanRateMax,Math.Min(profile.R1,profile.R2));
-            if(lengthBound>0) rate=Math.Min(rate,rates.Feed*steps/lengthBound);
-            if(rate<DeviceContract.RateMin) throw new ArgumentException($"当前位置到目标的末端限速需要低于设备 {DeviceContract.RateMin} 微步/s 下限；请提高末端速度或分段移动。");
             StartExperiment("point",pointSequence+1,[new(pose,0)]);
             pendingPoint = ++pointSequence; pointRequestedAt = DateTime.UtcNow;
             QueuePointPacket(PtpProtocol.Encode(pendingPoint, ptp.Epoch, pose,(ushort)Math.Floor(rate)));
             xyPreview.PausePlayback();
-            Append($"HOST PTP request seq={pendingPoint} q1={pose.Q1:F2} q2={pose.Q2:F2} rate={Math.Floor(rate)} usteps/s; global joint/feed limits; joint-space move, not a straight XY path");
+            Append($"HOST PTP request seq={pendingPoint} q1={pose.Q1:F2} q2={pose.Q2:F2} rate={Math.Floor(rate)} usteps/s; global joint limits; joint-space move, not a straight XY path");
             ShowDeviceState();
             UpdateControls();
         });
@@ -525,6 +549,7 @@ public sealed partial class ControlWindow : Window
             pointWire.Clear();
             foreach (byte b in packet) pointWire.Enqueue(b);
         }
+        wireWake.Set();
     }
     private void FlushHardwarePacket(Action<byte[], int, int> write)
     {
@@ -564,7 +589,7 @@ public sealed partial class ControlWindow : Window
         lock (wireSync) { pointWire.Clear(); }
         pendingPoint = 0; ptp = null;
         manualReferencePending = false;
-        uploading = null; executing = false;
+        uploading = uploaded = null; executing = false;
         keyboardMask = mouseMask = 0;
         pendingControl = null; telemetry = null;
         if (serial is not null) {
@@ -582,6 +607,8 @@ public sealed partial class ControlWindow : Window
         Volatile.Write(ref limitsMotionAllowed, LimitsReady ? 1 : 0);
         if (manualReferenceConfirmedEpoch!=0 && (!enabled || homing || ptp is not { Referenced:true } || ptp.Epoch!=manualReferenceConfirmedEpoch))
             InvalidateManualReferenceFeedback();
+        // The device forgets a loaded plan when its reference epoch changes or it is disabled.
+        if (uploaded is not null && (!enabled || homing || ptp is not { Referenced: true } || ptp.Epoch != trajectoryEpoch)) uploaded = null;
         xyPreview.SetEditingAllowed(!PointBusy && !homing);
         enable.IsEnabled = LimitsReady && compatible && !enabled && !stopPending && !PointBusy;
         manualReference.IsEnabled = CanManualReference;
@@ -595,35 +622,39 @@ public sealed partial class ControlWindow : Window
             !LimitsReady ? LimitsStatus :
             !enabled ? "未使能：请点“使能 / 重新检查”，再人工确认零位或回零。" :
             homing ? "正在回零：等待两轴完成并报告 HOME OK。" :
-            !homed ? (supportsManualReference ? "坐标参考未建立：把两杆摆直，点击上方“人工确认：当前位置为伸直零位”；也可选择开关回零。" : "坐标参考未建立：当前固件需开关回零；人工确认功能需要 stage2-v3。") :
+            !homed ? (supportsManualReference ? "坐标参考未建立：把两杆摆直，点击工具栏“人工确认当前位置为伸直零位”；也可选择开关回零。" : "坐标参考未建立：当前固件需开关回零；人工确认功能需要 stage2-v3。") :
             !feedbackReady ? "驱动、编码器或方向状态未就绪，请查看状态和停止原因。" :
             ptp is not { Referenced: true, Epoch: > 0 } ? "XY 参考无效：重新摆直并人工确认零位，或执行开关回零。" :
             (DateTime.UtcNow - lastPtpAt).TotalSeconds >= 2 ? "XY 固件状态超过 2 秒未更新，请检查通信。" :
             supportsTelemetry && (telemetry is null || (DateTime.UtcNow-lastTelemetryAt).TotalSeconds >= 2) ? "等待 v5 当前角度反馈；超过 2 秒请检查通信。" :
-            supportsTelemetry && telemetry is { Inputs: > 0 } ? "传感器或驱动输入触发；请查看左侧设备状态。" :
+            supportsTelemetry && telemetry is { Inputs: > 0 } ? "传感器或驱动输入触发；请查看右侧输入 / 状态。" :
             keyboardMask != 0 || mouseMask != 0 ? "请松开所有点动按键。" :
-            CanPoint ? (supportsTrajectory ? "设备已就绪：目标须通过下方范围检查，再移到轨迹起点并上传执行。固件范围为临时软件限制。" :
+            CanPoint ? (supportsTrajectory ? "设备已就绪：目标须通过下方范围检查，再移到轨迹起点，上传图形并落笔后执行。固件范围为临时软件限制。" :
                 "当前固件仅支持单点移动；图形执行需要 stage2-v2 固件。") :
             "单点执行：等待有效坐标参考、编码器反馈和新鲜固件状态。";
-        xyPreview.SetPointMoveState(CanPoint, reportedLimits, reason, supportsTrajectory, LimitsReady);
+        xyPreview.SetPointMoveState(CanPoint, reportedLimits, reason, supportsTrajectory, LimitsReady, uploaded);
         xyPreview.SetStartFeedback(supportsTelemetry && telemetry is { Referenced: true } && ptp is { Referenced: true } &&
             telemetry.Epoch == ptp.Epoch && telemetry.Sequence == ptp.Sequence && (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2 ? telemetry : null);
         readInputs.IsEnabled = compatible && !PointBusy && !homing;
+        referenceStatus.Text = "坐标参考：" + (ptp is { Referenced: true } ? "已建立" + (telemetry is { Referenced: true } ? " · " + telemetry.ReferenceName : "") : "未建立");
+        rangeStatus.Text = "关节范围：" + (LimitsReady ? "已同步" : "未同步");
+        leds[0].Fill = enabled ? WorkbenchTheme.Ok : WorkbenchTheme.Idle;
+        leds[1].Fill = !compatible ? WorkbenchTheme.Idle : ptp is { Referenced: true } ? WorkbenchTheme.Ok : WorkbenchTheme.Warn;
         connectionBadge.Text = compatible ? (framedControl ? "在线 · v7 校验控制" : hardwareUart ? "在线 · v6 硬件串口" : supportsTelemetry ? "在线 · v5 兼容慢速串口" : "在线 · 旧固件，建议更新") : "未连接 · 离线预览";
         bool statusFault=lastStop.Text.Length>0 && (!enabled || stopPending);
         bool statusBusy=PointBusy || homing || stopPending;
         string? statusMessage=stopPending?"停止请求已发送，等待设备确认":
             statusFault?lastStop.Text.Split('\n')[0]:
-            uploading is {} plan?$"上传 {Math.Min(uploadNext,plan.Nodes.Length)} / {plan.Nodes.Length} 点，上传期间不运动":
+            uploading is {} plan?(uploadNext>=plan.Nodes.Length?"正在启动图形执行，等待设备确认":$"上传 {Math.Min(uploadNext,plan.Nodes.Length)} / {plan.Nodes.Length} 点，上传期间不运动"):
             executing?$"正在绘制 {trajectoryIndex} / {trajectoryTotal} 段":
             manualReferencePending?"正在确认人工零位；等待设备确认，不运动":
             pendingControl is not null?$"正在{pendingControl}，等待设备确认":
             homing?"正在开关回零":PointBusy?"正在低速移动 / 到位检查":
             !compatible?"连接设备；离线可预览":!stage2?"当前固件仅支持点动，完整绘图需 v5":
             !LimitsReady?LimitsStatus:
-            !enabled?"请在设备页使能 / 重新检查":!homed?"请在设备页确认人工零位或回零":
+            !enabled?"请点工具栏“使能 / 重新检查”":!homed?"请点工具栏确认人工零位或回零":
             CanPoint?null:reason;
-        if(uploading is {} upload && uploadNext>0 && !statusFault)
+        if(uploading is {} upload && uploadNext>0 && uploadNext<upload.Nodes.Length && !statusFault)
             statusMessage+=$" · 预计剩余 {Math.Max(0,(DateTime.UtcNow-uploadStartedAt).TotalSeconds*(upload.Nodes.Length-uploadNext)/uploadNext):F0} 秒";
         double percent=uploading is {} p?uploadNext*100.0/p.Nodes.Length:executing?trajectoryIndex*100.0/Math.Max(1,trajectoryTotal):0;
         xyPreview.SetDeviceStatus(statusMessage,statusFault,statusBusy,percent,
@@ -655,7 +686,7 @@ public sealed partial class ControlWindow : Window
         pendingControl = null; telemetry = null; supportsTelemetry = supportsPacketRetry = false;
         lock (wireSync) { pointWire.Clear(); }
         pendingPoint = 0; ptp = null; stage2 = homed = feedbackReady = false;
-        uploading = null; executing = supportsTrajectory = false;
+        uploading = uploaded = null; executing = supportsTrajectory = false;
         manualReferencePending = supportsManualReference = hardwareReady = false;
         try { Send(0x79); } catch { /* Firmware heartbeat timeout remains the fallback. */ }
         hardwareUart = false; supportsShortHeartbeat = false; connectionBadge.ToolTip = null;
@@ -664,7 +695,7 @@ public sealed partial class ControlWindow : Window
         serial = null;
         compatible = enabled = homing = stopPending = false;
         pending.Clear(); state.Text = reason; inputs.Text = "输入状态已失效，需重新连接读取";
-        liveValues.Text="设备已断开；当前位置反馈无效。"; errorHistory.Clear(); DrawErrorPlot();
+        ShowFeedback(null, "设备已断开；当前位置反馈无效。"); errorHistory.Clear(); DrawErrorPlot();
         connect.Content = "连接"; ports.IsEnabled = true; UpdateControls();
         try { Append("HOST " + reason); } catch { }
         try { recording?.Dispose(); } catch { }
@@ -686,6 +717,7 @@ public sealed partial class ControlWindow : Window
         MotionProfileSelfTest();
         JointLimitsSyncSelfTest();
         StopRecoverySelfTest();
+        ShapeFlowSelfTest();
         // Accumulate step by step: a later failure used to discard every earlier
         // measurement, which is exactly the evidence needed to diagnose the failure.
         var heartbeatReport = new StringBuilder();
@@ -863,16 +895,21 @@ public sealed partial class ControlWindow : Window
         uint first = window.pendingPoint;
         window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={first} min1=-6000 max1=6000 min2=-9000 max2=9000");
         Check(window.pendingPoint == first && window.uploadNext == 0); // PTP status is not a node acknowledgement
+        uint lastSeq = 0;
         for (int i = 0; i < execution.Nodes.Length; i++) {
-            uint seq = window.pendingPoint;
+            uint seq = lastSeq = window.pendingPoint;
             window.TestLine($"TRAJ_STATE state={(i + 1 == execution.Nodes.Length ? 2 : 1)} count={i + 1} total={execution.Nodes.Length} index=0 seq={seq} epoch=8");
-            Check(window.uploadNext == i + 1 && window.pendingPoint == seq + 1);
+            Check(window.uploadNext == i + 1 && window.pendingPoint == (i + 1 == execution.Nodes.Length ? 0 : seq + 1)); // the last ACK ends the upload; RUN is a separate request
             if (i == 0) { // duplicate ack cannot enqueue the next node twice
                 window.TestLine($"TRAJ_STATE state=1 count=1 total={execution.Nodes.Length} index=0 seq={seq} epoch=8");
                 Check(window.uploadNext == 1 && window.pointWire.Count == 36);
             }
         }
-        Check(window.uploading is not null && !window.executing); // waits for explicit run acknowledgement
+        Check(window.uploading is null && window.uploaded == execution && !window.executing && window.pointWire.Count == 0 && window.CanPoint); // fully loaded, nothing moves
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={lastSeq} min1=-6000 max1=6000 min2=-9000 max2=9000"); StartSample(8, lastSeq); // the device reports the last node as its sequence
+        window.RequestPoint(new JointPose(1, 1)); window.RequestManualReference();
+        Check(window.pendingPoint == 0 && window.pointWire.Count == 0 && !window.CanManualReference); // the device refuses other moves while it holds a plan
+        window.RequestExecute(); Check(window.uploading is not null && window.uploaded is null && window.pendingPoint != 0 && window.pointWire.Count == 36);
         window.TestLine($"TRAJ_STATE state=3 count={execution.Nodes.Length} total={execution.Nodes.Length} index=1 seq={window.pendingPoint} epoch=8");
         Check(window.uploading is null && window.executing && window.pointWire.Count == 0 && window.pendingPoint == 0);
         window.TestLine($"TRAJ_STATE state=4 count={execution.Nodes.Length} total={execution.Nodes.Length} index={execution.Nodes.Length} seq={window.trajectoryRunSequence} epoch=8");
@@ -881,6 +918,7 @@ public sealed partial class ControlWindow : Window
         StartSample(8,window.trajectoryRunSequence);
         window.RequestTrajectory(execution); Check(window.uploading is not null);
         window.Stop(); Check(window.uploading is null && window.pointWire.Count == 0 && window.pendingPoint == 0);
+        window.uploaded = execution; window.UpdateControls(); Check(window.uploaded is null); // no reference, no held plan
         window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=9999 min1=-6000 max1=6000 min2=-9000 max2=9000");
         StartSample(9,9999);
         window.RequestTrajectory(execution);
@@ -907,12 +945,12 @@ public sealed partial class ControlWindow : Window
             string dir=Path.GetDirectoryName(snapshotPath)!;
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench.png"),1380,930);
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-compact.png"),1100,760);
-            window.sideTabs.SelectedIndex=1; window.diagnostics.IsExpanded=true;
+            window.diagnostics.IsExpanded=true;
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-feedback.png"),1380,930);
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-feedback-compact.png"),1100,760);
             window.diagnostics.IsExpanded=false; window.xyPreview.FitView(false);
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-full-arm.png"),1380,930);
-            window.xyPreview.FitView(true); window.sideTabs.SelectedIndex=0;
+            window.xyPreview.FitView(true);
             window.TestLine("STATE fw=stage2-v5 enabled=0 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
             window.connectionBadge.Text="离线界面检查 · 模拟未使能";
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-waiting.png"),1100,760);

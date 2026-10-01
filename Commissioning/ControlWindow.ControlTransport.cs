@@ -188,11 +188,13 @@ public sealed partial class ControlWindow
     // policy that actually ships.  Sleep only, never spin: the delay is recomputed
     // from the deadline each pass, so a late wake costs one bounded overshoot instead
     // of the compounding 15.6 ms quantisation that Thread.Sleep(1) produced.
+    // A queued trajectory packet cuts the wait short (wireWake) instead of sitting out up to 17 ms.
+    private readonly AutoResetEvent wireWake = new(false);
     private void WireIdleWait()
     {
         if (LeasedEpoch() == 0) { Thread.Sleep(5); return; }
         double remaining = MsUntilHeartbeatDue();
-        Thread.Sleep(remaining > 4 ? (int)(remaining - 3) : 1);
+        wireWake.WaitOne(remaining > 4 ? (int)(remaining - 3) : 1);
     }
 
     private string WireSessionSummary()

@@ -20,15 +20,15 @@ public static class DeviceContract
 
     // Rates and accelerations the host may configure (microsteps/s and microsteps/s^2).
     public const int RateMin = 20;                  // CFG_RATE_MIN
-    public const int Arm1RateMax = 800;             // CFG_RATE_MAX_AXIS1
-    public const int Arm2RateMax = 600;             // CFG_RATE_MAX_AXIS2
+    public const int Arm1RateMax = 2500;            // CFG_RATE_MAX_AXIS1
+    public const int Arm2RateMax = 2500;            // CFG_RATE_MAX_AXIS2
     public const int AccelMin = 100;                // CFG_ACCEL_MIN
     public const int Arm1AccelMax = 20000;          // CFG_ACCEL_MAX_AXIS1
     public const int Arm2AccelMax = 12000;          // CFG_ACCEL_MAX_AXIS2
 
     // Caps for drawing and positioning moves, per axis.
-    public const int PlanRateMax = 600;             // PTP_RATE_MAX, TRAJ_RATE_MAX
-    public const int PlanAccelMax = 800;            // PTP_ACCEL, TRAJ_ACCEL_MAX
+    public const int PlanRateMax = 2500;            // PTP_RATE_MAX, TRAJ_RATE_MAX
+    public const int PlanAccelMax = 3000;           // PTP_ACCEL, TRAJ_ACCEL_MAX
     public const int HomeSlowRate = 400;            // HOME_SLOW_RATE_USTEP_S
 
     // Trajectory upload.

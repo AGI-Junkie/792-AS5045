@@ -39,6 +39,11 @@ public sealed class PlanarArm
                                 elbow.Y + L2 * Math.Sin(p.Q2 * Rad)));
     }
 
+    // Largest tip speed (mm/s) with |q1 rate| <= v1 and |q2 - q1 rate| <= v2 (deg/s), i.e. the two motor rates.
+    // The tip velocity is convex in the rates, so a corner of the rate box is worst; the best corner has both motors
+    // turning the same way with the arm straight: L1*v1 + L2*(v1 + v2).
+    public double MaxTipSpeed(double v1, double v2) => (L1 * v1 + L2 * (v1 + v2)) * Rad;
+
     public JointPose[] Inverse(double x, double y)
     {
         if (!double.IsFinite(x) || !double.IsFinite(y) || Math.Abs(x) > 20000 || Math.Abs(y) > 20000)
@@ -94,5 +99,16 @@ public sealed class PlanarArm
         var unequal = new PlanarArm(100, 200);
         Check((unequal.Forward(unequal.Inverse(100, 0)[0]).Tip - new Point(100, 0)).Length < 1e-6);
         Check(unequal.Inverse(100, 0).Length == 2);
+        // Tip speed bound: no elbow angle and no corner of the rate box beats it, and the straight arm reaches it.
+        double bound = model.MaxTipSpeed(10, 6), fastest = 0;
+        for (int elbow = -180; elbow <= 180; elbow++)
+            foreach (var (w1, w2) in new[] { (10.0, 6.0), (10.0, -6.0), (-10.0, 6.0), (-10.0, -6.0) })
+            {
+                const double h = 1e-5;
+                var from = model.Forward(new JointPose(20, 20 + elbow)).Tip;
+                var to = model.Forward(new JointPose(20 + w1 * h, 20 + elbow + (w1 + w2) * h)).Tip;
+                fastest = Math.Max(fastest, (to - from).Length / h);
+            }
+        Check(Math.Abs(bound - fastest) < 1e-2 && Math.Abs(bound - (180 * 10 + 176.38 * 16) * Rad) < 1e-9);
     }
 }

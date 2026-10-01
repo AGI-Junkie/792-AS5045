@@ -35,7 +35,8 @@ public sealed partial class ControlWindow
         int copies = 0, received = 0, batches = 0, view = 1, progressChecks = 0;
         int completedAtBeat = -1, initialG0 = 0, initialG1 = 0, initialG2 = 0;
         uint sequence = 1, control = 0;
-        bool runAccepted = false, trimmed = false;
+        bool runAccepted = false, trimmed = false, runRequested = false;
+        double readySince = 0;
         double longestReceive = 0, nextStatus = 0;
         double sendStarted = 0, lastDispatchEnd = 0, leaseGap = 0, longestLease = 0, runSent = 0, runAck = 0;
         Exception? failure = null;
@@ -113,6 +114,7 @@ public sealed partial class ControlWindow
             bool run = received == plan.Nodes.Length;
             byte expectedType = run ? (byte)4 : received == 0 ? (byte)2 : (byte)3;
             Require(type == expectedType && !runAccepted, "BEGIN/NODE/RUN order invalid");
+            Require(!run || runRequested, "RUN left before the operator asked for 执行图形");
             var node = run ? new ExecutionNode(new JointPose(0, 0), 0) : plan.Nodes[received];
             ushort value = received == 0 ? (ushort)plan.Nodes.Length : node.Milliseconds;
             Require(packet.SequenceEqual(PtpProtocol.EncodePacket(expectedType, seq, 2, node.Pose, value)), "trajectory payload differs from checked plan");
@@ -156,7 +158,16 @@ public sealed partial class ControlWindow
                 window.RetryPendingPoint(DateTime.UtcNow);
                 window.UpdateControls();
                 trimmed |= window.logCharacters < 80000;
-                Require(window.uploading is not null || runAccepted, "upload cancelled: " + window.lastStop.Text);
+                Require(window.uploading is not null || window.uploaded is not null || runAccepted, "upload cancelled: " + window.lastStop.Text);
+                // Upload ends in a held plan; nothing may move until 执行图形, then RUN goes out on its own frame.
+                if (window.uploaded is not null && !runRequested) {
+                    if (readySince == 0) readySince = clock.Elapsed.TotalMilliseconds;
+                    else if (clock.Elapsed.TotalMilliseconds - readySince >= 600) {
+                        lock (peerSync) { Require(received == plan.Nodes.Length && !runAccepted && sentFrames.All(f => f.Type != 4), "the device was started without 执行图形"); }
+                        runRequested = true; window.RequestExecute();
+                        Require(window.uploading is not null && window.uploaded is null, "执行图形 did not queue RUN: " + window.lastStop.Text);
+                    }
+                }
                 Require(clock.Elapsed.TotalSeconds < 90, "upload did not finish within 90 seconds");
                 if (runAccepted && window.uploading is null && !window.executing) {
                     int beats;

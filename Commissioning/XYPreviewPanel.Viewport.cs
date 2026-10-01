@@ -14,13 +14,16 @@ public sealed partial class XYPreviewPanel
     private Point cameraCenter, dragFrom, dragCenter, dragTo;
     private double pixelsPerMm = 1;
     private bool cameraReady, autoFit = true, dragging, boxDrag;
-    private readonly CheckBox liveLayer = new() { Content = "命令位置", IsChecked = true, Margin = new Thickness(8,8,4,4) };
+    private readonly CheckBox liveLayer = new() { Content = "设备姿态", IsChecked = true, Margin = new Thickness(8,8,4,4),
+        ToolTip = "运动期间，两根连杆跟随设备回报的命令步数。arm2 和末端位置为模型估算，非实测；离线播放使用规划姿态。" };
     private readonly CheckBox unreachableLayer = new() { Content = "不可达区域", IsChecked = true, Margin = new Thickness(8,8,4,4) };
     private readonly Button boxTool = new() { Content = "框选", ToolTip = "点击后在画布上拖出矩形，放大选区；仅改变视图。" };
-    private readonly TextBlock pointerInfo = new() { FontSize = 11, Foreground = WorkbenchTheme.Muted, IsHitTestVisible = false };
+    private readonly TextBlock pointerInfo = new() { FontSize = 11, Foreground = WorkbenchTheme.Muted, IsHitTestVisible = false, TextTrimming=TextTrimming.CharacterEllipsis };
     private bool boxMode;
     private readonly DispatcherTimer viewportRedrawTimer = new(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(33) };
-    private Rect Plot => new(48, 16, Math.Max(1, canvas.ActualWidth - 68), Math.Max(1, canvas.ActualHeight - 64));
+    private bool HasTrajectoryDetail => trajectory is not null && canvas.ActualWidth>560 && canvas.ActualHeight>280;
+    private Rect Plot => new(48, 16, Math.Max(1, canvas.ActualWidth - 68 - (HasTrajectoryDetail?210:0)), Math.Max(1, canvas.ActualHeight - 82));
+    private bool FollowCommand => commandView && liveLayer.IsChecked==true && startFeedback is {Referenced:true};
     private Point ToScreen(Point p) => new(Plot.Left + Plot.Width / 2 + (p.X-cameraCenter.X)*pixelsPerMm,
         Plot.Top + Plot.Height / 2 - (p.Y-cameraCenter.Y)*pixelsPerMm);
     private Point ToWorld(Point p) => new(cameraCenter.X+(p.X-Plot.Left-Plot.Width/2)/pixelsPerMm,
@@ -28,13 +31,13 @@ public sealed partial class XYPreviewPanel
 
     private UIElement BuildViewportToolbar()
     {
-        var bar = new WrapPanel { Margin = new Thickness(0,0,0,6) };
+        var bar = new WrapPanel { VerticalAlignment = VerticalAlignment.Center };
         void Action(string label, string hint, Action action) {
-            var button = new Button { Content = label, ToolTip = hint, Padding = new Thickness(10,6,10,6) };
+            var button = new Button { Content = label, ToolTip = hint, Padding = new Thickness(10,2,10,2) };
             button.Click += (_,_) => action(); bar.Children.Add(button);
         }
         Action("全臂", "显示机械臂与理论可达圆；可达圆不代表已验证的机械安全范围。", () => FitView(false));
-        Action("适合轨迹", "完整显示当前轨迹。", () => FitView(true));
+        Action("适合运动", "显示基座、两根连杆和整条轨迹；按全部规划姿态缩放。", () => FitView(true));
         Action("−", "缩小视图", () => ZoomAt(ToScreen(cameraCenter), 1/1.3));
         Action("＋", "放大视图；也可滚轮缩放。", () => ZoomAt(ToScreen(cameraCenter), 1.3));
         boxTool.Click += (_,_) => { boxMode = !boxMode; UpdateBoxTool(); }; bar.Children.Add(boxTool);
@@ -154,22 +157,30 @@ public sealed partial class XYPreviewPanel
     {
         canvas.Children.Clear();
         if(canvas.ActualWidth<100 || canvas.ActualHeight<100) return;
-        bool detail=detailView && showPreview;
+        bool follow=FollowCommand;
+        var armPose=follow?startFeedback!.Command:pose;
+        var (elbow,tip)=model.Forward(armPose);
+        bool detail=detailView && (showPreview || follow);
+        if(detail && autoFit && cameraReady && follow &&
+           new[] {new Point(),elbow,tip}.Any(p=>!Plot.Contains(ToScreen(p)))) cameraReady=false;
         if(!cameraReady) {
             Rect bounds=new(-model.OuterRadius,-model.OuterRadius,model.OuterRadius*2,model.OuterRadius*2);
             if(detail) {
-                var points=trajectory?.Samples.Select(s=>s.Target).ToArray() ?? [new Point(tx,ty)];
-                double left=points.Min(p=>p.X), right=points.Max(p=>p.X), bottom=points.Min(p=>p.Y), top=points.Max(p=>p.Y);
-                bounds=new Rect(left,bottom,right-left,top-bottom);
+                bounds=new Rect(new Point(),new Point(tx,ty));
+                if(trajectory is {} motion) foreach(var sample in motion.Samples) {
+                    var joints=model.Forward(sample.Pose); bounds.Union(joints.Elbow); bounds.Union(joints.Tip);
+                }
+                bounds.Union(elbow); bounds.Union(tip);
             }
             cameraCenter=new Point(bounds.Left+bounds.Width/2,bounds.Top+bounds.Height/2);
-            double padding=detail?1.5:1.12;
+            double padding=detail?1.18:1.12;
             pixelsPerMm=Math.Clamp(Math.Min(Plot.Width/Math.Max(12,bounds.Width*padding),Plot.Height/Math.Max(12,bounds.Height*padding)),0.05,4000);
             cameraReady=true;
         }
         var plot=new Canvas { Clip=new RectangleGeometry(Plot), IsHitTestVisible=false }; canvas.Children.Add(plot);
         static void Line(Canvas host, Point a, Point b, Brush color, double thickness=1, bool dashed=false) => host.Children.Add(new Line {
-            X1=a.X,Y1=a.Y,X2=b.X,Y2=b.Y,Stroke=color,StrokeThickness=thickness,StrokeDashArray=dashed?new DoubleCollection([4,3]):null });
+            X1=a.X,Y1=a.Y,X2=b.X,Y2=b.Y,Stroke=color,StrokeThickness=thickness,
+            StrokeStartLineCap=PenLineCap.Round,StrokeEndLineCap=PenLineCap.Round,StrokeDashArray=dashed?new DoubleCollection([4,3]):null });
         static void Circle(Canvas host, Point p, double radius, Brush stroke, Brush? fill=null) {
             var circle=new Ellipse { Width=radius*2,Height=radius*2,Stroke=stroke,Fill=fill,StrokeThickness=1.5 };
             Canvas.SetLeft(circle,p.X-radius); Canvas.SetTop(circle,p.Y-radius); host.Children.Add(circle);
@@ -206,12 +217,12 @@ public sealed partial class XYPreviewPanel
         var low=ToWorld(new Point(Plot.Left,Plot.Bottom)); var high=ToWorld(new Point(Plot.Right,Plot.Top));
         for(double gx=Math.Ceiling(low.X/step)*step;gx<=high.X;gx+=step) {
             double px=ToScreen(new Point(gx,0)).X;
-            Line(plot,new Point(px,Plot.Top),new Point(px,Plot.Bottom),WorkbenchTheme.Line);
+            Line(plot,new Point(px,Plot.Top),new Point(px,Plot.Bottom),WorkbenchTheme.GridLine);
             Label(canvas,(Math.Abs(gx)<step/100?0:gx).ToString("0.###",CultureInfo.InvariantCulture),new Point(px-12,Plot.Bottom+4));
         }
         for(double gy=Math.Ceiling(low.Y/step)*step;gy<=high.Y;gy+=step) {
             double py=ToScreen(new Point(0,gy)).Y;
-            Line(plot,new Point(Plot.Left,py),new Point(Plot.Right,py),WorkbenchTheme.Line);
+            Line(plot,new Point(Plot.Left,py),new Point(Plot.Right,py),WorkbenchTheme.GridLine);
             Label(canvas,(Math.Abs(gy)<step/100?0:gy).ToString("0.###",CultureInfo.InvariantCulture),new Point(1,py-7));
         }
         Line(plot,new Point(Plot.Left,origin.Y),new Point(Plot.Right,origin.Y),WorkbenchTheme.Brush("#A6B6CC"));
@@ -241,40 +252,48 @@ public sealed partial class XYPreviewPanel
                 var finish=ToScreen(path.Samples[^1].Target); Circle(plot,finish,4,WorkbenchTheme.Teal,WorkbenchTheme.Teal); Label(plot,"终点",finish+new Vector(8,-22));
             }
         }
-        var (elbow,tip)=model.Forward(pose);
-        var color=inRange?WorkbenchTheme.Blue:WorkbenchTheme.Red;
-        if(showPreview) {
-            Line(plot,origin,ToScreen(elbow),color,detail?1.5:4,detail); Line(plot,ToScreen(elbow),ToScreen(tip),color,detail?1.5:4,detail);
-            Circle(plot,origin,5,color,Brushes.White); Circle(plot,ToScreen(elbow),5,color,Brushes.White);
-            Circle(plot,ToScreen(new Point(tx,ty)),5,reachable?WorkbenchTheme.Brush("#C66B05"):WorkbenchTheme.Red,reachable?WorkbenchTheme.Brush("#FFCC66"):WorkbenchTheme.Brush("#FFC9C9"));
+        var color=inRange || follow?WorkbenchTheme.Blue:WorkbenchTheme.Red;
+        var secondColor=inRange || follow?Brushes.SlateBlue:WorkbenchTheme.Red;
+        if(showPreview || follow) {
+            var joint=ToScreen(elbow); var end=ToScreen(tip);
+            Line(plot,origin,joint,color,5); Line(plot,joint,end,secondColor,5);
+            Circle(plot,origin,7,color,Brushes.White); Circle(plot,joint,6,secondColor,Brushes.White);
+            Label(plot,$"arm1 · {armPose.Q1:F1}°",origin+(joint-origin)*0.5+new Vector(8,-22),color);
+            Label(plot,$"arm2 · {armPose.Q2:F1}°",joint+(end-joint)*0.5+new Vector(8,-22),secondColor);
+            Circle(plot,follow?end:ToScreen(new Point(tx,ty)),6,reachable || follow?WorkbenchTheme.Brush("#C66B05"):WorkbenchTheme.Red,
+                reachable || follow?WorkbenchTheme.Brush("#FFCC66"):WorkbenchTheme.Brush("#FFC9C9"));
         }
         if(liveLayer.IsChecked==true && startFeedback is {Referenced:true} live) {
             var p=ToScreen(model.Forward(live.Command).Tip);
             Line(plot,p-new Vector(8,0),p+new Vector(8,0),Brushes.MediumVioletRed,2);
             Line(plot,p-new Vector(0,8),p+new Vector(0,8),Brushes.MediumVioletRed,2);
         }
-        Label(canvas,"─ 规划轨迹",new Point(Plot.Left,Plot.Bottom+29),WorkbenchTheme.Teal);
-        Label(canvas,"● 预览点",new Point(Plot.Left+88,Plot.Bottom+29),WorkbenchTheme.Brush("#A35600"));
-        Label(canvas,"＋ 命令估算 XY（非实测）",new Point(Plot.Left+164,Plot.Bottom+29),Brushes.MediumVioletRed);
-        Label(canvas,"■ 不可达区域（按当前关节范围）",new Point(Plot.Left+332,Plot.Bottom+29),WorkbenchTheme.Brush("#8FB42338"));
+        Label(canvas,"━━ arm1",new Point(Plot.Left,Plot.Bottom+25),WorkbenchTheme.Blue);
+        Label(canvas,"━━ arm2",new Point(Plot.Left+78,Plot.Bottom+25),Brushes.SlateBlue);
+        Label(canvas,"─ 规划轨迹",new Point(Plot.Left+156,Plot.Bottom+25),WorkbenchTheme.Teal);
+        Label(canvas,"● 末端",new Point(Plot.Left+250,Plot.Bottom+25),WorkbenchTheme.Brush("#A35600"));
+        Label(canvas,follow?"设备命令姿态 · 非实测":"离线规划姿态",new Point(Plot.Left,Plot.Bottom+43));
+        Label(canvas,"＋ 命令估算 XY（非实测）",new Point(Plot.Left+180,Plot.Bottom+43),Brushes.MediumVioletRed);
         pointerInfo.Text=string.IsNullOrEmpty(pointerInfo.Text)?PointerHint:pointerInfo.Text;
+        pointerInfo.MaxWidth=Math.Max(1,Plot.Width-16);
         Canvas.SetLeft(pointerInfo,Plot.Left+8); Canvas.SetTop(pointerInfo,Plot.Top+6); canvas.Children.Add(pointerInfo);
-        // The overview remains a context view; its pose is the offline preview, never measured XY.
-        if(detail && canvas.ActualWidth>560 && canvas.ActualHeight>280) {
-            var box=new Rect(Plot.Right-164,Plot.Top+4,160,116);
+        // Keep small drawings legible while the main view shows the complete arm.
+        if(trajectory is {} miniPath && HasTrajectoryDetail) {
+            var box=new Rect(Plot.Right+14,Plot.Top+4,190,144);
             var background=new Rectangle { Width=box.Width,Height=box.Height,Fill=Brushes.White,Stroke=WorkbenchTheme.Line,RadiusX=5,RadiusY=5,IsHitTestVisible=false };
             Canvas.SetLeft(background,box.Left); Canvas.SetTop(background,box.Top); canvas.Children.Add(background);
             var overview=new Canvas { Clip=new RectangleGeometry(box),IsHitTestVisible=false }; canvas.Children.Add(overview);
-            double k=42/model.OuterRadius; var o=new Point(box.Left+box.Width/2,box.Top+66);
-            Point Mini(Point p)=>o+new Vector(p.X*k,-p.Y*k);
-            Circle(overview,o,model.OuterRadius*k,WorkbenchTheme.Line);
-            Line(overview,o,Mini(elbow),WorkbenchTheme.Blue,2); Line(overview,Mini(elbow),Mini(tip),WorkbenchTheme.Blue,2);
-            Circle(overview,o,3,WorkbenchTheme.Blue,Brushes.White);
-            if(trajectory is {} miniPath) { var line=new Polyline {Stroke=WorkbenchTheme.Teal,StrokeThickness=2}; foreach(var s in miniPath.Samples) line.Points.Add(Mini(s.Target)); overview.Children.Add(line); }
-            var topLeft=Mini(new Point(low.X,high.Y));
-            var window=new Rectangle {Width=(high.X-low.X)*k,Height=(high.Y-low.Y)*k,Stroke=WorkbenchTheme.Teal,StrokeThickness=1,Fill=WorkbenchTheme.Brush("#18087F8C")};
-            Canvas.SetLeft(window,topLeft.X); Canvas.SetTop(window,topLeft.Y); overview.Children.Add(window);
-            Label(overview,"全臂概览 · 预览姿态",new Point(box.Left+8,box.Top+5));
+            Rect bounds=new(miniPath.Samples[0].Target,new Size());
+            foreach(var sample in miniPath.Samples) bounds.Union(sample.Target);
+            double k=Math.Min((box.Width-24)/Math.Max(12,bounds.Width*1.3),(box.Height-40)/Math.Max(12,bounds.Height*1.3));
+            var center=new Point(bounds.Left+bounds.Width/2,bounds.Top+bounds.Height/2);
+            var o=new Point(box.Left+box.Width/2,box.Top+28+(box.Height-36)/2);
+            Point Mini(Point p)=>o+new Vector((p.X-center.X)*k,-(p.Y-center.Y)*k);
+            var line=new Polyline {Stroke=WorkbenchTheme.Teal,StrokeThickness=2.4};
+            foreach(var sample in miniPath.Samples) line.Points.Add(Mini(sample.Target)); overview.Children.Add(line);
+            Circle(overview,Mini(miniPath.Samples[0].Target),4,WorkbenchTheme.Teal,Brushes.White);
+            Circle(overview,Mini(tip),5,WorkbenchTheme.Brush("#C66B05"),WorkbenchTheme.Brush("#FFCC66"));
+            Label(overview,"轨迹局部 · "+shape.SelectedItem,new Point(box.Left+8,box.Top+5));
         }
         double scaleLength=step*pixelsPerMm;
         var scaleStart=new Point(Plot.Left+12,Plot.Bottom-18);
@@ -287,6 +306,7 @@ public sealed partial class XYPreviewPanel
     }
     private void ViewportSelfTest()
     {
+        bool initialDetail=detailView;
         Measure(new Size(900,720)); Arrange(new Rect(0,0,900,720)); UpdateLayout(); RedrawViewport();
         int requests=0; PointMoveRequested+=CountPoint; TrajectoryRequested+=CountPath;
         void CountPoint(JointPose _) => requests++;
@@ -310,7 +330,7 @@ public sealed partial class XYPreviewPanel
         foreach(bool detail in new[] { false, true }) {
             FitView(detail);
             var plot=canvas.Children.OfType<Canvas>().First();
-            var links=plot.Children.OfType<Line>().Count(line=>line.Stroke==WorkbenchTheme.Blue || line.Stroke==WorkbenchTheme.Red);
+            var links=plot.Children.OfType<Line>().Count(line=>line.Stroke==WorkbenchTheme.Blue || line.Stroke==WorkbenchTheme.Red || line.Stroke==Brushes.SlateBlue);
             var strokes=plot.Children.OfType<Path>().Count(shape=>shape.Stroke is not null);
             var fills=plot.Children.OfType<Path>().Count(shape=>shape.Fill is not null);
             int images=plot.Children.OfType<Image>().Count();
@@ -318,13 +338,77 @@ public sealed partial class XYPreviewPanel
                 throw new InvalidOperationException($"Preview links/不可达区域层不符：detail={detail} links={links} strokes={strokes} fills={fills} images={images}");
         }
         if(requests!=0 || GridStep(4)!=5) throw new InvalidOperationException("Viewport separation failed");
-        PointMoveRequested-=CountPoint; TrajectoryRequested-=CountPath; SetStartFeedback(null); FitView(false);
+        PointMoveRequested-=CountPoint; TrajectoryRequested-=CountPath; SetStartFeedback(null); FitView(initialDetail);
+    }
+    private static void ArmMotionPreviewSelfTest()
+    {
+        var panel = new XYPreviewPanel();
+        panel.Measure(new Size(900,720)); panel.Arrange(new Rect(0,0,900,720)); panel.UpdateLayout();
+        int requests=0; panel.PointMoveRequested+=_=>requests++; panel.TrajectoryRequested+=_=>requests++;
+        (Point Elbow, Point Tip) CheckPose(JointPose pose)
+        {
+            var links=panel.canvas.Children.OfType<Canvas>().First().Children.OfType<Line>()
+                .Where(line=>line.Stroke==WorkbenchTheme.Blue || line.Stroke==WorkbenchTheme.Red || line.Stroke==Brushes.SlateBlue).ToArray();
+            var (elbow,tip)=panel.Model.Forward(pose);
+            Point[] joints=[panel.ToScreen(new Point()),panel.ToScreen(elbow),panel.ToScreen(tip)];
+            if(links.Length!=2 || joints.Any(p=>!panel.Plot.Contains(p)))
+                throw new InvalidOperationException($"Both arm links must be visible: shape={panel.shape.SelectedIndex}, branch={panel.branch.SelectedIndex}, detail={panel.detailView}");
+            if(panel.canvas.Children.OfType<Canvas>().Skip(1).Any(layer=>layer.Clip is {} clip && joints.Any(p=>clip.Bounds.Contains(p))))
+                throw new InvalidOperationException("Trajectory detail must not cover arm joints");
+            for(int axis=0;axis<2;axis++) {
+                if((new Point(links[axis].X1,links[axis].Y1)-joints[axis]).Length>1e-7 ||
+                   (new Point(links[axis].X2,links[axis].Y2)-joints[axis+1]).Length>1e-7 ||
+                   links[axis].StrokeThickness<4 || links[axis].StrokeDashArray is { Count: >0 })
+                    throw new InvalidOperationException("Arm links must follow the displayed joint pose with clear solid strokes");
+            }
+            return (elbow,tip);
+        }
+        for(int selected=0;selected<4;selected++) for(int branch=0;branch<2;branch++) {
+            panel.updating=true;
+            panel.shape.SelectedIndex=selected; panel.branch.SelectedIndex=branch;
+            panel.x.Text="260"; panel.y.Text="0"; panel.a.Text=selected==1?"290":"25"; panel.b.Text="30";
+            panel.min1.Text="-135";panel.max1.Text="135";panel.min2.Text="-155";panel.max2.Text="155";
+            panel.updating=false; panel.ShapeFields(); panel.Refresh();
+            if(panel.pointTarget is null || selected>0 && panel.timing is null)
+                throw new InvalidOperationException("Arm preview check needs a valid shape");
+            foreach(bool detail in new[] {false,true}) {
+                panel.FitView(detail);
+                var first=CheckPose(panel.pointTarget.Value);
+                bool moved=false;
+                if(panel.timing is {} plan) {
+                    foreach(double fraction in new[] {0.25,0.5,0.75,1.0}) {
+                        panel.cursor.Value=plan.Duration*fraction; panel.RedrawViewport();
+                        var current=CheckPose(plan.At(panel.cursor.Value).Pose);
+                        moved|=(current.Elbow-first.Elbow).Length>0.1 && (current.Tip-first.Tip).Length>0.1;
+                    }
+                    if(!moved) throw new InvalidOperationException("Both arm links must move during every shape preview");
+                    panel.cursor.Value=0;
+                }
+                panel.SetDeviceStatus("模拟设备运动（非实机）",false,true,25,false);
+                (Point Elbow,Point Tip)? firstCommand=null;
+                TelemetrySample? lastSample=null;
+                foreach(double fraction in new[] {0.25,0.75}) {
+                    var command=panel.timing is {} motion?motion.At(motion.Duration*fraction).Pose:
+                        new JointPose(panel.pointTarget.Value.Q1*fraction,panel.pointTarget.Value.Q2*fraction);
+                    var sample=new TelemetrySample(0,1,1,true,2,ExecutionTrajectory.Counts(0,command),ExecutionTrajectory.Counts(1,command),0,0,0,0);
+                    panel.SetStartFeedback(sample); panel.RedrawViewport(); var current=CheckPose(sample.Command);
+                    if(firstCommand is {} from && ((current.Elbow-from.Elbow).Length<0.1 || (current.Tip-from.Tip).Length<0.1))
+                        throw new InvalidOperationException("Both links must move with device feedback, including point moves");
+                    firstCommand=current; lastSample=sample;
+                }
+                panel.SetDeviceStatus(null,false,false,0,false); panel.RedrawViewport(); CheckPose(lastSample!.Command);
+                panel.liveLayer.IsChecked=false; panel.RedrawViewport(); CheckPose(panel.pointTarget.Value);
+                panel.liveLayer.IsChecked=true; panel.RedrawViewport(); CheckPose(lastSample.Command);
+                panel.SetStartFeedback(null); panel.RedrawViewport(); CheckPose(panel.pointTarget.Value);
+            }
+        }
+        if(requests!=0) throw new InvalidOperationException("Preview sent a motion request");
     }
     internal void CheckViewportLayout()
     {
         if(canvas.ActualWidth<400 || canvas.ActualHeight<260 || double.IsFinite(canvas.Height))
             throw new InvalidOperationException($"Viewport squeezed or fixed: {canvas.ActualWidth} x {canvas.ActualHeight}");
-        var bottom=execute.TranslatePoint(new Point(0,execute.ActualHeight),this);
+        var bottom=run.TranslatePoint(new Point(0,run.ActualHeight),this);
         if(bottom.Y>ActualHeight || bottom.X<0) throw new InvalidOperationException("Motion actions clipped");
     }
 }

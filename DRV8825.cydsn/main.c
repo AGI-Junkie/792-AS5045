@@ -72,7 +72,7 @@
  * The STATE line keeps the plain "stage2-v7" token because the host matches it to
  * select the framed transport.  Bump this on every firmware change so a field log
  * can answer "was this fix actually flashed?". */
-#define FW_BUILD_ID                 "stage2-v7-absolute-q2"
+#define FW_BUILD_ID                 "stage2-v7-absolute-q2-r2500"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -114,8 +114,8 @@
 /* Numbers the host has to agree on.  Commissioning/DeviceContract.cs holds the same values and
  * build-release.ps1 compares the two, so change them together or the release build fails. */
 #define CFG_RATE_MIN                 (20)     /* configurable jog/home/PTP rate range, microsteps/s    */
-#define CFG_RATE_MAX_AXIS1           (800)
-#define CFG_RATE_MAX_AXIS2           (600)
+#define CFG_RATE_MAX_AXIS1           (2500)
+#define CFG_RATE_MAX_AXIS2           (2500)
 #define CFG_ACCEL_MIN                (100)    /* configurable acceleration range, microsteps/s^2       */
 #define CFG_ACCEL_MAX_AXIS1          (20000)
 #define CFG_ACCEL_MAX_AXIS2          (12000)
@@ -143,8 +143,8 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
     (PTP_MIN1_CD < -CFG_JOINT_CD_MAX) || (PTP_MAX1_CD > CFG_JOINT_CD_MAX) || (PTP_MIN2_CD < -CFG_JOINT_CD_MAX) || (PTP_MAX2_CD > CFG_JOINT_CD_MAX))
 #error "PTP requires valid software bounds within +/-180 deg containing straight zero"
 #endif
-#define PTP_RATE_MAX                 (600u)
-#define PTP_ACCEL                    (800u)
+#define PTP_RATE_MAX                 (2500u)
+#define PTP_ACCEL                    (3000u)
 #define PTP_FRAME_BYTES              (17u)
 #define PTP_FRAME_START              (0xD1u)
 #define PTP_FRAME_END                (0xD3u)
@@ -1151,8 +1151,10 @@ static uint32 g_keyMaxGapMs;
 
 /* Whole-path preload: no movement until every numbered node is accepted. */
 #define TRAJ_CAPACITY 2048u
-#define TRAJ_RATE_MAX 600u
-#define TRAJ_ACCEL_MAX 800u
+#define TRAJ_RATE_MAX 2500u
+#define TRAJ_ACCEL_MAX 3000u
+/* Never pulse a trajectory faster than its own rate cap, even when catching up. */
+#define TRAJ_STEP_MIN_US (1000000u / TRAJ_RATE_MAX)
 typedef struct { int16 q1, q2; uint16 ms; } traj_node_t;
 static struct {
     uint8 state; /* 0 empty, 1 uploading, 2 ready, 3 running, 4 done */
@@ -1807,7 +1809,7 @@ static void traj_service(void)
     if(g_traj.elapsedCy>duration+20000u*SU_CY_PER_US) { stage_stop("trajectory timing overrun",0u); return; }
     if(g_ptp.done<g_ptp.total) {
         uint32 due=(uint32)((int64)(g_ptp.done+1u)*duration/g_ptp.total);
-        if(g_traj.elapsedCy<due || SU_ELAPSED(g_ptp.lastStep)<1667u*SU_CY_PER_US) { return; }
+        if(g_traj.elapsedCy<due || SU_ELAPSED(g_ptp.lastStep)<TRAJ_STEP_MIN_US*SU_CY_PER_US) { return; }
         g_ptp.lastStep=SU_NOW();
         if(!coordinated_step("trajectory pulse blocked")) { return; }
     }

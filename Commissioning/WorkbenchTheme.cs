@@ -5,35 +5,39 @@ using System.Windows.Media;
 
 namespace TwoLinkCommissioning;
 
+// Light "engineering software" look (design 3a): flat 2 px controls, gray panels, hairline borders, blue accents.
 internal static class WorkbenchTheme
 {
-    public static readonly Brush Ink = Brush("#172B4D"), Muted = Brush("#5D6D83"), Blue = Brush("#245BE8"),
-        Teal = Brush("#087F8C"), Red = Brush("#B42338"), Line = Brush("#DFE6F0"), Background = Brush("#F2F5FA");
+    public static readonly Brush Ink = Brush("#1F2933"), Sub = Brush("#3E4C59"), Muted = Brush("#616E7C"), Blue = Brush("#1F5FBF"),
+        Teal = Brush("#087F8C"), Red = Brush("#C62828"), Line = Brush("#C9D1DB"), Background = Brush("#ECEFF3"),
+        Bar = Brush("#F7F9FB"), Head = Brush("#E3E8EE"), Group = Brush("#F0F3F7"), Field = Brush("#B8C2CF"),
+        Faint = Brush("#EEF1F5"), GridLine = Brush("#E3E8EE"), Idle = Brush("#9AA5B1"), Ok = Brush("#2E7D32"), Warn = Brush("#E0A100");
+    public static readonly FontFamily Mono = new("Consolas");
     public static SolidColorBrush Brush(string color) => (SolidColorBrush)new BrushConverter().ConvertFromString(color)!;
     public static void Apply(FrameworkElement root)
     {
         root.Resources.MergedDictionaries.Add((ResourceDictionary)XamlReader.Parse("""
         <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
           <Style TargetType="Button">
-            <Setter Property="Background" Value="White"/><Setter Property="Foreground" Value="#172B4D"/>
-            <Setter Property="BorderBrush" Value="#D4DDED"/><Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Padding" Value="12,8"/><Setter Property="Margin" Value="3"/>
-            <Setter Property="MinHeight" Value="34"/><Setter Property="FontSize" Value="13"/>
+            <Setter Property="Background" Value="#F7F9FB"/><Setter Property="Foreground" Value="#1F2933"/>
+            <Setter Property="BorderBrush" Value="#C9D1DB"/><Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="12,3"/><Setter Property="Margin" Value="2"/>
+            <Setter Property="MinHeight" Value="26"/><Setter Property="FontSize" Value="12"/>
             <Setter Property="Cursor" Value="Hand"/><Setter Property="HorizontalContentAlignment" Value="Center"/>
             <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
-              <Border x:Name="surface" CornerRadius="7" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}">
+              <Border x:Name="surface" CornerRadius="2" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}">
                 <ContentPresenter x:Name="caption" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center" RecognizesAccessKey="True" TextElement.Foreground="{TemplateBinding Foreground}"/>
               </Border>
               <ControlTemplate.Triggers>
                 <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="surface" Property="Opacity" Value="0.85"/></Trigger>
                 <Trigger Property="IsPressed" Value="True"><Setter TargetName="surface" Property="Opacity" Value="0.65"/></Trigger>
-                <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="surface" Property="BorderBrush" Value="#172B4D"/><Setter TargetName="surface" Property="BorderThickness" Value="2"/></Trigger>
-                <Trigger Property="IsEnabled" Value="False"><Setter TargetName="surface" Property="Opacity" Value="0.5"/><Setter TargetName="surface" Property="Background" Value="#E5E7EB"/><Setter TargetName="surface" Property="BorderBrush" Value="#CBD0D8"/><Setter TargetName="caption" Property="TextElement.Foreground" Value="#677386"/><Setter Property="Cursor" Value="Arrow"/></Trigger>
+                <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="surface" Property="BorderBrush" Value="#1F2933"/><Setter TargetName="surface" Property="BorderThickness" Value="2"/></Trigger>
+                <Trigger Property="IsEnabled" Value="False"><Setter TargetName="surface" Property="Opacity" Value="0.5"/><Setter TargetName="surface" Property="Background" Value="#ECEFF3"/><Setter TargetName="surface" Property="BorderBrush" Value="#C9D1DB"/><Setter TargetName="caption" Property="TextElement.Foreground" Value="#677386"/><Setter Property="Cursor" Value="Arrow"/></Trigger>
               </ControlTemplate.Triggers>
             </ControlTemplate></Setter.Value></Setter>
           </Style>
-          <Style TargetType="TextBox"><Setter Property="FontSize" Value="13"/><Setter Property="Foreground" Value="#172B4D"/><Setter Property="BorderBrush" Value="#CBD5E5"/><Setter Property="Padding" Value="7,5"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="SelectionBrush" Value="#B2CBFF"/></Style>
-          <Style TargetType="ComboBox"><Setter Property="FontSize" Value="13"/><Setter Property="MinHeight" Value="32"/><Setter Property="Padding" Value="5"/><Setter Property="VerticalContentAlignment" Value="Center"/></Style>
+          <Style TargetType="TextBox"><Setter Property="FontSize" Value="12"/><Setter Property="Foreground" Value="#1F2933"/><Setter Property="BorderBrush" Value="#B8C2CF"/><Setter Property="Padding" Value="6,3"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="SelectionBrush" Value="#B2CBFF"/></Style>
+          <Style TargetType="ComboBox"><Setter Property="FontSize" Value="12"/><Setter Property="MinHeight" Value="24"/><Setter Property="Padding" Value="5,2"/><Setter Property="VerticalContentAlignment" Value="Center"/></Style>
           <!-- The default determinate bar also animates its glow. Keep rendering finite so input and heartbeats can run. -->
           <Style TargetType="ProgressBar">
             <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ProgressBar">
@@ -44,28 +48,61 @@ internal static class WorkbenchTheme
             </ControlTemplate></Setter.Value></Setter>
           </Style>
           <Style TargetType="TabItem">
-            <Setter Property="Padding" Value="14,9"/><Setter Property="FontSize" Value="13"/><Setter Property="Foreground" Value="#172B4D"/>
+            <Setter Property="Padding" Value="14,4"/><Setter Property="FontSize" Value="12"/><Setter Property="Foreground" Value="#1F2933"/>
             <Setter Property="Background" Value="Transparent"/>
             <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="TabItem">
-              <Border x:Name="tab" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}" BorderThickness="0,0,0,2" BorderBrush="Transparent">
-                <ContentPresenter x:Name="tabTitle" ContentSource="Header" VerticalAlignment="Center" TextElement.Foreground="#5D6D83"/>
+              <Border x:Name="tab" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}" BorderThickness="1,1,1,0" BorderBrush="Transparent">
+                <ContentPresenter x:Name="tabTitle" ContentSource="Header" VerticalAlignment="Center" TextElement.Foreground="#616E7C"/>
               </Border>
               <ControlTemplate.Triggers>
-                <Trigger Property="IsSelected" Value="True"><Setter TargetName="tabTitle" Property="TextElement.Foreground" Value="#245BE8"/><Setter Property="Background" Value="White"/><Setter TargetName="tab" Property="BorderBrush" Value="#245BE8"/></Trigger>
-                <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="tab" Property="BorderBrush" Value="#172B4D"/></Trigger>
+                <Trigger Property="IsSelected" Value="True"><Setter TargetName="tabTitle" Property="TextElement.Foreground" Value="#1F5FBF"/><Setter TargetName="tabTitle" Property="TextElement.FontWeight" Value="Bold"/><Setter Property="Background" Value="White"/><Setter TargetName="tab" Property="BorderBrush" Value="#C9D1DB"/></Trigger>
+                <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="tab" Property="BorderBrush" Value="#1F2933"/></Trigger>
               </ControlTemplate.Triggers>
             </ControlTemplate></Setter.Value></Setter>
           </Style>
-          <Style TargetType="TabControl"><Setter Property="Background" Value="White"/><Setter Property="BorderBrush" Value="#DFE6F0"/><Setter Property="Padding" Value="8"/></Style>
+          <Style TargetType="TabControl">
+            <Setter Property="Background" Value="White"/><Setter Property="BorderBrush" Value="#C9D1DB"/><Setter Property="Padding" Value="0"/>
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="TabControl">
+              <Grid>
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
+                <Border Background="#E3E8EE" BorderBrush="#C9D1DB" BorderThickness="0,0,0,1"><TabPanel IsItemsHost="True" Margin="8,3,8,0"/></Border>
+                <Border Grid.Row="1" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}"><ContentPresenter ContentSource="SelectedContent"/></Border>
+              </Grid>
+            </ControlTemplate></Setter.Value></Setter>
+          </Style>
         </ResourceDictionary>
         """));
     }
-    public static TextBlock Text(string text, double size = 13, Brush? color = null) => new() {
+    public static TextBlock Text(string text, double size = 12, Brush? color = null) => new() {
         Text = text, FontSize = size, Foreground = color ?? Ink, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(3,4,3,4)
     };
-    public static Border Card(UIElement content, Thickness? margin = null) => new() {
-        Background = Brushes.White, BorderBrush = Line, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(10),
-        Padding = new Thickness(14), Margin = margin ?? new Thickness(0,0,0,12), Child = content
-    };
     public static void Primary(Button b) { b.Background = Blue; b.Foreground = Brushes.White; b.BorderBrush = Blue; }
+    public static Border Edge(UIElement child, Brush? fill = null, Thickness? edge = null) => new() {
+        Background = fill ?? Bar, BorderBrush = Line, BorderThickness = edge ?? new Thickness(0,0,0,1), Child = child
+    };
+
+    // Property-grid pieces: a dock caption, a group header, and a "name | value | unit" row.
+    public static Border Caption(string title) => Edge(new TextBlock { Text = title, FontWeight = FontWeights.Bold, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10,0,10,0) }, Head);
+    public static Border GroupHeader(string title, UIElement? trailing = null)
+    {
+        var dock = new DockPanel { Margin = new Thickness(10,3,6,3) };
+        if (trailing is not null) { DockPanel.SetDock(trailing, Dock.Right); dock.Children.Add(trailing); }
+        dock.Children.Add(new TextBlock { Text = title, FontWeight = FontWeights.Bold, Foreground = Sub, VerticalAlignment = VerticalAlignment.Center });
+        return new() { Background = Group, BorderBrush = Brush("#DDE3EA"), BorderThickness = new Thickness(0,0,0,1), Child = dock };
+    }
+    public static Border Row(UIElement label, Control value, string unit = "")
+    {
+        value.Width = double.NaN; value.Margin = new Thickness(0); value.MinHeight = 22; value.VerticalAlignment = VerticalAlignment.Center;
+        if (value is TextBox box) { box.HorizontalContentAlignment = HorizontalAlignment.Right; box.Padding = new Thickness(6,1,6,1); box.FontFamily = Mono; }
+        var grid = new Grid { Margin = new Thickness(10,2,10,2) };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(104) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition());
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(40) });
+        if (label is FrameworkElement l) { l.VerticalAlignment = VerticalAlignment.Center; l.Margin = new Thickness(0,0,6,0); }
+        Grid.SetColumn(value, 1);
+        var u = new TextBlock { Text = unit, Foreground = Muted, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6,0,0,0) }; Grid.SetColumn(u, 2);
+        grid.Children.Add(label); grid.Children.Add(value); grid.Children.Add(u);
+        return new() { Background = Brushes.White, BorderBrush = Faint, BorderThickness = new Thickness(0,0,0,1), Child = grid };
+    }
+    public static TextBlock Label(string text, Brush? color = null) => new() { Text = text, Foreground = color ?? Sub, TextTrimming = TextTrimming.CharacterEllipsis };
 }

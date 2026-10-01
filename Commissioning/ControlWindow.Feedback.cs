@@ -21,7 +21,7 @@ public sealed partial class ControlWindow
     private void CheckTelemetryTimeout(DateTime now)
     {
         if (!supportsTelemetry || (now-lastTelemetryAt).TotalSeconds < 2) return;
-        telemetry = null; liveValues.Text = "反馈已过期；等待新的设备数据。";
+        telemetry = null; ShowFeedback(null, "反馈已过期；等待新的设备数据。");
         if (pendingControl is null && (PointBusy || executing)) { Append("HOST telemetry timeout; stopping"); Stop(); }
     }
     private bool AtStart(JointPose pose) => supportsTelemetry && ptp is { Active: 0, Referenced: true } &&
@@ -38,21 +38,18 @@ public sealed partial class ControlWindow
         }
         if (telemetry?.Epoch != sample.Epoch) errorHistory.Clear();
         telemetry = sample; lastTelemetryAt = DateTime.UtcNow;
-        inputs.Text = $"全局限位：{((sample.Inputs & 1)==0?"正常":"触发")}  arm1：{((sample.Inputs & 2)==0?"释放":"触发")}\n" +
-            $"arm2 NPN：{((sample.Inputs & 4)==0?"释放":"触发")}  驱动：{((sample.Inputs & 8)==0?"正常":"故障")}";
         if (sample.Referenced) {
-            liveValues.Text = $"arm1  命令 {sample.Command.Q1:F3}° / 编码器 {sample.Measured1:F3}°\n" +
-                $"arm2  命令 {sample.Command.Q2:F3}°   ·   {sample.ReferenceName}\narm1 偏差 {sample.Error1:+0.000;-0.000;0.000}° · 累计丢包 {sample.Drops}";
+            ShowFeedback(sample, "坐标参考：" + sample.ReferenceName);
             errorHistory.Enqueue(sample.Error1); while(errorHistory.Count > 120) errorHistory.Dequeue(); DrawErrorPlot();
             if (experiment is { } recorder) {
-                recorder.Record(sample,uploading is not null ? "upload" : experimentPhase=="trajectory" ? "drawing" : "point",trajectoryIndex);
+                recorder.Record(sample,uploading is not null ? "upload" : uploaded is not null ? "ready" : experimentPhase=="trajectory" ? "drawing" : "point",trajectoryIndex);
                 experimentResult.Text = recorder.MotionSamples==0 ? $"已保存 {recorder.Samples} 条反馈；等待运动样本，暂不计算误差统计。" :
                     $"本次采样 {recorder.Samples} · arm1 RMSE {recorder.Rmse:F4}° · 峰值 {recorder.Peak:F4}°\n数据正在自动保存。";
                 if(experimentPhase=="point" && pendingPoint==0 && ptp.Active==0 && sample.Sequence==experimentSequence) experimentCompleting="complete";
                 if (experimentCompleting is { } outcome) FinishExperiment(outcome);
             }
         } else {
-            liveValues.Text = "坐标参考尚未建立；角度与误差不作有效读数。";
+            ShowFeedback(sample, "坐标参考尚未建立；角度与误差不作有效读数。");
             if (experiment is not null) FinishExperiment("reference_invalidated");
             if (!manualReferencePending && (pendingPoint != 0 || uploading is not null || executing || ptp.Active != 0)) Stop();
         }
@@ -98,7 +95,6 @@ public sealed partial class ControlWindow
         static void Check(bool b,[System.Runtime.CompilerServices.CallerArgumentExpression(nameof(b))] string? expression=null) { if(!b) throw new Exception("Feedback guard: "+expression); }
         void Snapshot(string name) {
             if (snapshotPath is null) return;
-            w.sideTabs.SelectedIndex=1;
             w.SaveWorkbenchSnapshot(Path.Combine(Path.GetDirectoryName(snapshotPath)!,name),1100,760);
         }
         void Ready(uint epoch=4, uint seq=1) {
