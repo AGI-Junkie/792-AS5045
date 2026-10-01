@@ -1,0 +1,16 @@
+﻿Two-Link Studio stage2-workbench-v7-unified-limits build - 2026-09-29T17:00:14.3739006+13:00
+Creator 4.4 ARM GCC 5.4 Debug firmware; .NET 10 Windows WPF Release host.
+PTP_COMMISSIONED=1; boot defaults q1 +/-30, q2 +/-60 degrees. Host synchronizes user limits while disabled; motion is gated until both axes match. Range fields use 0.01 degree precision, within +/-180 and containing zero.
+HostUart: UDB UART 115200 8N1, RX P12[6], TX P12[7], 256-byte RX/TX interrupt buffers.
+v7 host writes two copies of each byte with >=0.5 ms spacing; firmware deduplicates them into one frame. Data and command frames are 36 wire bytes; the compact heartbeat (D5..D7, advertised by short_hb=1) is 6 wire bytes. Frames are written by one dedicated thread; a heartbeat follows each data frame and idle spacing is >=20 ms after a completed heartbeat.
+CRC + control sequence/epoch protect enable, home and input leases; raw STOP remains immediate.
+Hardware monotonic deadlines, 250 ms deadman, 256-384 ms foreground-fed watchdog; no pulse catch-up.
+Encoder gap/jump/overflow latches position invalid until explicit enable establishes a new origin.
+Host self-test passed: guards, parameter roundtrip, recording, numerical planning, UI snapshots.
+v7 real upload: 383 nodes + RUN ACK, 28.9 s, 57 status/telemetry batches, raw log/feedback views, log trimmed=True, visible static progress checks=2; complete heartbeat max gap=61.1 ms (first=42.6 ms); dropped complete heartbeat #562, receive max gap=118.6 ms; receive callback=4.5 ms; UI lease max gap=32.4 ms; beats=743.
+337 actual-C simulation cases passed; hardware validation still required.
+Line: 4 actual-C simulation cases passed; hardware validation still required.
+Rectangle: 4 actual-C simulation cases passed; hardware validation still required.
+No serial connection, programming, or real motor movement performed.
+Screenshots contain explicitly marked simulated data, not hardware evidence.
+Arm2 and pen XY are not measured; real-machine acceptance and calibration remain with operator.

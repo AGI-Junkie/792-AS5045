@@ -1,5 +1,9 @@
 # v6：硬件 UART 通信升级
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
+本页记录首版 `stage2-workbench-v6-uart` 的整帧传输。当前 `stage2-workbench-v6-uart-recovery` 上位机改为最多 8 字节分段发送，并增加人工零位反馈，详见 [WORKBENCH_UART_RECOVERY.md](WORKBENCH_UART_RECOVERY.md)。下文的首版实现和数据保留作历史记录。
+
 交付目录：`deliverables/stage2-workbench-v6-uart`。本版需要同时更新固件和上位机，烧录和实机验收由操作者完成。
 
 ## 使用

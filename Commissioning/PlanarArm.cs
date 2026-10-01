@@ -7,9 +7,14 @@ public readonly record struct JointLimits(double Min1, double Max1, double Min2,
 {
     public bool Contains(JointPose p) => p.Q1 >= Min1 - 1e-8 && p.Q1 <= Max1 + 1e-8 &&
                                          p.Q2 >= Min2 - 1e-8 && p.Q2 <= Max2 + 1e-8;
+    // q2 is the absolute link angle, so motor 2 (the elbow) travels q2 - q1. Firmware bounds only the two
+    // boxes; the elbow range they imply is [Min2 - Max1, Max2 - Min1] (measured on the real firmware C).
+    public double ElbowMin => Min2 - Max1;
+    public double ElbowMax => Max2 - Min1;
 }
 
-// Angles in degrees: CCW positive, both joints zero at the straight reference pose.
+// Angles in degrees from the fixed +X zero direction: q1 is link 1, q2 is link 2.
+// Motor 2's elbow travel is q2 - q1; both angles are zero at the straight reference.
 // This geometric model has no serial or motor-control dependency.
 public sealed class PlanarArm
 {
@@ -30,9 +35,14 @@ public sealed class PlanarArm
     {
         if (!double.IsFinite(p.Q1) || !double.IsFinite(p.Q2)) throw new ArgumentException("角度须为有限数值。");
         var elbow = new Point(L1 * Math.Cos(p.Q1 * Rad), L1 * Math.Sin(p.Q1 * Rad));
-        return (elbow, new Point(elbow.X + L2 * Math.Cos((p.Q1 + p.Q2) * Rad),
-                                elbow.Y + L2 * Math.Sin((p.Q1 + p.Q2) * Rad)));
+        return (elbow, new Point(elbow.X + L2 * Math.Cos(p.Q2 * Rad),
+                                elbow.Y + L2 * Math.Sin(p.Q2 * Rad)));
     }
+
+    // Largest tip speed (mm/s) with |q1 rate| <= v1 and |q2 - q1 rate| <= v2 (deg/s), i.e. the two motor rates.
+    // The tip velocity is convex in the rates, so a corner of the rate box is worst; the best corner has both motors
+    // turning the same way with the arm straight: L1*v1 + L2*(v1 + v2).
+    public double MaxTipSpeed(double v1, double v2) => (L1 * v1 + L2 * (v1 + v2)) * Rad;
 
     public JointPose[] Inverse(double x, double y)
     {
@@ -45,8 +55,10 @@ public sealed class PlanarArm
             throw new ArgumentException("等长连杆在原点完全折叠时解不唯一，请选择其他目标。");
         double c2 = Math.Clamp((x * x + y * y - L1 * L1 - L2 * L2) / (2 * L1 * L2), -1, 1);
         double angle = Math.Acos(c2);
-        JointPose Solve(double q2) => new(Normalize((Math.Atan2(y, x) -
-            Math.Atan2(L2 * Math.Sin(q2), L1 + L2 * Math.Cos(q2))) / Rad), q2 / Rad);
+        JointPose Solve(double elbow) {
+            double q1 = Math.Atan2(y, x) - Math.Atan2(L2 * Math.Sin(elbow), L1 + L2 * Math.Cos(elbow));
+            return new(Normalize(q1 / Rad), Normalize((q1 + elbow) / Rad));
+        }
         // Keep +180/-180 distinct for joint-limit checks, even though their poses coincide.
         return angle < 1e-10 ? [Solve(angle)] : [Solve(angle), Solve(-angle)];
     }
@@ -71,10 +83,15 @@ public sealed class PlanarArm
                 Check((model.Forward(pose).Tip - point).Length < 1e-6);
         }
         var branches = model.Inverse(300, 0);
-        Check(branches.Length == 2 && branches[0].Q2 > 0 && branches[1].Q2 < 0);
+        // q2 is absolute, so its sign does not identify the elbow-up/down branch.
+        Check(branches.Length == 2 && branches[0].Q2 > branches[0].Q1 && branches[1].Q2 < branches[1].Q1);
         var limits = new JointLimits(-90, 90, 0, 160);
         Check(limits.Contains(branches[0]) && !limits.Contains(branches[1]));
         Check(new JointLimits(-90, 90, -5, 5).Contains(new JointPose(-90, 5)));
+        var bent = model.Forward(new JointPose(30, 60));
+        Check((bent.Elbow - new Point(180 * Math.Cos(30 * Rad), 90)).Length < 1e-8);
+        Check((bent.Tip - new Point(bent.Elbow.X + 176.38 / 2, bent.Elbow.Y + 176.38 * Math.Sin(60 * Rad))).Length < 1e-8);
+        Check(model.Inverse(bent.Tip.X, bent.Tip.Y).Any(p => Math.Abs(p.Q1 - 30) < 1e-8 && Math.Abs(p.Q2 - 60) < 1e-8));
         Reject(() => model.Inverse(357, 0)); Reject(() => model.Inverse(3, 0));
         Reject(() => model.Inverse(double.NaN, 0)); Reject(() => model.Inverse(double.PositiveInfinity, 0));
         Reject(() => new PlanarArm(0, 1)); Reject(() => new PlanarArm(double.NaN, 1));
@@ -82,5 +99,16 @@ public sealed class PlanarArm
         var unequal = new PlanarArm(100, 200);
         Check((unequal.Forward(unequal.Inverse(100, 0)[0]).Tip - new Point(100, 0)).Length < 1e-6);
         Check(unequal.Inverse(100, 0).Length == 2);
+        // Tip speed bound: no elbow angle and no corner of the rate box beats it, and the straight arm reaches it.
+        double bound = model.MaxTipSpeed(10, 6), fastest = 0;
+        for (int elbow = -180; elbow <= 180; elbow++)
+            foreach (var (w1, w2) in new[] { (10.0, 6.0), (10.0, -6.0), (-10.0, 6.0), (-10.0, -6.0) })
+            {
+                const double h = 1e-5;
+                var from = model.Forward(new JointPose(20, 20 + elbow)).Tip;
+                var to = model.Forward(new JointPose(20 + w1 * h, 20 + elbow + (w1 + w2) * h)).Tip;
+                fastest = Math.Max(fastest, (to - from).Length / h);
+            }
+        Check(Math.Abs(bound - fastest) < 1e-2 && Math.Abs(bound - (180 * 10 + 176.38 * 16) * Rad) < 1e-9);
     }
 }

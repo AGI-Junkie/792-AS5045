@@ -107,9 +107,22 @@ if ($HardwareUart) {
     }
     if ($verilog -notmatch 'BaudRate=115200,') { $issues.Add('Expected UART baud 115200') }
 }
+# main.c addresses pins by register; every PIN_<name> there must be the port/bit the table (and so TopDesign) says.
+$main = Get-Content -LiteralPath (Join-Path $ProjectPath 'main.c') -Raw
+$defs = @{}
+foreach ($m in [regex]::Matches($main, '(?m)^#define\s+PIN_(?<n>\w+)\s+CYREG_PRT(?<p>\d+)_PC(?<b>\d+)')) {
+    $defs[$m.Groups['n'].Value] = "CYREG_PRT$($m.Groups['p'].Value)_PC$($m.Groups['b'].Value)"
+}
+foreach ($pin in $expected) {
+    $want = "CYREG_PRT$($pin.Port)_PC$($pin.Bit)"
+    if (-not $defs.ContainsKey($pin.Logical)) { $issues.Add("main.c has no PIN_$($pin.Logical)") }
+    elseif ($defs[$pin.Logical] -cne $want) { $issues.Add("main.c PIN_$($pin.Logical) is $($defs[$pin.Logical]) but TopDesign has $want") }
+}
+$rawUses = [regex]::Matches(($main -replace '(?m)^#define\s+PIN_\w+\s+CYREG_PRT\d+_PC\d+', ''), 'CYREG_PRT\d+_PC\d+').Count
+if ($rawUses) { $issues.Add("main.c uses $rawUses raw CYREG_PRT pin name(s) outside its PIN_* table") }
 $report | Format-Table -AutoSize
 if ($issues.Count) { throw ($issues -join [Environment]::NewLine) }
-Write-Output 'PASS: 25 physical pins, electrical settings, interrupts and hardware routes verified.'
+Write-Output 'PASS: 25 physical pins, electrical settings, interrupts and hardware routes verified; main.c PIN_* names match.'
 if ($NamedInstances) {
     Write-Output 'PASS: all 25 functional instance names verified (DO = AS5045_DO).'
 } else {

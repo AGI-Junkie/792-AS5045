@@ -1,5 +1,7 @@
 # Two-Link Studio v5 UI3
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 本版只更新上位机，兼容 stage2-v5 固件，无需因界面更新重新烧录。关闭旧程序，运行 `deliverables/stage2-workbench-v5-ui3/host/TwoLinkCommissioning.exe`，保留完整 host 文件夹。UI2 交付目录保留，可回退。
 
 ## 本次调整

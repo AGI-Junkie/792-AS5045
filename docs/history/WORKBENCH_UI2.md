@@ -1,5 +1,7 @@
 # Two-Link Studio v5 UI2
 
+> **历史记录**：记录当时那次交付的改动和验证，可能与当前源码不一致（版本目录、固件标识、坐标约定都已变）。当前说明见 [README](../../README.md)、[协议](../PROTOCOL.md)、[状态模型](../STATE_MODEL.md)；以源码为准。
+
 本次为上位机界面更新，兼容已有 stage2-v5 固件。交付目录为 `deliverables/stage2-workbench-v5-ui2`，只发布上位机，不包含新固件；不需要因本次界面更新重新烧录。
 
 ## 启动与操作
