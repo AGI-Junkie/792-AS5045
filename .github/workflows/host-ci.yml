@@ -1,0 +1,63 @@
+name: Host CI
+
+on:
+  pull_request:
+    paths:
+      - 'Commissioning/**'
+      - '.github/workflows/host-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Commissioning/**'
+      - '.github/workflows/host-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host:
+    name: Build and self-test
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish WPF host
+        run: |
+          $ciRoot = Join-Path $env:RUNNER_TEMP 'host-ci'
+          $results = Join-Path $ciRoot 'results'
+          New-Item -ItemType Directory -Force -Path $results | Out-Null
+          dotnet publish Commissioning/Commissioning.csproj -c Release -r win-x64 --self-contained false --nologo -o (Join-Path $ciRoot 'app') 2>&1 | Tee-Object -FilePath (Join-Path $results 'publish.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run offline host self-test
+        run: |
+          $ciRoot = Join-Path $env:RUNNER_TEMP 'host-ci'
+          $results = Join-Path $ciRoot 'results'
+          $snapshot = Join-Path $results 'preview.png'
+          $process = Start-Process -FilePath (Join-Path $ciRoot 'app/TwoLinkCommissioning.exe') -ArgumentList @('--self-test', '--snapshot', ('"' + $snapshot + '"')) -WorkingDirectory $results -WindowStyle Hidden -Wait -PassThru
+          "Host self-test exit=$($process.ExitCode); no serial opened." | Set-Content (Join-Path $results 'host-tests.log')
+          if ($process.ExitCode -ne 0) {
+            $errorLog = Join-Path $results 'commissioning-self-test-error.txt'
+            if (Test-Path -LiteralPath $errorLog) { Get-Content -LiteralPath $errorLog }
+            exit $process.ExitCode
+          }
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: host-ci-diagnostics
+          path: ${{ runner.temp }}/host-ci/results
+          retention-days: 14

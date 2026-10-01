@@ -100,6 +100,8 @@ python tools/check-log.py --last        # 最新一份；--all 全部；PATH… 
 
 ## 构建与离线检查
 
+GitHub Actions 的 `Host CI` 在上位机源码或工作流变更的 PR、`main` 推送时运行，也支持手动触发。它使用 Windows / .NET 10 发布上位机并运行现有 `--self-test`；日志、离线截图和规划数据保存为 `host-ci-diagnostics`，保留 14 天。该工作流不构建固件、不连接串口。
+
 `build-release.ps1` 依次做：Creator 构建固件 → `verify-creator-pins.ps1`（TopDesign 与 `main.c` 的引脚一致）→ 发布上位机 → 上位机 `--self-test`（含真实 WPF 调度回放，UI 租约间隔 ≥ 200 ms 判失败）→ 固件 C 测试 → 源码哈希前后比对 → `BUILD_REPORT.txt` / `SHA256SUMS.txt`。构建过程中改动被哈希的源文件会中止并报错。
 
 单独运行：
