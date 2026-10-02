@@ -34,8 +34,18 @@ public sealed class App : Application
         // The pure geometry and planning checks alone (a few seconds, no window): quick feedback while changing shapes or timing.
         if (args.Contains("--geometry-self-test"))
         {
-            try { Lang.PersistChanges = false; Lang.Set(false, persist: false); PlanarArm.SelfTest(); DrawingTrajectory.SelfTest(); TimedTrajectory.SelfTest(); ExecutionTrajectory.SelfTest(); ReachabilityMask.SelfTest(); return 0; }
+            try { Lang.PersistChanges = false; Lang.Set(false, persist: false); PlanarArm.SelfTest(); DrawingTrajectory.SelfTest(); TimedTrajectory.SelfTest(); ExecutionTrajectory.SelfTest(); ReachabilityMask.SelfTest(); ExperimentArchiveTests.SelfTest(); return 0; }
             catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
+        }
+        // The experiment table of any folder as a CSV, with the plan/sample alignment check; no window.
+        int report = Array.IndexOf(args, "--experiments-report");
+        if (report >= 0)
+        {
+            if (report + 2 >= args.Length) return 2;
+            var (runs, unreadable) = ExperimentArchive.List(args[report + 1]);
+            File.WriteAllText(args[report + 2], ExperimentArchive.ReportCsv(runs), new UTF8Encoding(true));
+            Console.Error.WriteLine($"{runs.Count} experiments, {unreadable} unreadable");
+            return 0;
         }
         // Line-quality experiment against a real firmware on a serial port; see docs/UART_DIAGNOSIS.md.
         int stress = Array.IndexOf(args, "--uart-stress");
@@ -811,8 +821,10 @@ public sealed partial class ControlWindow : Window
         ShortHeartbeatSelfTest();
         ExecutionTrajectory.SelfTest();
         ExperimentRecorder.SelfTest();
+        ExperimentArchiveTests.SelfTest();
         FeedbackSelfTest(snapshotPath);
         XYPreviewPanel.SelfTest(snapshotPath);
+        ExperimentWindow.SelfTest(snapshotPath);
         var window = new ControlWindow { selfTesting = true };
         static void Check(bool condition, [System.Runtime.CompilerServices.CallerArgumentExpression(nameof(condition))] string? expression = null)
         { if (!condition) throw new InvalidOperationException("UI state check failed: " + expression); }
