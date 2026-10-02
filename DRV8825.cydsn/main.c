@@ -72,13 +72,14 @@
  * The STATE line keeps the plain "stage2-v7" token because the host matches it to
  * select the framed transport.  Bump this on every firmware change so a field log
  * can answer "was this fix actually flashed?". */
-#define FW_BUILD_ID                 "stage2-v7-absolute-q2-r4000-live"
+#define FW_BUILD_ID                 "stage2-v7-absolute-q2-elbow-r4000-live"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
  * above can change freely.  Bump it (and the host constant) whenever a frame format, a field's meaning,
- * the sequence/epoch rules or the coordinate convention changes. */
-#define PROTO_VERSION               (1u)
+ * the sequence/epoch rules or the coordinate convention changes.  2: PTP_STATE carries emin/emax and type 9
+ * accepts axis 2, the elbow range (q2 - q1, i.e. motor 2's own travel). */
+#define PROTO_VERSION               (2u)
 
 /* The software UART only accepts odd bytes.  jog.ps1 maps physical R to this
  * otherwise-unused wire byte, because ASCII 'r' (0x72) is even. */
@@ -143,6 +144,16 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
     (PTP_MIN1_CD > 0) || (PTP_MAX1_CD < 0) || (PTP_MIN2_CD > 0) || (PTP_MAX2_CD < 0) || \
     (PTP_MIN1_CD < -CFG_JOINT_CD_MAX) || (PTP_MAX1_CD > CFG_JOINT_CD_MAX) || (PTP_MIN2_CD < -CFG_JOINT_CD_MAX) || (PTP_MAX2_CD > CFG_JOINT_CD_MAX))
 #error "PTP requires valid software bounds within +/-180 deg containing straight zero"
+#endif
+/* Elbow (motor 2, q2 - q1) range, 0.01 deg.  Like the boxes above this is a provisional software bound, NOT a
+ * measured mechanical stroke; the host overwrites it (type 9, axis 2) before any motion is allowed.  The value
+ * is the same as the host's DeviceContract.ElbowDefaultCd. */
+#define PTP_ELBOW_DEFAULT_CD         (15500)
+#define PTP_MINE_CD                  (-PTP_ELBOW_DEFAULT_CD)
+#define PTP_MAXE_CD                  (PTP_ELBOW_DEFAULT_CD)
+#if PTP_COMMISSIONED && (PTP_MINE_CD >= PTP_MAXE_CD || PTP_MINE_CD > 0 || PTP_MAXE_CD < 0 || \
+    PTP_MINE_CD < -CFG_JOINT_CD_MAX || PTP_MAXE_CD > CFG_JOINT_CD_MAX)
+#error "PTP requires an elbow bound within +/-180 deg containing straight zero"
 #endif
 #define PTP_RATE_MAX                 (4000u)
 #define PTP_ACCEL                    (3000u)
@@ -1102,9 +1113,11 @@ static uint8  g_directionKnown;
 static uint8  g_homed1;
 static uint8  g_homed2;
 static int32  g_arm1SoftCenter;
-/* Volatile operator settings: boot restores defaults; stop/enable retain them. */
-static int16 g_jointMinCd[2] = { PTP_MIN1_CD, PTP_MIN2_CD };
-static int16 g_jointMaxCd[2] = { PTP_MAX1_CD, PTP_MAX2_CD };
+/* Volatile operator settings: boot restores defaults; stop/enable retain them.  Index 0/1 bound the link angles
+ * q1/q2; index 2 bounds the elbow q2 - q1, which is what motor 2 actually travels. */
+#define JOINT_ELBOW                 (2u)
+static int16 g_jointMinCd[3] = { PTP_MIN1_CD, PTP_MIN2_CD, PTP_MINE_CD };
+static int16 g_jointMaxCd[3] = { PTP_MAX1_CD, PTP_MAX2_CD, PTP_MAXE_CD };
 static uint8 g_limitsAccepted[15];
 static uint16 g_motionRate[2] = { JOG1_RATE_MAX_USTEP_S, JOG2_RATE_MAX_USTEP_S };
 static uint16 g_motionAccel[2] = { JOG1_ACCEL_USTEP_S2, JOG2_ACCEL_USTEP_S2 };
@@ -1473,7 +1486,9 @@ static uint8 ptp_counts_in_range(uint8 axis, int32 count)
     int32 q1=ptp_angle_from_counts(0u,axis==0u?count:g_arm1.usteps);
     int32 q2=q1+ptp_angle_from_counts(1u,axis==1u?count:g_arm2.usteps);
     int32 value=axis==0u ? q1 : q2;
-    return value>=g_jointMinCd[axis] && value<=g_jointMaxCd[axis];
+    int32 elbow=q2-q1;
+    return value>=g_jointMinCd[axis] && value<=g_jointMaxCd[axis] &&
+           elbow>=g_jointMinCd[JOINT_ELBOW] && elbow<=g_jointMaxCd[JOINT_ELBOW];
 }
 static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
 {
@@ -1489,6 +1504,9 @@ static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
                     (s>0 && a->usteps>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[0])))) return 0u;
     if(axis==1u && ((s<0 && a->usteps<=g_ptp.origin[1]-ptp_offset(1u,g_jointMaxCd[1]-q1)) ||
                     (s>0 && a->usteps>=g_ptp.origin[1]-ptp_offset(1u,g_jointMinCd[1]-q1)))) return 0u;
+    /* The elbow is motor 2's own angle, so its range bounds that motor directly. */
+    if(axis==1u && ((s<0 && a->usteps<=g_ptp.origin[1]-ptp_offset(1u,g_jointMaxCd[JOINT_ELBOW])) ||
+                    (s>0 && a->usteps>=g_ptp.origin[1]-ptp_offset(1u,g_jointMinCd[JOINT_ELBOW])))) return 0u;
     if(axis==0u && ((s<0 && g_arm1.usteps<=g_ptp.origin[0]-ptp_offset(0u,g_jointMaxCd[1]-elbow)) ||
                     (s>0 && g_arm1.usteps>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[1]-elbow)))) return 0u;
     if(a->hasEnc) {
@@ -1528,7 +1546,7 @@ static void joint_limits_accept(const uint8 *p)
         g_rxRejected++; g_ptpEpochRejected++; ptp_announce_epoch();
         JLOG("PTP_LIMITS refused: stale epoch\r\n"); return;
     }
-    if(!seq || axis>1u || (rates ?
+    if(!seq || axis>(rates ? 1u : JOINT_ELBOW) || (rates ?
        (min<CFG_RATE_MIN || min>(axis==0u?CFG_RATE_MAX_AXIS1:CFG_RATE_MAX_AXIS2) ||
         max<CFG_ACCEL_MIN || max>(axis==0u?CFG_ACCEL_MAX_AXIS1:CFG_ACCEL_MAX_AXIS2)) :
        (min < -CFG_JOINT_CD_MAX || max > CFG_JOINT_CD_MAX || min>=max || min>0 || max<0))) {
@@ -1687,7 +1705,8 @@ static void ptp_accept(void)
         JLOG("MANUAL REF OK: operator declares current pose q1=q2=0 straight; no motion; NOT sensor homed\r\n");
         stage_status(); return;
     }
-    if (q1 < g_jointMinCd[0] || q1 > g_jointMaxCd[0] || q2 < g_jointMinCd[1] || q2 > g_jointMaxCd[1] || (p[0]==1u && (rate < (uint32)CFG_RATE_MIN || rate > PTP_RATE_MAX)) ||
+    if (q1 < g_jointMinCd[0] || q1 > g_jointMaxCd[0] || q2 < g_jointMinCd[1] || q2 > g_jointMaxCd[1] ||
+        q2-q1 < g_jointMinCd[JOINT_ELBOW] || q2-q1 > g_jointMaxCd[JOINT_ELBOW] || (p[0]==1u && (rate < (uint32)CFG_RATE_MIN || rate > PTP_RATE_MAX)) ||
         !ptp_counts_in_range(0u,g_arm1.usteps) || !ptp_counts_in_range(1u,g_arm2.usteps)) {
         JLOG("PTP refused: joint range/rate\r\n"); return;
     }
@@ -2130,10 +2149,11 @@ static void home_service(void)
 
 static void motion_config_status(void)
 {
-    JLOGF("PTP_STATE lock=%u ref=%u active=%u epoch=%lu seq=%lu min1=%d max1=%d min2=%d max2=%d\r\n",
+    JLOGF("PTP_STATE lock=%u ref=%u active=%u epoch=%lu seq=%lu min1=%d max1=%d min2=%d max2=%d emin=%d emax=%d\r\n",
           (unsigned)!PTP_COMMISSIONED,(unsigned)g_ptp.reference,(unsigned)g_ptp.active,
           (unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,
-          (int)g_jointMinCd[0],(int)g_jointMaxCd[0],(int)g_jointMinCd[1],(int)g_jointMaxCd[1]);
+          (int)g_jointMinCd[0],(int)g_jointMaxCd[0],(int)g_jointMinCd[1],(int)g_jointMaxCd[1],
+          (int)g_jointMinCd[JOINT_ELBOW],(int)g_jointMaxCd[JOINT_ELBOW]);
     JLOGF("MOTION_RATES epoch=%lu r1=%u r2=%u a1=%u a2=%u\r\n",(unsigned long)g_ptp.epoch,
           (unsigned)g_motionRate[0],(unsigned)g_motionRate[1],(unsigned)g_motionAccel[0],(unsigned)g_motionAccel[1]);
 }

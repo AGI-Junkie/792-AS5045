@@ -58,7 +58,7 @@ public sealed partial class ControlWindow
             uint statusSequence;
             lock (peerSync) { statusSequence = sequence; }
             window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-            window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=2 seq={statusSequence} min1=-3000 max1=3000 min2=-6000 max2=6000");
+            window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=2 seq={statusSequence} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             window.TestLine($"TELEM t={49000 + batches * 500} epoch=2 seq={statusSequence} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, plan.Nodes[0].Pose)} p2={ExecutionTrajectory.Counts(1, plan.Nodes[0].Pose)} e1=0 err=0 inputs=0 drops=0");
             // Advertise the compact heartbeat so the replay exercises the configuration
             // that actually ships, not a legacy one.

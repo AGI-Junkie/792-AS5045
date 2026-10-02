@@ -23,7 +23,7 @@ public sealed partial class ControlWindow
                 const uint epoch = 4; uint seq = 1;
                 void Device(JointPose at) {
                     w.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-                    w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch={epoch} seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+                    w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch={epoch} seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
                     if (!w.protocolMatches) w.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
                     w.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, at)} p2={ExecutionTrajectory.Counts(1, at)} e1=0 err=0 inputs=0 drops=0");
                     w.UpdateControls();
@@ -33,7 +33,7 @@ public sealed partial class ControlWindow
                     Click(panel.MoveButton);
                     Check(w.pendingPoint != 0 && w.pointWire.Count == 36, name, "低速移到起点 did not queue a move");
                     uint moving = w.pendingPoint;
-                    w.TestLine($"PTP_STATE lock=0 ref=1 active=1 epoch={epoch} seq={moving} min1=-3000 max1=3000 min2=-6000 max2=6000");
+                    w.TestLine($"PTP_STATE lock=0 ref=1 active=1 epoch={epoch} seq={moving} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
                     Check(w.pendingPoint == 0, name, "the move was not acknowledged by its PTP_STATE");
                     seq = moving; Device(target);   // arrived: idle again at the target with matching telemetry
                 }

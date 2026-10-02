@@ -28,8 +28,9 @@ public sealed class DrawingTrajectory
         if (!Enum.IsDefined(shape) || branch is < 0 or > 1 ||
             new[] { x, y, a, b }.Any(v => !double.IsFinite(v) || Math.Abs(v) > 20000))
             throw Lang.Error("err.shapeRange");
-        if (limits is { } l && (new[] { l.Min1, l.Max1, l.Min2, l.Max2 }.Any(v => !double.IsFinite(v)) ||
-            l.Min1 < -180 || l.Max1 > 180 || l.Min2 < -180 || l.Max2 > 180 || l.Min1 >= l.Max1 || l.Min2 >= l.Max2))
+        if (limits is { } l && (new[] { l.Min1, l.Max1, l.Min2, l.Max2, l.ElbowMin, l.ElbowMax }.Any(v => !double.IsFinite(v)) ||
+            l.Min1 < -180 || l.Max1 > 180 || l.Min2 < -180 || l.Max2 > 180 || l.Min1 >= l.Max1 || l.Min2 >= l.Max2 ||
+            l.ElbowMin < -180 || l.ElbowMax > 180 || l.ElbowMin >= l.ElbowMax))
             throw Lang.Error("err.jointRange");
         var points = new List<Point> { new(x, y) };
         var stops = new List<int> { 0 };
@@ -98,7 +99,8 @@ public sealed class DrawingTrajectory
                 };
             }
             if (limits is { } range && !range.Contains(pose))
-                throw Lang.Error("err.sampleOutOfRange", i + 1, pose.Q1, pose.Q2, range.Min1, range.Max1, range.Min2, range.Max2);
+                throw Lang.Error("err.sampleOutOfRange", i + 1, pose.Q1, pose.Q2, range.Min1, range.Max1, range.Min2, range.Max2,
+                    JointLimits.Elbow(pose), range.ElbowMin, range.ElbowMax);
             samples[i] = new DrawingSample(distance, point, pose);
         }
         bool nearSingularity = samples.Any(s => Math.Abs(Math.Sin((s.Pose.Q2 - s.Pose.Q1) * Math.PI / 180)) < 0.05);
@@ -116,12 +118,15 @@ public sealed class DrawingTrajectory
             };
             nearSingularity |= Math.Abs(Math.Sin((pose.Q2 - pose.Q1) * Math.PI / 180)) < 0.05;
             if (limits is { } range && !range.Contains(pose))
-                throw Lang.Error("err.betweenSamples", pose.Q1, pose.Q2);
+                throw Lang.Error("err.betweenSamples", pose.Q1, pose.Q2, JointLimits.Elbow(pose));
         }
         if (shape == DrawingShape.Circle)
         {
             double centerRadius = Math.Sqrt(x * x + y * y), centerAngle = Math.Atan2(y, x);
             void CheckAngle(double angle) => CheckBetween((angle / (2 * Math.PI) % 1 + 1) % 1, 0, samples.Length - 1);
+            // The elbow depends on the tip's distance from the base only, so its extremes sit at the nearest and farthest
+            // points of the circle: on the line through the base and the centre.
+            if (centerRadius > 0) { CheckAngle(centerAngle); CheckAngle(centerAngle + Math.PI); }
             // Absolute q1/q2 extrema occur when the other link is radial to the circle.
             foreach (double link in new[] { model.L2, model.L1 })
             foreach (double offset in new[] { a - link, a + link })
@@ -159,13 +164,13 @@ public sealed class DrawingTrajectory
         return new DrawingTrajectory(model, limits, shape, branch, samples, stops.ToArray(), shape == DrawingShape.Circle ? new Point(x, y) : null, nearSingularity);
     }
 
-    internal const string CsvMetadataHeader = "kind,shape,l1_mm,l2_mm,branch,limits_status,q1_min_deg,q1_max_deg,q2_min_deg,q2_max_deg";
+    internal const string CsvMetadataHeader = "kind,shape,l1_mm,l2_mm,branch,limits_status,q1_min_deg,q1_max_deg,q2_min_deg,q2_max_deg,elbow_min_deg,elbow_max_deg";
     internal string CsvMetadata
     {
         get
         {
             static string N(double v) => v.ToString("G17", CultureInfo.InvariantCulture);
-            string range = Limits is { } l ? $"{N(l.Min1)},{N(l.Max1)},{N(l.Min2)},{N(l.Max2)}" : ",,,";
+            string range = Limits is { } l ? $"{N(l.Min1)},{N(l.Max1)},{N(l.Min2)},{N(l.Max2)},{N(l.ElbowMin)},{N(l.ElbowMax)}" : ",,,,,";
             return $"preview_only,{Shape},{N(Model.L1)},{N(Model.L2)},{Branch},{(Limits is null ? "unmeasured" : "samples_checked")},{range}";
         }
     }
@@ -199,7 +204,7 @@ public sealed class DrawingTrajectory
             }
             if (shape != DrawingShape.Line) Check(path.Samples[0].Target == path.Samples[^1].Target);
             string[] rows = path.ToCsv().Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
-            Check(rows.Length == path.Samples.Length + 1 && rows.All(row => row.Split(',').Length == 16));
+            Check(rows.Length == path.Samples.Length + 1 && rows.All(row => row.Split(',').Length == 18));
         }
         Check(Math.Abs(Create(model, DrawingShape.Rectangle, 200, 0, 30, 40, 0).Length - 140) < 1e-8);
         var wrap = Create(model, DrawingShape.Circle, 0, 0, 200, 0, 0);
@@ -217,7 +222,22 @@ public sealed class DrawingTrajectory
         Reject(() => Create(model, DrawingShape.Line, 200, 0, 201, 0, 0, new JointLimits(-1, 1, -1, 1)));
         Reject(() => Create(model, DrawingShape.Circle, 0, 0, 200, 0, 0, new JointLimits(-180, 180, -179, 179)));
         var limited = Create(model, DrawingShape.Line, 220, 0, 250, 20, 0, new JointLimits(-90, 90, 0, 160));
-        Check(limited.ToCsv().Contains("samples_checked,-90,90,0,160"));
+        Check(limited.ToCsv().Contains("samples_checked,-90,90,0,160,-155,155"));
+        // The elbow bound rejects a path that both q boxes accept, at a sample and between samples:
+        // a line near the base needs a large elbow; the same line far out does not.
+        var near = model.Inverse(60, 0)[0]; var far = model.Inverse(300, 0)[0];
+        Check(Math.Abs(JointLimits.Elbow(near)) > 120 && Math.Abs(JointLimits.Elbow(far)) < 70);
+        var boxes = new JointLimits(-180, 180, -180, 180, -100, 100);
+        Reject(() => Create(model, DrawingShape.Line, 60, 0, 70, 0, 0, boxes));
+        Check(Create(model, DrawingShape.Line, 300, 0, 310, 0, 0, boxes).Samples.Length > 2);
+        // The circle's nearest point to the base falls between two samples, whose elbows stay ~9e-4 deg short of the true
+        // extreme: only the analytic nearest/farthest check sees it, so a bound just under it must reject.
+        var ring = Create(model, DrawingShape.Circle, 200, 0, 50, 0, 0);
+        double ringMax = ring.Samples.Max(s => Math.Abs(JointLimits.Elbow(s.Pose)));
+        double exactMax = Math.Abs(JointLimits.Elbow(model.Inverse(150, 0)[0]));
+        Check(exactMax >= ringMax - 1e-9);
+        Reject(() => Create(model, DrawingShape.Circle, 200, 0, 50, 0, 0, new JointLimits(-180, 180, -180, 180, -(exactMax - 1e-4), exactMax - 1e-4)));
+        Check(Create(model, DrawingShape.Circle, 200, 0, 50, 0, 0, new JointLimits(-180, 180, -180, 180, -(exactMax + 1e-4), exactMax + 1e-4)).Samples.Length == ring.Samples.Length);
         // Endpoint/sample checks alone miss these interior joint extrema.
         double endQ2 = model.Inverse(-0.4, 200)[0].Q2, middleQ2 = model.Inverse(0, 200)[0].Q2;
         Reject(() => Create(model, DrawingShape.Line, -0.4, 200, 0.4, 200, 0, new JointLimits(-179, 179, 0, (endQ2 + middleQ2) / 2)));

@@ -862,9 +862,9 @@ public sealed partial class ControlWindow : Window
         Check(!window.enable.IsEnabled && !window.home.IsEnabled && !window.stopPending);
         window.xyPreview.RestoreLimitsForSelfTest("-60", "60", "-90", "90");
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-        window.TestLine("PTP_STATE lock=1 ref=1 active=0 epoch=7 seq=0 min1=0 max1=0 min2=0 max2=0");
+        window.TestLine("PTP_STATE lock=1 ref=1 active=0 epoch=7 seq=0 min1=0 max1=0 min2=0 max2=0 emin=0 emax=0");
         Check(!window.CanPoint);
-        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         Check(!window.CanPoint); // matching limits cannot override missing q2 capability
         window.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
         Check(!window.CanPoint); // the device has not confirmed the requested rates yet
@@ -875,9 +875,9 @@ public sealed partial class ControlWindow : Window
         window.RequestPoint(new JointPose(1.25, -2.5));
         Check(window.pendingPoint==1 && window.pointWire.Count==36 && !window.CanPoint && !window.home.IsEnabled);
         window.Stop(); Check(window.pendingPoint==0 && window.pointWire.Count==0 && !window.CanPoint);
-        window.TestLine("PTP_STATE lock=0 ref=1 active=1 epoch=7 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=1 epoch=7 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         Check(!window.CanPoint && !window.home.IsEnabled);
-        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         Arm(7, 1);
         Check(window.CanPoint);
         // Compact re-announcement: the firmware repeats this after a reference epoch
@@ -886,18 +886,18 @@ public sealed partial class ControlWindow : Window
         Check(window.ptp is { Epoch: 9 }, "compact epoch announcement was not adopted");
         window.TestLine("PTP_EPOCH nonsense");
         Check(window.ptp is { Epoch: 9 }, "malformed epoch announcement changed the epoch");
-        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         window.lastPtpAt = DateTime.UtcNow.AddSeconds(-3); Check(!window.CanPoint);
         window.TestLine("PTP_STATE malformed"); Check(!window.CanPoint);
         window.xyPreview.RestoreLimitsForSelfTest("-30", "30", "-60", "60");
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
-        window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=20 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=20 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(window.CanManualReference && window.manualReference.IsEnabled && !window.CanPoint);
         window.RequestManualReference();
         uint manualSeq = window.pendingPoint;
         Check(window.manualReferencePending && window.pointWire.Count == 36 && !window.CanManualReference);
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Arm(21, manualSeq);
         Check(window.CanPoint && !window.manualReferencePending && window.pointWire.Count == 0);
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
@@ -919,35 +919,35 @@ public sealed partial class ControlWindow : Window
         Check(window.pendingPoint == 0 && window.pointWire.Count == 0);
         window.RetryPendingPoint(window.pointRequestedAt.AddSeconds(4));
         Check(window.pointWire.Count == 0); // timeout cannot restart anything
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         window.RequestPoint(new JointPose(-21.95, 44.37));
         retrySeq = window.pendingPoint;
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=1 epoch=21 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=1 epoch=21 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         window.RetryPendingPoint(window.pointRequestedAt.AddMilliseconds(1100));
         Check(window.pendingPoint == 0 && window.pointWire.Count == 0); // ACK cancels retransmission
         window.TestLine("STOP: driver fault");
         Check(window.ptp is null && window.pointWire.Count == 0);
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=22 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=22 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         window.RequestPoint(new JointPose(-21.95, 44.37));
         window.TestLine("PTP refused: joint range/rate");
         window.RetryPendingPoint(window.pointRequestedAt.AddSeconds(1));
         Check(window.pendingPoint == 0 && window.pointWire.Count == 0); // genuine refusal never retries
         window.Stop(); Check(!window.CanPoint && !window.CanManualReference);
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=0 homed2=0 fault=0 enc=0 dir=0");
-        window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=22 seq=2 min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=22 seq=2 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(!window.CanManualReference);
         var path = DrawingTrajectory.Create(new PlanarArm(180, 176.38), DrawingShape.Circle, 340, 0, 5, 0, 0, null);
         var execution = new ExecutionTrajectory(new TimedTrajectory(path, new PlanningRates(20, 5, 3, 10, 6)), new JointLimits(-30, 30, -60, 60));
         window.xyPreview.RestoreLimitsForSelfTest("-60", "60", "-90", "90");
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=8 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=8 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         void StartSample(uint epoch, uint seq) => window.TestLine($"TELEM t=1000 epoch={epoch} seq={seq} ref=1 source=2 p1={ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose)} p2={ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose)} e1=0 err=0 inputs=0 drops=0");
         window.RequestTrajectory(execution); Check(window.uploading is null); // missing position feedback
         StartSample(8,1);
         window.RequestTrajectory(execution);
         Check(window.uploading is not null && window.pointWire.Count == 36 && !window.CanPoint && !window.home.IsEnabled);
         uint first = window.pendingPoint;
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={first} min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={first} min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         Check(window.pendingPoint == first && window.uploadNext == 0); // PTP status is not a node acknowledgement
         uint lastSeq = 0;
         for (int i = 0; i < execution.Nodes.Length; i++) {
@@ -960,7 +960,7 @@ public sealed partial class ControlWindow : Window
             }
         }
         Check(window.uploading is null && window.uploaded == execution && !window.executing && window.pointWire.Count == 0 && window.CanPoint); // fully loaded, nothing moves
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={lastSeq} min1=-6000 max1=6000 min2=-9000 max2=9000"); StartSample(8, lastSeq); // the device reports the last node as its sequence
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={lastSeq} min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500"); StartSample(8, lastSeq); // the device reports the last node as its sequence
         window.RequestPoint(new JointPose(1, 1)); window.RequestManualReference();
         Check(window.pendingPoint == 0 && window.pointWire.Count == 0 && !window.CanManualReference); // the device refuses other moves while it holds a plan
         window.RequestExecute(); Check(window.uploading is not null && window.uploaded is null && window.pendingPoint != 0 && window.pointWire.Count == 36);
@@ -968,18 +968,18 @@ public sealed partial class ControlWindow : Window
         Check(window.uploading is null && window.executing && window.pointWire.Count == 0 && window.pendingPoint == 0);
         window.TestLine($"TRAJ_STATE state=4 count={execution.Nodes.Length} total={execution.Nodes.Length} index={execution.Nodes.Length} seq={window.trajectoryRunSequence} epoch=8");
         Check(!window.executing && window.uploaded == execution && window.uploadedRan); // the device keeps a finished plan
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={window.trajectoryRunSequence} min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={window.trajectoryRunSequence} min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         StartSample(8,window.trajectoryRunSequence);
         window.RequestExecute(); Check(window.uploading is not null && window.uploaded is null && window.pointWire.Count == 36); // repeat: RUN only, no upload
         window.TestLine($"TRAJ_STATE state=3 count={execution.Nodes.Length} total={execution.Nodes.Length} index=1 seq={window.pendingPoint} epoch=8");
         window.TestLine($"TRAJ_STATE state=4 count={execution.Nodes.Length} total={execution.Nodes.Length} index={execution.Nodes.Length} seq={window.trajectoryRunSequence} epoch=8");
         Check(!window.executing && window.uploaded == execution && window.uploadedRan);
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={window.trajectoryRunSequence} min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={window.trajectoryRunSequence} min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         StartSample(8,window.trajectoryRunSequence);
         window.RequestTrajectory(execution); Check(window.uploading is not null);
         window.Stop(); Check(window.uploading is null && window.pointWire.Count == 0 && window.pendingPoint == 0);
         window.uploaded = execution; window.UpdateControls(); Check(window.uploaded is null); // no reference, no held plan
-        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=9999 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=9999 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         StartSample(9,9999);
         window.RequestTrajectory(execution);
         window.TestLine($"TRAJ_STATE state=1 count=2 total={execution.Nodes.Length} index=0 seq={window.pendingPoint} epoch=9");
@@ -997,7 +997,7 @@ public sealed partial class ControlWindow : Window
                 foreach(var n in extraPlan.Nodes) { extra.Write((short)Math.Round(n.Pose.Q1*100)); extra.Write((short)Math.Round(n.Pose.Q2*100)); extra.Write(n.Milliseconds); }
             }
             window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-            window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=30 seq=10000 min1=-3000 max1=3000 min2=-6000 max2=6000");
+            window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=30 seq=10000 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             int p1=ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose), p2=ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose);
             window.errorHistory.Clear();
             for(int i=0;i<40;i++) window.TestLine($"TELEM t={i*500} epoch=30 seq=10000 ref=1 source=2 p1={p1} p2={p2} e1={(int)Math.Round(p1*2.56)+i%9-4} err=0 inputs=0 drops=0");

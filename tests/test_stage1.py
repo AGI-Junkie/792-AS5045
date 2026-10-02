@@ -371,7 +371,9 @@ static void limits_test(const char *t) {
     if(!strcmp(t,"limits_invalid")) {
         const int16 bounds[][2]={{-18001,13500},{-13500,18001},{100,200},{-200,-100},{1,1},{100,-100}};
         for(i=0;i<sizeof(bounds)/sizeof(bounds[0]);i++)limits_send(seq,epoch,0,bounds[i][0],bounds[i][1]);
-        limits_send(seq,epoch,2,-13500,13500);limits_send(0,epoch,0,-13500,13500);
+        limits_send(seq,epoch,3,-13500,13500);limits_send(0,epoch,0,-13500,13500);
+        { const int16 elbow[][2]={{-18001,12000},{-9000,18001},{100,12000},{-9000,-100},{1,1},{100,-100}}; /* axis 2 = elbow: same rules as the boxes */
+          for(i=0;i<sizeof(elbow)/sizeof(elbow[0]);i++)limits_send(seq,epoch,2,elbow[i][0],elbow[i][1]); }
         limits_send(seq,epoch-1u,0,-13500,13500);
         packetType=9;ptp_send(seq,epoch,-13500,13500,0,1);packetType=1;
         assert(g_controlSequence<seq && g_ptp.epoch==epoch && !simPulse1 && !simPulse2);
@@ -404,9 +406,17 @@ static void limits_test(const char *t) {
     }
     limits_send(g_controlSequence+1u,epoch,1,-15000,15000);
     assert(strstr(simLog,"min1=-13500 max1=13500 min2=-15000 max2=15000"));
+    if(!strncmp(t,"limits_elbow",12)) {
+        /* Boot default first: straight is inside, +/-155 deg is the provisional bound. */
+        assert(g_jointMinCd[JOINT_ELBOW]==-15500 && g_jointMaxCd[JOINT_ELBOW]==15500 && strstr(simLog,"emin=-15500 emax=15500"));
+        simLogN=0;simLog[0]=0;limits_send(g_controlSequence+1u,epoch,JOINT_ELBOW,-9000,12000);
+        assert(g_jointMinCd[JOINT_ELBOW]==-9000 && g_jointMaxCd[JOINT_ELBOW]==12000);
+        assert(strstr(simLog,"PTP_LIMITS epoch=") && strstr(simLog,"axis=2 min=-9000 max=12000") && strstr(simLog,"emin=-9000 emax=12000"));
+        assert(g_jointMinCd[0]==-13500 && g_jointMaxCd[1]==15000); /* the boxes did not move */
+    }
     jog_handle_byte(JOG_CMD_STOP);short_send(0,0);stage_enable();txq_flush_blocking();
     assert(g_motionEnabled && !simPulse1 && !simPulse2);
-    assert(ptp_counts_in_range(0u,g_ptp.origin[0]-ptp_offset(0u,13500)) && ptp_counts_in_range(1u,g_ptp.origin[1]-ptp_offset(1u,15000)));
+    assert(ptp_counts_in_range(0u,g_ptp.origin[0]-ptp_offset(0u,13500)) && (!strncmp(t,"limits_elbow",12) || ptp_counts_in_range(1u,g_ptp.origin[1]-ptp_offset(1u,15000)))); /* the elbow cases narrow the elbow below q2's +150 */
     if(!strcmp(t,"limits_configure") || !strcmp(t,"limits_retry"))return;
     packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;
     assert(g_ptp.reference && g_homed1 && g_homed2);
@@ -414,6 +424,40 @@ static void limits_test(const char *t) {
         ptp_send(2,g_ptp.epoch,13501,0,600,0);assert(!g_ptp.active);
         packetType=2;ptp_send(2,g_ptp.epoch,13501,0,2,0);packetType=1;assert(!g_traj.state);
         ptp_send(2,g_ptp.epoch,13500,0,600,0);assert(g_ptp.active && g_ptp.target[0]==g_ptp.origin[0]-ptp_offset(0u,13500));
+        return;
+    }
+    if(!strcmp(t,"limits_elbow")) {
+        /* q1 and q2 are inside their boxes in every refusal below: only the elbow range (-90..+120 deg) can say no. */
+        ptp_send(2,g_ptp.epoch,0,12001,600,0);assert(!g_ptp.active);
+        ptp_send(2,g_ptp.epoch,-3000,9001,600,0);assert(!g_ptp.active);   /* elbow +120.01 */
+        ptp_send(2,g_ptp.epoch,3000,-6001,600,0);assert(!g_ptp.active);   /* elbow -90.01 */
+        packetType=2;ptp_send(2,g_ptp.epoch,0,12001,2,0);packetType=1;assert(!g_traj.state);
+        ptp_send(2,g_ptp.epoch,0,12000,600,0);
+        assert(g_ptp.active && g_ptp.target[1]==g_ptp.origin[1]-ptp_offset(1u,12000)); /* exactly on the bound is allowed */
+        return;
+    }
+    if(!strcmp(t,"limits_elbow_traj")) {
+        packetType=2;ptp_send(2,g_ptp.epoch,0,0,3,0);assert(g_traj.count==1);
+        simLogN=0;simLog[0]=0;
+        packetType=3;ptp_send(3,g_ptp.epoch,0,12001,250,0);txq_flush_blocking();
+        assert(g_traj.count==1 && strstr(simLog,"joint range/rate")); /* refused for the range, not for rate or order */
+        simLogN=0;simLog[0]=0;
+        ptp_send(3,g_ptp.epoch,0,-9001,250,0);txq_flush_blocking();
+        assert(g_traj.count==1 && strstr(simLog,"joint range/rate"));
+        packetType=1;
+        return;
+    }
+    if(!strcmp(t,"limits_elbow_jog")) {
+        jog_axis_t *a=&g_arm2;int32 count;
+        g_ptp.reference=0;simHome1Mode=simHome2Mode=-1;g_arm1.usteps=g_ptp.origin[0];
+        /* q2 would still allow +15000 here, so the elbow bound alone stops the outward step. */
+        a->usteps=g_ptp.origin[1]-ptp_offset(1u,12000);count=a->usteps;
+        jog_step(a,-1);assert(a->usteps==count);jog_step(a,1);assert(a->usteps==count+1);
+        a->usteps=g_ptp.origin[1]-ptp_offset(1u,-9000);count=a->usteps;
+        jog_step(a,1);assert(a->usteps==count);jog_step(a,-1);assert(a->usteps==count-1);
+        /* Outside the bound the axis may only come back; the position check agrees. */
+        a->usteps=g_ptp.origin[1]-ptp_offset(1u,12500);
+        assert(!ptp_counts_in_range(1u,a->usteps) && !ptp_counts_in_range(0u,g_arm1.usteps)); /* the elbow is shared by both checks */
         return;
     }
     assert(!strcmp(t,"limits_jog"));
@@ -1543,7 +1587,7 @@ ptp_cases += [f'ptp_uart_logged_{offset}' for offset in [0,499,1750]]
 ptp_cases += ['ptp_uart_paced','traj_uart_upload_paced','traj_uart_run_paced']
 ptp_cases += ['ptp_zero','ptp_axis1','ptp_axis2']
 ptp_cases += ['ptp_power_stable','ptp_fast_stall']
-ptp_cases += ['limits_ptp','limits_jog']
+ptp_cases += ['limits_ptp','limits_jog','limits_elbow','limits_elbow_traj','limits_elbow_jog']
 ptp_cases += ['rates_ptp','rates_traj','rates_live']
 ptp_cases += ['ptp_final_'+name for name in ['positive','negative','boundary','over_limit','following','counts']]
 ptp_cases += ['ptp_logged_retry']

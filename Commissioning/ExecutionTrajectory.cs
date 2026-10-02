@@ -78,7 +78,8 @@ public sealed class ExecutionTrajectory
             var n = nodes[i];
             if (!double.IsFinite(n.Pose.Q1) || !double.IsFinite(n.Pose.Q2) ||
                 Math.Abs(n.Pose.Q1) > 180 || Math.Abs(n.Pose.Q2) > 180 || !limits.Contains(n.Pose))
-                throw Lang.Error("err.execRange", i + 1, n.Pose.Q1, n.Pose.Q2, limits.Min1, limits.Max1, limits.Min2, limits.Max2);
+                throw Lang.Error("err.execRange", i + 1, n.Pose.Q1, n.Pose.Q2, limits.Min1, limits.Max1, limits.Min2, limits.Max2,
+                    JointLimits.Elbow(n.Pose), limits.ElbowMin, limits.ElbowMax);
             if (i == 0) continue;
             int dt = n.Milliseconds, previousDt = i == 1 ? dt : nodes[i - 1].Milliseconds;
             if (dt is < DeviceContract.TrajNodeMinMs or > DeviceContract.TrajNodeMaxMs || (totalMs += dt) > DeviceContract.TrajTotalMaxMs) throw Lang.Error("err.execTime");
@@ -123,6 +124,9 @@ public sealed class ExecutionTrajectory
         Reject([new(new(0, 0), 0), new(new(1, 0), 50)], limits);
         Reject([new(new(0, 0), 0), new(new(0, 0), 501)], limits);
         Reject([new(new(0, 0), 0), new(new(0, 170), 250)], limits);
+        // Inside both q boxes but past the elbow bound (q2 - q1 = 120 > 100): refused before any pulse math.
+        Reject([new(new(-30, 0), 0), new(new(-30, 90), 250)], new JointLimits(-90, 90, -160, 160, -100, 100));
+        Reject([new(new(0, 0), 0), new(new(40, -61), 250)], new JointLimits(-90, 90, -160, 160, -100, 100));
         Reject([new(new(double.NaN, 0), 0), new(new(0, 0), 250)], limits);
     }
 }

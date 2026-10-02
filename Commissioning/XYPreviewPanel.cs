@@ -45,16 +45,19 @@ public sealed partial class XYPreviewPanel : UserControl
     private JointLimits? planningLimits;
     private bool updating;
     private bool parametersDirty;
-    private TextBox[] ParameterFields => [l1,l2,x,y,a,b,min1,max1,min2,max2,feed,v1,v2,acc1,acc2];
+    // The elbow fields come last: files saved before the elbow range existed hold the first 15 only.
+    private const int LegacyFieldCount = 15;
+    private TextBox[] ParameterFields => [l1,l2,x,y,a,b,min1,max1,min2,max2,feed,v1,v2,acc1,acc2,elbowMin,elbowMax];
     private sealed record SavedParameters(int Schema, int Shape, int Branch, string[] Fields);
     private string SaveParameters() => JsonSerializer.Serialize(new SavedParameters(1,shape.SelectedIndex,branch.SelectedIndex,ParameterFields.Select(f=>f.Text).ToArray()),new JsonSerializerOptions { WriteIndented=true });
     private void RestoreParameters(string json)
     {
         var p=JsonSerializer.Deserialize<SavedParameters>(json);
         if(p is null || p.Schema!=1 || p.Shape is <0 or >3 || p.Branch is <0 or >1 || p.Fields is null ||
-            p.Fields.Length!=15 || p.Fields.Any(v=>v is null || v.Length>32)) throw Lang.Error("fault.paramFormat");
+            p.Fields.Length!=LegacyFieldCount && p.Fields.Length!=ParameterFields.Length || p.Fields.Any(v=>v is null || v.Length>32)) throw Lang.Error("fault.paramFormat");
         updating=true;
-        try { shape.SelectedIndex=p.Shape; branch.SelectedIndex=p.Branch; for(int i=0;i<15;i++) ParameterFields[i].Text=p.Fields[i]; }
+        try { shape.SelectedIndex=p.Shape; branch.SelectedIndex=p.Branch;
+            for(int i=0;i<ParameterFields.Length;i++) ParameterFields[i].Text=i<p.Fields.Length?p.Fields[i]:""; }   // an old file leaves the elbow at its default
         finally { updating=false; ShapeFields(); Refresh(); NotifyLimitsChanged(); }
     }
     private static string ParametersPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "parameters.json");
@@ -95,7 +98,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private bool detailView;   // false = whole arm and reach circle; the default and only view the operator gets
     private JointLimits? overlayLimits = DefaultTrialRange;
     public PlanarArm Model => new(Number(l1), Number(l2));
-    public string SettingsDescription => $"shape={shape.SelectedIndex}; branch={branch.SelectedIndex}; L1={l1.Text}; L2={l2.Text}; x={x.Text}; y={y.Text}; a={a.Text}; b={b.Text}; feed={feed.Text}; v1={v1.Text}; v2={v2.Text}; a1={acc1.Text}; a2={acc2.Text}; min1={min1.Text}; max1={max1.Text}; min2={min2.Text}; max2={max2.Text}";
+    public string SettingsDescription => $"shape={shape.SelectedIndex}; branch={branch.SelectedIndex}; L1={l1.Text}; L2={l2.Text}; x={x.Text}; y={y.Text}; a={a.Text}; b={b.Text}; feed={feed.Text}; v1={v1.Text}; v2={v2.Text}; a1={acc1.Text}; a2={acc2.Text}; min1={min1.Text}; max1={max1.Text}; min2={min2.Text}; max2={max2.Text}; emin={elbowMin.Text}; emax={elbowMax.Text}";
     // `whyNot` explains a missing device pose on the canvas (homing, no reference, waiting for feedback); null when offline.
     public void SetStartFeedback(TelemetrySample? sample, string? whyNot = null) {
         bool changed=startFeedback!=sample || deviceNote!=whyNot;
@@ -142,6 +145,7 @@ public sealed partial class XYPreviewPanel : UserControl
     }
     private readonly TextBox l1 = Field("180"), l2 = Field("176.38"), x = Field("340"), y = Field("0");
     private readonly TextBox min1 = Field(""), max1 = Field(""), min2 = Field(""), max2 = Field("");
+    private readonly TextBox elbowMin = Field(""), elbowMax = Field("");   // q2 - q1: motor 2's own travel
     private readonly ComboBox branch = new() { Width = 132, Margin = new Thickness(4), SelectedIndex = 0 };
     private readonly ComboBox shape = new() { Width = 94, Margin = new Thickness(4), SelectedIndex = 3 };
     private readonly TextBox a = Field("5"), b = Field("10");
@@ -204,7 +208,8 @@ public sealed partial class XYPreviewPanel : UserControl
         run.Content = Lang.T("btn.run");
         movePoint.Content = shape.SelectedIndex == 0 ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
         feed.ToolTip = Lang.T("xy.feed.tip");
-        foreach (var (field, name, value) in new[] { (min1, Lang.T("xy.q1min"), -30), (max1, Lang.T("xy.q1max"), 30), (min2, Lang.T("xy.q2min"), -60), (max2, Lang.T("xy.q2max"), 60) })
+        foreach (var (field, name, value) in new[] { (min1, Lang.T("xy.q1min"), -30), (max1, Lang.T("xy.q1max"), 30), (min2, Lang.T("xy.q2min"), -60), (max2, Lang.T("xy.q2max"), 60),
+                     (elbowMin, Lang.T("xy.elbowMin"), -(int)JointLimits.DefaultElbow), (elbowMax, Lang.T("xy.elbowMax"), (int)JointLimits.DefaultElbow) })
             field.ToolTip = Lang.T("xy.rangeField.tip", name, value.ToString());
         ShapeFields();
         foreach (var element in new FrameworkElement[] { result, notice, executionInfo }) Lang.RefreshText(element);
@@ -259,7 +264,8 @@ public sealed partial class XYPreviewPanel : UserControl
         var rangeHelpIcon = HelpIcon(RangeHelpText());
         rangeHelp.Add(rangeHelpIcon);
         var ranges = Group("section.limits", rangeHelpIcon);
-        foreach(var (field,name,value) in new[] { (min1,"xy.q1min",-30), (max1,"xy.q1max",30), (min2,"xy.q2min",-60), (max2,"xy.q2max",60) }) {
+        foreach(var (field,name,value) in new[] { (min1,"xy.q1min",-30), (max1,"xy.q1max",30), (min2,"xy.q2min",-60), (max2,"xy.q2max",60),
+                     (elbowMin,"xy.elbowMin",-(int)JointLimits.DefaultElbow), (elbowMax,"xy.elbowMax",(int)JointLimits.DefaultElbow) }) {
             ranges.Children.Add(Prop(name, field, "°", name));
             field.ToolTip=Lang.T("xy.rangeField.tip", Lang.T(name), value.ToString());
         }
@@ -302,8 +308,8 @@ public sealed partial class XYPreviewPanel : UserControl
         upload.Click += (_,_) => { if(upload.IsEnabled && execution is {} plan) { RememberUploaded(); TrajectoryRequested?.Invoke(plan); } };
         run.Click += (_,_) => { if(run.IsEnabled) ExecuteRequested?.Invoke(); };
         moveState.FontSize = 12;
-        foreach(var control in new Control[] { l1,l2,x,y,a,b,min1,max1,min2,max2,v1,v2,acc1,acc2,shape,branch,play,rewind,cursor }) editControls.Add(control);
-        foreach (var field in new[] { l1, l2, x, y, a, b, min1, max1, min2, max2, v1, v2, acc1, acc2 }) field.TextChanged += (_, _) => ParametersChanged();
+        foreach(var control in new Control[] { l1,l2,x,y,a,b,min1,max1,min2,max2,elbowMin,elbowMax,v1,v2,acc1,acc2,shape,branch,play,rewind,cursor }) editControls.Add(control);
+        foreach (var field in new[] { l1, l2, x, y, a, b, min1, max1, min2, max2, elbowMin, elbowMax, v1, v2, acc1, acc2 }) field.TextChanged += (_, _) => ParametersChanged();
         foreach (var help in rangeHelp) editControls.Add(help);
         branch.SelectionChanged += (_, _) => ParametersChanged();
         shape.SelectionChanged += (_, _) => { SwitchShape(); ShapeFields(); ParametersChanged(); };
@@ -376,7 +382,7 @@ public sealed partial class XYPreviewPanel : UserControl
         try { return Envelope(PreviewLimits()); } catch(ArgumentException) { return Lang.T("xy.envelopeInvalid"); }
     }
     private static string Envelope(JointLimits? limits) => limits is { } range
-        ? Lang.T("xy.envelopeFormat", range.Min1, range.Max1, range.Min2, range.Max2)
+        ? Lang.T("xy.envelopeFormat", range.Min1, range.Max1, range.Min2, range.Max2, range.ElbowMin, range.ElbowMax)
         : Lang.T("xy.envelopeEmpty");
     private void RefreshRangeHelp()
     {
@@ -414,7 +420,7 @@ public sealed partial class XYPreviewPanel : UserControl
     }
     private JointLimits? Limits()
     {
-        if (new[] { min1, max1, min2, max2 }.All(f => string.IsNullOrWhiteSpace(f.Text))) return null;
+        if (new[] { min1, max1, min2, max2, elbowMin, elbowMax }.All(f => string.IsNullOrWhiteSpace(f.Text))) return null;
         static double Bound(TextBox field, double fallback)
         {
             double value = string.IsNullOrWhiteSpace(field.Text) ? fallback : Number(field);
@@ -422,11 +428,12 @@ public sealed partial class XYPreviewPanel : UserControl
             if (Math.Abs(value - rounded) > 1e-8) throw Lang.Error("err.limitDecimals");
             return rounded;
         }
-        var limits = new JointLimits(Bound(min1,-30), Bound(max1,30), Bound(min2,-60), Bound(max2,60));
-        if (limits.Min1 < -180 || limits.Max1 > 180 || limits.Min2 < -180 || limits.Max2 > 180 ||
-            limits.Min1 >= limits.Max1 || limits.Min2 >= limits.Max2 ||
-            limits.Min1 > 0 || limits.Max1 < 0 || limits.Min2 > 0 || limits.Max2 < 0)
-            throw Lang.Error("err.limitBounds");
+        var limits = new JointLimits(Bound(min1,-30), Bound(max1,30), Bound(min2,-60), Bound(max2,60),
+            Bound(elbowMin,-JointLimits.DefaultElbow), Bound(elbowMax,JointLimits.DefaultElbow));
+        for (int axis = 0; axis < 3; axis++) {   // q1, q2 and the elbow share one rule, the firmware's
+            var (min, max) = (limits.Bounds(axis).Q1, limits.Bounds(axis).Q2);
+            if (min < -180 || max > 180 || min >= max || min > 0 || max < 0) throw Lang.Error("err.limitBounds");
+        }
         return limits;
     }
     private JointLimits PreviewLimits() => Limits() ?? DefaultTrialRange;
@@ -459,7 +466,8 @@ public sealed partial class XYPreviewPanel : UserControl
                 Lang.Text(result, () => Lang.T("plan.trajOk") + (Lang.IsEn ? "; " : "；") + Lang.T("plan.trajStats",
                     trajectory.Samples.Length, timing.Length, timing.Duration,
                     trajectory.Samples.Min(s => s.Pose.Q1), trajectory.Samples.Max(s => s.Pose.Q1),
-                    trajectory.Samples.Min(s => s.Pose.Q2), trajectory.Samples.Max(s => s.Pose.Q2)) +
+                    trajectory.Samples.Min(s => s.Pose.Q2), trajectory.Samples.Max(s => s.Pose.Q2),
+                    trajectory.Samples.Min(s => JointLimits.Elbow(s.Pose)), trajectory.Samples.Max(s => JointLimits.Elbow(s.Pose))) +
                     (trajectory.NearSingularity ? Lang.T("plan.nearSing") : ""));
                 cursor.Maximum = timing.Duration; cursor.Value = 0; offlineSim = false;   // resetting the cursor is not scrubbing
                 export.IsEnabled = cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = true; DrawSample();
@@ -471,7 +479,7 @@ public sealed partial class XYPreviewPanel : UserControl
             Lang.Text(notice, () => limits is null ? Lang.T("notice.pointNoRange") : Lang.T("notice.pointChecked"));
             result.Foreground = Brushes.DarkSlateGray;
             Lang.Text(result, () => Lang.T("plan.target", tx, ty, model.InnerRadius, model.OuterRadius) +
-                string.Join("\n", poses.Select((p, i) => Lang.T("plan.solution", i + 1, p.Q1, p.Q2) +
+                string.Join("\n", poses.Select((p, i) => Lang.T("plan.solution", i + 1, p.Q1, p.Q2, JointLimits.Elbow(p)) +
                     (limits is null ? Lang.T("plan.noRangeCheck") : limits.Value.Contains(p) ? Lang.T("plan.inRange") : Lang.T("plan.outRange")))) +
                 (Math.Abs(Math.Sin((selected.Q2 - selected.Q1) * Math.PI / 180)) < 1e-6 ? Lang.T("plan.singular") : ""));
             Draw(model, selected, tx, ty, limits is null || limits.Value.Contains(selected), Reachability(model).IsReachable(model.Forward(selected).Tip));
@@ -540,7 +548,7 @@ public sealed partial class XYPreviewPanel : UserControl
         if (pointTarget is { } target && firmwareLimits is { } bounds) {
             target = PtpProtocol.Quantize(target);
             string label = bounds.Contains(target) ? Lang.T("move.inFw") : shape.SelectedIndex == 0 ? Lang.T("move.outFw") : Lang.T("move.outFwStart");
-            move += Lang.T("move.fwBounds", label, target.Q1, target.Q2, bounds.Min1, bounds.Max1, bounds.Min2, bounds.Max2);
+            move += Lang.T("move.fwBounds", label, target.Q1, target.Q2, bounds.Min1, bounds.Max1, bounds.Min2, bounds.Max2, JointLimits.Elbow(target), bounds.ElbowMin, bounds.ElbowMax);
         } else if (pointTarget is null) move += Lang.T("move.planFail") + result.Text;
         if (execution is not null) move += held ? (uploadedRan ? Lang.T("move.ran") : Lang.T("move.uploaded")) : atStart ? Lang.T("move.atStart") : Lang.T("move.needStart");
         if (uploadedPlan is not null && !held) move += Lang.T("move.otherPlan");
@@ -617,7 +625,7 @@ public sealed partial class XYPreviewPanel : UserControl
             var pose=FollowCommand?startFeedback!.Command:sample.Pose;
             var tip=plan.Path.Model.Forward(pose).Tip;
             sampleInfo.Text = (FollowCommand?Lang.T("vp.sampleDevice"):Lang.T("vp.offlineTime", sample.Time, plan.Duration)) +
-                Lang.T("vp.samplePose", pose.Q1, pose.Q2, tip.X, tip.Y);
+                PoseText(pose, tip);
             sampleInfo.ToolTip=FollowCommand?Lang.T("vp.sampleTooltipDevice"):
                 Lang.T("vp.sampleTooltipOffline", sample.Distance, sample.Speed);
         }
@@ -702,6 +710,58 @@ public sealed partial class XYPreviewPanel : UserControl
             _ = MotionProfile.From(panel.RequestedRates);   // throws if a slider end is outside what the firmware accepts
         }
     }
+    // The elbow (q2 - q1) range from the box to the plan, the point-move gate and the saved file.
+    private static void ElbowLimitSelfTest()
+    {
+        static void Fail(string message) => throw new InvalidOperationException("肘角范围：" + message);
+        var panel = new XYPreviewPanel();
+        panel.Refresh();   // the default circle: centre (340, 0), r = 5, so the elbow stays within about 29-41 deg
+        if (panel.timing is null || panel.RequestedLimits?.ElbowMin != -155 || panel.RequestedLimits?.ElbowMax != 155 || panel.overlayLimits != DefaultTrialRange)
+            Fail("默认肘范围应为 ±155° 且默认圆可规划：" + panel.result.Text);
+        double elbowAtStart = JointLimits.Elbow(panel.timing!.At(0).Pose);
+        panel.elbowMax.Text = "30"; panel.Refresh();
+        if (panel.RequestedLimits != new JointLimits(-30, 30, -60, 60, -155, 30) || panel.overlayLimits?.ElbowMax != 30 || panel.timing is not null ||
+            panel.execution is not null || !panel.result.Text.Contains("肘"))
+            Fail("肘最大 30° 时 q1/q2 范围内的圆必须被拒绝并说明肘角：" + panel.result.Text);
+        panel.elbowMax.Text = "45"; panel.Refresh();
+        if (panel.timing is null || panel.execution is null) Fail("肘最大 45° 应可规划：" + panel.result.Text);
+        // The pose readout shows the elbow and the room to each bound.
+        if (!panel.sampleInfo.Text.Contains($"肘={elbowAtStart:F2}°") || !panel.sampleInfo.Text.Contains($"距下限 {elbowAtStart + 155:F1}°") ||
+            !panel.sampleInfo.Text.Contains($"距上限 {45 - elbowAtStart:F1}°"))
+            Fail("姿态读数缺少肘角或距两侧边界的余量：" + panel.sampleInfo.Text);
+        // Each elbow box follows the firmware's rule: contains 0, ordered, within +/-180, two decimals.
+        foreach (var (low, high) in new[] { ("1", "45"), ("-155", "-1"), ("-155", "181"), ("-181", "45"), ("-155.001", "45"), ("-155", "45.005"), ("abc", "45") })
+        {
+            panel.elbowMin.Text = low; panel.elbowMax.Text = high;
+            if (panel.RequestedLimits is not null || panel.overlayLimits is not null) Fail($"无效肘范围 [{low}, {high}] 被接受");
+        }
+        panel.elbowMin.Text = "-155"; panel.elbowMax.Text = "45"; panel.Refresh();   // editing a box invalidates the plan until it is checked again
+        // The firmware must report the same elbow range before anything moves, and the saved file keeps it.
+        var wanted = panel.RequestedLimits!.Value;
+        panel.SetStartFeedback(new TelemetrySample(0, 1, 1, true, 2, ExecutionTrajectory.Counts(0, panel.execution!.Nodes[0].Pose), ExecutionTrajectory.Counts(1, panel.execution.Nodes[0].Pose), 0, 0, 0, 0));
+        panel.SetPointMoveState(true, wanted with { ElbowMax = 155 }, "设备肘范围仍是默认值", true);
+        if (panel.movePoint.IsEnabled || panel.upload.IsEnabled) Fail("设备的肘范围与输入不同，运动必须保持锁定");
+        panel.SetPointMoveState(true, wanted, "设备已确认", true);
+        if (!panel.movePoint.IsEnabled || !panel.upload.IsEnabled) Fail("设备确认同一肘范围后应开放运动");
+        string saved = panel.SaveParameters();
+        panel.elbowMin.Text = ""; panel.elbowMax.Text = ""; panel.RestoreParameters(saved);
+        if (panel.elbowMin.Text != "-155" || panel.elbowMax.Text != "45") Fail("保存的参数丢了肘范围");
+        // A file saved before the elbow range existed has 15 fields; it restores with the elbow at its default.
+        var oldFields = panel.ParameterFields.Take(LegacyFieldCount).Select(f => f.Text).ToArray();
+        panel.RestoreParameters(JsonSerializer.Serialize(new SavedParameters(1, panel.shape.SelectedIndex, panel.branch.SelectedIndex, oldFields)));
+        if (panel.elbowMin.Text != "" || panel.elbowMax.Text != "" || panel.RequestedLimits != DefaultTrialRange) Fail("旧参数文件应以默认肘范围恢复");
+        try { panel.RestoreParameters(JsonSerializer.Serialize(new SavedParameters(1, 3, 0, oldFields.Append("-155").ToArray()))); Fail("字段数不对的参数文件被接受"); }
+        catch (ArgumentException) { }
+        // A single point: wide q boxes, so only the elbow can refuse it. (150, 0) needs an elbow of 130 degrees.
+        panel.shape.SelectedIndex = 0; panel.x.Text = "150"; panel.y.Text = "0";
+        panel.min1.Text = "-180"; panel.max1.Text = "180"; panel.min2.Text = "-180"; panel.max2.Text = "180";
+        panel.elbowMin.Text = ""; panel.elbowMax.Text = "100"; panel.Refresh();
+        panel.SetPointMoveState(true, panel.RequestedLimits, "设备已确认", false);
+        if (panel.movePoint.IsEnabled || !panel.actionSummary.Text.Contains("超出范围")) Fail("单点目标的肘角超出范围时不得移动：" + panel.actionSummary.Text);
+        panel.elbowMax.Text = ""; panel.Refresh();
+        panel.SetPointMoveState(true, panel.RequestedLimits, "设备已确认", false);
+        if (!panel.movePoint.IsEnabled) Fail("肘角在默认范围内的单点应可移动：" + panel.actionSummary.Text);
+    }
     private static void ShapeDefaultsSelfTest()
     {
         var panel = new XYPreviewPanel();
@@ -732,6 +792,7 @@ public sealed partial class XYPreviewPanel : UserControl
     {
         ReachabilityMask.SelfTest();
         UnifiedLimitsSelfTest();
+        ElbowLimitSelfTest();
         ShapeDefaultsSelfTest();
         var panel = new XYPreviewPanel();
         panel.ViewportSelfTest();

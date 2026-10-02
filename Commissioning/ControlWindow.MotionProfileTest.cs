@@ -7,7 +7,7 @@ public sealed partial class ControlWindow
         var w=new ControlWindow { selfTesting=true };
         static void Check(bool b,string why) { if(!b) throw new InvalidOperationException("Global profile: "+why); }
         void State() => w.HandleLine("STATE fw=stage2-v7 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=1");
-        void Range() => w.HandleLine("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000");
+        void Range() => w.HandleLine("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         void Rates(MotionProfile p) => w.HandleLine($"MOTION_RATES epoch=7 r1={p.R1} r2={p.R2} a1={p.A1} a2={p.A2}");
         var frames=new List<byte[]>();
         void Write(byte[] b,int offset,int count) { if(offset==0 && (frames.Count==0 || !ReferenceEquals(frames[^1],b)))frames.Add(b); }

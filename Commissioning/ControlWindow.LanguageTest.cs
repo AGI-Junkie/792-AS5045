@@ -46,7 +46,7 @@ public sealed partial class ControlWindow
             p.SelectShapeForSelfTest(3); p.LoadExampleForSelfTest();
             const uint epoch = 4;
             w.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-            w.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=4 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000");
+            w.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=4 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             w.TestLine($"LINK fw=stage2-v7-absolute-q2 proto={DeviceContract.ProtocolVersion} motion_rates=1 joint_limits=1");
             var plan = p.Plan!; var start = plan.Nodes[0].Pose;
             w.TestLine($"TELEM t=10 epoch=4 seq=1 ref=1 source=2 p1={ExecutionTrajectory.Counts(0,start)} p2={ExecutionTrajectory.Counts(1,start)} e1=0 err=0 inputs=0 drops=0");
@@ -61,7 +61,7 @@ public sealed partial class ControlWindow
             Toggle(false);
             for (int i = 0; i < plan.Nodes.Length; i++)
                 w.TestLine($"TRAJ_STATE state={(i+1 == plan.Nodes.Length ? 2 : 1)} count={i+1} total={plan.Nodes.Length} index=0 seq={w.pendingPoint} epoch={epoch}");
-            w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=4 seq={w.pointSequence} min1=-3000 max1=3000 min2=-6000 max2=6000");
+            w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=4 seq={w.pointSequence} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             w.TestLine($"TELEM t=11 epoch=4 seq={w.pointSequence} ref=1 source=2 p1={ExecutionTrajectory.Counts(0,start)} p2={ExecutionTrajectory.Counts(1,start)} e1=0 err=0 inputs=0 drops=0");
             Check(w.uploaded == plan && p.RunButton.IsEnabled && !w.executing, "held plan missing");
             p.CheckLanguagePreservesPreview(() => Toggle(true));

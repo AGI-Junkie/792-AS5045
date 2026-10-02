@@ -3,14 +3,22 @@ using System.Windows;
 namespace TwoLinkCommissioning;
 
 public readonly record struct JointPose(double Q1, double Q2);
-public readonly record struct JointLimits(double Min1, double Max1, double Min2, double Max2)
+// q1 and q2 are absolute link angles, so motor 2 (the elbow) travels q2 - q1.  The two boxes alone let the elbow reach
+// [Min2 - Max1, Max2 - Min1] (up to +/-360 deg), so the elbow has a range of its own: host planning, the reachable
+// region, point moves and the firmware (type 9, axis 2) all test a pose against all three.
+public readonly record struct JointLimits(double Min1, double Max1, double Min2, double Max2,
+    double ElbowMin = -JointLimits.DefaultElbow, double ElbowMax = JointLimits.DefaultElbow)
 {
+    // Provisional (README): the value the firmware boots with, not a measured mechanical stroke.
+    public const double DefaultElbow = DeviceContract.ElbowDefaultCd / 100.0;
+    public static double Elbow(JointPose p) => p.Q2 - p.Q1;
+    // (min, max) of one firmware range entry: 0 = q1, 1 = q2, 2 = elbow.  Q1 holds the minimum, Q2 the maximum.
+    public JointPose Bounds(int axis) => axis switch { 0 => new(Min1, Max1), 1 => new(Min2, Max2), _ => new(ElbowMin, ElbowMax) };
     public bool Contains(JointPose p) => p.Q1 >= Min1 - 1e-8 && p.Q1 <= Max1 + 1e-8 &&
-                                         p.Q2 >= Min2 - 1e-8 && p.Q2 <= Max2 + 1e-8;
-    // q2 is the absolute link angle, so motor 2 (the elbow) travels q2 - q1. Firmware bounds only the two
-    // boxes; the elbow range they imply is [Min2 - Max1, Max2 - Min1] (measured on the real firmware C).
-    public double ElbowMin => Min2 - Max1;
-    public double ElbowMax => Max2 - Min1;
+                                         p.Q2 >= Min2 - 1e-8 && p.Q2 <= Max2 + 1e-8 &&
+                                         Elbow(p) >= ElbowMin - 1e-8 && Elbow(p) <= ElbowMax + 1e-8;
+    // Room left to each elbow bound (degrees, negative once past it).
+    public (double ToMin, double ToMax) ElbowMargins(JointPose p) => (Elbow(p) - ElbowMin, ElbowMax - Elbow(p));
 }
 
 // Angles in degrees from the fixed +X zero direction: q1 is link 1, q2 is link 2.
@@ -88,6 +96,14 @@ public sealed class PlanarArm
         var limits = new JointLimits(-90, 90, 0, 160);
         Check(limits.Contains(branches[0]) && !limits.Contains(branches[1]));
         Check(new JointLimits(-90, 90, -5, 5).Contains(new JointPose(-90, 5)));
+        // The elbow is bounded on its own, whatever the two boxes allow: q1 = -90, q2 = +5 is an elbow of 95.
+        var tight = new JointLimits(-90, 90, -160, 160, -10, 60);
+        Check(tight.Contains(new JointPose(0, 60)) && tight.Contains(new JointPose(0, -10)) && tight.Contains(new JointPose(40, 100)));
+        Check(!tight.Contains(new JointPose(0, 60.01)) && !tight.Contains(new JointPose(0, -10.01)) && !tight.Contains(new JointPose(-90, 5)));
+        Check(Math.Abs(JointLimits.Elbow(branches[0])) > 60 && !tight.Contains(branches[0]) && !tight.Contains(branches[1])); // r = 300 needs an elbow of +/-65.4
+        Check(new JointLimits(-30, 30, -60, 60).ElbowMax == JointLimits.DefaultElbow && JointLimits.DefaultElbow == 155);
+        var (toMin, toMax) = tight.ElbowMargins(new JointPose(10, 40));
+        Check(Math.Abs(toMin - 40) < 1e-9 && Math.Abs(toMax - 30) < 1e-9);
         var bent = model.Forward(new JointPose(30, 60));
         Check((bent.Elbow - new Point(180 * Math.Cos(30 * Rad), 90)).Length < 1e-8);
         Check((bent.Tip - new Point(bent.Elbow.X + 176.38 / 2, bent.Elbow.Y + 176.38 * Math.Sin(60 * Rad))).Length < 1e-8);

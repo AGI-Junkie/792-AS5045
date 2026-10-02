@@ -305,7 +305,7 @@ public sealed partial class ControlWindow
             }
             try {
                 window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-                window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000");
+                window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
                 window.supportsShortHeartbeat = true;
                 // A closed port exercises the connected STOP state without opening hardware.
                 window.serial = new System.IO.Ports.SerialPort();
@@ -344,7 +344,7 @@ public sealed partial class ControlWindow
                 window.PublishHeartbeatLease(); window.ForceHeartbeatNow(); window.WireWriterStep(Write);
                 Check(frames[^1].Length == 6 && window.ptp is null && !window.enable.IsEnabled,
                     "heartbeat did not resume independently of motion/range confirmation");
-                window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=10 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000");
+                window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=10 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
                 window.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1 short_hb=1");
                 window.RequestEnable();
                 Check(window.pendingControlType == 7, "confirmed range did not permit enable");
@@ -402,7 +402,7 @@ public sealed partial class ControlWindow
         try {
             window.TestLine("STATE fw=stage2-v7 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
             window.TestLine("CONTROL seq=9");
-            window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=1 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000");
+            window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=1 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             window.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
             if (!window.framedControl || !window.hardwareUart || window.heartbeatTimer.Interval.TotalMilliseconds != 8)
                 throw new InvalidOperationException("v7 transport not selected");
@@ -427,7 +427,7 @@ public sealed partial class ControlWindow
             if (frames.Count != 2 || Type(frames[0]) != 6 || Type(frames[1]) != 7)
                 throw new InvalidOperationException("Enable did not follow a complete idle heartbeat");
             window.pendingControlType = 8;
-            window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=2 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000");
+            window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=2 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             for (elapsed = 16; elapsed <= 24; elapsed += 8)
                 window.FlushControlTransport(Write, start + elapsed * Stopwatch.Frequency / 1000, 0, 2);
             if (frames.Count != 4 || Type(frames[2]) != 6 || Type(frames[3]) != 8)
@@ -462,7 +462,7 @@ public sealed partial class ControlWindow
         var window = new ControlWindow { selfTesting = true };
         try {
             window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-            window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=4 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000");
+            window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=4 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             if (window.supportsShortHeartbeat)
                 throw new InvalidOperationException("Compact heartbeat selected without a capability line");
             window.TestLine($"LINK uart=hw baud=115200 rx_overflow=0 rx_error=0 tx_dropped=0 fw=stage2-v7-absolute-q2 short_hb=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion}");

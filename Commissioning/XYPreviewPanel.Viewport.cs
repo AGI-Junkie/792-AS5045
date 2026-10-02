@@ -336,7 +336,16 @@ public sealed partial class XYPreviewPanel
     {
         if(timing is not null) return;
         var pose=FollowCommand?startFeedback!.Command:offline; var tip=model.Forward(pose).Tip;
-        sampleInfo.Text=(FollowCommand?Lang.T("vp.sampleDevice"):Lang.T("vp.sampleOffline"))+Lang.T("vp.samplePose", pose.Q1, pose.Q2, tip.X, tip.Y);
+        sampleInfo.Text=(FollowCommand?Lang.T("vp.sampleDevice"):Lang.T("vp.sampleOffline"))+PoseText(pose,tip);
+    }
+    // q1, q2, tip, then the elbow with the room left to each of its bounds (negative = past the bound), measured against the
+    // range being planned with; the firmware holds the same numbers once the device has confirmed them.
+    private string PoseText(JointPose pose, Point tip)
+    {
+        string text=Lang.T("vp.samplePose", pose.Q1, pose.Q2, tip.X, tip.Y);
+        if((planningLimits??RequestedLimits) is not {} range) return text;
+        var (toMin,toMax)=range.ElbowMargins(pose);
+        return text+Lang.T("vp.sampleElbow", JointLimits.Elbow(pose), toMin, toMax)+(range.Contains(pose)?"":Lang.T("vp.sampleElbowOut"));
     }
     private void ViewportSelfTest()
     {

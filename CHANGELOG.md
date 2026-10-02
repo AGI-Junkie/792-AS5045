@@ -2,6 +2,15 @@
 
 最新在前。每条写“改了什么、验证到哪一步”；“未烧录”指固件镜像没有下载到板子上。
 
+## 2026-10-02：`stage2-v7-absolute-q2-elbow-r4000-live`，`proto=2`（肘角范围纳入上位机和固件校验；固件和上位机都改了，需重新烧录；实机未验证）
+
+- 起因：q1、q2 是连杆绝对角，肘（电机 2）转过 q2 − q1，两个 q 框只能间接限制它（q1 ±135°、q2 ±155° 时肘可达 ±290°），此前只靠操作者保证。现在肘有自己的最小/最大，**固件和上位机各自独立检查**。
+- 协议：type 9 新增轴 2 = 肘（规则与 q1/q2 相同，同样只在未使能、无参考时接受）；`PTP_STATE` 末尾加 `emin/emax`，缺这两项的行上位机不接受；`PROTO_VERSION`/`ProtocolVersion` 1 → 2，所以 proto=1 的固件会被上位机拒绝运动并提示更新。固件开机默认 ∓155°（`PTP_ELBOW_DEFAULT_CD`），与 `DeviceContract.ElbowDefaultCd` 同值，已加入发布闸门的共享数字核对。
+- 固件：PTP 单点、轨迹 BEGIN/NODE 的 q2 − q1 超出肘范围即拒绝（`PTP refused: joint range/rate`）；`ptp_counts_in_range` 同时检查肘，所以当前位置在范围外时拒绝新的 PTP、运动中越界停止（`PTP time/joint limit`）；电机 2 点动到肘边界后不再向外（只能退回）。arm1 点动不改变肘，不受影响。
+- 上位机：参数分组里新增“肘 最小 / 最大”（留空 ±155°，规则同 q1/q2：含 0、−180…180°、两位小数）；`JointLimits` 增加肘范围，所有 `Contains` 调用（预览红区、轨迹规划、执行计划校验、单点移动、上传前复核）自动按三个范围判定。轨迹检查补了圆形在离基座最近/最远点的肘极值（采样点之间）。姿态读数行显示当前肘角和到两侧边界的余量，越界时标出。拒绝提示、范围概要、轨迹统计、CSV（新增 `elbow_min_deg/elbow_max_deg` 两列）、实验记录里的参数描述都带肘范围。旧版保存的 `parameters.json`（15 个字段）仍可载入，肘取默认值。
+- 没做：肘范围的数值没有实测（README 里有测量办法）；固件里肘范围存在 `g_jointMinCd[2]`/`g_jointMaxCd[2]`；改开机默认值只改 `PTP_ELBOW_DEFAULT_CD` 和 `DeviceContract.ElbowDefaultCd`（闸门核对两者一致）。
+- 验证：固件 C 仿真新增 `limits_elbow`、`limits_elbow_traj`、`limits_elbow_jog`（只有肘能拒绝的单点/BEGIN/NODE、恰在边界允许、点动在肘边界不外推、轴 2 接受/轴 3 拒绝/非法肘范围拒绝，PTP_STATE 回报 emin/emax），并对三处新增检查分别做变异验证（去掉任一处，对应用例失败）；上位机自检新增肘范围同步（只改肘 → 轴 2 请求、ACK 与回报缺一不可、先 q 后肘）、`PtpState` 解析、type 9 轴 2 编码、`JointLimits`/可达区域/轨迹/执行计划/UI 的肘范围用例，以及旧参数文件兼容。
+
 ## 2026-10-01（续二）：`stage2-v7-absolute-q2-r4000-live`（已使能时改速度/加速度立即生效；回零快碰跟随全局速度；固件已改，需重新烧录）
 
 - 固件：type 10（速度/加速度）现在已使能、有参考、静止时也接受，不用总停止、不丢零位参考。仍然拒绝：回零中、任一轴在动或在停稳、PTP/轨迹运行或上传中、上传隔离期间（日志 `PTP_LIMITS refused: moving, homing or uploading`）。设备里缓存的轨迹是按旧速度检查过的，type 10 数值有变化就丢弃（`TRAJ held plan dropped`，`TRAJ_STATE state=0`），数值没变则保留。type 9（关节范围）规则不变，仍要未使能、无参考。`LINK` 行新增能力位 `rates_live=1`；`FW_BUILD_ID` 改为 `stage2-v7-absolute-q2-r4000-live`；`proto` 不变（没有改帧格式）。`main.c` 重构出 `traj_discard()`，`ptp_invalidate()` 行为不变。

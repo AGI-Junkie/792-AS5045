@@ -168,7 +168,7 @@ public sealed class TimedTrajectory
             var slower = new TimedTrajectory(path, new PlanningRates(10, 2.5, 1.5, 2.5, 1.5));
             Check(Math.Abs(slower.Duration - 2 * motion.Duration) < 1e-7, "time scaling");
             var rows = motion.ToCsv().Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
-            Check(rows.All(r => r.Split(',').Length == 27), "CSV columns");
+            Check(rows.All(r => r.Split(',').Length == 29), "CSV columns");
         }
         var circle = DrawingTrajectory.Create(model, DrawingShape.Circle, 0, 0, 100, 0, 0);
         var turn = new TimedTrajectory(circle, rates);

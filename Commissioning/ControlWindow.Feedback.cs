@@ -101,7 +101,7 @@ public sealed partial class ControlWindow
         }
         void Ready(uint epoch=4, uint seq=1) {
             w.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-            w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch={epoch} seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+            w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch={epoch} seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             if(!w.protocolMatches) w.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
             w.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
         }
@@ -109,13 +109,13 @@ public sealed partial class ControlWindow
         w.lastTelemetryAt=DateTime.UtcNow.AddSeconds(-3); Check(!w.CanPoint && !w.AtStart(new(0,0)));
         Ready(); w.RequestPoint(new(1,1)); uint seq=w.pendingPoint; int n=w.pointWire.Count;
         w.RequestPoint(new(2,2)); Check(w.pendingPoint==seq && w.pointWire.Count==n); // double click
-        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=99 seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=99 seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(w.pendingPoint==0 && w.pointWire.Count==0 && w.ptp is null); // wrong reference cancels, never ACKs
         Ready(5,3); w.RequestPoint(new(1,1)); w.TestLine("TELEM broken"); Check(w.pendingPoint==0 && w.ptp is null);
         Ready(6,4); w.TestLine("TELEM t=11 epoch=6 seq=4 ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=1 drops=0"); Check(!w.CanPoint);
         Ready(7,5); w.RequestPoint(new(1,1)); w.Disconnect("test unplug"); Check(w.pendingPoint==0 && w.pointWire.Count==0 && !w.CanPoint && !w.compatible);
         w.TestLine("STATE fw=stage2-v7 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
-        w.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=5 min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=5 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         w.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
         w.RequestEnable(); Check(w.pendingControl=="使能" && !w.enable.IsEnabled && !w.home.IsEnabled);
         w.CheckControlTimeout(w.controlRequestedAt.AddSeconds(3)); Check(w.pendingControl is null && w.lastStop.Text.Contains("未收到确认"));
@@ -127,16 +127,16 @@ public sealed partial class ControlWindow
             w.manualReference.Content.ToString()=="人工确认当前位置为伸直零位");
         Snapshot("manual-reference-waiting.png");
         w.RequestManualReference(); Check(w.pendingPoint==manualSeq && w.pointWire.Count==36); // repeated click never re-zeroes
-        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=20 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=20 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(w.manualReferencePending && !w.manualReference.IsEnabled && w.manualReference.Background==WorkbenchTheme.Blue); // matching seq alone is not an ACK
-        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(!w.manualReferencePending && w.manualReference.IsEnabled && w.manualReference.Background==WorkbenchTheme.Teal &&
             w.manualReference.BorderBrush==WorkbenchTheme.Teal && w.manualReference.Content.ToString()=="人工确认当前位置为伸直零位");
         Ready(21,manualSeq); Check(w.manualReference.Background==WorkbenchTheme.Teal); Check(w.xyPreview.FollowsDevice); // normal telemetry does not flash away success
         Snapshot("manual-reference-confirmed.png");
         Ready(22,manualSeq); Check(w.manualReference.Background==WorkbenchTheme.Blue); // a new reference is not the acknowledged one
         w.RequestManualReference(); manualSeq=w.pendingPoint;
-        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=23 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=23 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         w.TestLine("STOP: UART receive error/overflow"); Check(w.manualReference.Background==WorkbenchTheme.Blue);
         Snapshot("manual-reference-invalid.png");
         Ready(24,manualSeq); w.RequestManualReference(); w.TestLine("PTP refused: not homed/idle/healthy");
@@ -146,7 +146,7 @@ public sealed partial class ControlWindow
         Ready(26,manualSeq); w.RequestManualReference(); w.Disconnect("test unplug");
         Check(!w.manualReference.IsEnabled && w.manualReference.Background==WorkbenchTheme.Blue);
         Ready(27,manualSeq); w.RequestManualReference(); manualSeq=w.pendingPoint;
-        w.TestLine($"PTP_STATE lock=0 ref=0 active=0 epoch=28 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine($"PTP_STATE lock=0 ref=0 active=0 epoch=28 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(!w.manualReferencePending && !w.manualReference.IsEnabled && w.manualReference.Background==WorkbenchTheme.Blue);
         Ready(29,manualSeq); w.RequestPoint(new(1,1));
         w.TestLine("STOP: DEADMAN host heartbeat timeout; position invalid, release keys then C to enable");

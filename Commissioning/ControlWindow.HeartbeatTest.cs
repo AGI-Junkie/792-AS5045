@@ -83,7 +83,7 @@ public sealed partial class ControlWindow
                 var receive = Stopwatch.StartNew();
                 if (clock.ElapsedMilliseconds >= batch * 500) {
                     window.TestLine("STATE fw=stage2-v6 enabled=1 home=3 homed1=0 homed2=0 fault=0 enc=1 dir=1");
-                    window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=20 seq=6 min1=-3000 max1=3000 min2=-6000 max2=6000");
+                    window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=20 seq=6 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
                     window.TestLine("TRAJ_STATE state=0 count=0 total=0 index=0 seq=6 epoch=20");
                     window.TestLine("LINK uart=hw baud=115200 rx_overflow=0 rx_error=2 tx_dropped=0");
                     window.TestLine($"TELEM t={1123000 + batch * 500} epoch=20 seq=6 ref=0 source=0 p1={-249 - batch * 900} p2=0 e1={-620 - batch * 2300} err=15 inputs=0 drops=2");

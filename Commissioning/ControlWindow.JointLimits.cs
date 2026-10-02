@@ -24,7 +24,7 @@ public sealed partial class ControlWindow
     private byte[] limitPacket = [];
     private bool limitAcknowledged;
     private DateTime limitRequestedAt;
-    private static readonly Regex LimitsAckPattern = new(@"^PTP_(?:LIMITS|RATES) epoch=(\d+) seq=(\d+) axis=([01]) min=(-?\d+) max=(-?\d+)$", RegexOptions.CultureInvariant);
+    private static readonly Regex LimitsAckPattern = new(@"^PTP_(?:LIMITS|RATES) epoch=(\d+) seq=(\d+) axis=([012]) min=(-?\d+) max=(-?\d+)$", RegexOptions.CultureInvariant);
     private static readonly Regex RatesPattern = new(@"^MOTION_RATES epoch=(\d+) r1=(\d+) r2=(\d+) a1=(\d+) a2=(\d+)$", RegexOptions.CultureInvariant);
     private bool RatesReady => xyPreview.RequestedProfile is { } p && reportedProfile == p;
 
@@ -70,8 +70,7 @@ public sealed partial class ControlWindow
         if (state.Epoch != cancelledLimitEpoch) limitsAwaitingState = false;
         lock (wireSync) {
             if (limitType==9 && limitAxis >= 0 && limitAcknowledged && state.Epoch == limitEpoch &&
-                (limitAxis == 0 ? new JointPose(state.Limits.Min1, state.Limits.Max1) :
-                                  new JointPose(state.Limits.Min2, state.Limits.Max2)) == limitBounds) {
+                state.Limits.Bounds(limitAxis) == limitBounds) {
                 CancelLimitSync();
                 limitSyncError = "";
             }
@@ -135,8 +134,8 @@ public sealed partial class ControlWindow
             if(wanted!=actual) {
                 if (enabled) return;   // a range change needs STOP ALL first
                 limitType=9;
-                limitAxis = wanted.Min1 != actual.Min1 || wanted.Max1 != actual.Max1 ? 0 : 1;
-                limitBounds = limitAxis == 0 ? new(wanted.Min1, wanted.Max1) : new(wanted.Min2, wanted.Max2);
+                limitAxis = Enumerable.Range(0, 3).First(axis => wanted.Bounds(axis) != actual.Bounds(axis));   // q1, q2, then the elbow
+                limitBounds = wanted.Bounds(limitAxis);
             } else {
                 if(!supportsMotionRates || reportedProfile is not { } profile || xyPreview.RequestedProfile is not { } requested) return;
                 limitType=10; limitAxis=requested.R1!=profile.R1 || requested.A1!=profile.A1 ? 0 : 1;
@@ -159,9 +158,9 @@ public sealed partial class ControlWindow
             if (offset == 0 && (frames.Count == 0 || !ReferenceEquals(frames[^1], data))) frames.Add(data);
         }
         void State(bool enabled = false) => w.TestLine($"STATE fw=stage2-v7 enabled={(enabled ? 1 : 0)} home=0 homed1=0 homed2=0 fault=0 enc=1 dir=1");
-        void Range(JointLimits range, uint epoch = 1) => w.TestLine($"PTP_STATE lock=0 ref=0 active=0 epoch={epoch} seq=0 min1={(int)Math.Round(range.Min1*100)} max1={(int)Math.Round(range.Max1*100)} min2={(int)Math.Round(range.Min2*100)} max2={(int)Math.Round(range.Max2*100)}");
-        void Set(JointLimits range) => w.xyPreview.RestoreLimitsForSelfTest(range.Min1.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            range.Max1.ToString(System.Globalization.CultureInfo.InvariantCulture), range.Min2.ToString(System.Globalization.CultureInfo.InvariantCulture), range.Max2.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        void Range(JointLimits range, uint epoch = 1) => w.TestLine($"PTP_STATE lock=0 ref=0 active=0 epoch={epoch} seq=0 min1={(int)Math.Round(range.Min1*100)} max1={(int)Math.Round(range.Max1*100)} min2={(int)Math.Round(range.Min2*100)} max2={(int)Math.Round(range.Max2*100)} emin={(int)Math.Round(range.ElbowMin*100)} emax={(int)Math.Round(range.ElbowMax*100)}");
+        static string Text(double v) => v.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        void Set(JointLimits range) => w.xyPreview.RestoreLimitsForSelfTest(Text(range.Min1), Text(range.Max1), Text(range.Min2), Text(range.Max2), Text(range.ElbowMin), Text(range.ElbowMax));
         byte[] SendConfig() {
             w.PublishHeartbeatLease();
             for (int i = 0; i < 4; i++) {
@@ -201,6 +200,26 @@ public sealed partial class ControlWindow
             SendConfig(); Ack(); State(); Range(wide);
             Check(w.LimitsReady && w.enable.IsEnabled && w.pendingControl is null && w.pointWire.Count == 0,
                 "range sync automatically enabled/moved or failed to unlock explicit enable");
+            // The elbow range is the third entry: an elbow-only edit queues axis 2, and (like the boxes) it only counts once
+            // the device has acknowledged it AND reported it back.
+            var elbowOnly = wide with { ElbowMin = -100, ElbowMax = 120 };
+            State(); Range(wide); Set(elbowOnly);
+            Check(w.limitAxis == 2 && !w.LimitsReady && w.limitBounds == new JointPose(-100, 120), "an elbow-only edit was not queued as axis 2");
+            var elbowFrame = SendConfig();
+            static int Payload(byte[] f, int i) => ((f[1 + 2 * i] >> 1) & 15) | (((f[2 + 2 * i] >> 1) & 15) << 4);
+            static int U16(byte[] f, int at) => Payload(f, at) | (Payload(f, at + 1) << 8);
+            Check(U16(elbowFrame, 13) == 2 && (short)U16(elbowFrame, 9) == -10000 && (short)U16(elbowFrame, 11) == 12000, "elbow request frame carries axis 2 and the elbow bounds in 0.01 deg");
+            Ack(); Check(w.limitAxis == 2 && !w.LimitsReady, "ACK alone confirmed the elbow range");
+            State(); Range(wide); Check(w.limitAxis == 2 && !w.LimitsReady, "a report of the old elbow range confirmed the new one");
+            State(); Range(elbowOnly); Check(w.limitAxis < 0 && w.LimitsReady && w.enable.IsEnabled, "ACK + reported elbow range did not finish the sync");
+            // Boxes first, then the elbow, when both differ.
+            Set(wide with { Min1 = -100, ElbowMax = 100 });
+            Check(w.limitAxis == 0, "a box edit must be queued before the elbow edit");
+            w.CancelLimitSync(); Set(elbowOnly);
+            Check(w.limitAxis < 0 && w.LimitsReady, "editing back to what the device reports must need no request");
+            Set(wide); Check(w.limitAxis == 2, "the elbow range was not synchronized back");
+            SendConfig(); Ack(); State(); Range(wide);
+            Check(w.limitAxis < 0 && w.LimitsReady, "putting everything back must restore the match");
             State(true); Range(wide); Set(defaults);
             Check(w.enabled && !w.stopPending && w.limitAxis < 0 && !w.home.IsEnabled && !w.manualReference.IsEnabled &&
                 w.jogButtons.All(b => !b.IsEnabled) && !w.CanPoint && !w.CanJog && w.LimitsStatus.Contains("总停止"),
@@ -248,7 +267,7 @@ public sealed partial class ControlWindow
         string Link(bool live) => $"LINK uart=hw baud=115200 fw=stage2-v7-test short_hb=1 joint_limits=1 motion_rates=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion}" + (live ? " rates_live=1" : "");
         void Device(MotionProfile rates, int axisRange = 6000) {
             w.HandleLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-            w.HandleLine($"PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=1 min1=-3000 max1=3000 min2=-{axisRange} max2={axisRange}");
+            w.HandleLine($"PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=1 min1=-3000 max1=3000 min2=-{axisRange} max2={axisRange} emin=-15500 emax=15500");
             w.HandleLine($"MOTION_RATES epoch=7 r1={rates.R1} r2={rates.R2} a1={rates.A1} a2={rates.A2}");
         }
         byte[] SendConfig() {
@@ -316,10 +335,10 @@ public sealed partial class ControlWindow
 
 public sealed partial class XYPreviewPanel
 {
-    internal void RestoreLimitsForSelfTest(string minA, string maxA, string minB, string maxB)
+    internal void RestoreLimitsForSelfTest(string minA, string maxA, string minB, string maxB, string elbowLow = "", string elbowHigh = "")
     {
         var fields = ParameterFields.Select(f => f.Text).ToArray();
-        fields[6] = minA; fields[7] = maxA; fields[8] = minB; fields[9] = maxB;
+        fields[6] = minA; fields[7] = maxA; fields[8] = minB; fields[9] = maxB; fields[15] = elbowLow; fields[16] = elbowHigh;
         RestoreParameters(System.Text.Json.JsonSerializer.Serialize(new SavedParameters(1, shape.SelectedIndex, branch.SelectedIndex, fields)));
     }
     internal void RestoreRatesForSelfTest(string v1Text, string v2Text, string a1Text, string a2Text)
