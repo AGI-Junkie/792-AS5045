@@ -70,7 +70,7 @@
 | `TIMING loop_max_ms tick_lag_max_ms clock wdt key_age_ms key_max_gap_ms` | `key_max_gap_ms`：使能以来运动许可有效期间最长的一次心跳间隔，ENABLE 清零 |
 | `ENC_DIAG irq_max_us retries rejected gap_max_ms follow_peak_lsb` | 编码器读取的关中断最长时间等 |
 | `PTP_RX short_ok drop_crc drop_short drop_timeout rejected epoch_rejected last_rejected_byte` | 协议层丢帧/拒绝计数；`rx_error` 只统计 UART 级故障 |
-| `TELEM t epoch seq ref source p1 p2 e1 err inputs drops` | 位置遥测：`p1/p2` 指令微步，`e1` 编码器，`err` 跟随误差。默认只随 500 ms 状态块出现（约 2 Hz）；type 11 设为 5…20 Hz 后，**已使能期间**另外按该速率单独发送，格式不变 |
+| `TELEM t epoch seq ref source p1 p2 e1 err inputs drops` | 位置遥测：`p1/p2` 指令微步，`e1` 编码器，`err` 跟随误差。默认只随 500 ms 状态块出现（约 2 Hz）；type 11 设为 5…20 Hz 后，**已使能期间**另外按该速率单独发送，格式不变。`seq` 是设备最后接受的序号，**收下一条指令（上传的每个节点、RUN）就立刻前进**，而 `PTP_STATE` 仍是每 500 ms 一条：所以流式 `TELEM` 的 `seq` 可以领先主机最近一条 `PTP_STATE`。主机把“`seq` 大于 `PTP_STATE` 的、但不超过自己已发出的最大序号”当作正常（照常使用，只是还不算“已稳定”，`AtStart` 等要等 `PTP_STATE` 追上）；`seq` 落后、超过自己发出过的、或 `epoch` 不同才按“设备反馈无效”处理并停止 |
 | `TELEM_RATE epoch seq hz` | type 11 的回执；`LINK` 里的 `telem_hz=` 是当前值 |
 | `TELEM_DIAG hz sent skipped max_us` | 流式遥测的代价：已发送行数、因发送队列过半而跳过的行数、一次格式化最长耗时（微秒）。**跳过而不是丢弃**：流式行从不占用发送队列的后一半，ACK 和停止信息保有余量 |
 | `FAULT_SNAPSHOT t epoch seq phase home traj idx ref p1 p2 e1 err inputs hb_age_ms hb_max_gap_ms drv reason="…"` | 每次停止的第一行（在任何状态被清除之前）：停机时的阶段（`home/ptp/traj_run/traj_upload/jog/idle/disabled`）、位置（同 `TELEM`）、输入掩码、心跳年龄。`drv=nfault_undetermined` 表示驱动器 nFAULT 有效，**原因待诊断**：该引脚可由过流、过热或欠压触发，不能据此认定过热；否则 `drv=ok` |

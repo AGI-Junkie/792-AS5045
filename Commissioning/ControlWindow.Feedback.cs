@@ -32,7 +32,11 @@ public sealed partial class ControlWindow
     private void HandleTelemetry(string line)
     {
         var sample = TelemetrySample.Parse(line);
-        if (!supportsTelemetry || sample is null || ptp is null || sample.Epoch != ptp.Epoch || sample.Sequence != ptp.Sequence) {
+        // A streamed line may be ahead of the last PTP_STATE: the device moves its sequence on as soon as it accepts a command this host sent
+        // (every node of an upload, the RUN), while PTP_STATE only comes twice a second. Ahead, but never past what the host has issued, is normal;
+        // behind it, past it, or another epoch is not.
+        bool ahead = sample is not null && ptp is not null && sample.Sequence > ptp.Sequence && sample.Sequence <= pointSequence;
+        if (!supportsTelemetry || sample is null || ptp is null || sample.Epoch != ptp.Epoch || (sample.Sequence != ptp.Sequence && !ahead)) {
             // Enable/home establish their own reference; telemetry can arrive before PTP_STATE.
             if (supportsTelemetry && pendingControl is null && (PointBusy || executing)) { Lang.Text(lastStop, () => Lang.T("fault.badTelemetry")); Stop(); }
             return;
@@ -117,6 +121,18 @@ public sealed partial class ControlWindow
         Check(w.pendingPoint==0 && w.pointWire.Count==0 && w.ptp is null); // wrong reference cancels, never ACKs
         Ready(5,3); w.RequestPoint(new(1,1)); w.TestLine("TELEM broken"); Check(w.pendingPoint==0 && w.ptp is null);
         Ready(6,4); w.TestLine("TELEM t=11 epoch=6 seq=4 ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=1 drops=0"); Check(!w.CanPoint);
+        // Streamed telemetry: ahead of the last PTP_STATE by what the host has sent is normal; behind it or past what was sent is a bad feedback.
+        string Streamed(uint epoch, uint at) => $"TELEM t=12 epoch={epoch} seq={at} ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0";
+        Ready(40,1); w.RequestPoint(new(1,1)); uint sent=w.pendingPoint; Check(sent>1);
+        w.TestLine(Streamed(40,sent));
+        Check(w.pendingPoint==sent && w.ptp is not null && w.telemetry!.Sequence==sent && !w.AtStart(new(0,0)));   // taken as feedback, but not "settled" until PTP_STATE catches up
+        w.TestLine(Streamed(40,sent+1));
+        Check(w.pendingPoint==0 && w.ptp is null);   // the device claims a command the host never sent
+        Ready(41,50); w.RequestPoint(new(1,1)); Check(w.pendingPoint>50);
+        w.TestLine(Streamed(41,49));
+        Check(w.pendingPoint==0 && w.ptp is null);   // the device went backwards
+        Ready(42,60); w.RequestPoint(new(1,1)); uint other=w.pendingPoint; w.TestLine(Streamed(43,other));
+        Check(w.pendingPoint==0 && w.ptp is null);   // another reference epoch
         Ready(7,5); w.RequestPoint(new(1,1)); w.Disconnect("test unplug"); Check(w.pendingPoint==0 && w.pointWire.Count==0 && !w.CanPoint && !w.compatible);
         w.TestLine("STATE fw=stage2-v7 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
         w.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=5 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
