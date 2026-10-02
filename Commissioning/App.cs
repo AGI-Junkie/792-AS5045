@@ -31,6 +31,12 @@ public sealed class App : Application
             }
             catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
         }
+        // The pure geometry and planning checks alone (a few seconds, no window): quick feedback while changing shapes or timing.
+        if (args.Contains("--geometry-self-test"))
+        {
+            try { Lang.PersistChanges = false; Lang.Set(false, persist: false); PlanarArm.SelfTest(); DrawingTrajectory.SelfTest(); TimedTrajectory.SelfTest(); ExecutionTrajectory.SelfTest(); ReachabilityMask.SelfTest(); return 0; }
+            catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
+        }
         // Line-quality experiment against a real firmware on a serial port; see docs/UART_DIAGNOSIS.md.
         int stress = Array.IndexOf(args, "--uart-stress");
         if (stress >= 0) return UartStress.Run(args[(stress + 1)..]);

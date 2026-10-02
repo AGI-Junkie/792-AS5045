@@ -45,19 +45,22 @@ public sealed partial class XYPreviewPanel : UserControl
     private JointLimits? planningLimits;
     private bool updating;
     private bool parametersDirty;
-    // The elbow fields come last: files saved before the elbow range existed hold the first 15 only.
-    private const int LegacyFieldCount = 15;
-    private TextBox[] ParameterFields => [l1,l2,x,y,a,b,min1,max1,min2,max2,feed,v1,v2,acc1,acc2,elbowMin,elbowMax];
-    private sealed record SavedParameters(int Schema, int Shape, int Branch, string[] Fields);
-    private string SaveParameters() => JsonSerializer.Serialize(new SavedParameters(1,shape.SelectedIndex,branch.SelectedIndex,ParameterFields.Select(f=>f.Text).ToArray()),new JsonSerializerOptions { WriteIndented=true });
+    // New fields are appended, so a file saved by an older version is a prefix: 15 fields before the elbow range, 17 before
+    // the extra shape fields (c, rotation, scale, custom contour).
+    private const int LegacyFieldCount = 15, ElbowFieldCount = 17, CustomFieldIndex = 20;
+    private TextBox[] ParameterFields => [l1,l2,x,y,a,b,min1,max1,min2,max2,feed,v1,v2,acc1,acc2,elbowMin,elbowMax,c,rotation,scale,custom];
+    private sealed record SavedParameters(int Schema, int Shape, int Branch, string[] Fields, int Direction = 0);
+    private string SaveParameters() => JsonSerializer.Serialize(new SavedParameters(1,shape.SelectedIndex,branch.SelectedIndex,ParameterFields.Select(f=>f.Text).ToArray(),direction.SelectedIndex),new JsonSerializerOptions { WriteIndented=true });
     private void RestoreParameters(string json)
     {
         var p=JsonSerializer.Deserialize<SavedParameters>(json);
-        if(p is null || p.Schema!=1 || p.Shape is <0 or >3 || p.Branch is <0 or >1 || p.Fields is null ||
-            p.Fields.Length!=LegacyFieldCount && p.Fields.Length!=ParameterFields.Length || p.Fields.Any(v=>v is null || v.Length>32)) throw Lang.Error("fault.paramFormat");
+        if(p is null || p.Schema!=1 || p.Shape < 0 || p.Shape >= shape.Items.Count || p.Branch is <0 or >1 || p.Direction is <0 or >1 || p.Fields is null ||
+            p.Fields.Length!=LegacyFieldCount && p.Fields.Length!=ElbowFieldCount && p.Fields.Length!=ParameterFields.Length ||
+            p.Fields.Select((v,i)=>v is null || v.Length>(i==CustomFieldIndex?4096:32)).Any(bad=>bad)) throw Lang.Error("fault.paramFormat");
         updating=true;
-        try { shape.SelectedIndex=p.Shape; branch.SelectedIndex=p.Branch;
-            for(int i=0;i<ParameterFields.Length;i++) ParameterFields[i].Text=i<p.Fields.Length?p.Fields[i]:""; }   // an old file leaves the elbow at its default
+        try { shape.SelectedIndex=p.Shape; branch.SelectedIndex=p.Branch; direction.SelectedIndex=p.Direction;
+            // A field the file does not have keeps its default: the elbow range, c and the custom contour empty, rotation 0, scale 1.
+            for(int i=0;i<ParameterFields.Length;i++) ParameterFields[i].Text=i<p.Fields.Length?p.Fields[i]:ParameterFields[i]==rotation?"0":ParameterFields[i]==scale?"1":""; }
         finally { updating=false; ShapeFields(); Refresh(); NotifyLimitsChanged(); }
     }
     private static string ParametersPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "parameters.json");
@@ -68,8 +71,7 @@ public sealed partial class XYPreviewPanel : UserControl
         try {
             _=Model; _=PreviewLimits(); _=MotionProfile.From(RequestedRates);
             _=Number(x); _=Number(y);
-            if(shape.SelectedIndex>0) _=Number(a);
-            if(shape.SelectedIndex is 1 or 2) _=Number(b);
+            if(shape.SelectedIndex>0) _=ShapeOptionsFromFields(); 
             WriteParameters(path);
             ParametersSaved?.Invoke();
         } catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or ArgumentException) { operationError=() => Lang.T("fault.paramSave")+ex.Message; UpdatePointButton(); }
@@ -98,7 +100,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private bool detailView;   // false = whole arm and reach circle; the default and only view the operator gets
     private JointLimits? overlayLimits = DefaultTrialRange;
     public PlanarArm Model => new(Number(l1), Number(l2));
-    public string SettingsDescription => $"shape={shape.SelectedIndex}; branch={branch.SelectedIndex}; L1={l1.Text}; L2={l2.Text}; x={x.Text}; y={y.Text}; a={a.Text}; b={b.Text}; feed={feed.Text}; v1={v1.Text}; v2={v2.Text}; a1={acc1.Text}; a2={acc2.Text}; min1={min1.Text}; max1={max1.Text}; min2={min2.Text}; max2={max2.Text}; emin={elbowMin.Text}; emax={elbowMax.Text}";
+    public string SettingsDescription => $"shape={shape.SelectedIndex}; branch={branch.SelectedIndex}; L1={l1.Text}; L2={l2.Text}; x={x.Text}; y={y.Text}; a={a.Text}; b={b.Text}; feed={feed.Text}; v1={v1.Text}; v2={v2.Text}; a1={acc1.Text}; a2={acc2.Text}; min1={min1.Text}; max1={max1.Text}; min2={min2.Text}; max2={max2.Text}; emin={elbowMin.Text}; emax={elbowMax.Text}; c={c.Text}; rot={rotation.Text}; scale={scale.Text}; dir={(direction.SelectedIndex==1?"cw":"ccw")}; custom_chars={custom.Text.Length}";
     // `whyNot` explains a missing device pose on the canvas (homing, no reference, waiting for feedback); null when offline.
     public void SetStartFeedback(TelemetrySample? sample, string? whyNot = null) {
         bool changed=startFeedback!=sample || deviceNote!=whyNot;
@@ -117,30 +119,55 @@ public sealed partial class XYPreviewPanel : UserControl
     // a and b mean radius, end point or size depending on the shape, so a value typed for one shape is meaningless for
     // another (a circle's radius 5 became a line ending at X=5). Each shape keeps its own a/b; a shape never visited
     // starts from a small example next to the start point that fits the default joint range.
-    private readonly string[][] shapeDims = [["",""],["",""],["",""],["",""]];
+    private readonly string[][] shapeDims = Enumerable.Range(0, 11).Select(_ => new[] { "", "", "" }).ToArray();
     private int shownShape = 3;
     private static string Mm(double value) => Math.Round(value, 2).ToString("0.##", CultureInfo.InvariantCulture);
     private string[] ExampleDims(int index)
     {
         double px = double.TryParse(x.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double vx) && double.IsFinite(vx) ? vx : 340;
         double py = double.TryParse(y.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double vy) && double.IsFinite(vy) ? vy : 0;
-        return index switch { 1 => [Mm(px + 10), Mm(py + 10)], 2 => ["10", "10"], 3 => ["5", "10"], _ => ["5", "10"] };
+        // Every example sits next to (340, 0) and passes the full check at the default joint range.
+        return index switch {
+            1 => [Mm(px + 10), Mm(py + 10), ""], 2 => ["10", "10", ""], 3 => ["5", "10", ""],
+            4 => ["12", "6", ""],                 // ellipse: semi-axes
+            5 => ["10", "0", "180"],              // arc: radius, start angle, sweep
+            6 => ["12", "8", "3"],                // rounded rectangle: width, height, corner radius
+            7 => ["10", "5", "2"],                // figure 8: half width, half height, y frequency
+            8 => ["8", "3", ""],                  // polygon: circumradius, sides (a triangle)
+            9 => ["2", "10", "2"],                // spiral: start radius, end radius, turns
+            _ => ["5", "10", ""] };
+    }
+    private const string ExampleContour = "M 0 0 C 0 -8 8 -8 8 0 L 14 0 L 14 6";   // SVG: y points down, so the arch bulges up
+    // Which of a, b, c a shape reads; the others keep whatever another shape left in them.
+    private static (bool A, bool B, bool C) ShapeUses(int index) => index switch {
+        1 or 2 or 4 or 7 or 8 or 9 => (true, true, index is 7 or 9),   // line, rectangle, ellipse, polygon: a,b | figure 8, spiral: a,b,c
+        3 => (true, false, false), 5 or 6 => (true, true, true), _ => (false, false, false) };
+    private ShapeOptions ShapeOptionsFromFields()
+    {
+        int index = shape.SelectedIndex; var uses = ShapeUses(index);
+        _ = Number(x); _ = Number(y);
+        if (uses.A) _ = Number(a);
+        if (uses.B) _ = Number(b);
+        return new ShapeOptions { C = uses.C ? Number(c) : 0, Rotation = Number(rotation), Scale = Number(scale),
+            Clockwise = direction.SelectedIndex == 1, Text = index == 10 ? custom.Text : "" };
     }
     private void SwitchShape()
     {
-        if (!updating && shownShape >= 0) shapeDims[shownShape] = [a.Text, b.Text];
+        if (!updating && shownShape >= 0) shapeDims[shownShape] = [a.Text, b.Text, c.Text];
         shownShape = shape.SelectedIndex;
         if (updating || shownShape < 0) return;
         var dims = shapeDims[shownShape][0] == "" ? ExampleDims(shownShape) : shapeDims[shownShape];
         updating = true;   // the caller runs one ParametersChanged for the whole switch
-        try { a.Text = dims[0]; b.Text = dims[1]; } finally { updating = false; }
+        try { a.Text = dims[0]; b.Text = dims[1]; c.Text = dims[2]; if (shownShape == 10 && custom.Text.Trim() == "") custom.Text = ExampleContour; } finally { updating = false; }
     }
     private void LoadExample()
     {
         updating = true;
         try {
             branch.SelectedIndex=0; x.Text="340"; y.Text="0";
-            var dims = ExampleDims(shape.SelectedIndex); a.Text=dims[0]; b.Text=dims[1];
+            var dims = ExampleDims(shape.SelectedIndex); a.Text=dims[0]; b.Text=dims[1]; c.Text=dims[2];
+            rotation.Text="0"; scale.Text="1"; direction.SelectedIndex=0;
+            if (shape.SelectedIndex == 10) custom.Text = ExampleContour;
         } finally { updating=false; ShapeFields(); Refresh(); NotifyLimitsChanged(); }
     }
     private readonly TextBox l1 = Field("180"), l2 = Field("176.38"), x = Field("340"), y = Field("0");
@@ -149,7 +176,11 @@ public sealed partial class XYPreviewPanel : UserControl
     private readonly ComboBox branch = new() { Width = 132, Margin = new Thickness(4), SelectedIndex = 0 };
     private readonly ComboBox shape = new() { Width = 94, Margin = new Thickness(4), SelectedIndex = 3 };
     private readonly TextBox a = Field("5"), b = Field("10");
-    private readonly TextBlock xLabel = new(), yLabel = new(), aLabel = new(), bLabel = new();
+    private readonly TextBox c = Field(""), rotation = Field("0"), scale = Field("1");   // third size; rotation about (x, y) in degrees; uniform scale
+    private readonly ComboBox direction = new() { Width = 132, Margin = new Thickness(4), SelectedIndex = 0 };
+    private readonly TextBox custom = new() { AcceptsReturn = true, TextWrapping = TextWrapping.NoWrap, MinHeight = 64, MaxHeight = 150, FontFamily = WorkbenchTheme.Mono, FontSize = 11,
+        VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, Margin = new Thickness(10,2,10,6), Padding = new Thickness(4) };
+    private readonly TextBlock xLabel = new(), yLabel = new(), aLabel = new(), bLabel = new(), cLabel = new(), customLabel = new();
     private readonly Slider cursor = new() { Minimum = 0, Maximum = 1, SmallChange = 0.1, LargeChange = 1, MinWidth = 180, Margin = new Thickness(4), IsEnabled = false };
     private readonly TextBox feed = new() { IsReadOnly = true, Width = 76, Margin = new Thickness(4), Padding = new Thickness(4), Background = WorkbenchTheme.Background, Foreground = WorkbenchTheme.Muted },
         v1 = Field("5"), v2 = Field("3"), acc1 = Field("10"), acc2 = Field("6");
@@ -194,7 +225,7 @@ public sealed partial class XYPreviewPanel : UserControl
         Background = Brushes.Transparent, Margin = new Thickness(4), MinHeight = 75 };
     private readonly TextBlock notice = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4), Foreground = Brushes.DarkSlateGray };
 
-    private Border aRow = null!, bRow = null!;
+    private Border aRow = null!, bRow = null!, cRow = null!, customRow = null!;
     private Button? sampleButton, previewButton, saveButton, speedHelp;
     internal void RefreshLanguage()
     {
@@ -222,8 +253,10 @@ public sealed partial class XYPreviewPanel : UserControl
     }
     public XYPreviewPanel()
     {
-        foreach (var key in new[] { "xy.shape0", "xy.shape1", "xy.shape2", "xy.shape3" })
+        foreach (var key in Enumerable.Range(0, 11).Select(i => "xy.shape" + i))
             shape.Items.Add(Lang.Bind(new ComboBoxItem(), ContentControl.ContentProperty, key));
+        foreach (var key in new[] { "xy.dirCcw", "xy.dirCw" })
+            direction.Items.Add(Lang.Bind(new ComboBoxItem(), ContentControl.ContentProperty, key));
         foreach (var key in new[] { "xy.branchPos", "xy.branchNeg" })
             branch.Items.Add(Lang.Bind(new ComboBoxItem(), ContentControl.ContentProperty, key));
         shape.SelectedIndex = 3; branch.SelectedIndex = 0;
@@ -259,6 +292,12 @@ public sealed partial class XYPreviewPanel : UserControl
         geometry.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.branch"), branch));
         geometry.Children.Add(WorkbenchTheme.Row(xLabel, x)); geometry.Children.Add(WorkbenchTheme.Row(yLabel, y));
         geometry.Children.Add(aRow = WorkbenchTheme.Row(aLabel, a)); geometry.Children.Add(bRow = WorkbenchTheme.Row(bLabel, b));
+        geometry.Children.Add(cRow = WorkbenchTheme.Row(cLabel, c));
+        customLabel.Margin = new Thickness(10,4,10,0); customLabel.Foreground = WorkbenchTheme.Muted; customLabel.TextWrapping = TextWrapping.Wrap;
+        geometry.Children.Add(customRow = WorkbenchTheme.Edge(new StackPanel { Children = { customLabel, custom } }, Brushes.White, new Thickness(0,0,0,1)));
+        var transform = Group("section.transform");
+        transform.Children.Add(Prop("xy.rotation", rotation, "°")); transform.Children.Add(Prop("xy.scale", scale, "×"));
+        transform.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.direction"), direction));
         var dimensions = Group("section.dimensions");
         dimensions.Children.Add(Prop("xy.l1", l1, "mm")); dimensions.Children.Add(Prop("xy.l2", l2, "mm"));
         var rangeHelpIcon = HelpIcon(RangeHelpText());
@@ -308,8 +347,9 @@ public sealed partial class XYPreviewPanel : UserControl
         upload.Click += (_,_) => { if(upload.IsEnabled && execution is {} plan) { RememberUploaded(); TrajectoryRequested?.Invoke(plan); } };
         run.Click += (_,_) => { if(run.IsEnabled) ExecuteRequested?.Invoke(); };
         moveState.FontSize = 12;
-        foreach(var control in new Control[] { l1,l2,x,y,a,b,min1,max1,min2,max2,elbowMin,elbowMax,v1,v2,acc1,acc2,shape,branch,play,rewind,cursor }) editControls.Add(control);
-        foreach (var field in new[] { l1, l2, x, y, a, b, min1, max1, min2, max2, elbowMin, elbowMax, v1, v2, acc1, acc2 }) field.TextChanged += (_, _) => ParametersChanged();
+        foreach(var control in new Control[] { l1,l2,x,y,a,b,c,rotation,scale,custom,direction,min1,max1,min2,max2,elbowMin,elbowMax,v1,v2,acc1,acc2,shape,branch,play,rewind,cursor }) editControls.Add(control);
+        foreach (var field in new[] { l1, l2, x, y, a, b, c, rotation, scale, custom, min1, max1, min2, max2, elbowMin, elbowMax, v1, v2, acc1, acc2 }) field.TextChanged += (_, _) => ParametersChanged();
+        direction.SelectionChanged += (_, _) => ParametersChanged();
         foreach (var help in rangeHelp) editControls.Add(help);
         branch.SelectionChanged += (_, _) => ParametersChanged();
         shape.SelectionChanged += (_, _) => { SwitchShape(); ShapeFields(); ParametersChanged(); };
@@ -402,15 +442,24 @@ public sealed partial class XYPreviewPanel : UserControl
     private void ShapeFields()
     {
         int s = shape.SelectedIndex;
-        xLabel.Text = s == 3 ? Lang.T("xy.centerX") : s == 2 ? Lang.T("xy.cornerX") : s == 1 ? Lang.T("xy.startX") : Lang.T("xy.x");
-        yLabel.Text = s == 3 ? Lang.T("xy.centerY") : s == 2 ? Lang.T("xy.cornerY") : s == 1 ? Lang.T("xy.startY") : Lang.T("xy.y");
-        aLabel.Text = s == 3 ? Lang.T("xy.radius") : s == 2 ? Lang.T("xy.width") : Lang.T("xy.endX");
-        bLabel.Text = s == 2 ? Lang.T("xy.height") : Lang.T("xy.endY");
-        a.Visibility = aLabel.Visibility = s == 0 ? Visibility.Collapsed : Visibility.Visible;
-        b.Visibility = bLabel.Visibility = s is 0 or 3 ? Visibility.Collapsed : Visibility.Visible;
-        aRow.Visibility = a.Visibility; bRow.Visibility = b.Visibility;
+        // Where (x, y) sits: the start of a line, the corner of a rectangle, the contour's origin, otherwise the centre.
+        string anchor = s switch { 0 => "xy", 1 => "xy.start", 2 or 6 => "xy.corner", 10 => "xy.origin", _ => "xy.center" };
+        xLabel.Text = Lang.T(anchor == "xy" ? "xy.x" : anchor + "X"); yLabel.Text = Lang.T(anchor == "xy" ? "xy.y" : anchor + "Y");
+        var (la, lb, lc) = s switch {
+            1 => ("xy.endX", "xy.endY", ""), 2 => ("xy.width", "xy.height", ""), 3 => ("xy.radius", "", ""),
+            4 => ("xy.semiX", "xy.semiY", ""), 5 => ("xy.radius", "xy.startAngle", "xy.sweep"),
+            6 => ("xy.width", "xy.height", "xy.cornerRadius"), 7 => ("xy.halfWidth", "xy.halfHeight", "xy.freq"),
+            8 => ("xy.circumRadius", "xy.sides", ""), 9 => ("xy.startRadius", "xy.endRadius", "xy.turns"), _ => ("", "", "") };
+        foreach (var (label, key) in new[] { (aLabel, la), (bLabel, lb), (cLabel, lc) }) label.Text = key == "" ? "" : Lang.T(key);
+        aRow.Visibility = a.Visibility = aLabel.Visibility = la == "" ? Visibility.Collapsed : Visibility.Visible;
+        bRow.Visibility = b.Visibility = bLabel.Visibility = lb == "" ? Visibility.Collapsed : Visibility.Visible;
+        cRow.Visibility = c.Visibility = cLabel.Visibility = lc == "" ? Visibility.Collapsed : Visibility.Visible;
+        customRow.Visibility = s == 10 ? Visibility.Visible : Visibility.Collapsed;
+        customLabel.Text = Lang.T("xy.customHelp");
+        System.Windows.Automation.AutomationProperties.SetName(custom, Lang.T("xy.customName"));
         System.Windows.Automation.AutomationProperties.SetName(x,xLabel.Text); System.Windows.Automation.AutomationProperties.SetName(y,yLabel.Text);
         System.Windows.Automation.AutomationProperties.SetName(a,aLabel.Text); System.Windows.Automation.AutomationProperties.SetName(b,bLabel.Text);
+        System.Windows.Automation.AutomationProperties.SetName(c,cLabel.Text);
     }
     private static double Number(TextBox field)
     {
@@ -457,8 +506,9 @@ public sealed partial class XYPreviewPanel : UserControl
             if (shape.SelectedIndex > 0)
             {
                 JointLimits? bounds = limits;
+                var uses = ShapeUses(shape.SelectedIndex); var extras = ShapeOptionsFromFields();
                 trajectory = DrawingTrajectory.Create(model, (DrawingShape)(shape.SelectedIndex - 1), tx, ty,
-                    Number(a), shape.SelectedIndex == 3 ? 0 : Number(b), Math.Max(0, branch.SelectedIndex), bounds);
+                    uses.A ? Number(a) : 0, uses.B ? Number(b) : 0, Math.Max(0, branch.SelectedIndex), bounds, extras);
                 timing = new TimedTrajectory(trajectory, RequestedRates);
                 pointTarget = timing.At(0).Pose; RefreshExecution(); UpdatePointButton();
                 Lang.Text(notice, () => bounds is null ? Lang.T("notice.noRange") : Lang.T("notice.checked"));
@@ -762,6 +812,75 @@ public sealed partial class XYPreviewPanel : UserControl
         panel.SetPointMoveState(true, panel.RequestedLimits, "设备已确认", false);
         if (!panel.movePoint.IsEnabled) Fail("肘角在默认范围内的单点应可移动：" + panel.actionSummary.Text);
     }
+    // The newer shapes: which fields each shows, the transform fields, the saved file, and the messages for bad input.
+    private static void ShapeFieldsSelfTest()
+    {
+        static void Fail(string message) => throw new InvalidOperationException("图形参数：" + message);
+        var panel = new XYPreviewPanel();
+        void Show(int index) { panel.shape.SelectedIndex = index; panel.LoadExample(); }
+        double Width(DrawingTrajectory t) => t.Samples.Max(s => s.Target.X) - t.Samples.Min(s => s.Target.X);
+        // Each shape shows the fields it reads and hides the rest.
+        foreach (var (index, usesA, usesB, usesC, usesText) in new[] { (0,false,false,false,false), (1,true,true,false,false), (2,true,true,false,false), (3,true,false,false,false),
+            (4,true,true,false,false), (5,true,true,true,false), (6,true,true,true,false), (7,true,true,true,false), (8,true,true,false,false), (9,true,true,true,false), (10,false,false,false,true) })
+        {
+            Show(index);
+            if ((panel.aRow.Visibility == Visibility.Visible) != usesA || (panel.bRow.Visibility == Visibility.Visible) != usesB ||
+                (panel.cRow.Visibility == Visibility.Visible) != usesC || (panel.customRow.Visibility == Visibility.Visible) != usesText)
+                Fail($"图形 {index} 显示的输入框与它读取的不一致");
+            if (index > 0 && (panel.execution is null || panel.timing is null)) Fail($"图形 {index} 的示例不可执行：" + panel.result.Text);
+        }
+        Show(5); if (panel.cLabel.Text != "扫过角度 / °" || panel.bLabel.Text != "起始角 / °") Fail("圆弧的标签应是半径/起始角/扫过角度");
+        Show(3); if (panel.xLabel.Text != "中心 X / mm") Fail("圆的锚点标签");
+        Show(2); if (panel.xLabel.Text != "左下角 X / mm") Fail("矩形的锚点标签");
+        // Rotation, scale and direction reach the plan.
+        Show(4); double flat = Width(panel.trajectory!);
+        panel.rotation.Text = "90"; panel.Refresh(); double upright = Width(panel.trajectory!);
+        if (Math.Abs(flat - 24) > 0.05 || Math.Abs(upright - 12) > 0.05) Fail($"椭圆旋转 90° 后宽度应由 24 变为 12：{flat}/{upright}");
+        panel.rotation.Text = "0"; panel.scale.Text = "0.5"; panel.Refresh();
+        if (panel.trajectory is null || Math.Abs(Width(panel.trajectory) - 12) > 0.05) Fail("缩放 0.5 应使椭圆缩小一半：" + panel.result.Text);
+        Show(3); double ccwY = panel.trajectory!.Samples[1].Target.Y;
+        panel.direction.SelectedIndex = 1; panel.Refresh();
+        if (!(ccwY > 0 && panel.trajectory!.Samples[1].Target.Y < 0)) Fail("顺时针圆应从同一点向另一侧出发");
+        // Bad input says which field is wrong.
+        Show(4); panel.rotation.Text = "abc"; panel.Refresh();
+        if (panel.trajectory is not null || !panel.result.Text.Contains("旋转角")) Fail("旋转角无效时应指出该输入框：" + panel.result.Text);
+        panel.rotation.Text = "0"; panel.scale.Text = "0"; panel.Refresh();
+        if (panel.trajectory is not null || !panel.result.Text.Contains("缩放")) Fail("缩放为 0 应被拒绝并说明：" + panel.result.Text);
+        Show(5); panel.c.Text = "0"; panel.Refresh();
+        if (panel.trajectory is not null || !panel.result.Text.Contains("扫过角度")) Fail("圆弧扫过 0° 应被拒绝并说明：" + panel.result.Text);
+        Show(8); panel.b.Text = "2"; panel.Refresh();
+        if (panel.trajectory is not null || !panel.result.Text.Contains("边数")) Fail("多边形 2 条边应被拒绝并说明：" + panel.result.Text);
+        Show(10); panel.custom.Text = "M 0 0 L 5 0 M 10 0 L 15 0"; panel.Refresh();
+        if (panel.trajectory is not null || !panel.result.Text.Contains("一条连续路径")) Fail("两条轮廓应被拒绝并说明没有抬笔：" + panel.result.Text);
+        panel.custom.Text = "0 0\n6 0\n6 4\n0 4\n0 0"; panel.Refresh();
+        if (panel.execution is null || panel.trajectory!.Stops.Length != 5) Fail("点列轮廓应得到四条直线：" + panel.result.Text);
+        // Each shape remembers its own sizes while another is shown.
+        panel.shape.SelectedIndex = 5; panel.c.Text = "123"; panel.shape.SelectedIndex = 3; panel.shape.SelectedIndex = 5;
+        if (panel.c.Text != "123") Fail("切换图形后丢了圆弧自己的扫过角度");
+        // The saved file keeps everything, newlines of the custom contour included.
+        Show(6); panel.rotation.Text = "10"; panel.scale.Text = "1.2"; panel.c.Text = "2"; panel.direction.SelectedIndex = 1;
+        string saved = panel.SaveParameters();
+        Show(10); panel.custom.Text = "0 0\n5 5"; panel.rotation.Text = "0"; panel.RestoreParameters(saved);
+        if (panel.shape.SelectedIndex != 6 || panel.rotation.Text != "10" || panel.scale.Text != "1.2" || panel.c.Text != "2" || panel.direction.SelectedIndex != 1) Fail("保存的文件丢了旋转/缩放/方向/第三尺寸");
+        panel.shape.SelectedIndex = 10; panel.custom.Text = "0 0\n10 0\n10 5"; string withContour = panel.SaveParameters();
+        panel.custom.Text = ""; panel.RestoreParameters(withContour);
+        if (panel.custom.Text != "0 0\n10 0\n10 5") Fail("自定义轮廓没有随参数保存");
+        // Files written by older versions are prefixes: rotation and scale come back as 0 and 1, the direction as counter-clockwise.
+        foreach (int count in new[] { LegacyFieldCount, ElbowFieldCount })
+        {
+            Show(3); panel.rotation.Text = "33"; panel.scale.Text = "2"; panel.direction.SelectedIndex = 1;
+            var fields = panel.ParameterFields.Take(count).Select(f => f.Text).ToArray();
+            panel.RestoreParameters(JsonSerializer.Serialize(new { Schema = 1, Shape = 3, Branch = 0, Fields = fields }));
+            if (panel.rotation.Text != "0" || panel.scale.Text != "1" || panel.direction.SelectedIndex != 0 || panel.custom.Text != "") Fail($"{count} 个字段的旧文件应以默认变换恢复");
+        }
+        foreach (string bad in new[] { JsonSerializer.Serialize(new { Schema = 1, Shape = 11, Branch = 0, Fields = panel.ParameterFields.Select(f => f.Text).ToArray() }),
+            JsonSerializer.Serialize(new { Schema = 1, Shape = 3, Branch = 0, Fields = panel.ParameterFields.Select(f => f.Text).ToArray(), Direction = 2 }),
+            JsonSerializer.Serialize(new { Schema = 1, Shape = 3, Branch = 0, Fields = panel.ParameterFields.Select((f, i) => i == 0 ? new string('9', 33) : f.Text).ToArray() }),
+            JsonSerializer.Serialize(new { Schema = 1, Shape = 10, Branch = 0, Fields = panel.ParameterFields.Select((f, i) => i == CustomFieldIndex ? new string('1', 4097) : f.Text).ToArray() }) })
+        {
+            try { panel.RestoreParameters(bad); Fail("越界的参数文件被接受"); } catch (ArgumentException) { }
+        }
+    }
     private static void ShapeDefaultsSelfTest()
     {
         var panel = new XYPreviewPanel();
@@ -781,7 +900,7 @@ public sealed partial class XYPreviewPanel : UserControl
         Show(0);
         if (panel.pointTarget is null || panel.execution is not null) throw new InvalidOperationException("单点没有目标，或误生成了执行计划");
         // The example button loads the current shape's own example, and each one passes the full check at the default range.
-        for (int index = 0; index < 4; index++)
+        for (int index = 0; index < 11; index++)
         {
             panel.shape.SelectedIndex = index; panel.x.Text = "300"; panel.LoadExample();
             if (panel.x.Text != "340" || panel.pointTarget is null || (index > 0 && (panel.execution is null || panel.RequestedLimits != DefaultTrialRange)))
@@ -793,6 +912,7 @@ public sealed partial class XYPreviewPanel : UserControl
         ReachabilityMask.SelfTest();
         UnifiedLimitsSelfTest();
         ElbowLimitSelfTest();
+        ShapeFieldsSelfTest();
         ShapeDefaultsSelfTest();
         var panel = new XYPreviewPanel();
         panel.ViewportSelfTest();
@@ -998,24 +1118,30 @@ public sealed partial class XYPreviewPanel : UserControl
             // Render every supported shape through the same controls and planner.
             panel.SetStartFeedback(null);
             panel.SetPointMoveState(false,null,"离线预览；未连接设备。",true);
-            for(int selected=0;selected<=3;selected++) {
+            string[] shapeNames={"point","line","rectangle","circle","ellipse","arc","rounded-rectangle","figure8","polygon","spiral","custom"};
+            for(int selected=0;selected<shapeNames.Length;selected++) {
                 panel.shape.SelectedIndex=selected;
-                panel.x.Text="260"; panel.y.Text="0";
-                panel.a.Text=selected==1?"290":"25";panel.b.Text="30";
-                panel.min1.Text="-135";panel.max1.Text="135";panel.min2.Text="-155";panel.max2.Text="155";
-                panel.Refresh();
+                if(selected<=3) {
+                    panel.x.Text="260"; panel.y.Text="0";
+                    panel.a.Text=selected==1?"290":"25";panel.b.Text="30";
+                    panel.min1.Text="-135";panel.max1.Text="135";panel.min2.Text="-155";panel.max2.Text="155";
+                    panel.Refresh();
+                } else {   // the newer shapes use their examples (which also set the position and the transform back to defaults)
+                    panel.LoadExample();
+                    if(selected==4) { panel.rotation.Text="30"; panel.Refresh(); }
+                }
                 if(selected>0 && (panel.execution is null || !ReferenceEquals(panel.timing,panel.execution.Timing)))
                     throw new InvalidOperationException("Shape preview does not share execution timing");
                 if(panel.timing is {} motion) panel.cursor.Value=motion.Duration*0.35;
                 panel.Measure(new Size(panel.Width,panel.Height));panel.Arrange(new Rect(0,0,panel.Width,panel.Height));panel.UpdateLayout();
                 var shapeImage=new RenderTargetBitmap(1050,860,96,96,PixelFormats.Pbgra32);shapeImage.Render(panel);
                 var shapePng=new PngBitmapEncoder();shapePng.Frames.Add(BitmapFrame.Create(shapeImage));
-                using var shapeStream=File.Create(Path.Combine(Path.GetDirectoryName(snapshotPath)!,new[]{"point","line","rectangle","circle"}[selected]+".preview.png"));shapePng.Save(shapeStream);
+                using var shapeStream=File.Create(Path.Combine(Path.GetDirectoryName(snapshotPath)!,shapeNames[selected]+".preview.png"));shapePng.Save(shapeStream);
                 if(selected>0) {
                     panel.FitView(true);panel.UpdateLayout();
                     var detailImage=new RenderTargetBitmap(1050,860,96,96,PixelFormats.Pbgra32);detailImage.Render(panel);
                     var detailPng=new PngBitmapEncoder();detailPng.Frames.Add(BitmapFrame.Create(detailImage));
-                    using var detailStream=File.Create(Path.Combine(Path.GetDirectoryName(snapshotPath)!,new[]{"point","line","rectangle","circle"}[selected]+".detail.png"));detailPng.Save(detailStream);
+                    using var detailStream=File.Create(Path.Combine(Path.GetDirectoryName(snapshotPath)!,shapeNames[selected]+".detail.png"));detailPng.Save(detailStream);
                     panel.FitView(false);
                 }
             }

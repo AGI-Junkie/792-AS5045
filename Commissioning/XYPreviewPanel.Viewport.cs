@@ -250,17 +250,20 @@ public sealed partial class XYPreviewPanel
             bool closed=(path.Samples[^1].Target-path.Samples[0].Target).Length<=0.01;
             Label(plot,closed?Lang.T("vp.startEnd"):Lang.T("vp.start"),start+new Vector(9,6),WorkbenchTheme.Teal,fit:Plot);
             for(int segment=0; segment<path.Stops.Length-1; segment++) {
-                int i=path.Shape==DrawingShape.Circle?Math.Max(1,path.Samples.Length/4):
+                // A closed one-stroke shape (circle, ellipse, ...) gets its arrow a quarter of the way round, not at the far side.
+                int i=closed && path.Stops.Length==2?Math.Max(1,path.Samples.Length/4):
                     Math.Max(path.Stops[segment]+1,(path.Stops[segment]+path.Stops[segment+1])/2);
                 var end=ToScreen(path.Samples[i].Target); var delta=end-ToScreen(path.Samples[i-1].Target);
                 if(delta.Length>0.001) { delta.Normalize(); var side=new Vector(-delta.Y,delta.X);
                     Line(plot,end,end-delta*10+side*4,WorkbenchTheme.Teal,2); Line(plot,end,end-delta*10-side*4,WorkbenchTheme.Teal,2); }
-                if(path.Shape==DrawingShape.Rectangle && segment<3) {
+                if(segment<path.Stops.Length-2) {   // every interior stop is a corner where the pen dwells
                     var corner=ToScreen(path.Samples[path.Stops[segment+1]].Target);
                     Circle(plot,corner,3,WorkbenchTheme.Teal,Brushes.White);
-                    var diagonal=ToScreen(path.Samples[path.Stops[2]].Target)-start;
-                    if(Math.Abs(diagonal.X)>120 && Math.Abs(diagonal.Y)>55)
-                        Label(plot,Lang.T("vp.cornerPause", segment+1),corner+new Vector(segment==2?-82:7,-20),WorkbenchTheme.Teal);
+                    if(path.Shape==DrawingShape.Rectangle) {
+                        var diagonal=ToScreen(path.Samples[path.Stops[2]].Target)-start;
+                        if(Math.Abs(diagonal.X)>120 && Math.Abs(diagonal.Y)>55)
+                            Label(plot,Lang.T("vp.cornerPause", segment+1),corner+new Vector(segment==2?-82:7,-20),WorkbenchTheme.Teal);
+                    }
                 }
             }
             if((path.Samples[^1].Target-path.Samples[0].Target).Length>0.01) {
@@ -406,10 +409,14 @@ public sealed partial class XYPreviewPanel
             }
             return (elbow,tip);
         }
-        for(int selected=0;selected<4;selected++) for(int branch=0;branch<2;branch++) {
+        for(int selected=0;selected<11;selected++) for(int branch=0;branch<2;branch++) {
             panel.updating=true;
             panel.shape.SelectedIndex=selected; panel.branch.SelectedIndex=branch;
-            panel.x.Text="260"; panel.y.Text="0"; panel.a.Text=selected==1?"290":"25"; panel.b.Text="30";
+            if(selected<4) { panel.x.Text="260"; panel.y.Text="0"; panel.a.Text=selected==1?"290":"25"; panel.b.Text="30"; }
+            else {   // the newer shapes read their own fields: use their examples
+                panel.x.Text="340"; panel.y.Text="0"; var example=panel.ExampleDims(selected);
+                panel.a.Text=example[0]; panel.b.Text=example[1]; panel.c.Text=example[2]; if(selected==10) panel.custom.Text=ExampleContour;
+            }
             panel.min1.Text="-135";panel.max1.Text="135";panel.min2.Text="-155";panel.max2.Text="155";
             panel.updating=false; panel.ShapeFields(); panel.Refresh();
             if(panel.pointTarget is null || selected>0 && panel.timing is null)
