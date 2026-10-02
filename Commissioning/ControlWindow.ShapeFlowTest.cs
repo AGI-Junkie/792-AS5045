@@ -65,13 +65,20 @@ public sealed partial class ControlWindow
                 Check(!w.executing, name, "completion was not recognized");
                 var end = plan.Nodes[^1].Pose; seq = run; Device(end);
                 bool closed = ExecutionTrajectory.Counts(0, end) == ExecutionTrajectory.Counts(0, start) && ExecutionTrajectory.Counts(1, end) == ExecutionTrajectory.Counts(1, start);
-                if (closed) Check(panel.UploadButton.IsEnabled && !panel.RunButton.IsEnabled, name, "a closed shape ends at its start: upload again without moving");
+                Check(w.uploaded == plan && w.uploadedRan, name, "a finished plan must stay held for a repeat");
+                if (closed) Check(panel.UploadButton.IsEnabled && panel.RunButton.IsEnabled, name, "a closed shape ends at its start: run again without moving");
                 else {
                     Check(!panel.UploadButton.IsEnabled && !panel.RunButton.IsEnabled && panel.MoveButton.IsEnabled, name, "an open shape ends away from its start: only the move is open");
                     MoveThere(start);
-                    Check(panel.UploadButton.IsEnabled && !panel.RunButton.IsEnabled, name, "back at the start upload must open again");
+                    Check(panel.UploadButton.IsEnabled && panel.RunButton.IsEnabled && w.uploaded == plan, name, "back at the start the held plan must run again");
                 }
-            }
+                // Repeat: a fresh RUN on the next sequence, no new upload.
+                Click(panel.RunButton);
+                Check(w.uploading is not null && w.uploaded is null && w.pendingPoint != 0, name, "repeat did not send RUN");
+                w.TestLine($"TRAJ_STATE state=3 count={n} total={n} index=1 seq={w.pendingPoint} epoch={epoch}");
+                run = w.trajectoryRunSequence;
+                w.TestLine($"TRAJ_STATE state=4 count={n} total={n} index={n} seq={run} epoch={epoch}");
+                Check(!w.executing && w.uploaded == plan && w.uploadedRan, name, "second run was not recognized as complete");            }
             finally { w.Stop(); w.Close(); }
         }
     }

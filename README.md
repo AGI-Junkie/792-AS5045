@@ -67,12 +67,11 @@ E 还没测量，暂按 155°（沿用旧版的肘限位，不是实测机械行
 |---|---:|---|
 | `JOG1_RATE_MAX_USTEP_S` | 800 | arm1 低速验收，4.5 输出度/秒 |
 | `JOG2_RATE_MAX_USTEP_S` | 600 | arm2 低速验收 |
-| `HOME_FAST_RATE_USTEP_S` | 600 | 回零快碰 / 释放 / 退开上限，沿用较低的点动速度上限 |
-| `HOME_SLOW_RATE_USTEP_S` | 400 | 二次触碰上限 |
-| `HOME_STRAIGHT_RATE_USTEP_S` | 800 | arm1 伸直段上限，沿用 arm1 点动速度上限 |
-| `HOME2_STRAIGHT_RATE_USTEP_S` | 600 | arm2 伸直段沿用已测试的低速；匀速部分约 61.7 秒，实际受调度和加减速影响，需核实实物对齐 |
+| （无固定值） | 全局速度 | 回零快碰和走到伸直位按界面设置的全局速度和加速度（`g_motionRate` / `g_motionAccel`），不再有固定的 600/800 上限；机械上能否承受这个速度要自己把握 |
+| `HOME_RELEASE_RATE_USTEP_S` | 600 | 回零释放 / 退开速率，沿用较低的点动速度上限（全局速度更低时取全局） |
+| `HOME_SLOW_RATE_USTEP_S` | 400 | 二次触碰上限（全局速度更低时取全局速度） |
 | `HOME_ZERO_SAMPLES` / `HOME_ZERO_SAMPLE_MS` | 12 / 1 ms | arm1 停稳后平均采样次数 / 最小间隔 |
-| `HOME_ACCEL_USTEP_S2` | 4000 | 回零加减速 |
+| `HOME_ACCEL_USTEP_S2` | 4000 | 释放、退开、慢碰的加减速上限（快碰和走到伸直位用全局加速度） |
 | `HOME_BACKOFF_USTEPS` | 64 | 释放传感器后的额外退开 |
 | `HOME_RELEASE_MAX_USTEPS` | 800 | 传感器必须释放的最大行程 |
 | `HOME_PHASE_TIMEOUT_MS` | 120000 | 释放、退开、停稳及伸直阶段的时间上限（不用于快碰/慢碰搜索） |

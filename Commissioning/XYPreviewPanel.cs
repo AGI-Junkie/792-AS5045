@@ -38,7 +38,10 @@ public sealed partial class XYPreviewPanel : UserControl
     }
     private readonly List<Control> editControls = new();
     private TelemetrySample? startFeedback;
-    private bool commandView;
+    // The solid arm follows the device whenever it has a valid pose. It follows the plan instead only while the operator
+    // scrubs or plays the offline preview (offlineSim), or when the device has no usable pose (deviceNote says why).
+    private bool offlineSim;
+    private string? deviceNote;
     private JointLimits? planningLimits;
     private bool updating;
     private bool parametersDirty;
@@ -49,7 +52,7 @@ public sealed partial class XYPreviewPanel : UserControl
     {
         var p=JsonSerializer.Deserialize<SavedParameters>(json);
         if(p is null || p.Schema!=1 || p.Shape is <0 or >3 || p.Branch is <0 or >1 || p.Fields is null ||
-            p.Fields.Length!=15 || p.Fields.Any(v=>v is null || v.Length>32)) throw new ArgumentException("参数文件格式不兼容或字段无效。");
+            p.Fields.Length!=15 || p.Fields.Any(v=>v is null || v.Length>32)) throw Lang.Error("fault.paramFormat");
         updating=true;
         try { shape.SelectedIndex=p.Shape; branch.SelectedIndex=p.Branch; for(int i=0;i<15;i++) ParameterFields[i].Text=p.Fields[i]; }
         finally { updating=false; ShapeFields(); Refresh(); NotifyLimitsChanged(); }
@@ -66,7 +69,7 @@ public sealed partial class XYPreviewPanel : UserControl
             if(shape.SelectedIndex is 1 or 2) _=Number(b);
             WriteParameters(path);
             ParametersSaved?.Invoke();
-        } catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or ArgumentException) { operationError="保存参数失败："+ex.Message; UpdatePointButton(); }
+        } catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or ArgumentException) { operationError=() => Lang.T("fault.paramSave")+ex.Message; UpdatePointButton(); }
     }
     private void WriteParameters(string path)
     {
@@ -85,17 +88,20 @@ public sealed partial class XYPreviewPanel : UserControl
     {
         if (!File.Exists(path)) return;
         try {
-            if (new FileInfo(path).Length > 32768) throw new ArgumentException("参数文件过大。");
+            if (new FileInfo(path).Length > 32768) throw Lang.Error("fault.paramTooBig");
             RestoreParameters(File.ReadAllText(path));
-        } catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException) { operationError="恢复参数失败："+ex.Message; UpdatePointButton(); }
+        } catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException) { operationError=() => Lang.T("fault.paramRestore")+ex.Message; UpdatePointButton(); }
     }
-    private bool detailView = true;
+    private bool detailView;   // false = whole arm and reach circle; the default and only view the operator gets
     private JointLimits? overlayLimits = DefaultTrialRange;
     public PlanarArm Model => new(Number(l1), Number(l2));
     public string SettingsDescription => $"shape={shape.SelectedIndex}; branch={branch.SelectedIndex}; L1={l1.Text}; L2={l2.Text}; x={x.Text}; y={y.Text}; a={a.Text}; b={b.Text}; feed={feed.Text}; v1={v1.Text}; v2={v2.Text}; a1={acc1.Text}; a2={acc2.Text}; min1={min1.Text}; max1={max1.Text}; min2={min2.Text}; max2={max2.Text}";
-    public void SetStartFeedback(TelemetrySample? sample) {
-        bool changed=startFeedback!=sample; startFeedback = sample; UpdatePointButton();
-        commandView=sample is {Referenced:true} && (commandView || deviceStatusBusy);
+    // `whyNot` explains a missing device pose on the canvas (homing, no reference, waiting for feedback); null when offline.
+    public void SetStartFeedback(TelemetrySample? sample, string? whyNot = null) {
+        bool changed=startFeedback!=sample || deviceNote!=whyNot;
+        // A newly established or replaced reference (manual zero, homing done) returns the view to the device.
+        if(sample is {Referenced:true} && (startFeedback is not {Referenced:true} || startFeedback.Epoch!=sample.Epoch)) offlineSim=false;
+        startFeedback = sample; deviceNote = whyNot; UpdatePointButton();
         if(changed) RequestViewportRedraw();
     }
     public FrameworkElement ParameterContent { get; private set; } = null!;
@@ -136,46 +142,46 @@ public sealed partial class XYPreviewPanel : UserControl
     }
     private readonly TextBox l1 = Field("180"), l2 = Field("176.38"), x = Field("340"), y = Field("0");
     private readonly TextBox min1 = Field(""), max1 = Field(""), min2 = Field(""), max2 = Field("");
-    private readonly ComboBox branch = new() { Width = 132, Margin = new Thickness(4), ItemsSource = new[] { "肘角 ≥ 0 分支", "肘角 ≤ 0 分支" }, SelectedIndex = 0 };
-    private readonly ComboBox shape = new() { Width = 94, Margin = new Thickness(4), ItemsSource = new[] { "单点", "直线", "矩形", "圆" }, SelectedIndex = 3 };
+    private readonly ComboBox branch = new() { Width = 132, Margin = new Thickness(4), SelectedIndex = 0 };
+    private readonly ComboBox shape = new() { Width = 94, Margin = new Thickness(4), SelectedIndex = 3 };
     private readonly TextBox a = Field("5"), b = Field("10");
     private readonly TextBlock xLabel = new(), yLabel = new(), aLabel = new(), bLabel = new();
     private readonly Slider cursor = new() { Minimum = 0, Maximum = 1, SmallChange = 0.1, LargeChange = 1, MinWidth = 180, Margin = new Thickness(4), IsEnabled = false };
     private readonly TextBox feed = new() { IsReadOnly = true, Width = 76, Margin = new Thickness(4), Padding = new Thickness(4), Background = WorkbenchTheme.Background, Foreground = WorkbenchTheme.Muted },
         v1 = Field("5"), v2 = Field("3"), acc1 = Field("10"), acc2 = Field("6");
-    private readonly TextBlock speedState = new() { MinHeight=64, TextWrapping=TextWrapping.Wrap, FontSize=11, Margin=new Thickness(4), Foreground=WorkbenchTheme.Muted };
-    private readonly Button play = new() { Content = "▶ 预览", Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
-    private readonly Button rewind = new() { Content = "↺ 重播", Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
+    private readonly Button play = new() { Content = Lang.T("btn.play"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
+    private readonly Button rewind = new() { Content = Lang.T("btn.rewind"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
     private readonly DispatcherTimer playbackTimer = new() { Interval = TimeSpan.FromMilliseconds(33) };
     private readonly Stopwatch playbackClock = new();
     private double playbackFrom;
     private bool advancing;
-    private readonly Button export = new() { Content = "导出规划 CSV", Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
+    private readonly Button export = new() { Content = Lang.T("btn.export"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
     private readonly TextBox sampleInfo = new() { IsReadOnly = true, TextWrapping = TextWrapping.Wrap, BorderThickness = new Thickness(0), Background = Brushes.Transparent, Margin = new Thickness(4) };
     private DrawingTrajectory? trajectory;
     private TimedTrajectory? timing;
-    private readonly Button movePoint = new() { Content = "低速移到此 XY 点", Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
-    private readonly TextBlock moveState = new() { Text = "低速实机试运行：连接后人工确认伸直零位，或执行开关回零。", Margin = new Thickness(4), TextWrapping = TextWrapping.Wrap };
+    private readonly Button movePoint = new() { Content = Lang.T("btn.movePoint"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
+    private readonly TextBlock moveState = new() { Text = Lang.T("move.default"), Margin = new Thickness(4), TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock actionSummary = new() { FontWeight=FontWeights.SemiBold, MaxWidth=390, TextTrimming=TextTrimming.CharacterEllipsis, VerticalAlignment=VerticalAlignment.Center };
     private readonly Border actionStatus = new() { CornerRadius=new CornerRadius(6), Padding=new Thickness(10,8,10,8), Margin=new Thickness(8,4,4,4), VerticalAlignment=VerticalAlignment.Center };
     private readonly ProgressBar actionProgress = new() { Height=4, Minimum=0, Maximum=100, Foreground=WorkbenchTheme.Teal, Background=WorkbenchTheme.Line, Margin=new Thickness(4,6,4,0), Visibility=Visibility.Collapsed };
-    private string? deviceStatusMessage, operationError;
+    private string? deviceStatusMessage;
+    private Func<string>? operationError;
     private bool deviceStatusFault, deviceStatusBusy;
     private JointPose? pointTarget;
     private JointLimits? firmwareLimits;
     private ReachabilityMask? reachability;
     private bool overlayUnreachable = true;
     private readonly List<Button> rangeHelp = [];
-    private readonly TextBlock rangeState = new() { MinHeight=32, FontSize=11, TextWrapping=TextWrapping.Wrap, Margin=new Thickness(4), Foreground=WorkbenchTheme.Muted };
     private bool pointMoveAllowed;
     private bool deviceLimitsConfirmed;
-    private string deviceMoveReason = "等待连接并建立人工或开关坐标参考。";
+    private string deviceMoveReason = Lang.T("move.waitConnect");
     public event Action<JointPose>? PointMoveRequested;
     public event Action<ExecutionTrajectory>? TrajectoryRequested;   // upload only: the device does not move
     public event Action? ExecuteRequested;                            // start the plan the device already holds
-    private readonly Button upload = new() { Content = "上传图形", Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
-    private readonly Button run = new() { Content = "执行图形", Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
+    private readonly Button upload = new() { Content = Lang.T("btn.upload"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
+    private readonly Button run = new() { Content = Lang.T("btn.run"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
     private ExecutionTrajectory? uploadedPlan;   // complete plan waiting on the device for 执行图形
+    private bool uploadedRan;                    // ...and it has already been drawn: single moves are open again, 执行图形 repeats it
     private readonly TextBox executionInfo = new() { IsReadOnly = true, TextWrapping = TextWrapping.Wrap, Background = Brushes.Transparent, BorderThickness = new Thickness(0), Margin = new Thickness(4) };
     private ExecutionTrajectory? execution;
     private bool trajectorySupported;
@@ -185,8 +191,37 @@ public sealed partial class XYPreviewPanel : UserControl
     private readonly TextBlock notice = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4), Foreground = Brushes.DarkSlateGray };
 
     private Border aRow = null!, bRow = null!;
+    private Button? sampleButton, previewButton, saveButton, speedHelp;
+    internal void RefreshLanguage()
+    {
+        if (sampleButton is { } sample) { sample.Content = Lang.T("btn.sample"); sample.ToolTip = Lang.T("btn.sample.tip"); }
+        if (previewButton is { } preview) preview.Content = Lang.T("btn.preview");
+        if (saveButton is { } save) save.Content = Lang.T("btn.save");
+        export.Content = Lang.T("btn.export");
+        play.Content = playbackTimer.IsEnabled ? Lang.T("btn.playPause") : Lang.T("btn.play");
+        rewind.Content = Lang.T("btn.rewind");
+        upload.Content = Lang.T("btn.upload");
+        run.Content = Lang.T("btn.run");
+        movePoint.Content = shape.SelectedIndex == 0 ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
+        feed.ToolTip = Lang.T("xy.feed.tip");
+        foreach (var (field, name, value) in new[] { (min1, Lang.T("xy.q1min"), -30), (max1, Lang.T("xy.q1max"), 30), (min2, Lang.T("xy.q2min"), -60), (max2, Lang.T("xy.q2max"), 60) })
+            field.ToolTip = Lang.T("xy.rangeField.tip", name, value.ToString());
+        ShapeFields();
+        foreach (var element in new FrameworkElement[] { result, notice, executionInfo }) Lang.RefreshText(element);
+        foreach (var help in rangeHelp) System.Windows.Automation.AutomationProperties.SetName(help, Lang.T("xy.help.name"));
+        if (speedHelp is { } speeds) System.Windows.Automation.AutomationProperties.SetName(speeds, Lang.T("xy.speedHelp.name"));
+        RefreshLanguageViewport();
+        RefreshRangeHelp();
+        UpdatePointButton();
+        RequestViewportRedraw();
+    }
     public XYPreviewPanel()
     {
+        foreach (var key in new[] { "xy.shape0", "xy.shape1", "xy.shape2", "xy.shape3" })
+            shape.Items.Add(Lang.Bind(new ComboBoxItem(), ContentControl.ContentProperty, key));
+        foreach (var key in new[] { "xy.branchPos", "xy.branchNeg" })
+            branch.Items.Add(Lang.Bind(new ComboBoxItem(), ContentControl.ContentProperty, key));
+        shape.SelectedIndex = 3; branch.SelectedIndex = 0;
         Background = Brushes.White;
         var shell = new Grid();
         shell.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -194,49 +229,54 @@ public sealed partial class XYPreviewPanel : UserControl
         shell.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         Content = shell;
         var title = new DockPanel { Margin = new Thickness(6,2,6,2) };
-        var sample = new Button { Content = "载入示例", ToolTip = "载入当前图形的小示例（起点约 340, 0 mm，在默认关节范围内）；只改图形参数。" };
+        var sample = new Button { Content = Lang.T("btn.sample"), ToolTip = Lang.T("btn.sample.tip") };
+        sampleButton = sample;
         sample.Click += (_,_) => LoadExample(); DockPanel.SetDock(sample,Dock.Right); title.Children.Add(sample);
         editControls.Add(sample); title.Children.Add(BuildViewportToolbar()); shell.Children.Add(WorkbenchTheme.Edge(title));
         var main = new Grid(); Grid.SetRow(main,1); shell.Children.Add(main);
         // Property grid (left column of the window): "name | value | unit" rows in titled groups.
         var controls = new StackPanel();
         var scroll = new ScrollViewer { Content = controls, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
-        Border Prop(string label, TextBox field, string unit, string? name = null, string? tip = null) {
-            System.Windows.Automation.AutomationProperties.SetName(field, name ?? label + " / " + unit);
-            var row = WorkbenchTheme.Row(WorkbenchTheme.Label(label), field, unit); if (tip is not null) row.ToolTip = tip; return row;
+        Border Prop(string key, TextBox field, string unit, string? name = null, string? tip = null, Slider? slider = null) {
+            Lang.Bind(field, System.Windows.Automation.AutomationProperties.NameProperty, name ?? key);
+            var label = WorkbenchTheme.LocalLabel(key);
+            Border row;
+            if (slider is null) row = WorkbenchTheme.Row(label, field, unit);
+            else { Lang.Bind(slider, System.Windows.Automation.AutomationProperties.NameProperty, name ?? key); editControls.Add(slider); row = WorkbenchTheme.SliderRow(label, slider, field, unit); }
+            if (tip is not null) Lang.Bind(row, ToolTipProperty, tip);
+            return row;
         }
-        controls.Children.Add(WorkbenchTheme.GroupHeader("图形与几何"));
-        controls.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.Label("形状"), shape));
-        controls.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.Label("逆解分支"), branch));
-        controls.Children.Add(WorkbenchTheme.Row(xLabel, x)); controls.Children.Add(WorkbenchTheme.Row(yLabel, y));
-        controls.Children.Add(aRow = WorkbenchTheme.Row(aLabel, a)); controls.Children.Add(bRow = WorkbenchTheme.Row(bLabel, b));
-        controls.Children.Add(WorkbenchTheme.GroupHeader("机构尺寸"));
-        controls.Children.Add(Prop("L1", l1, "mm")); controls.Children.Add(Prop("L2", l2, "mm"));
+        StackPanel Group(string title, UIElement? trailing = null, bool expanded = true) {
+            var body = new StackPanel(); controls.Children.Add(WorkbenchTheme.Section(title, body, trailing, expanded)); return body;
+        }
+        var geometry = Group("section.geometry");
+        geometry.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.shape"), shape));
+        geometry.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.branch"), branch));
+        geometry.Children.Add(WorkbenchTheme.Row(xLabel, x)); geometry.Children.Add(WorkbenchTheme.Row(yLabel, y));
+        geometry.Children.Add(aRow = WorkbenchTheme.Row(aLabel, a)); geometry.Children.Add(bRow = WorkbenchTheme.Row(bLabel, b));
+        var dimensions = Group("section.dimensions");
+        dimensions.Children.Add(Prop("xy.l1", l1, "mm")); dimensions.Children.Add(Prop("xy.l2", l2, "mm"));
         var rangeHelpIcon = HelpIcon(RangeHelpText());
         rangeHelp.Add(rangeHelpIcon);
-        controls.Children.Add(WorkbenchTheme.GroupHeader("关节范围", rangeHelpIcon));
-        foreach(var (field,name,value) in new[] { (min1,"q1 最小",-30), (max1,"q1 最大",30), (min2,"q2 最小",-60), (max2,"q2 最大",60) }) {
-            controls.Children.Add(Prop(name, field, "°", name));
-            field.ToolTip=$"{name} / °；留空使用 {value}°，填写后使用你的值。";
+        var ranges = Group("section.limits", rangeHelpIcon);
+        foreach(var (field,name,value) in new[] { (min1,"xy.q1min",-30), (max1,"xy.q1max",30), (min2,"xy.q2min",-60), (max2,"xy.q2max",60) }) {
+            ranges.Children.Add(Prop(name, field, "°", name));
+            field.ToolTip=Lang.T("xy.rangeField.tip", Lang.T(name), value.ToString());
         }
-        controls.Children.Add(new TextBlock { Text="默认 q1 ∈ [−30°, +30°] · q2 ∈ [−60°, +60°]\n留空用默认值 · 修改后红色区域实时更新", Foreground=WorkbenchTheme.Muted, FontSize=11, Margin=new Thickness(10,4,10,0) });
-        rangeState.Margin = new Thickness(10,4,10,4); controls.Children.Add(rangeState);
-        controls.Children.Add(WorkbenchTheme.GroupHeader("运动参数（全局）"));
-        string Name(int axis, int config, int plan, string text) => $"{text}（≤{Cap(axis,config,plan):0.##}）";
-        controls.Children.Add(Prop("电机1 速度", v1, "°/s", Name(0,DeviceContract.Arm1RateMax,DeviceContract.PlanRateMax,"电机1 °/s")));
-        controls.Children.Add(Prop("电机2 速度", v2, "°/s", Name(1,DeviceContract.Arm2RateMax,DeviceContract.PlanRateMax,"电机2 (q2−q1) °/s"), "电机2 转的是 q2−q1"));
-        controls.Children.Add(Prop("电机1 加速度", acc1, "°/s²", Name(0,DeviceContract.Arm1AccelMax,DeviceContract.PlanAccelMax,"电机1 °/s²")));
-        controls.Children.Add(Prop("电机2 加速度", acc2, "°/s²", Name(1,DeviceContract.Arm2AccelMax,DeviceContract.PlanAccelMax,"电机2 (q2−q1) °/s²"), "电机2 转的是 q2−q1"));
-        feed.ToolTip = "由杆长和两个电机速度算出的末端速度上限：机械臂伸直、两轴都以最高速度同向转动时。只读；实际绘图更慢。";
-        controls.Children.Add(Prop("末端最大", feed, "mm/s", "末端最大 mm/s（只读）"));
-        controls.Children.Add(new TextBlock { Text="全局：杆长用于全部图形、命令 XY 与记录；关节速度/加速度用于绘图、定位、点动和回零。\n" +
-            $"上限：电机1 ≤{Cap(0,DeviceContract.Arm1RateMax,DeviceContract.PlanRateMax):0.##} °/s、≤{Cap(0,DeviceContract.Arm1AccelMax,DeviceContract.PlanAccelMax):0.##} °/s²；" +
-            $"电机2 (q2−q1) ≤{Cap(1,DeviceContract.Arm2RateMax,DeviceContract.PlanRateMax):0.##} °/s、≤{Cap(1,DeviceContract.Arm2AccelMax,DeviceContract.PlanAccelMax):0.##} °/s²。", Foreground=WorkbenchTheme.Muted, FontSize=11, TextWrapping=TextWrapping.Wrap, Margin=new Thickness(10,4,10,0) });
-        speedState.Margin = new Thickness(10,2,10,4); controls.Children.Add(speedState);
-        var details = new StackPanel(); details.Children.Add(executionInfo); details.Children.Add(moveState); details.Children.Add(result); details.Children.Add(notice);
-        controls.Children.Add(new Expander { Header = "查看规划检查详情", Content = details, Margin = new Thickness(10,6,10,3) });
-        var preview = new Button { Content = "检查并预览", MinWidth = 120, Background = Brushes.White, Foreground = WorkbenchTheme.Blue, BorderBrush = WorkbenchTheme.Blue }; preview.Click += (_,_) => Refresh();
-        var save = new Button { Content = "保存" }; save.Click += (_,_) => SaveCurrentParameters(ParametersPath);
+        speedHelp = HelpIcon(SpeedsHelpText(), "xy.speedHelp.name");
+        var speeds = Group("section.speeds", speedHelp);
+        speeds.Children.Add(Prop("xy.motor1v", v1, "°/s", "xy.motor1v.name", slider: RateSlider(v1, 0, accel: false)));
+        speeds.Children.Add(Prop("xy.motor2v", v2, "°/s", "xy.motor2v.name", "xy.motor2.tip", RateSlider(v2, 1, accel: false)));
+        speeds.Children.Add(Prop("xy.motor1a", acc1, "°/s²", "xy.motor1a.name", slider: RateSlider(acc1, 0, accel: true)));
+        speeds.Children.Add(Prop("xy.motor2a", acc2, "°/s²", "xy.motor2a.name", "xy.motor2.tip", RateSlider(acc2, 1, accel: true)));
+        feed.ToolTip = Lang.T("xy.feed.tip");
+        speeds.Children.Add(Prop("xy.feed", feed, "mm/s", "xy.feed.name"));
+        var checks = Group("section.checks", expanded: false);
+        checks.Children.Add(executionInfo); checks.Children.Add(moveState); checks.Children.Add(result); checks.Children.Add(notice);
+        var preview = new Button { Content = Lang.T("btn.preview"), MinWidth = 120, Background = Brushes.White, Foreground = WorkbenchTheme.Blue, BorderBrush = WorkbenchTheme.Blue }; preview.Click += (_,_) => Refresh();
+        previewButton = preview;
+        var save = new Button { Content = Lang.T("btn.save") }; save.Click += (_,_) => SaveCurrentParameters(ParametersPath);
+        saveButton = save;
         export.Click += (_,_) => Export(); editControls.Add(preview); editControls.Add(export); editControls.Add(save);
         var buttons = new WrapPanel { Margin = new Thickness(8,4,8,4) }; buttons.Children.Add(preview); buttons.Children.Add(save); buttons.Children.Add(export);
         // The action buttons stay visible under the scrolling groups.
@@ -267,9 +307,9 @@ public sealed partial class XYPreviewPanel : UserControl
         foreach (var help in rangeHelp) editControls.Add(help);
         branch.SelectionChanged += (_, _) => ParametersChanged();
         shape.SelectionChanged += (_, _) => { SwitchShape(); ShapeFields(); ParametersChanged(); };
-        cursor.ValueChanged += (_, _) => { if (!advancing) { PausePlayback(); commandView=false; } DrawSample(); };
+        cursor.ValueChanged += (_, _) => { if (!advancing) { PausePlayback(); offlineSim=true; } DrawSample(); };
         canvas.SizeChanged += (_, _) => RedrawViewport();
-        play.Click += (_, _) => TogglePlayback(); rewind.Click += (_, _) => { PausePlayback(); commandView=false; cursor.Value = 0; RedrawViewport(); };
+        play.Click += (_, _) => TogglePlayback(); rewind.Click += (_, _) => { PausePlayback(); offlineSim=true; cursor.Value = 0; RedrawViewport(); };
         playbackTimer.Tick += (_, _) => AdvancePlayback(playbackFrom + playbackClock.Elapsed.TotalSeconds);
         Unloaded += (_, _) => PausePlayback();
         ShapeFields();
@@ -278,52 +318,76 @@ public sealed partial class XYPreviewPanel : UserControl
 
     // Drawing/positioning cap of one axis in degrees: the smaller of the configurable and the plan limit (microsteps).
     private static double Cap(int axis, int configMax, int planMax) => Math.Min(configMax, planMax) / MotionProfile.StepsPerDegree(axis);
+    private static double RateCap(int axis) => Cap(axis, axis == 0 ? DeviceContract.Arm1RateMax : DeviceContract.Arm2RateMax, DeviceContract.PlanRateMax);
+    private static double AccelCap(int axis) => Cap(axis, axis == 0 ? DeviceContract.Arm1AccelMax : DeviceContract.Arm2AccelMax, DeviceContract.PlanAccelMax);
     private static TextBox Field(string text) => new() { Text = text, Width = 76, Margin = new Thickness(4), Padding = new Thickness(4) };
-    private static Button HelpIcon(string tip)
+    // The slider only edits `field`, which stays the saved, tested and parsed value; typing in the box moves the slider.
+    // It spans the device minimum to the cap in 0.1 steps, so a slider value is always accepted by MotionProfile.From.
+    private static Slider RateSlider(TextBox field, int axis, bool accel)
+    {
+        double min = (accel ? DeviceContract.AccelMin : DeviceContract.RateMin) / MotionProfile.StepsPerDegree(axis);
+        var slider = new Slider { Minimum = Math.Ceiling(min * 10) / 10, Maximum = Math.Floor((accel ? AccelCap(axis) : RateCap(axis)) * 10) / 10,
+            TickFrequency = 0.1, IsSnapToTickEnabled = true, SmallChange = 0.1, LargeChange = 1 };
+        bool syncing = false;
+        void FromText() {
+            if (!double.TryParse(field.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double v) || !double.IsFinite(v)) return;
+            syncing = true; slider.Value = v; syncing = false;
+        }
+        slider.ValueChanged += (_, _) => { if (!syncing) field.Text = Mm(slider.Value); };
+        field.TextChanged += (_, _) => FromText();
+        FromText();
+        return slider;
+    }
+    private static Button HelpIcon(string tip, string nameKey = "xy.help.name")
     {
         var help=new Button { Content="?", Width=22, MinHeight=22, Padding=new Thickness(0), Margin=new Thickness(2,4,6,4),
             FontWeight=FontWeights.Bold, ToolTip=tip };
-        System.Windows.Automation.AutomationProperties.SetName(help, "关节范围说明");
+        System.Windows.Automation.AutomationProperties.SetName(help, Lang.T(nameKey));
         System.Windows.Automation.AutomationProperties.SetHelpText(help, tip);
         ToolTipService.SetShowOnDisabled(help, true);
         ToolTipService.SetInitialShowDelay(help, 200);
+        ToolTipService.SetShowDuration(help, 60000);   // these tips are paragraphs; the 5 s default cuts them off
         return help;
     }
+    private static void SetHelp(Button help, string tip)
+    {
+        if (Equals(help.ToolTip, tip)) return;
+        help.ToolTip = tip; System.Windows.Automation.AutomationProperties.SetHelpText(help, tip);
+    }
+    // Everything that used to sit under the speed sliders: what the group governs, the caps, and the values that take effect.
+    private string SpeedsHelpText()
+    {
+        string effective;
+        try { var r=RequestedRates; var d=MotionProfile.From(r).DrawingRates(r.Feed); effective = Lang.T("xy.effective", d.V1, d.V2, d.A1, d.A2); }
+        catch(ArgumentException ex) { effective = ex.Message; }
+        return Lang.T("xy.speedsGlobal", RateCap(0), AccelCap(0), RateCap(1), AccelCap(1)) + "\n" + effective;
+    }
+    // The range tip ends with the sync status that used to be printed under the range fields.
     private string RangeHelpText()
     {
-        return "关节范围 / °：q1、q2 两个关节角的规划范围（两轴逆时针为正，0° 为两杆伸直的零位）。\n" +
-            "· q1 ＝ arm1：主动臂（经 40:1 减速箱、带 AS5045 编码器反馈）。\n" +
-            "· q2 ＝ arm2 相对固定 +X 零方向的夹角；第二轴电机实际转角为 q2−q1（无编码器反馈）。\n" +
-            "· 因此 q2 范围不直接限制肘：肘可达 [q2 最小−q1 最大, q2 最大−q1 最小]，固件不检查。\n" +
-            "· 不确定哪个是哪个：按住点动 \"arm1 ← / D →\" 看状态栏，或轻推对应杆件，读数变化的那一路就是它。\n" +
-            "· 每个输入框留空时使用对应默认值：q1 ∈ [−30°, +30°]，q2 ∈ [−60°, +60°]。\n" +
-            "· 填写后以你填的值为准：" + EnteredEnvelope() + "。\n" +
-            "· 透明红色表示在此范围和连杆长度下，两个逆解分支都无法到达的区域；修改后实时更新。\n" +
-            "· 红区、轨迹规划和设备执行共用这组范围。未使能时自动同步到支持范围设置的固件，确认一致后才允许运动。\n" +
-            "· 两轴范围须在 −180°～180° 内并包含 0°，最多两位小数。修改已使能设备的范围后，先总停止再同步。\n" +
-            "· 这是软件关节范围，不是实测碰撞边界。";
+        return Lang.T("xy.rangeHelp1") + EnteredEnvelope() + Lang.T("xy.rangeHelp2") + "\n\n" + RangeStatusText();
     }
+    private string RangeStatusText() => RequestedLimits is not { } requested ? Lang.T("xy.rangeInvalid")
+        : firmwareLimits is null ? Lang.T("xy.rangePreviewOnly")
+        : requested == firmwareLimits && deviceLimitsConfirmed ? Lang.T("xy.rangeMatched")
+        : Lang.T("xy.rangeUnsynced") + deviceMoveReason + "\n" + Lang.T("xy.deviceRange") + Envelope(firmwareLimits);
     private string EnteredEnvelope()
     {
-        try { return Envelope(PreviewLimits()); } catch(ArgumentException) { return "当前输入无效，请检查上下限"; }
+        try { return Envelope(PreviewLimits()); } catch(ArgumentException) { return Lang.T("xy.envelopeInvalid"); }
     }
     private static string Envelope(JointLimits? limits) => limits is { } range
-        ? FormattableString.Invariant($"q1 [{range.Min1:F2}, {range.Max1:F2}]°、q2 [{range.Min2:F2}, {range.Max2:F2}]°")
-        : "未填写";
+        ? Lang.T("xy.envelopeFormat", range.Min1, range.Max1, range.Min2, range.Max2)
+        : Lang.T("xy.envelopeEmpty");
     private void RefreshRangeHelp()
     {
         string tipMax = "—";   // also shown while the link lengths or speeds are invalid
-        try { var r=RequestedRates; var p=MotionProfile.From(r); var d=p.DrawingRates(r.Feed);
-            SetText(speedState,$"实际生效：电机1/电机2 {d.V1:F2}/{d.V2:F2} °/s，加速度 {d.A1:F2}/{d.A2:F2} °/s²。填得比上限大会被压到上限。");
-            try { tipMax = Model.MaxTipSpeed(d.V1, d.V2).ToString("0.#", CultureInfo.InvariantCulture); } catch(ArgumentException) { }
-        } catch(ArgumentException ex) { SetText(speedState,ex.Message); }
+        try { var r=RequestedRates; var d=MotionProfile.From(r).DrawingRates(r.Feed);
+            tipMax = Model.MaxTipSpeed(d.V1, d.V2).ToString("0.#", CultureInfo.InvariantCulture);
+        } catch(ArgumentException) { }
         if (feed.Text != tipMax) feed.Text = tipMax;
+        if (speedHelp is { } speeds) SetHelp(speeds, SpeedsHelpText());
         var tip=RangeHelpText();
-        foreach(var help in rangeHelp) if(!Equals(help.ToolTip,tip)) { help.ToolTip=tip; System.Windows.Automation.AutomationProperties.SetHelpText(help,tip); }
-        SetText(rangeState, RequestedLimits is not { } requested ? "范围无效：须包含 0°、上下限有序，最多两位小数。"
-            : firmwareLimits is null ? "红区与规划使用上方范围；设备确认后才能运动。"
-            : requested == firmwareLimits && deviceLimitsConfirmed ? "设备已确认：红区、规划、执行范围一致。"
-            : "设备范围尚未同步；运动已锁定。\n" + deviceMoveReason + "\n设备当前：" + Envelope(firmwareLimits));
+        foreach(var help in rangeHelp) SetHelp(help, tip);
     }
     private void RefreshOverlayLimits()
     {
@@ -332,10 +396,10 @@ public sealed partial class XYPreviewPanel : UserControl
     private void ShapeFields()
     {
         int s = shape.SelectedIndex;
-        xLabel.Text = s == 3 ? "圆心 X / mm" : s == 2 ? "左下角 X / mm" : s == 1 ? "起点 X / mm" : "X / mm";
-        yLabel.Text = s == 3 ? "圆心 Y / mm" : s == 2 ? "左下角 Y / mm" : s == 1 ? "起点 Y / mm" : "Y / mm";
-        aLabel.Text = s == 3 ? "半径 / mm" : s == 2 ? "宽 / mm" : "终点 X / mm";
-        bLabel.Text = s == 2 ? "高 / mm" : "终点 Y / mm";
+        xLabel.Text = s == 3 ? Lang.T("xy.centerX") : s == 2 ? Lang.T("xy.cornerX") : s == 1 ? Lang.T("xy.startX") : Lang.T("xy.x");
+        yLabel.Text = s == 3 ? Lang.T("xy.centerY") : s == 2 ? Lang.T("xy.cornerY") : s == 1 ? Lang.T("xy.startY") : Lang.T("xy.y");
+        aLabel.Text = s == 3 ? Lang.T("xy.radius") : s == 2 ? Lang.T("xy.width") : Lang.T("xy.endX");
+        bLabel.Text = s == 2 ? Lang.T("xy.height") : Lang.T("xy.endY");
         a.Visibility = aLabel.Visibility = s == 0 ? Visibility.Collapsed : Visibility.Visible;
         b.Visibility = bLabel.Visibility = s is 0 or 3 ? Visibility.Collapsed : Visibility.Visible;
         aRow.Visibility = a.Visibility; bRow.Visibility = b.Visibility;
@@ -345,7 +409,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private static double Number(TextBox field)
     {
         if (!double.TryParse(field.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double value) || !double.IsFinite(value))
-            throw new ArgumentException(System.Windows.Automation.AutomationProperties.GetName(field) + "：请输入有效数值，小数点使用 .，不能留空或输入 NaN/Infinity。");
+            throw Lang.Error("err.number", (Func<string>)(() => System.Windows.Automation.AutomationProperties.GetName(field)));
         return value;
     }
     private JointLimits? Limits()
@@ -355,14 +419,14 @@ public sealed partial class XYPreviewPanel : UserControl
         {
             double value = string.IsNullOrWhiteSpace(field.Text) ? fallback : Number(field);
             double rounded = Math.Round(value * 100, MidpointRounding.AwayFromZero) / 100;
-            if (Math.Abs(value - rounded) > 1e-8) throw new ArgumentException("关节范围最多保留两位小数（0.01°）。");
+            if (Math.Abs(value - rounded) > 1e-8) throw Lang.Error("err.limitDecimals");
             return rounded;
         }
         var limits = new JointLimits(Bound(min1,-30), Bound(max1,30), Bound(min2,-60), Bound(max2,60));
         if (limits.Min1 < -180 || limits.Max1 > 180 || limits.Min2 < -180 || limits.Max2 > 180 ||
             limits.Min1 >= limits.Max1 || limits.Min2 >= limits.Max2 ||
             limits.Min1 > 0 || limits.Max1 < 0 || limits.Min2 > 0 || limits.Max2 < 0)
-            throw new ArgumentException("关节范围须位于 -180°～180° 内、包含 0°，且最小值小于最大值；留空项使用默认值。");
+            throw Lang.Error("err.limitBounds");
         return limits;
     }
     private JointLimits PreviewLimits() => Limits() ?? DefaultTrialRange;
@@ -370,13 +434,13 @@ public sealed partial class XYPreviewPanel : UserControl
     {
         if (updating) return;
         parametersDirty = false;
-        commandView = false;
+        offlineSim = false;
         cameraReady = false; autoFit = true; operationError=null;
         RefreshOverlayLimits(); RefreshRangeHelp();
-        pointTarget = null; movePoint.IsEnabled = false; execution = null; upload.IsEnabled = false; executionInfo.Clear();
+        pointTarget = null; movePoint.IsEnabled = false; execution = null; upload.IsEnabled = false; Lang.Text(executionInfo, () => "");
         PausePlayback(); trajectory = null; timing = null;
         export.IsEnabled = cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = false;
-        canvas.Children.Clear(); result.Clear(); sampleInfo.Clear(); notice.Text = "";
+        canvas.Children.Clear(); Lang.Text(result, () => ""); sampleInfo.Clear(); Lang.Text(notice, () => "");
         try
         {
             var model = new PlanarArm(Number(l1), Number(l2));
@@ -390,33 +454,30 @@ public sealed partial class XYPreviewPanel : UserControl
                     Number(a), shape.SelectedIndex == 3 ? 0 : Number(b), Math.Max(0, branch.SelectedIndex), bounds);
                 timing = new TimedTrajectory(trajectory, RequestedRates);
                 pointTarget = timing.At(0).Pose; RefreshExecution(); UpdatePointButton();
-                notice.Text = bounds is null ? "关节范围未测定；机械范围未检查。CSV 为规划数据，不能直接驱动机械臂。" :
-                    "已检查全部采样点的关节范围；未验证机械碰撞、线缆干涉或从当前位置到起点的路径。";
+                Lang.Text(notice, () => bounds is null ? Lang.T("notice.noRange") : Lang.T("notice.checked"));
                 result.Foreground = Brushes.DarkSlateGray;
-                string conclusion = "整条轨迹检查通过：使用当前关节范围";
-                result.Text = $"{conclusion}；{trajectory.Samples.Length} 点；路径长度 {timing.Length:F2} mm；预计 {timing.Duration:F2} 秒。\n" +
-                    $"q1：{trajectory.Samples.Min(s => s.Pose.Q1):F2}～{trajectory.Samples.Max(s => s.Pose.Q1):F2}°；" +
-                    $"q2：{trajectory.Samples.Min(s => s.Pose.Q2):F2}～{trajectory.Samples.Max(s => s.Pose.Q2):F2}°。\n" +
-                    "预览与执行共用设备上限内的时间规划；执行另含每段末尾 50 ms 停留。";
-                if (trajectory.NearSingularity) result.Text += "\n提示：部分姿态接近奇异位形，微小 XY 变化可能引起较大关节变化。";
-                cursor.Maximum = timing.Duration; cursor.Value = 0;
+                Lang.Text(result, () => Lang.T("plan.trajOk") + (Lang.IsEn ? "; " : "；") + Lang.T("plan.trajStats",
+                    trajectory.Samples.Length, timing.Length, timing.Duration,
+                    trajectory.Samples.Min(s => s.Pose.Q1), trajectory.Samples.Max(s => s.Pose.Q1),
+                    trajectory.Samples.Min(s => s.Pose.Q2), trajectory.Samples.Max(s => s.Pose.Q2)) +
+                    (trajectory.NearSingularity ? Lang.T("plan.nearSing") : ""));
+                cursor.Maximum = timing.Duration; cursor.Value = 0; offlineSim = false;   // resetting the cursor is not scrubbing
                 export.IsEnabled = cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = true; DrawSample();
                 return;
             }
             var poses = model.Inverse(tx, ty);
             var selected = poses[Math.Min(branch.SelectedIndex < 0 ? 0 : branch.SelectedIndex, poses.Length - 1)];
             pointTarget = selected; UpdatePointButton();
-            notice.Text = limits is null ? "两轴左转＝逆时针已确认；此处机械范围未填写。实际单点移动另受固件标定锁和固件范围限制。" :
-                "目标按当前关节范围检查，设备确认同一范围后才允许运动；尚未验证机械碰撞或线缆干涉。";
+            Lang.Text(notice, () => limits is null ? Lang.T("notice.pointNoRange") : Lang.T("notice.pointChecked"));
             result.Foreground = Brushes.DarkSlateGray;
-            result.Text = $"目标 ({tx:F2}, {ty:F2}) mm；几何半径 {model.InnerRadius:F2}～{model.OuterRadius:F2} mm\n" +
-                string.Join("\n", poses.Select((p, i) => $"解 {i + 1}：q1={p.Q1:F2}°，q2={p.Q2:F2}°；" +
-                    (limits is null ? "机械范围未检查" : limits.Value.Contains(p) ? "在填写的范围内" : "超出填写的范围")));
-            if (Math.Abs(Math.Sin((selected.Q2 - selected.Q1) * Math.PI / 180)) < 1e-6)
-                result.Text += "\n当前是伸直或完全折叠的奇异位形；不能据此认为连续轨迹可执行。";
+            Lang.Text(result, () => Lang.T("plan.target", tx, ty, model.InnerRadius, model.OuterRadius) +
+                string.Join("\n", poses.Select((p, i) => Lang.T("plan.solution", i + 1, p.Q1, p.Q2) +
+                    (limits is null ? Lang.T("plan.noRangeCheck") : limits.Value.Contains(p) ? Lang.T("plan.inRange") : Lang.T("plan.outRange")))) +
+                (Math.Abs(Math.Sin((selected.Q2 - selected.Q1) * Math.PI / 180)) < 1e-6 ? Lang.T("plan.singular") : ""));
             Draw(model, selected, tx, ty, limits is null || limits.Value.Contains(selected), Reachability(model).IsReachable(model.Forward(selected).Tip));
+            ShowPoseInfo(model, selected);
         }
-        catch (ArgumentException ex) { InvalidPlan(ex.Message); }
+        catch (ArgumentException ex) { InvalidPlan(() => ex.Message); }
     }
     private void ParametersChanged()
     {
@@ -425,35 +486,35 @@ public sealed partial class XYPreviewPanel : UserControl
         cameraReady = false; autoFit = true;
         RefreshOverlayLimits(); RefreshRangeHelp();
         pointerInfo.Text = PointerHint;
-        InvalidPlan("参数已修改，请点击“检查并预览”或“保存”后应用。");
+        InvalidPlan(() => Lang.T("err.needPreview"));
         NotifyLimitsChanged();
     }
-    private void InvalidPlan(string reason)
+    private void InvalidPlan(Func<string> reason)
     {
         PausePlayback(); trajectory = null; timing = null;
         export.IsEnabled = cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = false;
-        canvas.Children.Clear(); sampleInfo.Clear(); result.Foreground = Brushes.Firebrick; result.Text = reason;
+        canvas.Children.Clear(); sampleInfo.Clear(); result.Foreground = Brushes.Firebrick; Lang.Text(result, reason); Lang.Text(notice, () => "");
         pointTarget = null; movePoint.IsEnabled = false;
-        execution = null; upload.IsEnabled = false; executionInfo.Clear();
+        execution = null; upload.IsEnabled = false; Lang.Text(executionInfo, () => "");
         UpdatePointButton();
         RequestViewportRedraw();
     }
-    public void SetPointMoveState(bool allowed, JointLimits? limits, string reason, bool supportsTrajectory = false, bool limitsConfirmed = true, ExecutionTrajectory? uploaded = null)
+    public void SetPointMoveState(bool allowed, JointLimits? limits, string reason, bool supportsTrajectory = false, bool limitsConfirmed = true, ExecutionTrajectory? uploaded = null, bool ran = false)
     {
         pointMoveAllowed = allowed; firmwareLimits = limits; trajectorySupported = supportsTrajectory; deviceMoveReason = reason;
-        deviceLimitsConfirmed = limitsConfirmed; uploadedPlan = uploaded;
+        deviceLimitsConfirmed = limitsConfirmed; uploadedPlan = uploaded; uploadedRan = uploaded is not null && ran;
         RefreshOverlayLimits(); RefreshRangeHelp();
         UpdatePointButton();
     }
     private void RefreshExecution()
     {
-        execution = null; executionInfo.Clear();
+        execution = null; Lang.Text(executionInfo, () => "");
         if (timing is null || planningLimits is not { } range) return;
         try {
             execution = new ExecutionTrajectory(timing, range);
             timing = execution.Timing;
-            executionInfo.Text = $"低速执行计划 · {execution.Nodes.Length} 点 · {execution.Duration:F2} 秒 · 每轴 ≤{DeviceContract.PlanRateMax} 微步/秒";
-        } catch (ArgumentException ex) { executionInfo.Text = "执行检查未通过：" + ex.Message; }
+            Lang.Text(executionInfo, () => Lang.T("plan.execInfo", execution.Nodes.Length, execution.Duration, DeviceContract.PlanRateMax));
+        } catch (ArgumentException ex) { Lang.Text(executionInfo, () => Lang.T("plan.execFail") + ex.Message); }
     }
     // WPF compares reference values by reference, so re-assigning an equal string still raises a change: the status
     // box repaints and an open ToolTip closes and reopens on every device poll. Write only what actually differs.
@@ -461,10 +522,11 @@ public sealed partial class XYPreviewPanel : UserControl
     private static void SetTip(FrameworkElement element, string tip) { if (!Equals(element.ToolTip, tip)) element.ToolTip = tip; }
     private void UpdatePointButton()
     {
-        movePoint.Content = shape.SelectedIndex == 0 ? "低速移到此 XY 点" : "低速移到轨迹起点";
+        movePoint.Content = shape.SelectedIndex == 0 ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
         bool limitsMatch = deviceLimitsConfirmed && RequestedLimits is { } requested && requested == firmwareLimits && requested == planningLimits;
-        // While the device holds an uploaded plan it refuses every other move; only 执行图形 or 总停止 leaves that state.
-        movePoint.IsEnabled = pointMoveAllowed && limitsMatch && uploadedPlan is null && pointTarget is { } p && firmwareLimits is { } range && range.Contains(PtpProtocol.Quantize(p)) && (planningLimits is not { } local || local.Contains(p)) &&
+        // While the device holds a plan it has not drawn yet it refuses every other move; only 执行图形 or 总停止 leaves that state.
+        // After a run the plan stays on the device, so the move back to the start is allowed.
+        movePoint.IsEnabled = pointMoveAllowed && limitsMatch && (uploadedPlan is null || uploadedRan) && pointTarget is { } p && firmwareLimits is { } range && range.Contains(PtpProtocol.Quantize(p)) && (planningLimits is not { } local || local.Contains(p)) &&
             (shape.SelectedIndex == 0 || (execution is not null && trajectorySupported));
         bool atStart = execution is not null && startFeedback is { Referenced: true, Inputs: 0 } &&
             startFeedback.Steps1 == ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose) && startFeedback.Steps2 == ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose);
@@ -473,26 +535,26 @@ public sealed partial class XYPreviewPanel : UserControl
         bool held = uploadedPlan is { } sent && execution is { } shown && sent.Nodes.SequenceEqual(shown.Nodes);
         run.IsEnabled = upload.IsEnabled && held;
         string move = deviceMoveReason;
-        if (RequestedLimits is { } currentRange) move += "\n当前软件范围：" + Envelope(currentRange);
-        if (firmwareLimits is not null && !limitsMatch) move += "\n设备尚未确认当前范围/速度，运动已锁定；预览仍按输入设置显示。";
+        if (RequestedLimits is { } currentRange) move += Lang.T("move.currentRange") + Envelope(currentRange);
+        if (firmwareLimits is not null && !limitsMatch) move += Lang.T("move.locked");
         if (pointTarget is { } target && firmwareLimits is { } bounds) {
             target = PtpProtocol.Quantize(target);
-            string label = bounds.Contains(target) ? "目标在固件范围内" : shape.SelectedIndex == 0 ? "目标超出固件范围，不能移动" : "轨迹起点超出固件范围，不能移动";
-            move += FormattableString.Invariant($"\n{label}：q1={target.Q1:F2}°，q2={target.Q2:F2}°；固件允许 q1 [{bounds.Min1:F2}, {bounds.Max1:F2}]°、q2 [{bounds.Min2:F2}, {bounds.Max2:F2}]°。");
-        } else if (pointTarget is null) move += "\n参数检查未通过：" + result.Text;
-        if (execution is not null) move += held ? "\n图形已上传；手动落笔后点“执行图形”。" : atStart ? "\n已到当前轨迹起点；点“上传图形”（上传时不运动），落笔后再点“执行图形”。" : "\n图形执行：先移到起点并等待到位反馈（需 v5 固件）。";
-        if (uploadedPlan is not null && !held) move += "\n设备里已有另一份图形：重新上传，或先总停止。";
-        if (execution is null && shape.SelectedIndex > 0) move += "\n" + (executionInfo.Text.Length > 0 ? executionInfo.Text : "先完成图形参数检查。");
+            string label = bounds.Contains(target) ? Lang.T("move.inFw") : shape.SelectedIndex == 0 ? Lang.T("move.outFw") : Lang.T("move.outFwStart");
+            move += Lang.T("move.fwBounds", label, target.Q1, target.Q2, bounds.Min1, bounds.Max1, bounds.Min2, bounds.Max2);
+        } else if (pointTarget is null) move += Lang.T("move.planFail") + result.Text;
+        if (execution is not null) move += held ? (uploadedRan ? Lang.T("move.ran") : Lang.T("move.uploaded")) : atStart ? Lang.T("move.atStart") : Lang.T("move.needStart");
+        if (uploadedPlan is not null && !held) move += Lang.T("move.otherPlan");
+        if (execution is null && shape.SelectedIndex > 0) move += "\n" + (executionInfo.Text.Length > 0 ? executionInfo.Text : Lang.T("move.needCheck"));
         SetText(moveState, move);
         UpdateActionStatus();
-        SetTip(upload, move + "\n流程：准备 → 抬笔移到起点 → 上传图形 → 落笔 → 执行图形 → 保存结果。");
+        SetTip(upload, move + Lang.T("move.uploadTip"));
         SetTip(run, move);
         SetTip(movePoint, move);
     }
     public void SetDeviceStatus(string? message, bool fault, bool busy, double percent, bool indeterminate)
     {
         bool changed=deviceStatusBusy!=busy;
-        if(busy) commandView=true;
+        if(busy) { offlineSim=false; PausePlayback(); }   // the device is moving: show the device, not a simulation
         deviceStatusMessage=message; deviceStatusFault=fault; deviceStatusBusy=busy;
         // Unknown progress uses the status text; the theme's looping animation can starve input/heartbeat.
         actionProgress.Visibility=busy && !indeterminate?Visibility.Visible:Visibility.Collapsed;
@@ -503,38 +565,39 @@ public sealed partial class XYPreviewPanel : UserControl
     private void UpdateActionStatus()
     {
         string text; int severity; // 0 ready, 1 waiting, 2 rejected; text also conveys the state without color.
-        if(deviceStatusFault || deviceStatusBusy) { text=(deviceStatusFault?"被拒绝 · ":"等待中 · ")+(deviceStatusMessage??deviceMoveReason); severity=deviceStatusFault?2:1; }
-        else if(operationError is not null) { text="操作失败 · "+operationError; severity=2; }
-        else if(parametersDirty) { text="等待中 · 参数已修改，请检查或保存后应用"; severity=1; }
-        else if(pointTarget is null) { text="被拒绝 · "+result.Text; severity=2; }
-        else if(planningLimits is {} local && !local.Contains(pointTarget.Value)) { text="被拒绝 · 目标超出范围，调整图形参数"; severity=2; }
-        else if(firmwareLimits is not null && (!deviceLimitsConfirmed || firmwareLimits != RequestedLimits)) { text="等待中 · 设备尚未确认当前范围/速度"; severity=1; }
-        else if(shape.SelectedIndex>0 && firmwareLimits is not null && execution is null) { text="被拒绝 · 整条轨迹未通过检查"; severity=2; }
-        else if(!pointMoveAllowed) { text="等待中 · "+(deviceStatusMessage??deviceMoveReason); severity=1; }
-        else if(run.IsEnabled) { text="可执行 · 图形已上传，请落笔后点“执行图形”"; severity=0; }
-        else if(uploadedPlan is not null) { text="等待中 · 设备里的图形与当前参数不一致，请重新上传"; severity=1; }
-        else if(upload.IsEnabled) { text="可上传 · 已到起点；上传时不运动"; severity=0; }
-        else if(shape.SelectedIndex==0 && movePoint.IsEnabled) { text="可移动 · 目标检查通过"; severity=0; }
-        else if(!trajectorySupported) { text="等待中 · 当前固件不支持图形执行"; severity=1; }
-        else { text="等待中 · 请先抬笔，低速移到起点"; severity=1; }
+        if(deviceStatusFault || deviceStatusBusy) { text=(deviceStatusFault?Lang.T("act.rejected"):Lang.T("act.waiting"))+(deviceStatusMessage??deviceMoveReason); severity=deviceStatusFault?2:1; }
+        else if(operationError is not null) { text=Lang.T("act.opFail")+operationError(); severity=2; }
+        else if(parametersDirty) { text=Lang.T("act.paramsDirty"); severity=1; }
+        else if(pointTarget is null) { text=Lang.T("act.rejected")+result.Text; severity=2; }
+        else if(planningLimits is {} local && !local.Contains(pointTarget.Value)) { text=Lang.T("act.outOfRange"); severity=2; }
+        // While the device has not confirmed, its own reason says what to do (enabled: STOP ALL first; disabled: wait for the sync).
+        else if(firmwareLimits is not null && (!deviceLimitsConfirmed || firmwareLimits != RequestedLimits)) { text=deviceLimitsConfirmed ? Lang.T("act.unsynced") : Lang.T("act.waiting")+deviceMoveReason; severity=1; }
+        else if(shape.SelectedIndex>0 && firmwareLimits is not null && execution is null) { text=Lang.T("act.trajFail"); severity=2; }
+        else if(!pointMoveAllowed) { text=Lang.T("act.waiting")+(deviceStatusMessage??deviceMoveReason); severity=1; }
+        else if(run.IsEnabled) { text=uploadedRan?Lang.T("act.runAgain"):Lang.T("act.runNow"); severity=0; }
+        else if(uploadedPlan is not null) { text=Lang.T("act.planOnDevice"); severity=1; }
+        else if(upload.IsEnabled) { text=Lang.T("act.uploadReady"); severity=0; }
+        else if(shape.SelectedIndex==0 && movePoint.IsEnabled) { text=Lang.T("act.pointReady"); severity=0; }
+        else if(!trajectorySupported) { text=Lang.T("act.noTraj"); severity=1; }
+        else { text=Lang.T("act.needPen"); severity=1; }
         SetText(actionSummary,text);
         actionSummary.Foreground=StatusInk[severity];
         actionStatus.Background=StatusFill[severity];
-        SetTip(actionStatus,text+"\n"+moveState.Text+"\n完整参数见左侧“查看规划检查详情”。");
+        SetTip(actionStatus,text+"\n"+moveState.Text+Lang.T("act.details"));
         if(System.Windows.Automation.AutomationProperties.GetName(actionStatus)!=text) System.Windows.Automation.AutomationProperties.SetName(actionStatus,text);
     }
     // One shared brush per severity: a fresh brush on every call is a new value every time.
     private static readonly SolidColorBrush[] StatusInk = new[] { "#166534", "#854D0E", "#991B1B" }.Select(WorkbenchTheme.Brush).ToArray(),
         StatusFill = new[] { "#DCFCE7", "#FEF3C7", "#FEE2E2" }.Select(WorkbenchTheme.Brush).ToArray();
     public void PausePlayback()
-    { playbackTimer.Stop(); playbackClock.Stop(); play.Content = "▶ 预览"; }
+    { playbackTimer.Stop(); playbackClock.Stop(); play.Content = Lang.T("btn.play"); }
     private void TogglePlayback()
     {
         if (timing is null) return;
-        commandView=false;
+        offlineSim=true;
         if (playbackTimer.IsEnabled) { PausePlayback(); return; }
         if (cursor.Value >= timing.Duration) cursor.Value = 0;
-        playbackFrom = cursor.Value; playbackClock.Restart(); playbackTimer.Start(); play.Content = "Ⅱ 暂停预览";
+        playbackFrom = cursor.Value; playbackClock.Restart(); playbackTimer.Start(); play.Content = Lang.T("btn.playPause");
     }
     private void AdvancePlayback(double time)
     {
@@ -553,23 +616,23 @@ public sealed partial class XYPreviewPanel : UserControl
             Draw(plan.Path.Model, sample.Pose, sample.Target.X, sample.Target.Y, true, SampleReachable(plan.Path.Model, sample.Target));
             var pose=FollowCommand?startFeedback!.Command:sample.Pose;
             var tip=plan.Path.Model.Forward(pose).Tip;
-            sampleInfo.Text = (FollowCommand?"设备命令姿态（非实测） · ":$"离线预览 · 时间 {sample.Time:F2}/{plan.Duration:F2} s · ") +
-                $"q1={pose.Q1:F2}° · q2={pose.Q2:F2}° · X={tip.X:F2}，Y={tip.Y:F2} mm";
-            sampleInfo.ToolTip=FollowCommand?"按设备命令步数和连杆长度估算；arm2 / 末端没有实测反馈。":
-                $"仅屏幕预览，不代表执行进度。路程 {sample.Distance:F2} mm；末端速度 {sample.Speed:F2} mm/s。";
+            sampleInfo.Text = (FollowCommand?Lang.T("vp.sampleDevice"):Lang.T("vp.offlineTime", sample.Time, plan.Duration)) +
+                Lang.T("vp.samplePose", pose.Q1, pose.Q2, tip.X, tip.Y);
+            sampleInfo.ToolTip=FollowCommand?Lang.T("vp.sampleTooltipDevice"):
+                Lang.T("vp.sampleTooltipOffline", sample.Distance, sample.Speed);
         }
-        catch (ArgumentException ex) { InvalidPlan(ex.Message); }
+        catch (ArgumentException ex) { InvalidPlan(() => ex.Message); }
     }
     private void Export()
     {
         if (timing is not { } plan) return;
         PausePlayback();
-        var dialog = new Microsoft.Win32.SaveFileDialog { Title = "保存规划轨迹（非实测数据）", Filter = "CSV 文件 (*.csv)|*.csv",
+        var dialog = new Microsoft.Win32.SaveFileDialog { Title = Lang.T("vp.saveDialog"), Filter = Lang.T("vp.csvFilter"),
             DefaultExt = ".csv", FileName = $"timed-preview-{plan.Path.Shape}-{DateTime.Now:yyyyMMdd-HHmmss}.csv" };
         if (dialog.ShowDialog() != true) return;
-        try { File.WriteAllText(dialog.FileName, plan.ToCsv(), new UTF8Encoding(true)); sampleInfo.Text = "已保存规划数据：" + dialog.FileName; }
+        try { File.WriteAllText(dialog.FileName, plan.ToCsv(), new UTF8Encoding(true)); sampleInfo.Text = Lang.T("vp.savedPlan") + dialog.FileName; }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
-        { sampleInfo.Text = "保存失败：" + ex.Message; }
+        { sampleInfo.Text = Lang.T("vp.saveFail") + ex.Message; }
     }
     private static void UnifiedLimitsSelfTest()
     {
@@ -596,10 +659,10 @@ public sealed partial class XYPreviewPanel : UserControl
         if (panel.upload.IsEnabled) throw new InvalidOperationException("到位反馈绕过范围同步");
         panel.SetPointMoveState(true,requested,"已确认统一范围",true);
         if (!ReferenceEquals(plan,panel.timing) || !panel.movePoint.IsEnabled || !panel.upload.IsEnabled ||
-            !panel.rangeState.Text.Contains("范围一致"))
+            !((string)panel.rangeHelp[0].ToolTip).Contains("范围一致"))
             throw new InvalidOperationException("设备确认统一范围后未开放同一条轨迹");
         panel.SetPointMoveState(true,requested,"仍有范围请求等待完整确认",true,false);
-        if (panel.movePoint.IsEnabled || panel.upload.IsEnabled || panel.rangeState.Text.Contains("范围一致"))
+        if (panel.movePoint.IsEnabled || panel.upload.IsEnabled || ((string)panel.rangeHelp[0].ToolTip).Contains("范围一致"))
             throw new InvalidOperationException("报告范围相同不能绕过在途配置确认");
         panel.SetPointMoveState(false,null,"离线",false);
         if (!ReferenceEquals(plan,panel.timing) || panel.movePoint.IsEnabled || panel.upload.IsEnabled || !panel.play.IsEnabled)
@@ -621,6 +684,23 @@ public sealed partial class XYPreviewPanel : UserControl
         panel.LoadExample();
         if (panel.RequestedLimits != beforeExample || panel.RequestedRates != beforeRates || panel.Model.L1!=181)
             throw new InvalidOperationException("载入示例覆盖了全局杆长、速度或范围");
+        // The four speed/accel sliders (the first four in the edit list, in row order) mirror their boxes both ways.
+        var sliders = panel.editControls.OfType<Slider>().Take(4).ToArray();
+        panel.v1.Text = "7.5";
+        if (Math.Abs(sliders[0].Value - 7.5) > 1e-9) throw new InvalidOperationException("滑块没有跟随输入框");
+        sliders[0].Value = 9.3;
+        if (panel.v1.Text != "9.3" || Math.Abs(panel.RequestedRates.V1 - 9.3) > 1e-9) throw new InvalidOperationException("拖动滑块没有写回输入框");
+        panel.v1.Text = "99";
+        if (sliders[0].Value != sliders[0].Maximum || panel.v1.Text != "99") throw new InvalidOperationException("超上限的输入应让滑块停在上限、且不被改写");
+        // The explanations live in the "?" tips: caps and effective values for the speeds, the invalid-input message when a box is bad.
+        if (panel.speedHelp?.ToolTip is not string speedTip || !speedTip.Contains("上限") || !speedTip.Contains("实际生效")) throw new InvalidOperationException("运动参数的问号提示缺上限或实际生效值");
+        panel.v2.Text = "abc";
+        if (!((string)panel.speedHelp!.ToolTip).Contains("有效数值")) throw new InvalidOperationException("速度输入无效时，问号提示应说明原因");
+        panel.v2.Text = "3";
+        foreach (var slider in sliders) foreach (var end in new[] { slider.Minimum, slider.Maximum }) {
+            slider.Value = end;
+            _ = MotionProfile.From(panel.RequestedRates);   // throws if a slider end is outside what the firmware accepts
+        }
     }
     private static void ShapeDefaultsSelfTest()
     {
@@ -656,7 +736,8 @@ public sealed partial class XYPreviewPanel : UserControl
         var panel = new XYPreviewPanel();
         panel.ViewportSelfTest();
         ArmMotionPreviewSelfTest();
-        if(!panel.detailView) throw new InvalidOperationException("中间视图默认必须适合完整机械臂运动");
+        DeviceSyncSelfTest();
+        if(panel.detailView) throw new InvalidOperationException("中间视图默认必须是完整机械臂与可达圆（全臂）视图");
         if(!panel.overlayUnreachable || panel.overlayLimits is not { } trial || trial != DefaultTrialRange)
             throw new InvalidOperationException("默认应按固件范围显示不可达区域");
         if(!panel.Reachability(new PlanarArm(180, 176.38)).IsReachable(new Point(330, 0)) ||
@@ -754,6 +835,8 @@ public sealed partial class XYPreviewPanel : UserControl
         if (panel.movePoint.IsEnabled || panel.upload.IsEnabled || panel.timing is null || !panel.play.IsEnabled ||
             !panel.actionSummary.Text.Contains("设备尚未确认"))
             throw new InvalidOperationException("设备范围不一致必须锁定运动、保留原预览");
+        panel.SetPointMoveState(true, new JointLimits(-30, 30, -60, 60), "关节范围或全局速度与设备不一致：先总停止", true, false);
+        if (!panel.actionSummary.Text.Contains("先总停止")) throw new InvalidOperationException("设备未确认速度/范围时，状态条要带出设备给的处理办法");
         panel.SetPointMoveState(true, new JointLimits(-30, 30, -60, 60), "模拟范围恢复", true);
         if (!panel.movePoint.IsEnabled || !panel.upload.IsEnabled || !panel.result.Text.Contains("整条轨迹检查通过"))
             throw new InvalidOperationException("Restored firmware limits did not rebuild the full plan");

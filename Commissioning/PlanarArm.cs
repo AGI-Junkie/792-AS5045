@@ -27,13 +27,13 @@ public sealed class PlanarArm
     public PlanarArm(double l1, double l2)
     {
         if (!double.IsFinite(l1) || !double.IsFinite(l2) || l1 <= 0 || l2 <= 0 || l1 > 10000 || l2 > 10000)
-            throw new ArgumentException("连杆长度须为 0～10000 mm 之间的正数。");
+            throw Lang.Error("err.linkLength");
         L1 = l1; L2 = l2;
     }
 
     public (Point Elbow, Point Tip) Forward(JointPose p)
     {
-        if (!double.IsFinite(p.Q1) || !double.IsFinite(p.Q2)) throw new ArgumentException("角度须为有限数值。");
+        if (!double.IsFinite(p.Q1) || !double.IsFinite(p.Q2)) throw Lang.Error("err.angleFinite");
         var elbow = new Point(L1 * Math.Cos(p.Q1 * Rad), L1 * Math.Sin(p.Q1 * Rad));
         return (elbow, new Point(elbow.X + L2 * Math.Cos(p.Q2 * Rad),
                                 elbow.Y + L2 * Math.Sin(p.Q2 * Rad)));
@@ -47,12 +47,12 @@ public sealed class PlanarArm
     public JointPose[] Inverse(double x, double y)
     {
         if (!double.IsFinite(x) || !double.IsFinite(y) || Math.Abs(x) > 20000 || Math.Abs(y) > 20000)
-            throw new ArgumentException("目标坐标须为 ±20000 mm 内的有限数值。");
+            throw Lang.Error("err.targetFinite");
         double radius = Math.Sqrt(x * x + y * y);
         if (radius > OuterRadius + 1e-8 || radius < InnerRadius - 1e-8)
-            throw new ArgumentException($"目标几何不可达：距原点 {radius:F2} mm，可达半径 {InnerRadius:F2}～{OuterRadius:F2} mm。");
+            throw Lang.Error("err.targetUnreachable", radius, InnerRadius, OuterRadius);
         if (radius < 1e-8)
-            throw new ArgumentException("等长连杆在原点完全折叠时解不唯一，请选择其他目标。");
+            throw Lang.Error("err.equalFold");
         double c2 = Math.Clamp((x * x + y * y - L1 * L1 - L2 * L2) / (2 * L1 * L2), -1, 1);
         double angle = Math.Acos(c2);
         JointPose Solve(double elbow) {

@@ -1,4 +1,4 @@
-using System.Buffers.Binary;
+﻿using System.Buffers.Binary;
 using System.Text.RegularExpressions;
 
 namespace TwoLinkCommissioning;
@@ -51,7 +51,7 @@ public static class PtpProtocol
     // advertises short_hb=1 in its LINK line.
     public static byte[] EncodeShortHeartbeat(byte keys)
     {
-        if (keys > 15) throw new ArgumentException("心跳按键掩码无效。");
+        if (keys > 15) throw Lang.Error("err.keyMask");
         byte crc = Crc8(keys);
         return [0xd5, (byte)(0x81 | (keys << 1)), (byte)(0xa1 | (((keys >> 4) & 15) << 1)),
                 (byte)(0x81 | ((crc & 15) << 1)), (byte)(0xa1 | (((crc >> 4) & 15) << 1)), 0xd7];
@@ -61,23 +61,23 @@ public static class PtpProtocol
     {
         if (sequence == 0 || epoch == 0 || !double.IsFinite(pose.Q1) || !double.IsFinite(pose.Q2) ||
             Math.Abs(pose.Q1) > 180 || Math.Abs(pose.Q2) > 180 || rate is < DeviceContract.RateMin or > DeviceContract.PlanRateMax)
-            throw new ArgumentException("单点目标/序号/速度无效。");
+            throw Lang.Error("err.pointPacket");
         return EncodePacket(1, sequence, epoch, pose, rate);
     }
     public static byte[] EncodePacket(byte type, uint sequence, uint epoch, JointPose pose, ushort value)
     {
         if (type is < 1 or > 10 || sequence == 0 || epoch == 0 || !double.IsFinite(pose.Q1) ||
             !double.IsFinite(pose.Q2) || Math.Abs(pose.Q1) > 180 || Math.Abs(pose.Q2) > (type==10?DeviceContract.Arm1AccelMax/100.0:180))
-            throw new ArgumentException("运动数据包无效。");
+            throw Lang.Error("err.motionPacket");
         if (type is >= 6 and <= 8 && (pose.Q1 != 0 || pose.Q2 != 0 || value > (type == 6 ? 15 : 0)))
-            throw new ArgumentException("控制数据包无效。");
-        if (type == 9 && pose != Quantize(pose)) throw new ArgumentException("关节范围最多保留两位小数。");
+            throw Lang.Error("err.ctrlPacket");
+        if (type == 9 && pose != Quantize(pose)) throw Lang.Error("err.limitDecimals2");
         if (type == 10 && (value>1 || pose!=Quantize(pose) || pose.Q1<0.2 || pose.Q1>(value==0?DeviceContract.Arm1RateMax:DeviceContract.Arm2RateMax)/100.0 ||
                         pose.Q2<1 || pose.Q2>(value==0?DeviceContract.Arm1AccelMax:DeviceContract.Arm2AccelMax)/100.0))
-            throw new ArgumentException("设备速度配置无效。");
+            throw Lang.Error("err.rateConfig");
         pose = Quantize(pose);
         if (type == 9 && (value > 1 || pose.Q1 >= pose.Q2 || pose.Q1 > 0 || pose.Q2 < 0))
-            throw new ArgumentException("关节范围须包含零位，且下限小于上限。");
+            throw Lang.Error("err.limitContainsZero");
         byte[] packet = new byte[17]; packet[0] = type;
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(1), sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(5), epoch);

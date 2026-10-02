@@ -9,9 +9,11 @@ namespace TwoLinkCommissioning;
 
 public sealed partial class ControlWindow
 {
+    internal static void UploadLanguageTest() => System.IO.File.WriteAllText("language-upload-tests.txt", WithLeaseRetry(UploadReplaySelfTest));
     // The real upload/ACK queue and UI dispatcher; only the serial peer is simulated.
     private static string UploadReplaySelfTest()
     {
+        bool initialLanguage = Lang.IsEn;
         var window = new ControlWindow { selfTesting = true, ShowActivated = false, ShowInTaskbar = false, Left = -12000, Top = -12000 };
         window.heartbeatTimer.Tick -= window.OnHeartbeatTick;
         var limits = new JointLimits(-30, 30, -60, 60);
@@ -150,6 +152,7 @@ public sealed partial class ControlWindow
                 foreach (string line in lines) window.TestLine(line);
                 if (clock.Elapsed.TotalMilliseconds >= nextStatus) {
                     Status(); nextStatus = clock.Elapsed.TotalMilliseconds + 500;
+                    Lang.Set(batches % 2 == 0, persist: false);
                 }
                 if (received >= plan.Nodes.Length / 2 && view != 0) { view = 0; tabs.SelectedIndex = 0; }
                 if (!runAccepted && (progressChecks == 0 && received > 0 || progressChecks == 1 && view == 0)) {
@@ -231,9 +234,9 @@ public sealed partial class ControlWindow
                 summary.Contains("worstHeartbeatGap=") && summary.Contains("worstUiLeaseGap=") &&
                 summary.Contains("heartbeats="),
                 "session summary is incomplete: " + summary.Split('\n')[0]);
-            return report + "\n" + summary.Split('\n')[0] + "\nNo serial port opened; no motor commands sent.\n";
+            return report + $"\nLanguage switched {batches} times during upload/held/run.\n" + summary.Split('\n')[0] + "\nNo serial port opened; no motor commands sent.\n";
         }
-        finally { writerStop = true; replay.Stop(); window.heartbeatTimer.Stop(); window.Close(); }
+        finally { writerStop = true; replay.Stop(); window.heartbeatTimer.Stop(); window.Close(); Lang.Set(initialLanguage, persist: false); }
     }
 }
 

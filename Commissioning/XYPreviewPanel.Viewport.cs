@@ -14,16 +14,16 @@ public sealed partial class XYPreviewPanel
     private Point cameraCenter, dragFrom, dragCenter, dragTo;
     private double pixelsPerMm = 1;
     private bool cameraReady, autoFit = true, dragging, boxDrag;
-    private readonly CheckBox liveLayer = new() { Content = "设备姿态", IsChecked = true, Margin = new Thickness(8,8,4,4),
-        ToolTip = "运动期间，两根连杆跟随设备回报的命令步数。arm2 和末端位置为模型估算，非实测；离线播放使用规划姿态。" };
-    private readonly CheckBox unreachableLayer = new() { Content = "不可达区域", IsChecked = true, Margin = new Thickness(8,8,4,4) };
-    private readonly Button boxTool = new() { Content = "框选", ToolTip = "点击后在画布上拖出矩形，放大选区；仅改变视图。" };
+    private readonly CheckBox liveLayer = new() { Content = Lang.T("vp.liveLayer"), IsChecked = true, Margin = new Thickness(8,8,4,4),
+        ToolTip = Lang.T("vp.liveLayer.tip") };
+    private readonly CheckBox unreachableLayer = new() { Content = Lang.T("vp.unreachable"), IsChecked = true, Margin = new Thickness(8,8,4,4) };
+    private readonly Button boxTool = new() { Content = Lang.T("btn.box"), ToolTip = Lang.T("vp.box.tip") };
     private readonly TextBlock pointerInfo = new() { FontSize = 11, Foreground = WorkbenchTheme.Muted, IsHitTestVisible = false, TextTrimming=TextTrimming.CharacterEllipsis };
     private bool boxMode;
     private readonly DispatcherTimer viewportRedrawTimer = new(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(33) };
     private bool HasTrajectoryDetail => trajectory is not null && canvas.ActualWidth>560 && canvas.ActualHeight>280;
-    private Rect Plot => new(48, 16, Math.Max(1, canvas.ActualWidth - 68 - (HasTrajectoryDetail?210:0)), Math.Max(1, canvas.ActualHeight - 82));
-    private bool FollowCommand => commandView && liveLayer.IsChecked==true && startFeedback is {Referenced:true};
+    private Rect Plot => new(48, 16, Math.Max(1, canvas.ActualWidth - 68 - (HasTrajectoryDetail?210:0)), Math.Max(1, canvas.ActualHeight - 98));
+    private bool FollowCommand => !offlineSim && liveLayer.IsChecked==true && startFeedback is {Referenced:true};
     private Point ToScreen(Point p) => new(Plot.Left + Plot.Width / 2 + (p.X-cameraCenter.X)*pixelsPerMm,
         Plot.Top + Plot.Height / 2 - (p.Y-cameraCenter.Y)*pixelsPerMm);
     private Point ToWorld(Point p) => new(cameraCenter.X+(p.X-Plot.Left-Plot.Width/2)/pixelsPerMm,
@@ -33,37 +33,45 @@ public sealed partial class XYPreviewPanel
     {
         var bar = new WrapPanel { VerticalAlignment = VerticalAlignment.Center };
         void Action(string label, string hint, Action action) {
-            var button = new Button { Content = label, ToolTip = hint, Padding = new Thickness(10,2,10,2) };
+            var button = Lang.Bind(new Button { Content = label, Padding = new Thickness(10,2,10,2) }, ToolTipProperty, hint);
             button.Click += (_,_) => action(); bar.Children.Add(button);
         }
-        Action("全臂", "显示机械臂与理论可达圆；可达圆不代表已验证的机械安全范围。", () => FitView(false));
-        Action("适合运动", "显示基座、两根连杆和整条轨迹；按全部规划姿态缩放。", () => FitView(true));
-        Action("−", "缩小视图", () => ZoomAt(ToScreen(cameraCenter), 1/1.3));
-        Action("＋", "放大视图；也可滚轮缩放。", () => ZoomAt(ToScreen(cameraCenter), 1.3));
+        Action("−", "vp.zoomOut", () => ZoomAt(ToScreen(cameraCenter), 1/1.3));
+        Action("＋", "vp.zoomIn", () => ZoomAt(ToScreen(cameraCenter), 1.3));
         boxTool.Click += (_,_) => { boxMode = !boxMode; UpdateBoxTool(); }; bar.Children.Add(boxTool);
-        unreachableLayer.ToolTip = "透明红色＝按当前关节范围与连杆长度算出的不可达区域。\n留空使用默认 q1 [−30°, +30°]、q2 [−60°, +60°]；填写后按你的范围实时更新。\n红区、规划与设备执行使用同一范围；设备确认同步后才允许运动。红色边界是栅格近似，鼠标位置使用精确逆解检查。";
+        unreachableLayer.ToolTip = Lang.T("vp.unreachable.tip");
         unreachableLayer.Checked += (_,_) => { overlayUnreachable = true; RedrawViewport(); };
         unreachableLayer.Unchecked += (_,_) => { overlayUnreachable = false; RedrawViewport(); };
         bar.Children.Add(unreachableLayer);
-        liveLayer.Checked += (_,_) => RedrawViewport(); liveLayer.Unchecked += (_,_) => RedrawViewport();
+        liveLayer.Checked += (_,_) => { offlineSim=false; RedrawViewport(); }; liveLayer.Unchecked += (_,_) => RedrawViewport();
         bar.Children.Add(liveLayer);
         return bar;
     }
     private void UpdateBoxTool()
     {
-        boxTool.Content = boxMode ? "框选中…" : "框选";
+        boxTool.Content = boxMode ? Lang.T("btn.boxActive") : Lang.T("btn.box");
         boxTool.Background = boxMode ? WorkbenchTheme.Brush("#EDF8F8") : Brushes.White;
         boxTool.Foreground = boxMode ? WorkbenchTheme.Teal : WorkbenchTheme.Ink;
         boxTool.BorderBrush = boxMode ? WorkbenchTheme.Teal : WorkbenchTheme.Line;
         canvas.Cursor = boxMode ? Cursors.Cross : Cursors.Hand;
     }
-    private string PointerHint => overlayLimits is null || !overlayUnreachable ? "滚轮缩放 · 拖动平移 · 单位 mm"
-        : "滚轮缩放 · 拖动平移 · 单位 mm · 红色＝按当前关节范围不可达";
+    private string PointerHint => overlayLimits is null || !overlayUnreachable ? Lang.T("vp.hint") : Lang.T("vp.hintRed");
     private string PointerReach(Point world)
     {
         if(overlayLimits is null || !overlayUnreachable) return "";
-        try { return Reachability(Model).IsReachable(world) ? " · 可达" : " · 不可达（红色区域）"; }
+        try { return Reachability(Model).IsReachable(world) ? Lang.T("vp.reach") : Lang.T("vp.unreach"); }
         catch(ArgumentException) { return ""; }
+    }
+    private void RefreshLanguageViewport()
+    {
+        liveLayer.Content = Lang.T("vp.liveLayer");
+        liveLayer.ToolTip = Lang.T("vp.liveLayer.tip");
+        unreachableLayer.Content = Lang.T("vp.unreachable");
+        unreachableLayer.ToolTip = Lang.T("vp.unreachable.tip");
+        boxTool.Content = boxMode ? Lang.T("btn.boxActive") : Lang.T("btn.box");
+        boxTool.ToolTip = Lang.T("vp.box.tip");
+        System.Windows.Automation.AutomationProperties.SetName(canvas, Lang.T("vp.canvasName"));
+        pointerInfo.Text = PointerHint;
     }
     // Preview ranges are user editable; firmware restrictions remain separate execution gates.
     private ReachabilityMask Reachability(PlanarArm model)
@@ -83,10 +91,11 @@ public sealed partial class XYPreviewPanel
         viewportRedrawTimer.Tick += (_,_) => RedrawViewport();
         Unloaded += (_,_) => viewportRedrawTimer.Stop();
         canvas.Cursor = Cursors.Hand;
-        System.Windows.Automation.AutomationProperties.SetName(canvas,"轨迹视图：滚轮缩放，拖动平移，框选按钮放大局部；不控制机械臂运动。");
+        System.Windows.Automation.AutomationProperties.SetName(canvas,Lang.T("vp.canvasName"));
         canvas.MouseWheel += (_,e) => { if(cameraReady && !dragging) ZoomAt(e.GetPosition(canvas),Math.Pow(1.2,e.Delta/120.0)); e.Handled=true; };
         canvas.MouseDown += (_,e) => {
             if(!cameraReady || !Plot.Contains(e.GetPosition(canvas)) || e.ChangedButton is not (MouseButton.Left or MouseButton.Middle)) return;
+            if(e.ChangedButton==MouseButton.Left && e.ClickCount==2) { FitView(false); e.Handled=true; return; }   // back to the whole-arm view
             dragFrom=dragTo=e.GetPosition(canvas); dragCenter=cameraCenter;
             boxDrag=boxMode && e.ChangedButton==MouseButton.Left; dragging=canvas.CaptureMouse(); e.Handled=true;
         };
@@ -97,7 +106,7 @@ public sealed partial class XYPreviewPanel
                 if(!boxDrag) PanFrom(dragCenter,p-dragFrom);
                 RequestViewportRedraw();
             }
-            if(cameraReady) { var world=ToWorld(p); pointerInfo.Text=$"鼠标 X {world.X:F2}  Y {world.Y:F2} mm"+PointerReach(world); }
+            if(cameraReady) { var world=ToWorld(p); pointerInfo.Text=Lang.T("vp.mouse", world.X, world.Y)+PointerReach(world); }
         };
         canvas.MouseUp += (_,e) => {
             if(!dragging) return;
@@ -144,7 +153,8 @@ public sealed partial class XYPreviewPanel
             else if(pointTarget is {} pose) {
                 var model=Model; var tip=model.Forward(pose).Tip;
                 Draw(model,pose,tip.X,tip.Y,planningLimits is null || planningLimits.Value.Contains(pose), Reachability(model).IsReachable(tip));
-            } else Draw(Model,default,0,0,true,false,showPreview:false);
+                ShowPoseInfo(model,pose);
+            } else { Draw(Model,default,0,0,true,false,showPreview:false); if(FollowCommand) ShowPoseInfo(Model,default); else sampleInfo.Clear(); }
         }
         catch(ArgumentException) { canvas.Children.Clear(); }
     }
@@ -192,8 +202,13 @@ public sealed partial class XYPreviewPanel
             figure.Segments.Add(new ArcSegment(new Point(center.X-radius,center.Y),new Size(radius,radius),0,radius*2>=900, SweepDirection.Clockwise,true));
             var geometry=new PathGeometry(); geometry.Figures.Add(figure); arc.Data=geometry; host.Children.Add(arc);
         }
-        static void Label(Canvas host,string text,Point p,Brush? color=null,double size=11) {
+        static void Label(Canvas host,string text,Point p,Brush? color=null,double size=11,Rect? fit=null) {
             var label=new TextBlock { Text=text,Foreground=color??WorkbenchTheme.Muted,FontSize=size,IsHitTestVisible=false };
+            if (fit is { } bounds) {
+                label.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                p.X=Math.Clamp(p.X,bounds.Left+2,Math.Max(bounds.Left+2,bounds.Right-label.DesiredSize.Width-2));
+                p.Y=Math.Clamp(p.Y,bounds.Top+2,Math.Max(bounds.Top+2,bounds.Bottom-label.DesiredSize.Height-2));
+            }
             Canvas.SetLeft(label,p.X); Canvas.SetTop(label,p.Y); host.Children.Add(label);
         }
         var origin=ToScreen(new Point());
@@ -233,7 +248,7 @@ public sealed partial class XYPreviewPanel
             foreach(var s in path.Samples) poly.Points.Add(ToScreen(s.Target)); plot.Children.Add(poly);
             var start=ToScreen(path.Samples[0].Target); Circle(plot,start,5,WorkbenchTheme.Teal,Brushes.White);
             bool closed=(path.Samples[^1].Target-path.Samples[0].Target).Length<=0.01;
-            Label(plot,closed?"起点 / 收笔点":"起点",start+new Vector(9,6),WorkbenchTheme.Teal);
+            Label(plot,closed?Lang.T("vp.startEnd"):Lang.T("vp.start"),start+new Vector(9,6),WorkbenchTheme.Teal,fit:Plot);
             for(int segment=0; segment<path.Stops.Length-1; segment++) {
                 int i=path.Shape==DrawingShape.Circle?Math.Max(1,path.Samples.Length/4):
                     Math.Max(path.Stops[segment]+1,(path.Stops[segment]+path.Stops[segment+1])/2);
@@ -245,11 +260,11 @@ public sealed partial class XYPreviewPanel
                     Circle(plot,corner,3,WorkbenchTheme.Teal,Brushes.White);
                     var diagonal=ToScreen(path.Samples[path.Stops[2]].Target)-start;
                     if(Math.Abs(diagonal.X)>120 && Math.Abs(diagonal.Y)>55)
-                        Label(plot,$"角 {segment+1} · 停顿",corner+new Vector(segment==2?-82:7,-20),WorkbenchTheme.Teal);
+                        Label(plot,Lang.T("vp.cornerPause", segment+1),corner+new Vector(segment==2?-82:7,-20),WorkbenchTheme.Teal);
                 }
             }
             if((path.Samples[^1].Target-path.Samples[0].Target).Length>0.01) {
-                var finish=ToScreen(path.Samples[^1].Target); Circle(plot,finish,4,WorkbenchTheme.Teal,WorkbenchTheme.Teal); Label(plot,"终点",finish+new Vector(8,-22));
+                var finish=ToScreen(path.Samples[^1].Target); Circle(plot,finish,4,WorkbenchTheme.Teal,WorkbenchTheme.Teal); Label(plot,Lang.T("vp.end"),finish+new Vector(8,-22),fit:Plot);
             }
         }
         var color=inRange || follow?WorkbenchTheme.Blue:WorkbenchTheme.Red;
@@ -262,18 +277,30 @@ public sealed partial class XYPreviewPanel
             Label(plot,$"arm2 · {armPose.Q2:F1}°",joint+(end-joint)*0.5+new Vector(8,-22),secondColor);
             Circle(plot,follow?end:ToScreen(new Point(tx,ty)),6,reachable || follow?WorkbenchTheme.Brush("#C66B05"):WorkbenchTheme.Red,
                 reachable || follow?WorkbenchTheme.Brush("#FFCC66"):WorkbenchTheme.Brush("#FFC9C9"));
+            // The pose that is not the solid one stays visible as a thin dashed arm: the plan while following the device,
+            // the device while previewing, so the canvas never hides where the device really is.
+            JointPose? ghostPose=follow?(showPreview?pose:null):(liveLayer.IsChecked==true && startFeedback is {Referenced:true} device?device.Command:null);
+            if(ghostPose is {} ghost && (Math.Abs(ghost.Q1-armPose.Q1)>0.01 || Math.Abs(ghost.Q2-armPose.Q2)>0.01)) {
+                var (ghostElbow,ghostTip)=model.Forward(ghost); var ghostColor=follow?WorkbenchTheme.Idle:Brushes.MediumVioletRed;
+                Line(plot,origin,ToScreen(ghostElbow),ghostColor,2,true); Line(plot,ToScreen(ghostElbow),ToScreen(ghostTip),ghostColor,2,true);
+                Label(plot,follow?Lang.T("vp.ghostPlan"):Lang.T("vp.ghostDevice"),ToScreen(ghostElbow)+new Vector(6,4),ghostColor);
+            }
         }
         if(liveLayer.IsChecked==true && startFeedback is {Referenced:true} live) {
             var p=ToScreen(model.Forward(live.Command).Tip);
             Line(plot,p-new Vector(8,0),p+new Vector(8,0),Brushes.MediumVioletRed,2);
             Line(plot,p-new Vector(0,8),p+new Vector(0,8),Brushes.MediumVioletRed,2);
         }
-        Label(canvas,"━━ arm1",new Point(Plot.Left,Plot.Bottom+25),WorkbenchTheme.Blue);
-        Label(canvas,"━━ arm2",new Point(Plot.Left+78,Plot.Bottom+25),Brushes.SlateBlue);
-        Label(canvas,"─ 规划轨迹",new Point(Plot.Left+156,Plot.Bottom+25),WorkbenchTheme.Teal);
-        Label(canvas,"● 末端",new Point(Plot.Left+250,Plot.Bottom+25),WorkbenchTheme.Brush("#A35600"));
-        Label(canvas,follow?"设备命令姿态 · 非实测":"离线规划姿态",new Point(Plot.Left,Plot.Bottom+43));
-        Label(canvas,"＋ 命令估算 XY（非实测）",new Point(Plot.Left+180,Plot.Bottom+43),Brushes.MediumVioletRed);
+        Label(canvas,Lang.T("vp.legend1"),new Point(Plot.Left,Plot.Bottom+25),WorkbenchTheme.Blue);
+        Label(canvas,Lang.T("vp.legend2"),new Point(Plot.Left+78,Plot.Bottom+25),Brushes.SlateBlue);
+        Label(canvas,Lang.T("vp.legend3"),new Point(Plot.Left+156,Plot.Bottom+25),WorkbenchTheme.Teal);
+        Label(canvas,Lang.T("vp.legend4"),new Point(Plot.Left+250,Plot.Bottom+25),WorkbenchTheme.Brush("#A35600"));
+        bool deviceKnown=startFeedback is {Referenced:true};
+        string source=follow?Lang.T("vp.srcDevice"):
+            deviceKnown?(offlineSim?Lang.T("vp.srcOfflineFollow"):Lang.T("vp.srcOfflineLayer")):
+            deviceNote is null?Lang.T("vp.srcOffline"):Lang.T("vp.srcOffline")+" · "+deviceNote;
+        Label(canvas,source,new Point(Plot.Left,Plot.Bottom+43),!follow && deviceNote is not null?WorkbenchTheme.Brush("#A35600"):null);
+        Label(canvas,Lang.T("vp.srcEstXY"),new Point(Plot.Left,Plot.Bottom+59),Brushes.MediumVioletRed);
         pointerInfo.Text=string.IsNullOrEmpty(pointerInfo.Text)?PointerHint:pointerInfo.Text;
         pointerInfo.MaxWidth=Math.Max(1,Plot.Width-16);
         Canvas.SetLeft(pointerInfo,Plot.Left+8); Canvas.SetTop(pointerInfo,Plot.Top+6); canvas.Children.Add(pointerInfo);
@@ -293,7 +320,7 @@ public sealed partial class XYPreviewPanel
             foreach(var sample in miniPath.Samples) line.Points.Add(Mini(sample.Target)); overview.Children.Add(line);
             Circle(overview,Mini(miniPath.Samples[0].Target),4,WorkbenchTheme.Teal,Brushes.White);
             Circle(overview,Mini(tip),5,WorkbenchTheme.Brush("#C66B05"),WorkbenchTheme.Brush("#FFCC66"));
-            Label(overview,"轨迹局部 · "+shape.SelectedItem,new Point(box.Left+8,box.Top+5));
+            Label(overview,Lang.T("vp.mini")+Lang.T("xy.shape" + shape.SelectedIndex),new Point(box.Left+8,box.Top+5));
         }
         double scaleLength=step*pixelsPerMm;
         var scaleStart=new Point(Plot.Left+12,Plot.Bottom-18);
@@ -303,6 +330,13 @@ public sealed partial class XYPreviewPanel
             var r=new Rect(dragFrom,dragTo); var selection=new Rectangle {Width=r.Width,Height=r.Height,Stroke=WorkbenchTheme.Blue,Fill=WorkbenchTheme.Brush("#22245BE8"),IsHitTestVisible=false};
             Canvas.SetLeft(selection,r.Left); Canvas.SetTop(selection,r.Top); canvas.Children.Add(selection);
         }
+    }
+    // One-line readout under the canvas for the point preview; with a trajectory DrawSample owns it.
+    private void ShowPoseInfo(PlanarArm model, JointPose offline)
+    {
+        if(timing is not null) return;
+        var pose=FollowCommand?startFeedback!.Command:offline; var tip=model.Forward(pose).Tip;
+        sampleInfo.Text=(FollowCommand?Lang.T("vp.sampleDevice"):Lang.T("vp.sampleOffline"))+Lang.T("vp.samplePose", pose.Q1, pose.Q2, tip.X, tip.Y);
     }
     private void ViewportSelfTest()
     {
@@ -403,6 +437,49 @@ public sealed partial class XYPreviewPanel
             }
         }
         if(requests!=0) throw new InvalidOperationException("Preview sent a motion request");
+    }
+    internal bool FollowsDevice => FollowCommand;
+    internal void FlushViewport() { if(viewportRedrawTimer.IsEnabled) RedrawViewport(); }
+    // The solid arm must always be the pose the screen claims: the device when it has one, the plan otherwise.
+    private static void DeviceSyncSelfTest()
+    {
+        var panel = new XYPreviewPanel();
+        panel.Measure(new Size(900,720)); panel.Arrange(new Rect(0,0,900,720)); panel.UpdateLayout(); panel.Refresh();
+        void Solid(JointPose pose, string what)
+        {
+            var links=panel.canvas.Children.OfType<Canvas>().First().Children.OfType<Line>()
+                .Where(line=>line.Stroke==WorkbenchTheme.Blue || line.Stroke==WorkbenchTheme.Red || line.Stroke==Brushes.SlateBlue).ToArray();
+            var (elbow,tip)=panel.Model.Forward(pose);
+            if(links.Length!=2 || (new Point(links[0].X2,links[0].Y2)-panel.ToScreen(elbow)).Length>1e-6 ||
+               (new Point(links[1].X2,links[1].Y2)-panel.ToScreen(tip)).Length>1e-6)
+                throw new InvalidOperationException("预览与设备/状态不同步：" + what);
+        }
+        bool Said(string text) => panel.canvas.Children.OfType<TextBlock>().Concat(panel.canvas.Children.OfType<Canvas>().SelectMany(c=>c.Children.OfType<TextBlock>())).Any(t=>t.Text.Contains(text));
+        TelemetrySample At(uint epoch, JointPose pose) => new(0,epoch,1,true,2,ExecutionTrajectory.Counts(0,pose),ExecutionTrajectory.Counts(1,pose),0,0,0,0);
+        var plan0=panel.timing!.At(0).Pose;
+        Solid(plan0,"未连接时应显示规划姿态"); if(!Said("离线规划姿态")) throw new InvalidOperationException("未连接时画布应标明离线规划姿态");
+        // Manual zero confirmation: p1=p2=0, so both links must lie along +X.
+        panel.SetStartFeedback(At(1,new JointPose(0,0))); panel.RedrawViewport();
+        Solid(new JointPose(0,0),"人工确认伸直零位后两杆必须伸直"); if(!panel.FollowsDevice || !Said("设备命令姿态")) throw new InvalidOperationException("已建立参考的空闲设备也应跟随设备");
+        var straight=panel.Model.Forward(new JointPose(0,0)).Tip;
+        if(Math.Abs(straight.X-(panel.Model.L1+panel.Model.L2))>1e-9 || Math.Abs(straight.Y)>1e-9) throw new InvalidOperationException("零位末端必须在 (L1+L2, 0)");
+        // The device moves: the arm follows the new command; the plan stays visible only as a dashed ghost.
+        var moved=At(1,new JointPose(10,25)); panel.SetStartFeedback(moved); panel.RedrawViewport(); Solid(moved.Command,"设备移动时应跟随命令姿态");   // the command is the quantized step pose
+        if(!Said("规划姿态")) throw new InvalidOperationException("跟随设备时应保留规划姿态虚线");
+        // The operator scrubs the offline preview: the solid arm shows the plan, the device stays visible as a ghost.
+        panel.cursor.Value=panel.timing.Duration/2; panel.RedrawViewport();
+        Solid(panel.timing.At(panel.cursor.Value).Pose,"拖动预览时应显示规划姿态"); if(panel.FollowsDevice || !Said("设备当前")) throw new InvalidOperationException("离线预览应保留设备当前姿态虚线");
+        // A new reference (for example another manual confirmation) hands the view back to the device.
+        panel.SetStartFeedback(At(2,new JointPose(0,0))); panel.RedrawViewport(); Solid(new JointPose(0,0),"新的坐标参考应让视图回到设备");
+        panel.SetDeviceStatus("模拟运动",false,true,10,false); panel.cursor.Value=0; panel.SetDeviceStatus("模拟运动",false,true,10,false);
+        if(!panel.FollowsDevice) throw new InvalidOperationException("设备运动期间必须显示设备姿态");
+        panel.SetDeviceStatus(null,false,false,0,false);
+        // Homing or a lost reference: the device pose is unknown, and the canvas has to say so.
+        panel.SetStartFeedback(null,"回零中，设备位置未知"); panel.RedrawViewport();
+        Solid(panel.timing.At(panel.cursor.Value).Pose,"位置未知时显示规划姿态"); if(panel.FollowsDevice || !Said("回零中，设备位置未知")) throw new InvalidOperationException("回零中画布必须说明设备位置未知");
+        // A single point follows the device too, and says so under the canvas.
+        panel.SetStartFeedback(At(3,new JointPose(0,0))); panel.shape.SelectedIndex=0; panel.Refresh(); panel.RedrawViewport();
+        Solid(new JointPose(0,0),"单点模式也应跟随设备"); if(!panel.sampleInfo.Text.Contains("设备命令姿态")) throw new InvalidOperationException("单点模式缺少设备姿态读数");
     }
     internal void CheckViewportLayout()
     {

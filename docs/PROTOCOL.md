@@ -15,7 +15,7 @@
 
 | type | 含义 | q1 / q2 / value | 序号 |
 |---|---|---|---|
-| 1 | PTP 单点 | q1、q2 目标；value = 速度 20…2500 微步/秒 | PTP |
+| 1 | PTP 单点 | q1、q2 目标；value = 速度 20…4000 微步/秒 | PTP |
 | 2 | 轨迹 BEGIN | q1、q2 = 起点（必须就是当前位姿）；value = 节点数 2…2048 | PTP |
 | 3 | 轨迹 NODE | q1、q2；value = 该段时长 50…500 ms | PTP（须连续） |
 | 4 | 轨迹 RUN | 全 0 | PTP（须连续） |
@@ -24,14 +24,14 @@
 | 7 | 使能 | 全 0 | 控制 |
 | 8 | 开关回零 | 全 0 | 控制 |
 | 9 | 关节范围 | q1 = 最小，q2 = 最大（0.01°，−18000…0…18000，最小 < 最大）；value = 轴号 0/1 | 控制 |
-| 10 | 速度/加速度 | q1 = 最大速度（两轴均为 20…2500 微步/秒）；q2 = 加速度（轴 0：100…20000，轴 1：100…12000 微步/秒²）；value = 轴号 | 控制 |
+| 10 | 速度/加速度 | q1 = 最大速度（两轴均为 20…4000 微步/秒）；q2 = 加速度（轴 0：100…20000，轴 1：100…12000 微步/秒²）；value = 轴号 | 控制 |
 
 规则（`ptp_accept`、`control_accept`、`joint_limits_accept`）：
 
 - CRC 不对、字段非法、序号不大于已接受的序号、代次（`epoch`）不是当前代次 → 拒绝，不改变状态。载荷与上一帧完全相同的重发只重复回执（幂等）。
 - type 1…5 用 PTP 序号，type 6…10 用控制序号；两组序号各自递增，所以心跳不会打断轨迹节点的连续性。
 - 代次每次作废参考时加一（见 STATE_MODEL）。**唯一的例外**：type 6 心跳只要结构和 CRC 合法，即使代次过期也会续租约——但不应用按键、不接受序号、不执行任何命令；固件随后按 250 ms 节流补发一行 `PTP_EPOCH <n>`。
-- type 9/10 只在未使能、无参考、无运动时接受；范围与速度写入后由 `LINK`/`PTP_LIMITS`/`PTP_RATES` 回执确认。
+- type 9（范围）只在未使能、无参考、无运动、无缓存轨迹时接受。type 10（速度/加速度）在此之外，**已使能、有参考、静止时也接受**（`LINK` 含 `rates_live=1`）；回零、两轴任何一轴在动或在稳定、PTP/轨迹运行或上传中、上传隔离期间一律拒绝（`PTP_LIMITS refused: moving, homing or uploading`）。设备已缓存的轨迹是按旧速度检查过的：type 10 的数值有变化时丢弃它（日志 `TRAJ held plan dropped`，随后 `TRAJ_STATE state=0`），数值没变则保留；上位机据此要重新上传。写入后由 `PTP_LIMITS`/`PTP_RATES` 回执和 `PTP_STATE`/`MOTION_RATES` 确认。
 
 ## 3. 紧凑心跳（6 线上字节）
 
@@ -62,7 +62,7 @@
 | 行 | 内容 |
 |---|---|
 | `STATE fw=stage2-v7 enabled home homed1 homed2 fault enc dir` | 固定的 `fw=stage2-v7` 用于选择“帧控制”；`home`：0 待机、1 释放、2 额外退开、3 快碰、4 慢碰、5 零点稳定、6 伸直、7 伸直稳定。`homed1=1` 可能只表示 arm1 已置零，整个流程要看两轴且 `home=0` |
-| `LINK uart=hw baud=115200 rx_overflow rx_error tx_dropped fw=<构建号> short_hb=1 joint_limits=1 motion_rates=1 q2_absolute=1 proto=<n>` | 能力声明。上位机要求 `proto=` 等于自己的协议版本才解锁运动（见第 6 节）。计数器自上电起累计，判断“本次是否新增”要看日志内的增量 |
+| `LINK uart=hw baud=115200 rx_overflow rx_error tx_dropped fw=<构建号> short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 proto=<n>` | 能力声明。上位机要求 `proto=` 等于自己的协议版本才解锁运动（见第 6 节）；`rates_live=1` 表示已使能且静止时也接受 type 10。计数器自上电起累计，判断“本次是否新增”要看日志内的增量。整行约 180 个字符，固件调试缓冲区 `g_dbg` 为 256 字节；缓冲区太短会把行尾的 `proto=` 连同换行截掉，`link_capabilities` 测试检查行尾 |
 | `PTP_STATE lock ref active epoch seq min1 max1 min2 max2` | 执行锁、参考、运动阶段、代次、序号、固件里的关节范围 |
 | `TRAJ_STATE state count total index seq epoch` | 轨迹缓存状态（0 空、1 上传、2 就绪、3 运行、4 完成） |
 | `TIMING loop_max_ms tick_lag_max_ms clock wdt key_age_ms key_max_gap_ms` | `key_max_gap_ms`：使能以来运动许可有效期间最长的一次心跳间隔，ENABLE 清零 |
@@ -77,6 +77,6 @@
 
 ## 6. 版本与兼容
 
-- 固件标识 `FW_BUILD_ID`（现为 `stage2-v7-absolute-q2-r2500`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。行为不变的结构性重构（例如 2026-09-30 的循环拆分）没有改它，靠 `firmware.hex` 的 SHA-256 区分。
+- 固件标识 `FW_BUILD_ID`（现为 `stage2-v7-absolute-q2-r4000-live`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。行为不变的结构性重构（例如 2026-09-30 的循环拆分）没有改它，靠 `firmware.hex` 的 SHA-256 区分。
 - **协议版本号**：`LINK` 行末尾的 `proto=<n>`（固件 `PROTO_VERSION`，上位机 `DeviceContract.ProtocolVersion`）。上位机只在两者相等时解锁运动，与 `fw=` 构建号无关，所以构建号可以随时改。**帧格式、字段含义、序号/代次规则或坐标约定一变，两边一起加一**；发布闸门会核对两边的数字。当前为 `proto=1`（即本页描述的协议，含 absolute-q2 坐标）。固件仍同时输出旧的 `q2_absolute=1`，只为让上一版上位机继续可用。
-- 上位机对旧固件的处理：`LINK` 里没有 `short_hb` 就用 36 字节完整心跳；没有声明 `joint_limits`、`motion_rates` 或 `q2_absolute` 的能力，相应功能保持锁定并提示更新固件（不会静默忽略）。
+- 上位机对旧固件的处理：`LINK` 里没有 `short_hb` 就用 36 字节完整心跳；没有声明 `joint_limits`、`motion_rates` 或 `q2_absolute` 的能力，相应功能保持锁定并提示更新固件（不会静默忽略）。没有 `rates_live=1` 时，已使能下改速度不下发，仍要先总停止、禁用后自动同步、再使能。`rates_live` 是新增的能力位，不改帧格式，所以 `proto` 没有变。

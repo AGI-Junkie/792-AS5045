@@ -8,11 +8,11 @@ public readonly record struct MotionProfile(int R1, int R2, int A1, int A2)
     public static MotionProfile From(PlanningRates r)
     {
         if (new[] { r.Feed, r.V1, r.V2, r.A1, r.A2 }.Any(x => !double.IsFinite(x) || x <= 0 || x > 1000))
-            throw new ArgumentException("速度与加速度须为 0～1000 内的有限正数。");
+            throw Lang.Error("err.speedRange");
         static int Limit(double x, int axis, int min, int max)
         {
             int pulses = (int)Math.Floor(x * StepsPerDegree(axis) + 1e-9);
-            if (pulses < min) throw new ArgumentException($"arm{axis+1} 设置低于设备支持的下限 {min / StepsPerDegree(axis):F3}（速度 °/s 或加速度 °/s²）。");
+            if (pulses < min) throw Lang.Error("err.belowMin", axis + 1, min / StepsPerDegree(axis));
             return Math.Min(pulses, max);
         }
         return new(Limit(r.V1,0,DeviceContract.RateMin,DeviceContract.Arm1RateMax), Limit(r.V2,1,DeviceContract.RateMin,DeviceContract.Arm2RateMax),

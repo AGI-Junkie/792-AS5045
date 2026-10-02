@@ -15,13 +15,14 @@ public sealed partial class ControlWindow
     private void CheckControlTimeout(DateTime now)
     {
         if(pendingControl is null || (now-controlRequestedAt).TotalSeconds<3) return;
-        lastStop.Text=$"{pendingControl}未收到确认。已停止；检查串口和输入状态后重新使能。";
+        string control = pendingControl;
+        Lang.Text(lastStop, () => Lang.T("fault.controlTimeout", control=="使能"?Lang.T("ctl.enable"):Lang.T("ctl.home")));
         Append("HOST control acknowledgement timeout: "+pendingControl); Stop();
     }
     private void CheckTelemetryTimeout(DateTime now)
     {
         if (!supportsTelemetry || (now-lastTelemetryAt).TotalSeconds < 2) return;
-        telemetry = null; ShowFeedback(null, "反馈已过期；等待新的设备数据。");
+        telemetry = null; ShowFeedback(null, () => Lang.T("fault.telemetryStale"));
         if (pendingControl is null && (PointBusy || executing)) { Append("HOST telemetry timeout; stopping"); Stop(); }
     }
     private bool AtStart(JointPose pose) => supportsTelemetry && ptp is { Active: 0, Referenced: true } &&
@@ -33,23 +34,23 @@ public sealed partial class ControlWindow
         var sample = TelemetrySample.Parse(line);
         if (!supportsTelemetry || sample is null || ptp is null || sample.Epoch != ptp.Epoch || sample.Sequence != ptp.Sequence) {
             // Enable/home establish their own reference; telemetry can arrive before PTP_STATE.
-            if (supportsTelemetry && pendingControl is null && (PointBusy || executing)) { lastStop.Text = "设备反馈无效或参考代次不匹配；已停止，请重新建立坐标。"; Stop(); }
+            if (supportsTelemetry && pendingControl is null && (PointBusy || executing)) { Lang.Text(lastStop, () => Lang.T("fault.badTelemetry")); Stop(); }
             return;
         }
         if (telemetry?.Epoch != sample.Epoch) errorHistory.Clear();
         telemetry = sample; lastTelemetryAt = DateTime.UtcNow;
         if (sample.Referenced) {
-            ShowFeedback(sample, "坐标参考：" + sample.ReferenceName);
+            ShowFeedback(sample, () => Lang.T("status.ref") + sample.ReferenceName);
             errorHistory.Enqueue(sample.Error1); while(errorHistory.Count > 120) errorHistory.Dequeue(); DrawErrorPlot();
             if (experiment is { } recorder) {
                 recorder.Record(sample,uploading is not null ? "upload" : uploaded is not null ? "ready" : experimentPhase=="trajectory" ? "drawing" : "point",trajectoryIndex);
-                experimentResult.Text = recorder.MotionSamples==0 ? $"已保存 {recorder.Samples} 条反馈；等待运动样本，暂不计算误差统计。" :
-                    $"本次采样 {recorder.Samples} · arm1 RMSE {recorder.Rmse:F4}° · 峰值 {recorder.Peak:F4}°\n数据正在自动保存。";
+                Lang.Text(experimentResult, () => recorder.MotionSamples==0 ? Lang.T("exp.savedWaiting", recorder.Samples) :
+                    Lang.T("exp.live", recorder.Samples, recorder.Rmse, recorder.Peak));
                 if(experimentPhase=="point" && pendingPoint==0 && ptp.Active==0 && sample.Sequence==experimentSequence) experimentCompleting="complete";
                 if (experimentCompleting is { } outcome) FinishExperiment(outcome);
             }
         } else {
-            ShowFeedback(sample, "坐标参考尚未建立；角度与误差不作有效读数。");
+            ShowFeedback(sample, () => Lang.T("live.noRefYet"));
             if (experiment is not null) FinishExperiment("reference_invalidated");
             if (!manualReferencePending && (pendingPoint != 0 || uploading is not null || executing || ptp.Active != 0)) Stop();
         }
@@ -59,7 +60,7 @@ public sealed partial class ControlWindow
     {
         if (selfTesting || !supportsTelemetry) return;
         if (telemetry is not { Referenced: true } || ptp is null || telemetry.Epoch != ptp.Epoch ||
-            (DateTime.UtcNow-lastTelemetryAt).TotalSeconds >= 2) throw new IOException("缺少有效的当前位置反馈；请等待读数后重试。");
+            (DateTime.UtcNow-lastTelemetryAt).TotalSeconds >= 2) throw new IOException(Lang.T("fault.experimentMissingFeedback"));
         FinishExperiment("replaced"); errorHistory.Clear(); DrawErrorPlot();
         experiment = new ExperimentRecorder(ExperimentRoot,kind,sequence,ptp.Epoch,xyPreview.Model,xyPreview.SettingsDescription,telemetry.ReferenceName,nodes);
         experimentPhase = kind; experimentSequence=sequence; experimentCompleting = null; lastExperimentDirectory = experiment.DirectoryPath;
@@ -70,23 +71,24 @@ public sealed partial class ControlWindow
         var recorder = experiment; experiment = null; experimentCompleting = null;
         if (recorder is null) return;
         recorder.Finish(outcome);
-        experimentResult.Text = $"实验{(outcome=="complete"?"完成":"中止")} · {recorder.Samples} 个样本 · " +
-            (recorder.MotionSamples>0?$"RMSE {recorder.Rmse:F4}°\n":"无有效运动样本\n") +
-            $"已保存计划、反馈和摘要。arm2 / 末端误差未实测。";
+        Lang.Text(experimentResult, () => Lang.T("exp.finished", outcome=="complete"?Lang.T("exp.complete"):Lang.T("exp.aborted"), recorder.Samples) +
+            (recorder.MotionSamples>0?Lang.T("exp.rmse", recorder.Rmse):Lang.T("exp.noMotion")) +
+            Lang.T("exp.savedNote"));
+        diagnostics.IsExpanded = true;
         Append("HOST experiment " + outcome + ": " + recorder.DirectoryPath);
     }
     private static string ExplainFault(string line)
     {
-        string action = line.Contains("UART receive") ? "串口接收出错或缓冲溢出，已停止并作废坐标参考。检查 USB 连接及通信诊断，再使能并确认零位。" :
-            line.Contains("joint range") ? "目标超出软件范围：缩小图形或调整位置。" :
-            line.Contains("start") && line.Contains("mismatch") ? "起点不符：先低速移到当前轨迹起点。" :
-            line.Contains("encoder") || line.Contains("following") || line.Contains("slip") ? "编码器或跟随误差异常：检查负载、驱动与编码器，再使能并建立零位。" :
-            line.Contains("limit") || line.Contains("sensor") || line.Contains("NPN") ? "限位 / 传感器触发：检查实际位置及输入，再重新使能。" :
-            line.Contains("heartbeat") || line.Contains("deadman") ? "心跳超时：保持窗口响应，检查串口后重新使能。" :
-            line.Contains("stale") ? "坐标参考或序号失效：重新使能并人工确认零位，也可开关回零。" :
-            line.Contains("operator stop") ? "已停止。继续前重新使能，再人工确认零位或回零。" :
-            line.Contains("fault") ? "驱动故障：检查驱动供电 / 故障输入，再重新使能。" :
-            "请求已停止或被拒绝；检查以下设备原因，解决后再操作。";
+        string action = line.Contains("UART receive") ? Lang.T("explain.uart") :
+            line.Contains("joint range") ? Lang.T("explain.range") :
+            line.Contains("start") && line.Contains("mismatch") ? Lang.T("explain.start") :
+            line.Contains("encoder") || line.Contains("following") || line.Contains("slip") ? Lang.T("explain.encoder") :
+            line.Contains("limit") || line.Contains("sensor") || line.Contains("NPN") ? Lang.T("explain.limit") :
+            line.Contains("heartbeat") || line.Contains("deadman") ? Lang.T("explain.heartbeat") :
+            line.Contains("stale") ? Lang.T("explain.stale") :
+            line.Contains("operator stop") ? Lang.T("explain.operatorStop") :
+            line.Contains("fault") ? Lang.T("explain.fault") :
+            Lang.T("explain.other");
         return action + "\n" + line;
     }
     private static void FeedbackSelfTest(string? snapshotPath = null)
@@ -130,7 +132,7 @@ public sealed partial class ControlWindow
         w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
         Check(!w.manualReferencePending && w.manualReference.IsEnabled && w.manualReference.Background==WorkbenchTheme.Teal &&
             w.manualReference.BorderBrush==WorkbenchTheme.Teal && w.manualReference.Content.ToString()=="人工确认当前位置为伸直零位");
-        Ready(21,manualSeq); Check(w.manualReference.Background==WorkbenchTheme.Teal); // normal telemetry does not flash away success
+        Ready(21,manualSeq); Check(w.manualReference.Background==WorkbenchTheme.Teal); Check(w.xyPreview.FollowsDevice); // normal telemetry does not flash away success
         Snapshot("manual-reference-confirmed.png");
         Ready(22,manualSeq); Check(w.manualReference.Background==WorkbenchTheme.Blue); // a new reference is not the acknowledged one
         w.RequestManualReference(); manualSeq=w.pendingPoint;

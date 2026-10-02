@@ -18,7 +18,7 @@ public sealed record TelemetrySample(uint Milliseconds, uint Epoch, uint Sequenc
     }
     public double Measured1 => Encoder1 * 360.0 / (DeviceContract.EncoderCounts * DeviceContract.Arm1GearRatio);
     public double Error1 => Measured1 - Command.Q1;
-    public string ReferenceName => Source == 2 ? "人工伸直零位" : Source == 1 ? "开关回零" : "未建立";
+    public string ReferenceName => Source == 2 ? Lang.T("ref.manual") : Source == 1 ? Lang.T("ref.home") : Lang.T("ref.none");
     public static TelemetrySample? Parse(string line)
     {
         var m = Pattern.Match(line);

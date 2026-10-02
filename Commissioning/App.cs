@@ -17,12 +17,16 @@ public sealed class App : Application
     [STAThread]
     public static int Main(string[] args)
     {
-        if (args.Contains("--self-test"))
+        if (args.Contains("--self-test") || args.Contains("--language-self-test") || args.Contains("--upload-language-test"))
         {
             try
             {
+                Lang.PersistChanges = false;
                 int snapshot = Array.IndexOf(args, "--snapshot");
-                ControlWindow.SelfTest(snapshot >= 0 && snapshot + 1 < args.Length ? args[snapshot + 1] : null);
+                string? path = snapshot >= 0 && snapshot + 1 < args.Length ? args[snapshot + 1] : null;
+                if (args.Contains("--upload-language-test")) ControlWindow.UploadLanguageTest();
+                else if (args.Contains("--language-self-test")) { Lang.SelfTest(); ControlWindow.LanguageSelfTest(path); }
+                else ControlWindow.SelfTest(path);
                 return 0;
             }
             catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
@@ -38,6 +42,7 @@ public sealed class App : Application
             File.WriteAllLines(args[contract + 1], DeviceContract.Lines());
             return 0;
         }
+        Lang.Load();
         new App().Run(new ControlWindow(restoreParameters: true));
         return 0;
     }
@@ -46,16 +51,18 @@ public sealed class App : Application
 public sealed partial class ControlWindow : Window
 {
     private readonly ComboBox ports = new() { Width = 130, Margin = new Thickness(4) };
-    private readonly TextBlock state = new() { Text = "未连接", FontSize = 22, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4, 12, 4, 8) };
-    private readonly TextBlock inputs = new() { Text = "输入尚未读取", Margin = new Thickness(4), TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock state = new() { Text = Lang.T("state.disconnected"), FontSize = 22, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4, 12, 4, 8) };
+    private readonly TextBlock inputs = new() { Text = Lang.T("state.inputsEmpty"), Margin = new Thickness(4), TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock logPath = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4) };
     private readonly TextBlock lastStop = new() { TextWrapping = TextWrapping.Wrap, Foreground = Brushes.Firebrick, Margin = new Thickness(4) };
     private readonly TextBox log = new() { IsReadOnly = true, AcceptsReturn = true, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-        HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, FontFamily = new FontFamily("Consolas"), FontSize = 12 };
-    private readonly Button enable = MakeButton("使能 / 重新检查 (C)");
-    private readonly Button home = MakeButton("开始回零 (R)");
-    private readonly Button manualReference = MakeButton("人工确认：当前位置为伸直零位");
-    private readonly Button connect = MakeButton("连接");
+        HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, FontFamily = new FontFamily("Consolas"), FontSize = 12,
+        Language = System.Windows.Markup.XmlLanguage.GetLanguage("en-US") }; // Raw protocol text does not need language-dependent reformatting.
+    private readonly Button enable = MakeButton(Lang.T("btn.enable"));
+    private readonly Button home = MakeButton(Lang.T("btn.home"));
+    private readonly Button manualReference = MakeButton(Lang.T("btn.manualRef"));
+    private readonly Button connect = MakeButton(Lang.T("btn.connect"));
+    private readonly Button langToggle = MakeButton(Lang.T("lang.toggle"));
     private readonly XYPreviewPanel xyPreview = new();
     private readonly List<Button> jogButtons = [];
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(40) };
@@ -90,13 +97,16 @@ public sealed partial class ControlWindow : Window
     private static string ExperimentRoot => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "Experiments");
     private ExecutionTrajectory? uploading;
     private ExecutionTrajectory? uploaded;   // complete plan the device holds, waiting for 执行图形
+    private ExecutionTrajectory? runPlan;    // plan of the RUN in flight; becomes `uploaded` again when it completes
+    private bool uploadedRan;              // the held plan has already been drawn once; 执行图形 repeats it until the plan changes
     private int uploadNext, trajectoryIndex, trajectoryTotal;
     private bool supportsTrajectory, executing;
     private uint trajectoryEpoch, trajectoryRunSequence;
     private DateTime lastTrajectoryAt;
     private DateTime uploadStartedAt;
     private static readonly Regex TrajectoryPattern = new(@"^TRAJ_STATE state=([0-4]) count=(\d+) total=(\d+) index=(\d+) seq=(\d+) epoch=(\d+)$", RegexOptions.CultureInvariant);
-    private string regularStateText = "未连接";
+    private string? lastLinkLine;
+    private Func<string> regularStateText = () => Lang.T("state.disconnected");
     private static readonly Regex StatePattern = new(@"^STATE fw=(?:stage1-v3|stage2-v[1234567]) enabled=([01]) home=([0-7]) homed1=([01]) homed2=([01]) fault=([01]) enc=([01]) dir=([01])$", RegexOptions.CultureInvariant);
 
     public ControlWindow(bool restoreParameters = false)
@@ -105,6 +115,8 @@ public sealed partial class ControlWindow : Window
             foreach (var change in e.Changes) logCharacters += change.AddedLength - change.RemovedLength;
         };
         BuildLayout();
+        Lang.Changed += OnLanguageChanged;
+        Closed += (_, _) => Lang.Changed -= OnLanguageChanged;
         if (restoreParameters) xyPreview.RestoreSavedParameters();
         timer.Tick += (_, _) => Tick();
         heartbeatTimer.Tick += OnHeartbeatTick;
@@ -119,11 +131,31 @@ public sealed partial class ControlWindow : Window
             foreach (var button in jogButtons) if (button.IsMouseCaptured) button.ReleaseMouseCapture();
             SafeAction(Heartbeat);
         };
-        Closing += (_, _) => Disconnect("窗口关闭");
+        Closing += (_, _) => Disconnect(() => Lang.T("fault.windowClose"));
         RefreshPorts(); UpdateControls();
     }
 
     private static Button MakeButton(string title) => new() { Content = title, Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), MinHeight = 28 };
+    private void OnLanguageChanged()
+    {
+        enable.Content = Lang.T("btn.enable");
+        home.Content = Lang.T("btn.home");
+        manualReference.Content = Lang.T("btn.manualRef");
+        manualReference.ToolTip = Lang.T("btn.manualRef.tip");
+        connect.Content = serial is null ? Lang.T("btn.connect") : Lang.T("btn.disconnect");
+        langToggle.Content = Lang.T("lang.toggle");
+        readInputs.Content = Lang.T("btn.readInputs");
+        Title = Lang.T("app.title");
+        RefreshLanguageLayout();
+        xyPreview.RefreshLanguage();
+        langToggle.ToolTip = Lang.T("lang.toggle.tip");
+        System.Windows.Automation.AutomationProperties.SetName(langToggle, Lang.T("lang.toggle.tip"));
+        foreach (var element in new FrameworkElement[] { state, lastStop, inputs, liveValues, experimentResult, logPath }) Lang.RefreshText(element);
+        if (lastLinkLine is { } link) connectionBadge.ToolTip = Lang.T("link.diag") + link;
+        if (compatible) ShowDeviceState();
+        UpdateControls(synchronize: false);
+        Language = System.Windows.Markup.XmlLanguage.GetLanguage(Lang.IsEn ? "en-NZ" : "zh-CN");
+    }
     private void AddJog(Panel row, string title, int bit)
     {
         var button = MakeButton(title); WorkbenchTheme.Primary(button); jogButtons.Add(button); row.Children.Add(button);
@@ -166,7 +198,8 @@ public sealed partial class ControlWindow : Window
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Epoch: > 0 } &&
         (DateTime.UtcNow - lastPtpAt).TotalSeconds < 2;
     private bool CanJog => LimitsReady && compatible && enabled && !homing && !stopPending && !PointBusy && IsActive && (DateTime.UtcNow - lastStateAt).TotalSeconds < 2;
-    private bool IsEditingControls => Keyboard.FocusedElement is TextBoxBase or ComboBox || xyPreview.IsKeyboardFocusWithin;
+    // A focused slider takes the arrow keys itself; they must not also start a jog.
+    private bool IsEditingControls => Keyboard.FocusedElement is TextBoxBase or ComboBox or Slider || xyPreview.IsKeyboardFocusWithin;
     private void RefreshPorts()
     {
         if (serial is not null) return;
@@ -175,14 +208,14 @@ public sealed partial class ControlWindow : Window
     }
     private void Connect()
     {
-        if (ports.SelectedItem is not string port) { state.Text = "请选择 KitProg 的 COM 口"; return; }
+        if (ports.SelectedItem is not string port) { Lang.Text(state, () => Lang.T("state.needPort")); return; }
         try
         {
             string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "Logs");
             Directory.CreateDirectory(directory);
             string path = Path.Combine(directory, $"stage1-{DateTime.Now:yyyyMMdd-HHmmss-fff}.log");
             recording = new StreamWriter(path, false, new UTF8Encoding(false)) { AutoFlush = true };
-            logPath.Text = "日志自动保存：" + path;
+            Lang.Text(logPath, () => Lang.T("state.logSaved") + path);
             serial = new SerialPort(port, 115200, Parity.None, 8, StopBits.One) { WriteTimeout = 100, ReadTimeout = 10, DtrEnable = false, RtsEnable = false };
             serial.DataReceived += (_, _) => WakeSerialPump();
             serial.Open(); openedAt = DateTime.UtcNow; lastStateAt = DateTime.MinValue;
@@ -195,13 +228,13 @@ public sealed partial class ControlWindow : Window
             pending.Clear(); compatible = enabled = homing = false; stopPending = true;
             keyboardMask = mouseMask = 0;
             Send(0x79); Heartbeat(); Send((byte)'s'); Send((byte)'i');
-            state.Text = "已连接，等待 stage1-v3 / stage2 固件状态；不会自动使能";
-            connect.Content = "断开"; ports.IsEnabled = false; timer.Start(); heartbeatTimer.Start();
+            Lang.Text(state, () => Lang.T("state.connected"));
+            connect.Content = Lang.T("btn.disconnect"); ports.IsEnabled = false; timer.Start(); heartbeatTimer.Start();
             StartWireWriter();
             Append("HOST connected " + port);
             Append("HOST UI " + Title + "; executable=" + Environment.ProcessPath);
         }
-        catch (Exception ex) { Disconnect("连接失败：" + ex.Message); }
+        catch (Exception ex) { Disconnect(() => Lang.T("state.connectFail") + ex.Message); }
         UpdateControls();
     }
     private void Send(byte command, double gapMs = 1)
@@ -246,7 +279,7 @@ public sealed partial class ControlWindow : Window
             // window stops republishing, the lease goes stale, the writer stops
             // sending, and the firmware deadman stops the machine.
             double age = (DateTime.UtcNow - (compatible ? lastStateAt : openedAt)).TotalSeconds;
-            if (age > (compatible ? 2 : 8)) { Disconnect("固件状态超时 / 版本不匹配；已请求停止，请检查设备"); return; }
+            if (age > (compatible ? 2 : 8)) { Disconnect(() => Lang.T("state.fwTimeout")); return; }
             PublishHeartbeatLease();
         });
     }
@@ -275,7 +308,7 @@ public sealed partial class ControlWindow : Window
     {
         SafeAction(() =>
         {
-            if (serial is not { IsOpen: true }) throw new IOException("串口已关闭");
+            if (serial is not { IsOpen: true }) throw new IOException(Lang.T("fault.ioClosed"));
             PumpSerial();
             RetryPendingPoint(DateTime.UtcNow);
             CheckControlTimeout(DateTime.UtcNow);
@@ -331,30 +364,29 @@ public sealed partial class ControlWindow : Window
                 // disabled STATE requires the following full range report again.
                 reportedLimits = null; reportedProfile = null;
             }
-            string[] phases = ["待机", "释放开关", "额外退开", "快速触碰", "慢速触碰", "确认零点", "移到伸直位（轴号见日志）", "确认伸直位置"];
-            regularStateText =
-                $"{(enabled ? "已使能" : "运动禁用")} · {phases[int.Parse(match.Groups[2].Value)]}" +
-                $"\n坐标参考：arm1 {(match.Groups[3].Value == "1" ? "已建立" : "未建立")} / arm2 {(match.Groups[4].Value == "1" ? "已建立" : "未建立")}" +
-                $" · 编码器 {(match.Groups[6].Value == "1" ? "可用" : "不可用")} · 驱动故障：{(match.Groups[5].Value == "1" ? "有（锁定）" : "无")}";
+            regularStateText = () =>
+                $"{(match.Groups[1].Value == "1" ? Lang.T("state.enabled") : Lang.T("state.motionOff"))} · {Lang.T("phase." + match.Groups[2].Value)}" +
+                $"\n{Lang.T("status.ref")}arm1 {(match.Groups[3].Value == "1" ? Lang.T("state.refEstablished") : Lang.T("state.refMissing"))} / arm2 {(match.Groups[4].Value == "1" ? Lang.T("state.refEstablished") : Lang.T("state.refMissing"))}" +
+                $" · {Lang.T("lbl.encoder")} {(match.Groups[6].Value == "1" ? Lang.T("state.encOk") : Lang.T("state.encBad"))} · {Lang.T("lbl.driveFault")}{(Lang.IsEn ? ": " : "：")}{(match.Groups[5].Value == "1" ? Lang.T("state.faultOn") : Lang.T("state.faultOff"))}";
             ShowDeviceState();
             UpdateControls();
         }
         else if (line.StartsWith("PTP_STATE ")) {
             ptp = stage2 ? PtpState.Parse(line) : null; lastPtpAt = DateTime.UtcNow;
-            if (ptp is null && PointBusy) { lastStop.Text="运动状态回执格式无效，已取消请求；检查通信与固件版本。"; Stop(); return; }
+            if (ptp is null && PointBusy) { Lang.Text(lastStop, () => Lang.T("fault.badPtp")); Stop(); return; }
             if (ptp is not null) {
                 ObserveControlEpoch(ptp.Epoch);
                 ObserveJointLimits(ptp);
                 pointSequence = Math.Max(pointSequence, ptp.Sequence);
                 if (pendingPoint != 0 && ptp.Epoch != requestEpoch &&
                     (!manualReferencePending || ptp.Epoch != (requestEpoch == uint.MaxValue ? 1u : requestEpoch+1u))) {
-                    lastStop.Text="等待指令期间坐标参考已改变；已取消请求，请重新确认零位。"; Stop(); return;
+                    Lang.Text(lastStop, () => Lang.T("fault.epochChanged")); Stop(); return;
                 }
                 if (uploading is null && pendingPoint != 0 && ptp.Sequence == pendingPoint &&
                     ptp.Epoch == (manualReferencePending ? (requestEpoch == uint.MaxValue ? 1u : requestEpoch+1u) : requestEpoch)) {
                     if (manualReferencePending) {
                         if (ptp.Locked || !ptp.Referenced || ptp.Active!=0) {
-                            lastStop.Text="人工零位回执无效；设备未建立可用参考，请重新使能后再确认。"; Stop(); return;
+                            Lang.Text(lastStop, () => Lang.T("fault.manualRefAck")); Stop(); return;
                         }
                         manualReferenceConfirmedEpoch=ptp.Epoch;
                     }
@@ -380,7 +412,7 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("TRAJ_STATE ")) HandleTrajectoryState(line);
         else if (line.StartsWith("TELEM ")) HandleTelemetry(line);
         else if (line.StartsWith("LINK ")) {
-            connectionBadge.ToolTip = "通信诊断（累计计数，重启设备清零）：\n" + line;
+            lastLinkLine = line; connectionBadge.ToolTip = Lang.T("link.diag") + line;
             // The compact heartbeat is only sent to firmware that advertises it; an
             // older firmware keeps receiving the full 17-byte heartbeat frame.  Say so
             // in the log, because "which heartbeat is running" decides the margin.
@@ -395,6 +427,7 @@ public sealed partial class ControlWindow : Window
                                : "HOST heartbeat: legacy 36 wire bytes per beat, 40 ms idle target");
             supportsShortHeartbeat = compact;
             supportsMotionRates = line.Split(' ').Contains("motion_rates=1");
+            supportsLiveRates = line.Split(' ').Contains("rates_live=1");
             supportsJointLimits = line.Split(' ').Contains("joint_limits=1");
             // Compatibility is the numeric wire-contract version, not the build id: a new build with the same
             // contract stays usable, and a changed contract is refused even if the build id did not change.
@@ -409,16 +442,16 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("PTP refused:")) {
             // A queued packet may be refused after STOP invalidates its reference.
             // Keep the stop cause unless this refusal belongs to a pending request.
-            if (pendingPoint != 0 || lastStop.Text.Length == 0) lastStop.Text = ExplainFault(line);
+            if (pendingPoint != 0 || lastStop.Text.Length == 0) Lang.Text(lastStop, () => ExplainFault(line));
             if (pendingPoint != 0) Stop();
         }
-        else if (line.StartsWith("INPUTS:")) inputs.Text = line;
+        else if (line.StartsWith("INPUTS:")) Lang.Text(inputs, () => Lang.T("inputs.raw") + line[7..]);
         else if (line.StartsWith("STOP:") || line.StartsWith("ENABLE refused:") || line.StartsWith("HOME refused:")) {
-            if (!(stopPending && line.Contains("operator stop") && lastStop.Text.Length>0)) lastStop.Text = ExplainFault(line);
+            if (!(stopPending && line.Contains("operator stop") && lastStop.Text.Length>0)) Lang.Text(lastStop, () => ExplainFault(line));
             InvalidateManualReferenceFeedback();
             if (PointBusy) Stop();
         }
-        else if (line.StartsWith("ENABLE OK:")) lastStop.Text = "";
+        else if (line.StartsWith("ENABLE OK:")) Lang.Text(lastStop, () => "");
     }
     private void RequestEnable()
     {
@@ -426,7 +459,7 @@ public sealed partial class ControlWindow : Window
         SafeAction(() => { keyboardMask = mouseMask = 0; pendingControl = "使能"; controlRequestedAt = DateTime.UtcNow;
             if (framedControl) { lock (wireSync) { pendingControlType = 7; lastControlHeartbeat = 0; } }
             else { Send(0x41); Send(0x63); }
-            state.Text = "使能已请求，等待固件检查结果"; UpdateControls(); });
+            Lang.Text(state, () => Lang.T("state.enableReq")); UpdateControls(); });
     }
     private void RequestHome()
     {
@@ -434,13 +467,13 @@ public sealed partial class ControlWindow : Window
         SafeAction(() => { pendingControl = "回零"; controlRequestedAt = DateTime.UtcNow;
             if (framedControl) { lock (wireSync) { pendingControlType = 8; lastControlHeartbeat = 0; } }
             else { Send(0x41); Send(0x71); }
-            state.Text = "回零已请求，等待固件报告；Space / Esc 停止"; UpdateControls(); });
+            Lang.Text(state, () => Lang.T("state.homeReq")); UpdateControls(); });
     }
     private void RequestManualReference()
     {
         if (!CanManualReference || ptp is null) return;
         SafeAction(() => {
-            if (pointSequence == uint.MaxValue) throw new InvalidOperationException("运动序号用尽，请重启设备。");
+            if (pointSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("fault.seqExhausted"));
             pendingPoint = ++pointSequence; pointRequestedAt = DateTime.UtcNow; manualReferencePending = true;
             manualReferenceConfirmedEpoch=0;
             QueuePointPacket(PtpProtocol.EncodePacket(5, pendingPoint, ptp.Epoch, new JointPose(0, 0), 0));
@@ -450,23 +483,23 @@ public sealed partial class ControlWindow : Window
     }
     private void ShowDeviceState()
     {
-        if (!stopPending && manualReferencePending) { state.Text = "正在确认人工伸直零位；此指令不驱动电机。"; return; }
-        if (!stopPending && uploading is not null) { state.Text = uploadNext >= uploading.Nodes.Length ? "正在启动图形执行；等待设备确认" : $"轨迹上传：{Math.Min(uploadNext, uploading.Nodes.Length)} / {uploading.Nodes.Length} 点；等待确认，上传时不运动"; return; }
-        if (!stopPending && uploaded is not null) { state.Text = $"图形已上传（{uploaded.Nodes.Length} 点，未运动）；落笔后点“执行图形”"; return; }
-        if (!stopPending && executing) { state.Text = $"图形执行：{trajectoryIndex} / {trajectoryTotal} 段\narm2 为命令步数；末端位置未实测。"; return; }
-        state.Text = stopPending ? "停止已请求，等待固件确认" : PointBusy ?
-            (ptp is { Active: 2 } ? "XY 单点：停稳并检查到位" : ptp is { Active: 1 } ? "XY 单点：双轴协调移动中" : "XY 单点：等待固件接收") +
-            "\narm1 有编码器反馈；arm2 为命令步数，末端位置未实测。" : regularStateText;
+        if (!stopPending && manualReferencePending) { Lang.Text(state, () => Lang.T("state.manualRef")); return; }
+        if (!stopPending && uploading is not null) { Lang.Text(state, () => uploadNext >= uploading.Nodes.Length ? Lang.T("state.uploadStart") : Lang.T("state.uploading", Math.Min(uploadNext, uploading.Nodes.Length), uploading.Nodes.Length)); return; }
+        if (!stopPending && uploaded is not null) { Lang.Text(state, () => uploadedRan ? Lang.T("state.uploadedRan", uploaded.Nodes.Length) : Lang.T("state.uploaded", uploaded.Nodes.Length)); return; }
+        if (!stopPending && executing) { Lang.Text(state, () => Lang.T("state.executing", trajectoryIndex, trajectoryTotal)); return; }
+        Lang.Text(state, () => stopPending ? Lang.T("state.stopReq") : PointBusy ?
+            (ptp is { Active: 2 } ? Lang.T("state.pointSettle") : ptp is { Active: 1 } ? Lang.T("state.pointMove") : Lang.T("state.pointWait")) +
+            Lang.T("state.pointNote") : regularStateText());
     }
     private void RequestTrajectory(ExecutionTrajectory plan)
     {
         if (!CanPoint || !supportsTrajectory || ptp is null) return;
         SafeAction(() => {
             ExecutionTrajectory.Validate(plan.Nodes, ptp.Limits,xyPreview.RequestedProfile);
-            if (!AtStart(plan.Nodes[0].Pose)) { lastStop.Text = "尚未确认到达这条轨迹的起点。请先低速移到起点，等待到位反馈，再执行。"; UpdateControls(); return; }
-            if ((ulong)pointSequence + (uint)plan.Nodes.Length + 1 > uint.MaxValue) throw new InvalidOperationException("运动序号用尽，请重启设备后回零。");
+            if (!AtStart(plan.Nodes[0].Pose)) { Lang.Text(lastStop, () => Lang.T("fault.notAtStart")); UpdateControls(); return; }
+            if ((ulong)pointSequence + (uint)plan.Nodes.Length + 1 > uint.MaxValue) throw new InvalidOperationException(Lang.T("fault.seqExhaustedHome"));
             StartExperiment("trajectory",pointSequence+1,plan.Nodes);
-            uploading = plan; uploaded = null; uploadNext = 0; trajectoryEpoch = ptp.Epoch; uploadStartedAt = DateTime.UtcNow;
+            uploading = plan; uploaded = null; uploadedRan = false; uploadNext = 0; trajectoryEpoch = ptp.Epoch; uploadStartedAt = DateTime.UtcNow;
             xyPreview.PausePlayback();
             Append($"HOST trajectory upload start nodes={plan.Nodes.Length} duration={plan.Duration:F3}s; no automatic approach");
             SendNextTrajectoryPacket();
@@ -476,7 +509,9 @@ public sealed partial class ControlWindow : Window
     {
         if (uploaded is not { } plan || !CanPoint || ptp is null || ptp.Epoch != trajectoryEpoch || !AtStart(plan.Nodes[0].Pose)) return;
         SafeAction(() => {
-            uploading = plan; uploaded = null; uploadNext = plan.Nodes.Length;
+            // The first run continues the upload's recording; a repeat starts its own (the previous one finished with "complete").
+            if (experiment is null || experimentPhase != "trajectory") StartExperiment("trajectory", pointSequence + 1, plan.Nodes);
+            uploading = runPlan = plan; uploaded = null; uploadNext = plan.Nodes.Length;
             Append("HOST trajectory run requested; the device checks the start position again");
             SendNextTrajectoryPacket();
         });
@@ -513,7 +548,7 @@ public sealed partial class ControlWindow : Window
             if (run) { uploading = null; executing = true; }
             else if (++uploadNext == plan.Nodes.Length) {
                 // Fully loaded: the device holds the plan and does not move until the operator asks for RUN.
-                uploading = null; uploaded = plan;
+                uploading = null; uploaded = plan; uploadedRan = false;
                 Append("HOST trajectory upload complete; waiting for the operator to start it (no automatic run)");
             }
             else SendNextTrajectoryPacket();
@@ -521,15 +556,19 @@ public sealed partial class ControlWindow : Window
         if (executing && seq == trajectoryRunSequence && epoch == trajectoryEpoch) {
             if (mode is not (3 or 4) || count != total || total < 2) { Stop(); return; }
             lastTrajectoryAt = DateTime.UtcNow; trajectoryIndex = (int)values[3]; trajectoryTotal = (int)total - 1;
-            if (mode == 4) { executing = false; experimentCompleting = "complete"; Append("HOST trajectory complete; firmware arm1 check passed, arm2 commanded only"); }
+            if (mode == 4) {
+                // The device keeps the nodes after a run (state 4): hold the plan so 执行图形 can repeat it.
+                executing = false; experimentCompleting = "complete"; uploaded = runPlan; uploadedRan = true; Append("HOST trajectory complete; firmware arm1 check passed, arm2 commanded only"); }
         }
+        // The device dropped the plan it held (new speeds invalidate it): forget it too, or 执行图形 would offer a plan that is gone.
+        if (mode == 0 && uploaded is not null && uploading is null && !executing) { uploaded = null; uploadedRan = false; Append("HOST the device dropped the held plan; upload it again"); }
         ShowDeviceState(); UpdateControls();
     }
     private void RequestPoint(JointPose pose)
     {
-        if (!CanPoint || uploaded is not null || ptp is null || !ptp.Limits.Contains(PtpProtocol.Quantize(pose))) return;
+        if (!CanPoint || (uploaded is not null && !uploadedRan) || ptp is null || !ptp.Limits.Contains(PtpProtocol.Quantize(pose))) return;
         SafeAction(() => {
-            if (pointSequence == uint.MaxValue) throw new InvalidOperationException("PTP 序号用尽，请重启设备后重新建立坐标参考。");
+            if (pointSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("fault.seqExhaustedRef"));
             if (xyPreview.RequestedProfile is not { } profile || telemetry is null) return;
             double rate=Math.Min(DeviceContract.PlanRateMax,Math.Min(profile.R1,profile.R2));
             StartExperiment("point",pointSequence+1,[new(pose,0)]);
@@ -564,7 +603,8 @@ public sealed partial class ControlWindow : Window
         if (pendingPoint == 0) return;
         double age = (now - pointRequestedAt).TotalSeconds;
         if (age >= 3) {
-            lastStop.Text=$"设备未确认指令 {pendingPoint}（已发送 {pointAttempts} 次）。已停止；请检查串口和丢包日志，再重新使能。";
+            uint sequence = pendingPoint; int attempts = pointAttempts;
+            Lang.Text(lastStop, () => Lang.T("fault.pointTimeout", sequence, attempts));
             Append($"HOST PTP acknowledgement timeout seq={pendingPoint} attempts={pointAttempts}; stopping"); Stop(); return;
         }
         // Same seq/epoch/payload: firmware only acknowledges duplicates, never restarts motion.
@@ -589,73 +629,76 @@ public sealed partial class ControlWindow : Window
         lock (wireSync) { pointWire.Clear(); }
         pendingPoint = 0; ptp = null;
         manualReferencePending = false;
-        uploading = uploaded = null; executing = false;
+        uploading = uploaded = runPlan = null; executing = false;
         keyboardMask = mouseMask = 0;
         pendingControl = null; telemetry = null;
         if (serial is not null) {
             stopPending = true;
-            state.Text = "停止已请求，等待固件确认";
+            Lang.Text(state, () => Lang.T("state.stopReq"));
             SafeAction(() => { Send(0x79); Send(0x41); });
         }
         PublishHeartbeatLease();   // disabled confirmation first, then idle epoch probes
-        try { FinishExperiment("aborted"); } catch(Exception ex) { experimentResult.Text = "已请求停止；结果摘要保存失败：" + ex.Message; }
+        try { FinishExperiment("aborted"); } catch(Exception ex) { Lang.Text(experimentResult, () => Lang.T("fault.saveSummary") + ex.Message); }
         UpdateControls();
     }
-    private void UpdateControls()
+    private void UpdateControls(bool synchronize = true)
     {
-        SynchronizeJointLimits(DateTime.UtcNow);
+        if (synchronize) SynchronizeJointLimits(DateTime.UtcNow);
         Volatile.Write(ref limitsMotionAllowed, LimitsReady ? 1 : 0);
-        if (manualReferenceConfirmedEpoch!=0 && (!enabled || homing || ptp is not { Referenced:true } || ptp.Epoch!=manualReferenceConfirmedEpoch))
+        if (synchronize && manualReferenceConfirmedEpoch!=0 && (!enabled || homing || ptp is not { Referenced:true } || ptp.Epoch!=manualReferenceConfirmedEpoch))
             InvalidateManualReferenceFeedback();
         // The device forgets a loaded plan when its reference epoch changes or it is disabled.
-        if (uploaded is not null && (!enabled || homing || ptp is not { Referenced: true } || ptp.Epoch != trajectoryEpoch)) uploaded = null;
-        xyPreview.SetEditingAllowed(!PointBusy && !homing);
+        if (synchronize && uploaded is not null && (!enabled || homing || ptp is not { Referenced: true } || ptp.Epoch != trajectoryEpoch)) uploaded = null;
+        if (synchronize) xyPreview.SetEditingAllowed(!PointBusy && !homing);
         enable.IsEnabled = LimitsReady && compatible && !enabled && !stopPending && !PointBusy;
         manualReference.IsEnabled = CanManualReference;
         manualReference.Background=manualReference.BorderBrush=manualReferenceConfirmedEpoch!=0?WorkbenchTheme.Teal:WorkbenchTheme.Blue;
         home.IsEnabled = LimitsReady && compatible && enabled && !homing && !stopPending && !PointBusy;
         foreach (var button in jogButtons) button.IsEnabled = LimitsReady && compatible && enabled && !homing && !stopPending && !PointBusy;
-        string reason = !stage2 ? "图形执行需要 stage2-v2 固件；当前只可预览。" :
-            ptp is { Locked: true } ? "当前板上仍是锁定固件；请烧录 stage2-manual-reference 版本，再人工确认零位或回零。" :
-            PointBusy ? "运动指令发送 / 执行中；总停止按钮可中止。" :
-            stopPending ? "等待停止确认；随后重新使能，再人工确认零位或回零。" :
+        string reason = !stage2 ? Lang.T("reason.needStage2") :
+            ptp is { Locked: true } ? Lang.T("reason.lockedFw") :
+            PointBusy ? Lang.T("reason.busy") :
+            stopPending ? Lang.T("reason.waitStop") :
             !LimitsReady ? LimitsStatus :
-            !enabled ? "未使能：请点“使能 / 重新检查”，再人工确认零位或回零。" :
-            homing ? "正在回零：等待两轴完成并报告 HOME OK。" :
-            !homed ? (supportsManualReference ? "坐标参考未建立：把两杆摆直，点击工具栏“人工确认当前位置为伸直零位”；也可选择开关回零。" : "坐标参考未建立：当前固件需开关回零；人工确认功能需要 stage2-v3。") :
-            !feedbackReady ? "驱动、编码器或方向状态未就绪，请查看状态和停止原因。" :
-            ptp is not { Referenced: true, Epoch: > 0 } ? "XY 参考无效：重新摆直并人工确认零位，或执行开关回零。" :
-            (DateTime.UtcNow - lastPtpAt).TotalSeconds >= 2 ? "XY 固件状态超过 2 秒未更新，请检查通信。" :
-            supportsTelemetry && (telemetry is null || (DateTime.UtcNow-lastTelemetryAt).TotalSeconds >= 2) ? "等待 v5 当前角度反馈；超过 2 秒请检查通信。" :
-            supportsTelemetry && telemetry is { Inputs: > 0 } ? "传感器或驱动输入触发；请查看右侧输入 / 状态。" :
-            keyboardMask != 0 || mouseMask != 0 ? "请松开所有点动按键。" :
-            CanPoint ? (supportsTrajectory ? "设备已就绪：目标须通过下方范围检查，再移到轨迹起点，上传图形并落笔后执行。固件范围为临时软件限制。" :
-                "当前固件仅支持单点移动；图形执行需要 stage2-v2 固件。") :
-            "单点执行：等待有效坐标参考、编码器反馈和新鲜固件状态。";
-        xyPreview.SetPointMoveState(CanPoint, reportedLimits, reason, supportsTrajectory, LimitsReady, uploaded);
-        xyPreview.SetStartFeedback(supportsTelemetry && telemetry is { Referenced: true } && ptp is { Referenced: true } &&
-            telemetry.Epoch == ptp.Epoch && telemetry.Sequence == ptp.Sequence && (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2 ? telemetry : null);
+            !enabled ? Lang.T("reason.notEnabled") :
+            homing ? Lang.T("reason.homing") :
+            !homed ? (supportsManualReference ? Lang.T("reason.needManualRef") : Lang.T("reason.needHome")) :
+            !feedbackReady ? Lang.T("reason.notReady") :
+            ptp is not { Referenced: true, Epoch: > 0 } ? Lang.T("reason.badRef") :
+            (DateTime.UtcNow - lastPtpAt).TotalSeconds >= 2 ? Lang.T("reason.stalePtp") :
+            supportsTelemetry && (telemetry is null || (DateTime.UtcNow-lastTelemetryAt).TotalSeconds >= 2) ? Lang.T("reason.waitTelem") :
+            supportsTelemetry && telemetry is { Inputs: > 0 } ? Lang.T("reason.inputsHit") :
+            keyboardMask != 0 || mouseMask != 0 ? Lang.T("reason.keysDown") :
+            CanPoint ? (supportsTrajectory ? Lang.T("reason.readyTrajectory") :
+                Lang.T("reason.pointOnly")) :
+            Lang.T("reason.needRef");
+        xyPreview.SetPointMoveState(CanPoint, reportedLimits, reason, supportsTrajectory, LimitsReady, uploaded, uploadedRan);
+        var devicePose = supportsTelemetry && telemetry is { Referenced: true } && ptp is { Referenced: true } &&
+            telemetry.Epoch == ptp.Epoch && telemetry.Sequence == ptp.Sequence && (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2 ? telemetry : null;
+        // The canvas draws the device arm whenever there is a pose; otherwise it says why it shows the offline plan.
+        xyPreview.SetStartFeedback(devicePose, devicePose is not null || !compatible ? null :
+            homing ? Lang.T("why.homing") : ptp is not { Referenced: true } ? Lang.T("why.noRef") : Lang.T("why.waitFeed"));
         readInputs.IsEnabled = compatible && !PointBusy && !homing;
-        referenceStatus.Text = "坐标参考：" + (ptp is { Referenced: true } ? "已建立" + (telemetry is { Referenced: true } ? " · " + telemetry.ReferenceName : "") : "未建立");
-        rangeStatus.Text = "关节范围：" + (LimitsReady ? "已同步" : "未同步");
+        referenceStatus.Text = Lang.T("status.ref") + (ptp is { Referenced: true } ? Lang.T("status.ref.on") + (telemetry is { Referenced: true } ? " · " + telemetry.ReferenceName : "") : Lang.T("status.ref.off"));
+        rangeStatus.Text = Lang.T("status.range") + (LimitsReady ? Lang.T("status.range.on") : Lang.T("status.range.off"));
         leds[0].Fill = enabled ? WorkbenchTheme.Ok : WorkbenchTheme.Idle;
         leds[1].Fill = !compatible ? WorkbenchTheme.Idle : ptp is { Referenced: true } ? WorkbenchTheme.Ok : WorkbenchTheme.Warn;
-        connectionBadge.Text = compatible ? (framedControl ? "在线 · v7 校验控制" : hardwareUart ? "在线 · v6 硬件串口" : supportsTelemetry ? "在线 · v5 兼容慢速串口" : "在线 · 旧固件，建议更新") : "未连接 · 离线预览";
+        connectionBadge.Text = compatible ? (framedControl ? Lang.T("badge.v7") : hardwareUart ? Lang.T("badge.v6") : supportsTelemetry ? Lang.T("badge.v5") : Lang.T("badge.old")) : Lang.T("badge.offline");
         bool statusFault=lastStop.Text.Length>0 && (!enabled || stopPending);
         bool statusBusy=PointBusy || homing || stopPending;
-        string? statusMessage=stopPending?"停止请求已发送，等待设备确认":
+        string? statusMessage=stopPending?Lang.T("msg.stopSent"):
             statusFault?lastStop.Text.Split('\n')[0]:
-            uploading is {} plan?(uploadNext>=plan.Nodes.Length?"正在启动图形执行，等待设备确认":$"上传 {Math.Min(uploadNext,plan.Nodes.Length)} / {plan.Nodes.Length} 点，上传期间不运动"):
-            executing?$"正在绘制 {trajectoryIndex} / {trajectoryTotal} 段":
-            manualReferencePending?"正在确认人工零位；等待设备确认，不运动":
-            pendingControl is not null?$"正在{pendingControl}，等待设备确认":
-            homing?"正在开关回零":PointBusy?"正在低速移动 / 到位检查":
-            !compatible?"连接设备；离线可预览":!stage2?"当前固件仅支持点动，完整绘图需 v5":
+            uploading is {} plan?(uploadNext>=plan.Nodes.Length?Lang.T("msg.uploadRun"):Lang.T("msg.uploadPoint", Math.Min(uploadNext,plan.Nodes.Length), plan.Nodes.Length)):
+            executing?Lang.T("msg.drawing", trajectoryIndex, trajectoryTotal):
+            manualReferencePending?Lang.T("msg.manualRef"):
+            pendingControl is not null?Lang.T("msg.ctl", pendingControl=="使能"?Lang.T("ctl.enable"):Lang.T("ctl.home")):
+            homing?Lang.T("msg.homing"):PointBusy?Lang.T("msg.slowMove"):
+            !compatible?Lang.T("msg.connectFirst"):!stage2?Lang.T("msg.pointOnly"):
             !LimitsReady?LimitsStatus:
-            !enabled?"请点工具栏“使能 / 重新检查”":!homed?"请点工具栏确认人工零位或回零":
+            !enabled?Lang.T("msg.enableBtn"):!homed?Lang.T("msg.homeOrRef"):
             CanPoint?null:reason;
         if(uploading is {} upload && uploadNext>0 && uploadNext<upload.Nodes.Length && !statusFault)
-            statusMessage+=$" · 预计剩余 {Math.Max(0,(DateTime.UtcNow-uploadStartedAt).TotalSeconds*(upload.Nodes.Length-uploadNext)/uploadNext):F0} 秒";
+            statusMessage+=Lang.T("msg.eta", Math.Max(0,(DateTime.UtcNow-uploadStartedAt).TotalSeconds*(upload.Nodes.Length-uploadNext)/uploadNext));
         double percent=uploading is {} p?uploadNext*100.0/p.Nodes.Length:executing?trajectoryIndex*100.0/Math.Max(1,trajectoryTotal):0;
         xyPreview.SetDeviceStatus(statusMessage,statusFault,statusBusy,percent,
             stopPending || pendingControl is not null || homing || ptp is { Active: > 0 } && !executing);
@@ -666,10 +709,11 @@ public sealed partial class ControlWindow : Window
         catch (Exception ex) {
             Trace.TraceError(ex.ToString());
             try { Append("HOST exception: " + ex); } catch { /* Preserve fail-stop even if logging failed. */ }
-            Disconnect("操作失败：" + ex.GetType().Name + "：" + ex.Message + "；请确认下位机已停止");
+            Disconnect(() => Lang.T("fault.opFail") + ex.GetType().Name + "：" + ex.Message + Lang.T("fault.opFailSuffix"));
         }
     }
-    private void Disconnect(string reason)
+    private void Disconnect(string reason) => Disconnect(() => reason);
+    private void Disconnect(Func<string> reason)
     {
         // Stop the writer before the port closes so it cannot write to a dead handle,
         // then report the session while the capability flags still describe it.
@@ -678,7 +722,7 @@ public sealed partial class ControlWindow : Window
         ResetWireSession();
         ResetControlTransport();
         CancelLimitSync();
-        reportedLimits = null; reportedProfile = null; supportsJointLimits = supportsMotionRates = protocolMatches = limitsAwaitingState = false; protocolVersion = 0; reportedProfile=null; limitSyncError = "";
+        reportedLimits = null; reportedProfile = null; supportsJointLimits = supportsMotionRates = supportsLiveRates = protocolMatches = limitsAwaitingState = false; protocolVersion = 0; reportedProfile=null; limitSyncError = "";
         lock (wireSync) { reportedEpoch = 0; waitingStopEpoch = false; }
         framedControl = false; heartbeatTimer.Interval = TimeSpan.FromMilliseconds(40);
         InvalidateManualReferenceFeedback();
@@ -689,15 +733,15 @@ public sealed partial class ControlWindow : Window
         uploading = uploaded = null; executing = supportsTrajectory = false;
         manualReferencePending = supportsManualReference = hardwareReady = false;
         try { Send(0x79); } catch { /* Firmware heartbeat timeout remains the fallback. */ }
-        hardwareUart = false; supportsShortHeartbeat = false; connectionBadge.ToolTip = null;
-        try { FinishExperiment("disconnected: " + reason); } catch(Exception ex) { experimentResult.Text = "实验摘要保存失败：" + ex.Message; }
+        hardwareUart = false; supportsShortHeartbeat = false; connectionBadge.ToolTip = null; lastLinkLine = null;
+        try { FinishExperiment("disconnected: " + reason()); } catch(Exception ex) { Lang.Text(experimentResult, () => Lang.T("fault.saveSummary2") + ex.Message); }
         try { serial?.Dispose(); } catch { }
         serial = null;
         compatible = enabled = homing = stopPending = false;
-        pending.Clear(); state.Text = reason; inputs.Text = "输入状态已失效，需重新连接读取";
-        ShowFeedback(null, "设备已断开；当前位置反馈无效。"); errorHistory.Clear(); DrawErrorPlot();
-        connect.Content = "连接"; ports.IsEnabled = true; UpdateControls();
-        try { Append("HOST " + reason); } catch { }
+        pending.Clear(); Lang.Text(state, reason); regularStateText = reason; Lang.Text(inputs, () => Lang.T("fault.inputsInvalid"));
+        ShowFeedback(null, () => Lang.T("fault.unplugReason")); errorHistory.Clear(); DrawErrorPlot();
+        connect.Content = Lang.T("btn.connect"); ports.IsEnabled = true; UpdateControls();
+        try { Append("HOST " + reason()); } catch { }
         try { recording?.Dispose(); } catch { }
         recording = null;
     }
@@ -714,8 +758,12 @@ public sealed partial class ControlWindow : Window
     }
     public static void SelfTest(string? snapshotPath = null)
     {
+        Lang.Set(false, persist: false);   // assertions below match the Chinese UI copy
+        Lang.SelfTest();
+        LanguageSelfTest(snapshotPath);
         MotionProfileSelfTest();
         JointLimitsSyncSelfTest();
+        LiveRatesSyncSelfTest();
         StopRecoverySelfTest();
         ShapeFlowSelfTest();
         // Accumulate step by step: a later failure used to discard every earlier
@@ -747,6 +795,12 @@ public sealed partial class ControlWindow : Window
         var window = new ControlWindow { selfTesting = true };
         static void Check(bool condition, [System.Runtime.CompilerServices.CallerArgumentExpression(nameof(condition))] string? expression = null)
         { if (!condition) throw new InvalidOperationException("UI state check failed: " + expression); }
+        // One-click language toggle rewrites live chrome without rebuilding the window.
+        Check((string)window.langToggle.Content! == "EN" && (string)window.connect.Content! == "连接" && window.Title.Contains("轨迹工作台"));
+        Lang.Toggle();
+        Check((string)window.langToggle.Content! == "中" && (string)window.connect.Content! == "Connect" && window.Title.Contains("Trajectory"));
+        Lang.Toggle();
+        Check((string)window.langToggle.Content! == "EN" && (string)window.connect.Content! == "连接");
         // CanPoint also needs the device to report rates equal to the request and telemetry matching the
         // reference epoch AND sequence (HandleTelemetry drops anything else), as real firmware does periodically.
         void Arm(int epoch, uint seq = 0) {
@@ -913,7 +967,13 @@ public sealed partial class ControlWindow : Window
         window.TestLine($"TRAJ_STATE state=3 count={execution.Nodes.Length} total={execution.Nodes.Length} index=1 seq={window.pendingPoint} epoch=8");
         Check(window.uploading is null && window.executing && window.pointWire.Count == 0 && window.pendingPoint == 0);
         window.TestLine($"TRAJ_STATE state=4 count={execution.Nodes.Length} total={execution.Nodes.Length} index={execution.Nodes.Length} seq={window.trajectoryRunSequence} epoch=8");
-        Check(!window.executing);
+        Check(!window.executing && window.uploaded == execution && window.uploadedRan); // the device keeps a finished plan
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={window.trajectoryRunSequence} min1=-6000 max1=6000 min2=-9000 max2=9000");
+        StartSample(8,window.trajectoryRunSequence);
+        window.RequestExecute(); Check(window.uploading is not null && window.uploaded is null && window.pointWire.Count == 36); // repeat: RUN only, no upload
+        window.TestLine($"TRAJ_STATE state=3 count={execution.Nodes.Length} total={execution.Nodes.Length} index=1 seq={window.pendingPoint} epoch=8");
+        window.TestLine($"TRAJ_STATE state=4 count={execution.Nodes.Length} total={execution.Nodes.Length} index={execution.Nodes.Length} seq={window.trajectoryRunSequence} epoch=8");
+        Check(!window.executing && window.uploaded == execution && window.uploadedRan);
         window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={window.trajectoryRunSequence} min1=-6000 max1=6000 min2=-9000 max2=9000");
         StartSample(8,window.trajectoryRunSequence);
         window.RequestTrajectory(execution); Check(window.uploading is not null);
@@ -941,7 +1001,7 @@ public sealed partial class ControlWindow : Window
             int p1=ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose), p2=ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose);
             window.errorHistory.Clear();
             for(int i=0;i<40;i++) window.TestLine($"TELEM t={i*500} epoch=30 seq=10000 ref=1 source=2 p1={p1} p2={p2} e1={(int)Math.Round(p1*2.56)+i%9-4} err=0 inputs=0 drops=0");
-            window.lastStop.Text=""; window.connectionBadge.Text="离线界面检查 · 模拟数据";
+            Lang.Text(window.lastStop, () => ""); window.connectionBadge.Text="离线界面检查 · 模拟数据";
             string dir=Path.GetDirectoryName(snapshotPath)!;
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench.png"),1380,930);
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-compact.png"),1100,760);
@@ -954,6 +1014,40 @@ public sealed partial class ControlWindow : Window
             window.TestLine("STATE fw=stage2-v5 enabled=0 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
             window.connectionBadge.Text="离线界面检查 · 模拟未使能";
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-waiting.png"),1100,760);
+            // Every group folds: collapsed, only the header row may remain in the layout; expanded, the body is back.
+            var sections = window.Sections().ToList();
+            if (sections.Count < 8) throw new InvalidOperationException("Collapsible groups missing: " + sections.Count);
+            foreach (var section in sections) section.IsExpanded = false;
+            window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-collapsed.png"),1380,930);
+            var headerOnly = sections.Select(section => section.ActualHeight).ToList();
+            if (headerOnly.Any(height => height > 40)) throw new InvalidOperationException("A collapsed group kept its body in the layout: " + string.Join(", ", headerOnly));
+            foreach (var section in sections) section.IsExpanded = true;
+            window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-expanded.png"),1380,930);
+            if (sections.Where((section, i) => section.ActualHeight <= headerOnly[i] + 10).Any()) throw new InvalidOperationException("An expanded group has no body");
+            // The side columns are draggable: a drag on each splitter must move exactly that column's width.
+            var splitters = Descendants(window).OfType<GridSplitter>().ToList();
+            if (splitters.Count != 2) throw new InvalidOperationException("Expected two column splitters, found " + splitters.Count);
+            window.Show(); window.UpdateLayout();
+            var columns = ((Grid)splitters[0].Parent).ColumnDefinitions;
+            double leftWidth = columns[0].ActualWidth, rightWidth = columns[4].ActualWidth;
+            void Drag(GridSplitter splitter, double dx) {
+                splitter.RaiseEvent(new System.Windows.Controls.Primitives.DragStartedEventArgs(0, 0));
+                splitter.RaiseEvent(new System.Windows.Controls.Primitives.DragDeltaEventArgs(dx, 0));
+                splitter.RaiseEvent(new System.Windows.Controls.Primitives.DragCompletedEventArgs(dx, 0, false));
+                window.UpdateLayout();
+            }
+            Drag(splitters[0], 40); Drag(splitters[1], -30);
+            if (Math.Abs(columns[0].ActualWidth - (leftWidth + 40)) > 1 || Math.Abs(columns[4].ActualWidth - (rightWidth + 30)) > 1)
+                throw new InvalidOperationException($"Splitters did not resize the side columns: left {leftWidth}->{columns[0].ActualWidth}, right {rightWidth}->{columns[4].ActualWidth}");
+            Drag(splitters[0], -10000); Drag(splitters[1], 10000);
+            if (columns[0].ActualWidth < columns[0].MinWidth - 1 || columns[4].ActualWidth < columns[4].MinWidth - 1)
+                throw new InvalidOperationException("Splitters ignored the minimum column widths");
+            window.Hide();
+            // The solid arm tracks the device even when it differs from the plan; the plan stays as a dashed ghost.
+            window.xyPreview.FitView(false);
+            var away = new JointPose(10, 25);
+            window.TestLine($"TELEM t=30000 epoch=30 seq=10000 ref=1 source=2 p1={ExecutionTrajectory.Counts(0,away)} p2={ExecutionTrajectory.Counts(1,away)} e1=0 err=0 inputs=0 drops=0");
+            window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-device-moved.png"),1380,930);
         }
         window.Close();
     }

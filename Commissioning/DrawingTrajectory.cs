@@ -27,10 +27,10 @@ public sealed class DrawingTrajectory
     {
         if (!Enum.IsDefined(shape) || branch is < 0 or > 1 ||
             new[] { x, y, a, b }.Any(v => !double.IsFinite(v) || Math.Abs(v) > 20000))
-            throw new ArgumentException("图形参数须为 ±20000 内的有限数值，分支须有效。");
+            throw Lang.Error("err.shapeRange");
         if (limits is { } l && (new[] { l.Min1, l.Max1, l.Min2, l.Max2 }.Any(v => !double.IsFinite(v)) ||
             l.Min1 < -180 || l.Max1 > 180 || l.Min2 < -180 || l.Max2 > 180 || l.Min1 >= l.Max1 || l.Min2 >= l.Max2))
-            throw new ArgumentException("关节范围无效。");
+            throw Lang.Error("err.jointRange");
         var points = new List<Point> { new(x, y) };
         var stops = new List<int> { 0 };
         void Segment(Point end)
@@ -38,26 +38,26 @@ public sealed class DrawingTrajectory
             Point start = points[^1];
             Vector delta = end - start;
             int count = (int)Math.Ceiling(delta.Length); // at most 1 mm between samples
-            if (points.Count + count > 5000) throw new ArgumentException("轨迹过长：最多 5000 个预览点，请缩小图形。");
+            if (points.Count + count > 5000) throw Lang.Error("err.tooManyPoints");
             for (int i = 1; i <= count; i++) points.Add(start + delta * ((double)i / count));
             stops.Add(points.Count - 1);
         }
         switch (shape)
         {
             case DrawingShape.Line:
-                if ((new Point(a, b) - points[0]).Length < 0.001) throw new ArgumentException("直线起点与终点不能重合。");
+                if ((new Point(a, b) - points[0]).Length < 0.001) throw Lang.Error("err.lineDegenerate");
                 Segment(new Point(a, b)); break;
             case DrawingShape.Rectangle:
-                if (a < 0.001 || b < 0.001) throw new ArgumentException("矩形宽、高至少为 0.001 mm。");
+                if (a < 0.001 || b < 0.001) throw Lang.Error("err.rectSize");
                 Segment(new Point(x + a, y)); Segment(new Point(x + a, y + b));
                 Segment(new Point(x, y + b)); Segment(new Point(x, y)); break;
             case DrawingShape.Circle:
-                if (a < 0.001) throw new ArgumentException("圆半径至少为 0.001 mm。");
+                if (a < 0.001) throw Lang.Error("err.circleRadius");
                 // Check the exact circle as well as the sampled chords, including extrema between samples.
                 double centerRadius = Math.Sqrt(x * x + y * y);
                 CheckRadius(Math.Abs(centerRadius - a), centerRadius + a);
                 int count = Math.Max(32, (int)Math.Ceiling(2 * Math.PI * a));
-                if (count + 1 > 5000) throw new ArgumentException("圆周过长：最多 5000 个预览点，请缩小半径。");
+                if (count + 1 > 5000) throw Lang.Error("err.circleTooLong");
                 points.Clear();
                 for (int i = 0; i < count; i++)
                 {
@@ -69,9 +69,9 @@ public sealed class DrawingTrajectory
         void CheckRadius(double min, double max)
         {
             if (min < model.InnerRadius - 1e-8 || max > model.OuterRadius + 1e-8)
-                throw new ArgumentException("轨迹经过几何不可达区域；请移动或缩小图形。");
+                throw Lang.Error("err.geomUnreachable");
             if (min <= model.InnerRadius + 1e-6 || max >= model.OuterRadius - 1e-6)
-                throw new ArgumentException("轨迹触及完全伸直或折叠的奇异位形；请留出余量。");
+                throw Lang.Error("err.singularPath");
         }
         var samples = new DrawingSample[points.Count];
         double distance = 0;
@@ -98,7 +98,7 @@ public sealed class DrawingTrajectory
                 };
             }
             if (limits is { } range && !range.Contains(pose))
-                throw new ArgumentException($"第 {i + 1} 个采样点超出规划范围：q1={pose.Q1:F2}°，q2={pose.Q2:F2}°；允许 q1 [{range.Min1:F2},{range.Max1:F2}]°、q2 [{range.Min2:F2},{range.Max2:F2}]°。红区、规划与设备执行共用当前关节范围，请调整图形或关节范围。");
+                throw Lang.Error("err.sampleOutOfRange", i + 1, pose.Q1, pose.Q2, range.Min1, range.Max1, range.Min2, range.Max2);
             samples[i] = new DrawingSample(distance, point, pose);
         }
         bool nearSingularity = samples.Any(s => Math.Abs(Math.Sin((s.Pose.Q2 - s.Pose.Q1) * Math.PI / 180)) < 0.05);
@@ -116,7 +116,7 @@ public sealed class DrawingTrajectory
             };
             nearSingularity |= Math.Abs(Math.Sin((pose.Q2 - pose.Q1) * Math.PI / 180)) < 0.05;
             if (limits is { } range && !range.Contains(pose))
-                throw new ArgumentException($"图形在采样点之间超出当前关节范围：q1={pose.Q1:F6}°，q2={pose.Q2:F6}°；请调整图形或关节范围。");
+                throw Lang.Error("err.betweenSamples", pose.Q1, pose.Q2);
         }
         if (shape == DrawingShape.Circle)
         {

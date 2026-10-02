@@ -8,6 +8,9 @@ public sealed partial class ControlWindow
     private bool protocolMatches;      // the firmware's proto=<n> equals DeviceContract.ProtocolVersion
     private int protocolVersion;       // proto=<n> from the last LINK line, 0 when absent
     private bool supportsMotionRates;
+    private bool supportsLiveRates;          // LINK rates_live=1: the firmware takes speed/accel while enabled and idle
+    private DateTime lastLimitsEditAt;       // when the requested range or speeds last changed
+    private const double LiveSyncSettleMs = 400;   // an enabled device waits for the inputs to settle (a slider drag is one request)
     private MotionProfile? reportedProfile;
     private byte limitType=9;
     private JointLimits? reportedLimits;
@@ -28,19 +31,20 @@ public sealed partial class ControlWindow
     private bool LimitsReady => compatible && framedControl && protocolMatches && xyPreview.RequestedLimits is { } wanted && reportedLimits == wanted &&
         RatesReady && limitAxis < 0 && !limitsAwaitingState;
 
-    private string LimitsStatus => !protocolMatches ? $"固件协议版本不匹配（固件 proto={(protocolVersion == 0 ? "无" : protocolVersion.ToString())}，上位机需要 proto={DeviceContract.ProtocolVersion}）：请更新固件，并使用同一交付里的固件与上位机；运动已锁定。" :
-        xyPreview.RequestedProfile is null ? "机构尺寸或全局速度无效，请检查设置。" :
-        !supportsMotionRates ? "固件没有声明全局速度支持（motion_rates=1）；请更新固件后重新连接。" :
-        xyPreview.RequestedLimits is null ? "关节范围输入无效；请填写 ±180° 内、包含零位的有效范围（最多两位小数）。" :
-        limitSyncError.Length > 0 ? limitSyncError :
-        reportedLimits is null ? "等待设备确认关节范围；确认范围前不能使能或运动。" :
-        enabled && !LimitsReady ? "关节范围或全局速度与设备不一致：先总停止，禁用后自动同步，再重新使能。" :
-        !supportsJointLimits && !LimitsReady ? "当前固件的关节范围与输入不一致；请更新支持范围同步的固件。" :
-        "正在同步关节范围与全局速度，等待设备确认；确认前不能使能或运动。";
+    private string LimitsStatus => !protocolMatches ? Lang.T("limits.protoMismatch",
+            protocolVersion == 0 ? (Lang.IsEn ? "none" : "无") : protocolVersion.ToString(), DeviceContract.ProtocolVersion.ToString()) :
+        xyPreview.RequestedProfile is null ? Lang.T("limits.invalidProfile") :
+        !supportsMotionRates ? Lang.T("limits.noRates") :
+        xyPreview.RequestedLimits is null ? Lang.T("limits.invalidRange") :
+        limitSyncError.Length > 0 ? Lang.T(limitSyncError) :
+        reportedLimits is null ? Lang.T("limits.awaitDevice") :
+        enabled && !LimitsReady ? Lang.T(!supportsLiveRates ? "limits.mismatch" : xyPreview.RequestedLimits == reportedLimits ? "limits.liveRates" : "limits.rangeMismatch") :
+        !supportsJointLimits && !LimitsReady ? Lang.T("limits.fwMismatch") :
+        Lang.T("limits.syncing");
 
     private void OnLimitsChanged()
     {
-        limitSyncError = "";
+        limitSyncError = ""; lastLimitsEditAt = DateTime.UtcNow;
         lock (wireSync) {
             if (limitAxis >= 0 && limitAttempts >= 3) { limitAttempts = 0; limitRequestedAt = DateTime.MinValue; }
         }
@@ -111,14 +115,16 @@ public sealed partial class ControlWindow
         {
             if (limitAxis >= 0 && limitEpoch != reportedEpoch) CancelLimitSync(requireState: true);
             if (LimitsReady) { limitSyncError = ""; return; }
-            if (!compatible || !protocolMatches || !framedControl || !supportsJointLimits || enabled || homing || stopPending ||
+            // Speeds follow an enabled, idle device; the firmware refuses them while anything moves, and ranges need the stop first.
+            bool live = enabled && supportsLiveRates && keyboardMask == 0 && mouseMask == 0 && (now - lastLimitsEditAt).TotalMilliseconds >= LiveSyncSettleMs;
+            if (!compatible || !protocolMatches || !framedControl || !supportsJointLimits || (enabled && !live) || homing || stopPending ||
                 PointBusy || waitingStopEpoch || reportedEpoch == 0) return;
             if (limitAxis >= 0) {
                 if (pendingControlType is 9 or 10 || (now - limitRequestedAt).TotalSeconds < 1) return;
                 if (limitAttempts >= 3) {
                     if (limitSyncError.Length > 0) return;
-                    limitSyncError = "范围/速度同步未获完整确认；请重新连接，或修改设置后重试。";
-                    Append("HOST " + limitSyncError); return;
+                    limitSyncError = "limits.syncTimeout";
+                    Append("HOST " + Lang.T(limitSyncError)); return;
                 }
                 limitAttempts++; limitRequestedAt = now; pendingControlType = limitType;
                 Append($"HOST joint limits retry axis={limitAxis} seq={limitSequence} attempt={limitAttempts}/3");
@@ -127,6 +133,7 @@ public sealed partial class ControlWindow
             if (desired is not { } wanted || reportedLimits is null || limitsAwaitingState) return;
             var actual = reportedLimits.Value;
             if(wanted!=actual) {
+                if (enabled) return;   // a range change needs STOP ALL first
                 limitType=9;
                 limitAxis = wanted.Min1 != actual.Min1 || wanted.Max1 != actual.Max1 ? 0 : 1;
                 limitBounds = limitAxis == 0 ? new(wanted.Min1, wanted.Max1) : new(wanted.Min2, wanted.Max2);
@@ -226,6 +233,85 @@ public sealed partial class ControlWindow
         }
         finally { w.Close(); }
     }
+
+    // Speeds and accelerations follow an enabled, idle device when the firmware says rates_live=1, once the inputs have
+    // settled; ranges still wait for STOP ALL, and a firmware without the flag keeps the old rule.
+    private static void LiveRatesSyncSelfTest()
+    {
+        var w = new ControlWindow { selfTesting = true };
+        static void Check(bool yes, string reason) { if (!yes) throw new InvalidOperationException("Live rates sync: " + reason); }
+        var frames = new List<byte[]>();
+        void Write(byte[] data, int offset, int count) {
+            if (offset == 0 && (frames.Count == 0 || !ReferenceEquals(frames[^1], data))) frames.Add(data);
+        }
+        static int Type(byte[] frame) => (frame[1] >> 1) & 15;
+        string Link(bool live) => $"LINK uart=hw baud=115200 fw=stage2-v7-test short_hb=1 joint_limits=1 motion_rates=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion}" + (live ? " rates_live=1" : "");
+        void Device(MotionProfile rates, int axisRange = 6000) {
+            w.HandleLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
+            w.HandleLine($"PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=1 min1=-3000 max1=3000 min2=-{axisRange} max2={axisRange}");
+            w.HandleLine($"MOTION_RATES epoch=7 r1={rates.R1} r2={rates.R2} a1={rates.A1} a2={rates.A2}");
+        }
+        byte[] SendConfig() {
+            w.PublishHeartbeatLease();
+            for (int i = 0; i < 6; i++) {
+                w.WireWriterStep(Write);
+                if (frames.Count > 0 && frames[^1].Length == 36 && Type(frames[^1]) == 10) return frames[^1];
+            }
+            throw new InvalidOperationException("Live rates sync: speed configuration not emitted");
+        }
+        void Ack() => w.HandleLine($"PTP_RATES epoch=7 seq={w.limitSequence} axis={w.limitAxis} min={(int)Math.Round(w.limitBounds.Q1 * 100)} max={(int)Math.Round(w.limitBounds.Q2 * 100)}");
+        var later = TimeSpan.FromSeconds(2);
+        try {
+            w.HandleLine(Link(true));
+            var before = w.xyPreview.RequestedProfile!.Value;
+            Device(before);
+            Check(w.enabled && w.LimitsReady, "an enabled device that reports the requested ranges and speeds must be ready");
+            // A speed edit: nothing is sent while the inputs are still moving, then one request, no stop, no enable change.
+            w.xyPreview.RestoreRatesForSelfTest("8", "3", "10", "6");
+            var wanted = w.xyPreview.RequestedProfile!.Value;
+            Check(wanted.R1 != before.R1 && !w.LimitsReady && w.LimitsStatus.Contains("自动同步"), "an edited speed must lock motion and say it syncs by itself");
+            w.SynchronizeJointLimits(DateTime.UtcNow);
+            Check(w.limitAxis < 0 && w.pendingControlType == 0, "a request left before the input settled");
+            w.SynchronizeJointLimits(DateTime.UtcNow + later);
+            Check(w.limitType == 10 && w.limitAxis == 0 && w.pendingControlType == 10 && w.enabled, "the settled speed was not queued as axis-0 type 10");
+            SendConfig(); Ack();
+            Check(!w.LimitsReady, "ACK alone confirmed the speeds");
+            Device(wanted);
+            Check(w.LimitsReady && w.enabled && w.limitAxis < 0, "the reported speeds did not finish the sync");
+            Check(!frames.Any(f => f.Length == 36 && Type(f) == 9), "a speed sync wrote a range");
+            // A range edit on an enabled device still waits for STOP ALL, and says so.
+            w.xyPreview.RestoreLimitsForSelfTest("-20", "20", "-60", "60");
+            w.SynchronizeJointLimits(DateTime.UtcNow + later);
+            Check(w.limitAxis < 0 && w.pendingControlType == 0 && !w.LimitsReady && w.LimitsStatus.Contains("先总停止"), "an enabled range change must wait for STOP ALL");
+            w.xyPreview.RestoreLimitsForSelfTest("-30", "30", "-60", "60");
+            Check(w.LimitsReady, "putting the range back must restore the match");
+            // A held key, or a move in progress, keeps the sync waiting.
+            w.xyPreview.RestoreRatesForSelfTest("9", "3", "10", "6");
+            w.keyboardMask = 1; w.SynchronizeJointLimits(DateTime.UtcNow + later);
+            Check(w.limitAxis < 0, "a held jog key must keep the speed sync waiting");
+            w.keyboardMask = 0; w.executing = true; w.SynchronizeJointLimits(DateTime.UtcNow + later); w.executing = false;
+            Check(w.limitAxis < 0, "a running shape must keep the speed sync waiting");
+            w.SynchronizeJointLimits(DateTime.UtcNow + later);
+            Check(w.limitAxis == 0, "an idle device did not get the speed after the key and the run ended");
+            // A held plan the device drops is forgotten too.
+            w.HandleLine("TRAJ_STATE state=0 count=0 total=0 index=0 seq=1 epoch=7");
+            w.xyPreview.SelectShapeForSelfTest(3); w.xyPreview.LoadExampleForSelfTest();
+            var plan = w.xyPreview.Plan!;
+            w.trajectoryEpoch = 7; w.uploaded = plan;
+            w.HandleLine($"TRAJ_STATE state=2 count={plan.Nodes.Length} total={plan.Nodes.Length} index=0 seq=2 epoch=7");
+            Check(w.uploaded == plan, "a held plan must survive its own status line");
+            w.HandleLine("TRAJ_STATE state=0 count=0 total=0 index=0 seq=2 epoch=7");
+            Check(w.uploaded is null, "the device dropped the plan but the host still offers it");
+            // Firmware without rates_live: the old rule, speeds wait for STOP ALL.
+            w.CancelLimitSync(); w.HandleLine(Link(false));
+            w.xyPreview.RestoreRatesForSelfTest("7", "3", "10", "6");
+            w.SynchronizeJointLimits(DateTime.UtcNow + later);
+            Check(w.limitAxis < 0 && w.pendingControlType == 0 && w.LimitsStatus.Contains("先总停止"), "firmware without rates_live must not get speeds while enabled");
+            w.Disconnect("live rates self-test");
+            Check(!w.supportsLiveRates, "disconnect kept the live-rates capability");
+        }
+        finally { w.Close(); }
+    }
 }
 
 public sealed partial class XYPreviewPanel
@@ -234,6 +320,12 @@ public sealed partial class XYPreviewPanel
     {
         var fields = ParameterFields.Select(f => f.Text).ToArray();
         fields[6] = minA; fields[7] = maxA; fields[8] = minB; fields[9] = maxB;
+        RestoreParameters(System.Text.Json.JsonSerializer.Serialize(new SavedParameters(1, shape.SelectedIndex, branch.SelectedIndex, fields)));
+    }
+    internal void RestoreRatesForSelfTest(string v1Text, string v2Text, string a1Text, string a2Text)
+    {
+        var fields = ParameterFields.Select(f => f.Text).ToArray();
+        fields[11] = v1Text; fields[12] = v2Text; fields[13] = a1Text; fields[14] = a2Text;
         RestoreParameters(System.Text.Json.JsonSerializer.Serialize(new SavedParameters(1, shape.SelectedIndex, branch.SelectedIndex, fields)));
     }
 }
