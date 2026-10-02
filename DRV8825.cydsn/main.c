@@ -72,7 +72,7 @@
  * The STATE line keeps the plain "stage2-v7" token because the host matches it to
  * select the framed transport.  Bump this on every firmware change so a field log
  * can answer "was this fix actually flashed?". */
-#define FW_BUILD_ID                 "stage2-v7-absolute-q2-elbow-r4000-live"
+#define FW_BUILD_ID                 "stage2-v7-absolute-q2-elbow-r4000-telem"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -352,7 +352,7 @@ static void dbg_puts(const char *s)
     }
 }
 
-static char g_dbg[256];   /* the LINK line alone is ~180 characters */
+static char g_dbg[320];   /* the LINK line alone is ~230 characters; a FAULT_SNAPSHOT ~270 */
 #define DBG(s)       dbg_puts(s)
 #define DBGF(...)    do { snprintf(g_dbg, sizeof(g_dbg), __VA_ARGS__); \
                           dbg_puts(g_dbg); } while (0)
@@ -977,6 +977,11 @@ static uint8 txq_pending(void)
     return (g_txqHead != g_txqTail) ? 1u : 0u;
 }
 
+static uint16 txq_free(void)
+{
+    return (uint16)((g_txqTail + TXQ_SIZE - g_txqHead - 1u) % TXQ_SIZE);
+}
+
 static void txq_send_one(void)
 {
     if (g_txqHead != g_txqTail && HostUart_GetTxBufferSize() < HostUart_TX_BUFFER_SIZE - 1u)
@@ -1046,6 +1051,7 @@ static void uart_discard_rx(void)
 }
 #else
 static uint8 txq_pending(void)       { return 0u; }
+static uint16 txq_free(void)         { return 0u; }
 static void  txq_send_one(void)      { }
 static void  txq_flush_blocking(void){ }
 static int16 uart_rx_service(void)     { return -1; }
@@ -1122,6 +1128,15 @@ static uint8 g_limitsAccepted[15];
 static uint16 g_motionRate[2] = { JOG1_RATE_MAX_USTEP_S, JOG2_RATE_MAX_USTEP_S };
 static uint16 g_motionAccel[2] = { JOG1_ACCEL_USTEP_S2, JOG2_ACCEL_USTEP_S2 };
 static uint8 g_ratesAccepted[15];
+/* Position telemetry stream (control type 11).  0 = the TELEM line only rides in the 500 ms status block, as before;
+ * 5..20 Hz = a standalone TELEM line at that rate while enabled.  It never takes the last half of the transmit queue:
+ * when the queue is that full the line is skipped (counted), so ACKs and stop messages keep their room. */
+#define TELEM_HZ_MIN                (5u)
+#define TELEM_HZ_MAX                (20u)
+#define TELEM_MIN_FREE_BYTES        (1024u)
+static uint8  g_telemHz;
+static uint8  g_telemAccepted[15];
+static uint32 g_telemLastMs, g_telemSent, g_telemSkipped, g_telemMaxCy;
 static uint32 motion_min(uint32 a, uint32 b) { return a < b ? a : b; }
 
 static struct {
@@ -1277,10 +1292,35 @@ static void ptp_invalidate(void)
     if (++g_ptp.epoch == 0u) { ++g_ptp.epoch; }
 }
 
+/* What the machine was doing when a stop began, as one key=value line printed BEFORE anything is reset.  It states
+ * only what is known: the nFAULT pin cannot tell over-current from over-temperature or under-voltage, so a driver
+ * stop says drv=nfault_undetermined and nothing more.  Positions are as in TELEM (relative to the reference). */
+static const char *stop_phase(void)
+{
+    if (g_home.phase != HOME_IDLE) { return "home"; }
+    if (g_ptp.active) { return g_traj.state == 3u ? "traj_run" : "ptp"; }
+    if (g_traj.state == 1u) { return "traj_upload"; }
+    if (g_arm1.moving || g_arm2.moving || g_arm1.want || g_arm2.want) { return "jog"; }
+    return g_motionEnabled ? "idle" : "disabled";
+}
+static void fault_snapshot(const char *reason, uint8 driverFault)
+{
+    JLOGF("FAULT_SNAPSHOT t=%lu epoch=%lu seq=%lu phase=%s home=%u traj=%u idx=%u/%u ref=%u p1=%ld p2=%ld e1=%ld err=%ld inputs=%u hb_age_ms=%lu hb_max_gap_ms=%lu drv=%s reason=\"%s\"\r\n",
+          (unsigned long)g_jogMs,(unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,stop_phase(),
+          (unsigned)g_home.phase,(unsigned)g_traj.state,(unsigned)g_traj.index,(unsigned)g_traj.count,
+          (unsigned)(g_ptp.reference && g_directionKnown && g_arm1.hasEnc && !g_enc.badStreak),
+          (long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
+          (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),(long)(cmd_lsb()-g_enc.pos),
+          (unsigned)((HARD_LIMIT_ACTIVE()?1u:0u)|(ARM1_HOME_ACTIVE()?2u:0u)|(ARM2_NPN_ACTIVE()?4u:0u)|(FAULT_ACTIVE()?8u:0u)),
+          (unsigned long)(g_keysSeen ? (g_jogMs - g_lastKeyMs) : 0u),(unsigned long)g_keyMaxGapMs,
+          (driverFault != 0u || FAULT_ACTIVE()) ? "nfault_undetermined" : "ok", reason);
+}
+
 /* Protective stops retain holding current unless the driver itself faults.
  * The explicit operator STOP also disables both drivers at its command entry. */
 static void stage_stop(const char *reason, uint8 driverFault)
 {
+    fault_snapshot(reason, driverFault);
     JLOGF("STOP context: home=%u arm=%u phase_steps=%lu key_age_ms=%lu key_max_gap_ms=%lu rx_good=%lu late=%lu rejected=%lu\r\n",
           (unsigned)g_home.phase, (unsigned)g_home.arm, (unsigned long)g_home.steps,
           (unsigned long)(g_jogMs - g_lastKeyMs), (unsigned long)g_keyMaxGapMs, (unsigned long)g_rxGood,
@@ -1575,6 +1615,28 @@ static void joint_limits_accept(const uint8 *p)
     motion_config_status(); /* configuration ACKs need no full diagnostic burst */
 }
 
+/* Type 11: how often position telemetry is streamed (0 = off, else 5..20 Hz).  It only changes what is printed, so
+ * it is taken at any time (enabled, moving, uploading).  The epoch and sequence rules are the usual ones; an exact
+ * retry only repeats the receipt. */
+static void telem_rate_accept(const uint8 *p)
+{
+    uint32 seq=ptp_u32(p+1);
+    uint16 hz=ptp_u16(p+13);
+    if(ptp_u32(p+5)!=g_ptp.epoch) {
+        g_rxRejected++; g_ptpEpochRejected++; ptp_announce_epoch();
+        JLOG("TELEM_RATE refused: stale epoch\r\n"); return;
+    }
+    if(!seq || ptp_u16(p+9) || ptp_u16(p+11) || (hz!=0u && (hz<TELEM_HZ_MIN || hz>TELEM_HZ_MAX))) {
+        g_rxRejected++; JLOG("TELEM_RATE refused: rate\r\n"); return;
+    }
+    if(memcmp(g_telemAccepted,p,15u)!=0) {
+        if(seq<=g_controlSequence) { g_rxRejected++; JLOG("TELEM_RATE refused: stale sequence\r\n"); return; }
+        g_telemHz=(uint8)hz; g_telemLastMs=g_jogMs;
+        g_controlSequence=seq; memcpy(g_telemAccepted,p,15u);
+    }
+    JLOGF("TELEM_RATE epoch=%lu seq=%lu hz=%u\r\n",(unsigned long)g_ptp.epoch,(unsigned long)seq,(unsigned)g_telemHz);
+}
+
 /* A separate sequence lets periodic input leases coexist with contiguous
  * trajectory nodes, using the same CRC envelope and current reference epoch. */
 static void control_accept(const uint8 *p)
@@ -1673,6 +1735,7 @@ static void ptp_accept(void)
     jog_axis_t *axes[2]; axes[0]=&g_arm1; axes[1]=&g_arm2;
     if (ptp_crc(p,15u) != ptp_u16(p+15)) { g_ptpRxDropped++; g_ptpRxCrc++; JLOG("PTP RX dropped: CRC\r\n"); return; }
     if (p[0]==9u || p[0]==10u) { joint_limits_accept(p); return; }
+    if (p[0]==11u) { telem_rate_accept(p); return; }
     if (p[0]>=6u && p[0]<=8u) { control_accept(p); return; }
     if (p[0] < 1u || p[0] > 5u) { JLOG("PTP refused: version\r\n"); return; }
     if (!PTP_COMMISSIONED) { JLOG("PTP refused: commissioning lock\r\n"); return; }
@@ -2158,6 +2221,35 @@ static void motion_config_status(void)
           (unsigned)g_motionRate[0],(unsigned)g_motionRate[1],(unsigned)g_motionAccel[0],(unsigned)g_motionAccel[1]);
 }
 
+/* One coherent, low-rate sample, no extra encoder transactions. Positive = CCW.
+ * e1 is motor encoder LSB relative to the reference; arm2 is commanded only. */
+static void telem_line(void)
+{
+    JLOGF("TELEM t=%lu epoch=%lu seq=%lu ref=%u source=%u p1=%ld p2=%ld e1=%ld err=%ld inputs=%u drops=%lu\r\n",
+        (unsigned long)g_jogMs,(unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,
+        (unsigned)(g_ptp.reference && g_directionKnown && g_arm1.hasEnc && !g_enc.badStreak),
+        (unsigned)g_ptp.referenceSource,(long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
+        (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),
+        (long)(cmd_lsb()-g_enc.pos),
+        (unsigned)((HARD_LIMIT_ACTIVE()?1u:0u)|(ARM1_HOME_ACTIVE()?2u:0u)|(ARM2_NPN_ACTIVE()?4u:0u)|(FAULT_ACTIVE()?8u:0u)),
+        (unsigned long)g_ptpRxDropped);
+}
+
+/* The streamed TELEM line, between status blocks.  Its cost is measured (telem_max_us in TELEM_DIAG) because the
+ * formatting runs in the same loop that times the step pulses. */
+static void telem_service(void)
+{
+    uint32 started, cost;
+    if (g_telemHz == 0u || g_motionEnabled == 0u || (g_jogMs - g_telemLastMs) < (1000u / g_telemHz)) { return; }
+    g_telemLastMs = g_jogMs;
+    if (txq_free() < TELEM_MIN_FREE_BYTES) { g_telemSkipped++; return; }
+    started = SU_NOW();
+    telem_line();
+    cost = SU_ELAPSED(started);
+    if (cost > g_telemMaxCy) { g_telemMaxCy = cost; }
+    g_telemSent++;
+}
+
 static void stage_status(void)
 {
     JLOGF("STATE fw=stage2-v7 enabled=%u home=%u homed1=%u homed2=%u fault=%u enc=%u dir=%u\r\n",
@@ -2168,8 +2260,10 @@ static void stage_status(void)
     motion_config_status();
     JLOGF("PTP_CHECK final_lsb=%d follow_lsb=%d\r\n",PTP_FINAL_ERROR_LSB,SLIP_FAIL_LSB);
     traj_status();
-    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 proto=%u\r\n",
-          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)PROTO_VERSION);
+    /* traj_repeat: a held plan that already ran accepts another RUN.  fault_snapshot: every stop prints a FAULT_SNAPSHOT
+     * line first.  telem_hz: the streamed TELEM rate in force (0 = status block only); its presence means type 11 exists. */
+    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 traj_repeat=1 fault_snapshot=1 telem_hz=%u proto=%u\r\n",
+          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)g_telemHz, (unsigned)PROTO_VERSION);
     /* Frame loss by cause: rx_error only sees UART-level faults, so a frame that
      * simply arrives short must be counted here or it stays invisible. */
     JLOGF("PTP_RX short_ok=%lu drop_crc=%lu drop_short=%lu drop_timeout=%lu rejected=%lu epoch_rejected=%lu last_rejected_byte=0x%02X\r\n",
@@ -2182,16 +2276,9 @@ static void stage_status(void)
     JLOGF("ENC_DIAG irq_max_us=%lu retries=%lu rejected=%lu gap_max_ms=%lu follow_peak_lsb=%lu\r\n",
           (unsigned long)(g_encIrqMaxCy/SU_CY_PER_US),(unsigned long)g_encRetries,
           (unsigned long)g_encRejected,(unsigned long)g_encMaxGapMs,(unsigned long)g_followPeakLsb);
-    /* One coherent, low-rate sample, no extra encoder transactions. Positive = CCW.
-     * e1 is motor encoder LSB relative to the reference; arm2 is commanded only. */
-    JLOGF("TELEM t=%lu epoch=%lu seq=%lu ref=%u source=%u p1=%ld p2=%ld e1=%ld err=%ld inputs=%u drops=%lu\r\n",
-        (unsigned long)g_jogMs,(unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,
-        (unsigned)(g_ptp.reference && g_directionKnown && g_arm1.hasEnc && !g_enc.badStreak),
-        (unsigned)g_ptp.referenceSource,(long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
-        (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),
-        (long)(cmd_lsb()-g_enc.pos),
-        (unsigned)((HARD_LIMIT_ACTIVE()?1u:0u)|(ARM1_HOME_ACTIVE()?2u:0u)|(ARM2_NPN_ACTIVE()?4u:0u)|(FAULT_ACTIVE()?8u:0u)),
-        (unsigned long)g_ptpRxDropped);
+    JLOGF("TELEM_DIAG hz=%u sent=%lu skipped=%lu max_us=%lu\r\n",
+          (unsigned)g_telemHz,(unsigned long)g_telemSent,(unsigned long)g_telemSkipped,(unsigned long)(g_telemMaxCy/SU_CY_PER_US));
+    telem_line();
 }
 
 static void stage_enable(void)
@@ -2663,6 +2750,7 @@ static void jog_tick(void)
     jog_update_time();
     if ((g_jogMs - lastStatus) >= JOG_STATUS_MS)
     { lastStatus = g_jogMs; stage_status(); }
+    telem_service();
     if (g_motionEnabled == 0u) { return; }
     if (jog_safety_blocked() != 0u) { return; }
     if (g_home.phase != HOME_IDLE || g_ptp.active) { return; }

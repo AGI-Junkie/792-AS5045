@@ -68,7 +68,7 @@ public static class PtpProtocol
     }
     public static byte[] EncodePacket(byte type, uint sequence, uint epoch, JointPose pose, ushort value)
     {
-        if (type is < 1 or > 10 || sequence == 0 || epoch == 0 || !double.IsFinite(pose.Q1) ||
+        if (type is < 1 or > 11 || sequence == 0 || epoch == 0 || !double.IsFinite(pose.Q1) ||
             !double.IsFinite(pose.Q2) || Math.Abs(pose.Q1) > 180 || Math.Abs(pose.Q2) > (type==10?DeviceContract.Arm1AccelMax/100.0:180))
             throw Lang.Error("err.motionPacket");
         if (type is >= 6 and <= 8 && (pose.Q1 != 0 || pose.Q2 != 0 || value > (type == 6 ? 15 : 0)))
@@ -77,6 +77,9 @@ public static class PtpProtocol
         if (type == 10 && (value>1 || pose!=Quantize(pose) || pose.Q1<0.2 || pose.Q1>(value==0?DeviceContract.Arm1RateMax:DeviceContract.Arm2RateMax)/100.0 ||
                         pose.Q2<1 || pose.Q2>(value==0?DeviceContract.Arm1AccelMax:DeviceContract.Arm2AccelMax)/100.0))
             throw Lang.Error("err.rateConfig");
+        // Type 11 is the telemetry rate: no angles, and the rate (0 = status block only) in the value.
+        if (type == 11 && (pose.Q1 != 0 || pose.Q2 != 0 || value != 0 && value is < DeviceContract.TelemRateMin or > DeviceContract.TelemRateMax))
+            throw Lang.Error("err.telemRate");
         pose = Quantize(pose);
         if (type == 9 && (value > 2 || pose.Q1 >= pose.Q2 || pose.Q1 > 0 || pose.Q2 < 0))   // axis 2 is the elbow
             throw Lang.Error("err.limitContainsZero");
@@ -121,6 +124,18 @@ public static class PtpProtocol
         foreach (string bad in new[] { "emin=-18001 emax=100", "emin=-100 emax=18001", "emin=100 emax=200", "emin=-200 emax=-100", "emin=5 emax=5", "emin=100 emax=-100" })
             Check(PtpState.Parse("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 " + bad) is null);
         Check(EncodePacket(9, 1, 7, new(-180, 180), 1).Length == 36 && EncodePacket(9, 1, 7, new(-155, 155), 2).Length == 36);
+        // Type 11: the stream rate is 0 or 5..20 Hz and carries no angles.
+        var rateWire = EncodePacket(11, 3, 7, new JointPose(0, 0), 10);
+        var rateBytes = new byte[17];
+        for (int i = 0; i < 17; i++) rateBytes[i] = (byte)(((rateWire[1 + i * 2] >> 1) & 15) | (((rateWire[2 + i * 2] >> 1) & 15) << 4));
+        Check(rateWire.Length == 36 && rateBytes[0] == 11 && BinaryPrimitives.ReadUInt16LittleEndian(rateBytes.AsSpan(13)) == 10 && BinaryPrimitives.ReadUInt16LittleEndian(rateBytes.AsSpan(15)) == Crc(rateBytes.AsSpan(0, 15)));
+        Check(EncodePacket(11, 1, 7, new JointPose(0, 0), 0).Length == 36 && EncodePacket(11, 1, 7, new JointPose(0, 0), 20).Length == 36);
+        foreach (var (pose, rate) in new[] { (new JointPose(0, 0), (ushort)4), (new JointPose(0, 0), (ushort)21), (new JointPose(1, 0), (ushort)10), (new JointPose(0, 1), (ushort)10) })
+        {
+            bool refused = false;
+            try { EncodePacket(11, 1, 7, pose, rate); } catch (ArgumentException) { refused = true; }
+            Check(refused);
+        }
         foreach (var invalid in new[] { (new JointPose(-30,30), (ushort)3), (new JointPose(1,30), (ushort)0),
             (new JointPose(-30,-1), (ushort)0), (new JointPose(0,0), (ushort)0),
             (new JointPose(-180.01,30), (ushort)0), (new JointPose(-30,30.001), (ushort)0) }) {

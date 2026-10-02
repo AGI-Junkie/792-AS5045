@@ -39,9 +39,13 @@ public sealed partial class ControlWindow
         }
         if (telemetry?.Epoch != sample.Epoch) errorHistory.Clear();
         telemetry = sample; lastTelemetryAt = DateTime.UtcNow;
+        RememberTelemetry(sample);
+        // Streamed at 10-20 Hz the panel repaints at about 7 Hz; the recorder and the pre-fault buffer still get every sample.
+        bool paint = reportedTelemHz < 10 || (lastTelemetryAt - lastFeedbackPaintAt).TotalMilliseconds >= StreamPaintMs;
+        if (paint) lastFeedbackPaintAt = lastTelemetryAt;
         if (sample.Referenced) {
-            ShowFeedback(sample, () => Lang.T("status.ref") + sample.ReferenceName);
-            errorHistory.Enqueue(sample.Error1); while(errorHistory.Count > 120) errorHistory.Dequeue(); DrawErrorPlot();
+            if (paint) ShowFeedback(sample, () => Lang.T("status.ref") + sample.ReferenceName);
+            errorHistory.Enqueue(sample.Error1); while(errorHistory.Count > 600) errorHistory.Dequeue(); if (paint) DrawErrorPlot();
             if (experiment is { } recorder) {
                 recorder.Record(sample,uploading is not null ? "upload" : uploaded is not null ? "ready" : experimentPhase=="trajectory" ? "drawing" : "point",trajectoryIndex);
                 Lang.Text(experimentResult, () => recorder.MotionSamples==0 ? Lang.T("exp.savedWaiting", recorder.Samples) :
@@ -62,7 +66,7 @@ public sealed partial class ControlWindow
         if (telemetry is not { Referenced: true } || ptp is null || telemetry.Epoch != ptp.Epoch ||
             (DateTime.UtcNow-lastTelemetryAt).TotalSeconds >= 2) throw new IOException(Lang.T("fault.experimentMissingFeedback"));
         FinishExperiment("replaced"); errorHistory.Clear(); DrawErrorPlot();
-        experiment = new ExperimentRecorder(ExperimentRoot,kind,sequence,ptp.Epoch,xyPreview.Model,xyPreview.SettingsDescription,telemetry.ReferenceName,nodes);
+        experiment = new ExperimentRecorder(ExperimentRoot,kind,sequence,ptp.Epoch,xyPreview.Model,xyPreview.SettingsDescription,telemetry.ReferenceName,nodes,Math.Max(0,reportedTelemHz));
         experimentPhase = kind; experimentSequence=sequence; experimentCompleting = null; lastExperimentDirectory = experiment.DirectoryPath;
         Append("HOST experiment recording: " + lastExperimentDirectory);
     }

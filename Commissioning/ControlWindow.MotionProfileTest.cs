@@ -47,6 +47,7 @@ public sealed partial class ControlWindow
     {
         supportsMotionRates=true;
         if(line.StartsWith("LINK ") && !line.Contains("motion_rates=")) line+=" motion_rates=1";
+        if(line.StartsWith("LINK ") && !line.Contains("traj_repeat=")) line+=" traj_repeat=1";   // fixtures model a firmware that repeats a held plan
         HandleLine(line);
         if(line.StartsWith("PTP_STATE ") && PtpState.Parse(line) is { } state) {
             var p=MotionProfile.From(new PlanningRates(20,5,3,10,6));

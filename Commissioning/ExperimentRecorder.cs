@@ -46,7 +46,7 @@ public sealed class ExperimentRecorder : IDisposable
     private readonly DateTime started = DateTime.UtcNow;
     private bool finished;
     public ExperimentRecorder(string root, string kind, uint sequence, uint epoch, PlanarArm model, string settings,
-        string reference, ExecutionNode[] nodes)
+        string reference, ExecutionNode[] nodes, int telemetryHz = 0)
     {
         this.model = model; Epoch = epoch;
         DirectoryPath = Path.Combine(root, $"{DateTime.Now:yyyyMMdd-HHmmss-fff}-{kind}-{sequence}");
@@ -55,7 +55,9 @@ public sealed class ExperimentRecorder : IDisposable
             schema = 1, kind, sequence, epoch, reference, started_utc = started, model.L1, model.L2, settings,
             completion_file = "summary.json; absence means recording was interrupted before finalization",
             feedback = "arm1 motor encoder through nominal 40:1 ratio; arm2 commanded only; XY model estimate; no measured pen XY",
-            sampling = "approximately 2 Hz plus state transitions; not a high-rate tracking accuracy test"
+            telemetry_hz = telemetryHz,
+            sampling = telemetryHz > 0 ? $"streamed telemetry at {telemetryHz} Hz (firmware skips a line rather than crowd its transmit queue; see TELEM_DIAG skipped= in the log)"
+                                       : "approximately 2 Hz plus state transitions; not a high-rate tracking accuracy test"
         }, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
         var plan = new StringBuilder("index,time_ms,q1_target_deg,q2_target_deg,p1_ccw_microsteps,p2_ccw_microsteps\n");
         int time = 0;

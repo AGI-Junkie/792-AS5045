@@ -414,6 +414,9 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("CONTROL seq=") && uint.TryParse(line.AsSpan(12), out uint lastControl))
             lock (wireSync) { controlSequence = Math.Max(controlSequence, lastControl); }
         else if (line.StartsWith("MOTION_RATES ")) { ObserveMotionRates(line); }
+        else if (line.StartsWith("TELEM_RATE ")) { ObserveTelemetryRate(line); }
+        else if (line.StartsWith("TELEM_DIAG ")) { ObserveTelemetryDiagnostics(line); }
+        else if (line.StartsWith("FAULT_SNAPSHOT ")) { HandleFaultSnapshot(line); }
         else if (line.StartsWith("PTP_LIMITS ") || line.StartsWith("PTP_RATES ")) { HandleLimitsAck(line); UpdateControls(); }
         else if (line.StartsWith("TRAJ_STATE ")) HandleTrajectoryState(line);
         else if (line.StartsWith("TELEM ")) HandleTelemetry(line);
@@ -435,6 +438,7 @@ public sealed partial class ControlWindow : Window
             supportsMotionRates = line.Split(' ').Contains("motion_rates=1");
             supportsLiveRates = line.Split(' ').Contains("rates_live=1");
             supportsJointLimits = line.Split(' ').Contains("joint_limits=1");
+            ReadCapabilities(line.Split(' '));
             // Compatibility is the numeric wire-contract version, not the build id: a new build with the same
             // contract stays usable, and a changed contract is refused even if the build id did not change.
             protocolVersion = line.Split(' ').Where(w => w.StartsWith("proto=", StringComparison.Ordinal))
@@ -564,7 +568,10 @@ public sealed partial class ControlWindow : Window
             lastTrajectoryAt = DateTime.UtcNow; trajectoryIndex = (int)values[3]; trajectoryTotal = (int)total - 1;
             if (mode == 4) {
                 // The device keeps the nodes after a run (state 4): hold the plan so 执行图形 can repeat it.
-                executing = false; experimentCompleting = "complete"; uploaded = runPlan; uploadedRan = true; Append("HOST trajectory complete; firmware arm1 check passed, arm2 commanded only"); }
+                executing = false; experimentCompleting = "complete"; uploaded = supportsTrajRepeat ? runPlan : null; uploadedRan = uploaded is not null; Append("HOST trajectory complete; firmware arm1 check passed, arm2 commanded only");
+                // A firmware that does not declare traj_repeat=1 refuses a second RUN of the plan it holds (and stops): upload again instead.
+                if (!supportsTrajRepeat) Append("HOST this firmware cannot repeat a held plan (its LINK line has no traj_repeat=1); upload the plan again to draw it again");
+            }
         }
         // The device dropped the plan it held (new speeds invalidate it): forget it too, or 执行图形 would offer a plan that is gone.
         if (mode == 0 && uploaded is not null && uploading is null && !executing) { uploaded = null; uploadedRan = false; Append("HOST the device dropped the held plan; upload it again"); }
@@ -649,7 +656,7 @@ public sealed partial class ControlWindow : Window
     }
     private void UpdateControls(bool synchronize = true)
     {
-        if (synchronize) SynchronizeJointLimits(DateTime.UtcNow);
+        if (synchronize) { SynchronizeJointLimits(DateTime.UtcNow); SynchronizeTelemetryRate(DateTime.UtcNow); }
         Volatile.Write(ref limitsMotionAllowed, LimitsReady ? 1 : 0);
         if (synchronize && manualReferenceConfirmedEpoch!=0 && (!enabled || homing || ptp is not { Referenced:true } || ptp.Epoch!=manualReferenceConfirmedEpoch))
             InvalidateManualReferenceFeedback();
@@ -727,6 +734,7 @@ public sealed partial class ControlWindow : Window
         try { var summary = WireSessionSummary(); if (summary.Length > 0) Append(summary); } catch { }
         ResetWireSession();
         ResetControlTransport();
+        ResetDiagnostics();
         CancelLimitSync();
         reportedLimits = null; reportedProfile = null; supportsJointLimits = supportsMotionRates = supportsLiveRates = protocolMatches = limitsAwaitingState = false; protocolVersion = 0; reportedProfile=null; limitSyncError = "";
         lock (wireSync) { reportedEpoch = 0; waitingStopEpoch = false; }
@@ -770,6 +778,7 @@ public sealed partial class ControlWindow : Window
         MotionProfileSelfTest();
         JointLimitsSyncSelfTest();
         LiveRatesSyncSelfTest();
+        DiagnosticsSelfTest();
         StopRecoverySelfTest();
         ShapeFlowSelfTest();
         // Accumulate step by step: a later failure used to discard every earlier

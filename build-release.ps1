@@ -47,7 +47,7 @@ try {
         Arm1AccelMax = 'CFG_ACCEL_MAX_AXIS1'; Arm2AccelMax = 'CFG_ACCEL_MAX_AXIS2'
         PlanRateMax = 'PTP_RATE_MAX', 'TRAJ_RATE_MAX'; PlanAccelMax = 'PTP_ACCEL', 'TRAJ_ACCEL_MAX'; HomeSlowRate = 'HOME_SLOW_RATE_USTEP_S'
         TrajCapacity = 'TRAJ_CAPACITY'; TrajNodeMinMs = 'TRAJ_NODE_MIN_MS'; TrajNodeMaxMs = 'TRAJ_NODE_MAX_MS'
-        TrajTotalMaxMs = 'TRAJ_TOTAL_MAX_MS'; JointLimitCdMax = 'CFG_JOINT_CD_MAX'; ElbowDefaultCd = 'PTP_ELBOW_DEFAULT_CD'; DeadmanMs = 'JOG_DEADMAN_MS'; ProtocolVersion = 'PROTO_VERSION'
+        TrajTotalMaxMs = 'TRAJ_TOTAL_MAX_MS'; JointLimitCdMax = 'CFG_JOINT_CD_MAX'; ElbowDefaultCd = 'PTP_ELBOW_DEFAULT_CD'; TelemRateMin = 'TELEM_HZ_MIN'; TelemRateMax = 'TELEM_HZ_MAX'; DeadmanMs = 'JOG_DEADMAN_MS'; ProtocolVersion = 'PROTO_VERSION'
     }
     $hostValues = @{}
     foreach ($line in Get-Content -LiteralPath $contractFile) { $name, $value = $line -split '=', 2; $hostValues[$name] = [int]$value }

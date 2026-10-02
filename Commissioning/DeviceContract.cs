@@ -37,6 +37,10 @@ public static class DeviceContract
     public const int TrajNodeMaxMs = 500;           // TRAJ_NODE_MAX_MS
     public const int TrajTotalMaxMs = 600000;       // TRAJ_TOTAL_MAX_MS
 
+    // Streamed position telemetry (control type 11): 0 = only the 500 ms status block, otherwise this many TELEM lines a second.
+    public const int TelemRateMin = 5;              // TELEM_HZ_MIN
+    public const int TelemRateMax = 20;             // TELEM_HZ_MAX
+
     // Joint limits are 0.01 degree units within +/-180 degrees; the heartbeat deadline is the firmware's.
     public const int JointLimitCdMax = 18000;       // CFG_JOINT_CD_MAX
     // The elbow is motor 2's own angle q2 - q1.  Its range is a third entry of the joint limits (type 9, axis 2); this is

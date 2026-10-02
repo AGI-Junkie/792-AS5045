@@ -290,6 +290,118 @@ static void short_send(uint8 keys, int corrupt) {
 static void limits_send(uint32 seq,uint32 epoch,uint16 axis,int16 min,int16 max) {
     packetType=9;ptp_send(seq,epoch,min,max,axis,5);packetType=1;txq_flush_blocking();
 }
+static void telem_test(const char *t) {
+    uint32 seq,epoch,sent,skipped,dropped,started,elapsed; unsigned i,lines; const char *at;
+    static const uint16 badHz[]={1,4,21,100,65535};
+    /* The streamed TELEM line (control type 11) and its protections. setup() leaves the stage enabled. */
+    seq=g_controlSequence+1u;epoch=g_ptp.epoch;
+    if(!strcmp(t,"telem_rate_invalid")) {
+        packetType=11;
+        for(i=0;i<sizeof(badHz)/sizeof(badHz[0]);i++)ptp_send(seq,epoch,0,0,badHz[i],5);
+        ptp_send(seq,epoch,1,0,10,5);ptp_send(seq,epoch,0,1,10,5);   /* the angle fields must be zero */
+        ptp_send(0,epoch,0,0,10,5);ptp_send(seq,epoch-1u,0,0,10,5);  /* sequence 0, stale epoch */
+        ptp_send(seq,epoch,0,0,10,1);                                 /* corrupted CRC */
+        packetType=1;
+        assert(g_telemHz==0 && g_controlSequence<seq && g_telemSent==0);
+        return;
+    }
+    if(!strcmp(t,"telem_rate")) {
+        packetType=11;ptp_send(seq,epoch,0,0,10,5);packetType=1;txq_flush_blocking();
+        assert(g_telemHz==10 && g_controlSequence==seq && strstr(simLog,"TELEM_RATE epoch=") && strstr(simLog,"hz=10"));
+        simLogN=0;simLog[0]=0;packetType=11;ptp_send(seq,epoch,0,0,10,5);packetType=1;txq_flush_blocking();
+        assert(g_controlSequence==seq && strstr(simLog,"TELEM_RATE epoch=") && strstr(simLog,"hz=10")); /* an exact retry only repeats the receipt */
+        packetType=11;ptp_send(seq,epoch,0,0,20,5);packetType=1;
+        assert(g_telemHz==10);                                         /* the same sequence with another rate is stale */
+        packetType=11;ptp_send(g_controlSequence+1u,epoch,0,0,0,5);packetType=1;
+        assert(g_telemHz==0);                                          /* 0 switches the stream off */
+        simLogN=0;simLog[0]=0;stage_status();txq_flush_blocking();
+        assert(strstr(simLog," telem_hz=0 proto=") && strstr(simLog," traj_repeat=1") && strstr(simLog," fault_snapshot=1") && strstr(simLog,"TELEM_DIAG hz=0 sent=0"));
+        return;
+    }
+    if(!strcmp(t,"telem_stream")) {
+        /* Off: only the 500 ms status block carries TELEM, as before. */
+        simLogN=0;simLog[0]=0;
+        for(i=0;i<1000;i++)cycle(1);
+        assert(g_motionEnabled && g_telemSent==0);
+        for(lines=0,at=simLog;(at=strstr(at,"TELEM t="))!=NULL;at++)lines++;
+        assert(lines>=1 && lines<=3);
+        /* 20 Hz while enabled: one standalone line per 50 ms of device time, on top of the status blocks, with nothing dropped.
+         * (cycle() also pays for the heartbeat frames, so count against the device clock, not the loop count.) */
+        packetType=11;ptp_send(g_controlSequence+1u,epoch,0,0,20,5);packetType=1;
+        sent=g_telemSent;dropped=g_txqDropped;started=g_jogMs;simLogN=0;simLog[0]=0;
+        for(i=0;i<1000;i++)cycle(1);
+        elapsed=g_jogMs-started;
+        assert(g_motionEnabled && elapsed>=1000u && elapsed<=1400u && g_txqDropped==dropped && g_telemSkipped==0);
+        assert(g_telemSent-sent+1u>=elapsed/50u && g_telemSent-sent<=elapsed/50u+1u);
+        for(lines=0,at=simLog;(at=strstr(at,"TELEM t="))!=NULL;at++)lines++;
+        assert(lines>=g_telemSent-sent && lines<=g_telemSent-sent+3);
+        /* The slowest setting, 5 Hz. */
+        packetType=11;ptp_send(g_controlSequence+1u,epoch,0,0,5,5);packetType=1;
+        sent=g_telemSent;started=g_jogMs;
+        for(i=0;i<1000;i++)cycle(1);
+        elapsed=g_jogMs-started;
+        assert(g_telemSent-sent+1u>=elapsed/200u && g_telemSent-sent<=elapsed/200u+1u);
+        /* Disabled: no stream. */
+        jog_handle_byte(JOG_CMD_STOP);short_send(0,0);txq_flush_blocking();
+        sent=g_telemSent;g_telemLastMs=g_jogMs-1000u;telem_service();
+        assert(!g_motionEnabled && g_telemSent==sent);
+        return;
+    }
+    if(!strcmp(t,"telem_skip")) {
+        /* A nearly full transmit queue skips the stream line (counted) instead of dropping anything. */
+        char filler[101];memset(filler,'x',100);filler[100]=0;
+        g_telemHz=20;g_telemLastMs=g_jogMs-100u;
+        while(txq_free()>=TELEM_MIN_FREE_BYTES)txq_puts(filler);
+        sent=g_telemSent;skipped=g_telemSkipped;dropped=g_txqDropped;
+        telem_service();
+        assert(g_telemSkipped==skipped+1 && g_telemSent==sent && g_txqDropped==dropped);
+        txq_flush_blocking();
+        g_telemLastMs=g_jogMs-100u;telem_service();
+        assert(g_telemSent==sent+1);
+        return;
+    }
+    assert(!"unknown telem test");
+}
+static void fault_snapshot_test(void) {
+    /* One structured line per stop, printed BEFORE the stop resets anything. */
+    int32 beforeP1;
+    simLogN=0;simLog[0]=0;
+    g_ptp.origin[0]=100;g_ptp.origin[1]=200;g_arm1.usteps=40;g_arm2.usteps=50;
+    fault_snapshot("fixture protection",0u);txq_flush_blocking();
+    assert(strstr(simLog,"FAULT_SNAPSHOT t=") && strstr(simLog," phase=idle ") && strstr(simLog," p1=60 p2=150 ") &&
+           strstr(simLog,"reason=\"fixture protection\"") && strstr(simLog," drv=ok ") && strstr(simLog," hb_age_ms=") && strstr(simLog," inputs=0 "));
+    beforeP1=g_ptp.origin[0]-g_arm1.usteps;
+    simLogN=0;simLog[0]=0;
+    stage_stop("fixture protection",0u);txq_flush_blocking();
+    assert(beforeP1==60 && strstr(simLog,"FAULT_SNAPSHOT") && strstr(simLog,"STOP: fixture protection"));
+    assert(strstr(simLog,"FAULT_SNAPSHOT")<strstr(simLog,"STOP context")); /* before any reset */
+    assert(strstr(simLog," phase=idle ")); /* the phase is the one the machine was in, not "disabled" after the stop */
+    /* The phase names. */
+    g_motionEnabled=1u;
+    { static const struct { const char *name; } phases[]={{"home"},{"ptp"},{"traj_run"},{"traj_upload"},{"jog"},{"idle"},{"disabled"}}; unsigned k;
+      for(k=0;k<sizeof(phases)/sizeof(phases[0]);k++) {
+        g_home.phase=HOME_IDLE;g_ptp.active=0u;g_traj.state=0u;g_arm1.moving=0;g_motionEnabled=1u;
+        if(k==0)g_home.phase=HOME_FAST;
+        if(k==1)g_ptp.active=1u;
+        if(k==2){g_ptp.active=1u;g_traj.state=3u;}
+        if(k==3)g_traj.state=1u;
+        if(k==4)g_arm1.moving=1;
+        if(k==6)g_motionEnabled=0u;
+        simLogN=0;simLog[0]=0;fault_snapshot("x",0u);txq_flush_blocking();
+        { char want[40]; sprintf(want," phase=%s ",phases[k].name); assert(strstr(simLog,want)); }
+      } }
+    g_home.phase=HOME_IDLE;g_ptp.active=0u;g_traj.state=0u;g_arm1.moving=0;
+    /* A driver fault is never explained: the pin cannot tell over-current from over-temperature. */
+    simLogN=0;simLog[0]=0;fault_snapshot("DRV8825 nFAULT; drivers OFF",1u);txq_flush_blocking();
+    assert(strstr(simLog," drv=nfault_undetermined "));
+    assert(!strstr(simLog,"thermal") && !strstr(simLog,"over-temp") && !strstr(simLog,"overheat"));
+    simLogN=0;simLog[0]=0;simFault=1;fault_snapshot("fixture",0u);txq_flush_blocking();simFault=0;
+    assert(strstr(simLog," drv=nfault_undetermined ") && strstr(simLog," inputs=8 "));
+    /* An over-long reason is cut off by the debug buffer, never overflowed. */
+    simLogN=0;simLog[0]=0;
+    fault_snapshot("HOME direction: no credible rotor motion; check VMOT/motor/encoder; UART receive error/overflow; buffered commands discarded",0u);txq_flush_blocking();
+    assert(strstr(simLog,"FAULT_SNAPSHOT") && strstr(simLog,"reason=\"HOME direction"));
+}
 static void rates_live_test(void);
 static void rates_test(const char *t) {
     uint32 seq,epoch; unsigned i; uint32 before;
@@ -1101,9 +1213,12 @@ int main(int argc,char **argv) {
         sprintf(proto," proto=%u\r\n",(unsigned)PROTO_VERSION); /* with its end of line: the debug buffer must not cut the LINK line short */
         assert(strstr(simLog,"STATE fw=stage2-v7 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
         assert(strstr(simLog," short_hb=1") && strstr(simLog," joint_limits=1") && strstr(simLog," motion_rates=1") && strstr(simLog," rates_live=1") && strstr(simLog," q2_absolute=1"));
+        assert(strstr(simLog," traj_repeat=1") && strstr(simLog," fault_snapshot=1") && strstr(simLog," telem_hz=0 proto="));
         puts(t);return 0;
     }
     if(!strncmp(t,"limits_",7)){limits_test(t);puts(t);return 0;}
+    if(!strncmp(t,"telem_",6)){telem_test(t);puts(t);return 0;}
+    if(!strcmp(t,"fault_snapshot")){fault_snapshot_test();puts(t);return 0;}
     if(!strncmp(t,"rates_",6)){rates_test(t);puts(t);return 0;}
     if(!strncmp(t,"operator_stop_",14)) {
         uint32 epoch=g_ptp.epoch;
@@ -1561,6 +1676,7 @@ cases = ['boot','boot_bad','boot_limit','success','reverse_polarity','home_activ
 cases += ['startup_stiction','home_low_speed_tracking','home_following_stall','jog_slip_follow','jog_slip_stall','link_capabilities']
 cases += ['boot_tx_backlog','rejected_byte_status','operator_stop_reenable','operator_stop_after_protection','operator_stop_after_fault']
 cases += ['limits_'+n for n in ['configure','retry','invalid','busy','enabled']]
+cases += ['telem_rate','telem_rate_invalid','telem_stream','telem_skip','fault_snapshot']
 cases += ['rates_config','rates_jog','rates_home']
 cases += ['home_from_drawing','home_from_arm2_range','home_long_stop']
 cases += ['home_search_stop','home_search_heartbeat','home_search_limit','home_search_fault','home_release_time_limit']

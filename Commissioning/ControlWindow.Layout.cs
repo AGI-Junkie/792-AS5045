@@ -26,7 +26,9 @@ public sealed partial class ControlWindow
     private readonly Ellipse[] leds = Enumerable.Range(0, 6).Select(_ => new Ellipse { Width = 10, Height = 10, Fill = WorkbenchTheme.Idle, VerticalAlignment = VerticalAlignment.Center }).ToArray();
     private TextBlock[] jointNameBlocks = [];
     private TextBlock[] ledNameBlocks = [];
-    private TextBlock? chartTitleBlock, chartNoteBlock;
+    private TextBlock? chartTitleBlock, chartNoteBlock, telemRateLabel;
+    private readonly ComboBox telemRateBox = new() { Width = 118, Margin = new Thickness(4, 2, 4, 2) };
+    private static readonly int[] TelemChoices = [0, DeviceContract.TelemRateMin, DefaultTelemHz, DeviceContract.TelemRateMax];
     private TabItem? feedbackTab, logTab;
     private Button? stopButton, refreshButton, folderButton;
     private TextBlock? noteJogManual, noteJogStop;
@@ -46,6 +48,8 @@ public sealed partial class ControlWindow
         if (noteJogStop is { } n2) n2.Text = Lang.T("note.jogStop");
         if (chartTitleBlock is { } ct) ct.Text = Lang.T("chart.title");
         if (chartNoteBlock is { } cn) cn.Text = Lang.T("note.chart");
+        if (telemRateLabel is { } tl) tl.Text = Lang.T("lbl.telemRate");
+        Lang.RefreshText(faultDetail);
         if (feedbackTab is { } ft) ft.Header = Lang.T("tab.feedback");
         if (logTab is { } lt) { lt.Header = Lang.T("tab.log"); lt.ToolTip = Lang.T("tab.log.tip"); }
         if (jointNameBlocks.Length == 7) {
@@ -156,6 +160,7 @@ public sealed partial class ControlWindow
         state.FontSize = 12; state.Margin = new Thickness(10,6,10,2); inputGroup.Children.Add(state);
         inputs.FontSize = 11; inputs.Foreground = WorkbenchTheme.Muted; inputs.Margin = new Thickness(10,2,10,2); inputGroup.Children.Add(inputs);
         lastStop.FontSize = 12; lastStop.Margin = new Thickness(10,2,10,2); inputGroup.Children.Add(lastStop);
+        inputGroup.Children.Add(faultDetail);
         readInputs.Click += (_,_) => SafeAction(() => { Send((byte)'i'); Send((byte)'e'); Send((byte)'s'); }); readInputs.Margin = new Thickness(10,6,10,6); inputGroup.Children.Add(readInputs);
         var jogGroup = Group("section.jog");
         noteJogManual = Note(Lang.T("note.jogManual")); jogGroup.Children.Add(noteJogManual);
@@ -176,7 +181,13 @@ public sealed partial class ControlWindow
         chartTitleBlock=WorkbenchTheme.Text(Lang.T("chart.title"),12,WorkbenchTheme.Sub); chart.Children.Add(chartTitleBlock);
         Grid.SetRow(errorPlot,1); chart.Children.Add(errorPlot);
         chartNoteBlock=WorkbenchTheme.Text(Lang.T("note.chart"),11,WorkbenchTheme.Muted); Grid.SetRow(chartNoteBlock,2); chart.Children.Add(chartNoteBlock);
-        var folder = MakeButton(Lang.T("btn.openData")); folderButton = folder; folder.Click += (_,_) => OpenDataFolder(); Grid.SetRow(folder,3); chart.Children.Add(folder);
+        var folder = MakeButton(Lang.T("btn.openData")); folderButton = folder; folder.Click += (_,_) => OpenDataFolder();
+        foreach (int hz in TelemChoices) telemRateBox.Items.Add(Lang.Bind(new ComboBoxItem { Tag = hz }, ContentControl.ContentProperty, hz == 0 ? "telem.status" : hz == DefaultTelemHz ? "telem.hz10" : hz == DeviceContract.TelemRateMin ? "telem.hz5" : "telem.hz20"));
+        telemRateBox.SelectedIndex = Array.IndexOf(TelemChoices, DefaultTelemHz);
+        telemRateBox.SelectionChanged += (_,_) => { if (telemRateBox.SelectedIndex >= 0) { desiredTelemHz = TelemChoices[telemRateBox.SelectedIndex]; telemAttempts = 0; UpdateControls(); } };
+        telemRateLabel = WorkbenchTheme.Text(Lang.T("lbl.telemRate"), 12, WorkbenchTheme.Sub); telemRateLabel.VerticalAlignment = VerticalAlignment.Center;
+        var chartButtons = new WrapPanel(); chartButtons.Children.Add(folder); chartButtons.Children.Add(telemRateLabel); chartButtons.Children.Add(telemRateBox);
+        Grid.SetRow(chartButtons,3); chart.Children.Add(chartButtons);
         errorPlot.SizeChanged += (_,_) => DrawErrorPlot();
         feedbackTab = new TabItem { Header = Lang.T("tab.feedback"), Content = feedback };
         tabs.Items.Add(feedbackTab);

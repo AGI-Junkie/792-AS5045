@@ -203,7 +203,8 @@ public sealed partial class ControlWindow
         return $"HOST session: fw={lastFirmwareBuild} heartbeat={(supportsShortHeartbeat ? "compact6B/20ms" : "legacy36B/40ms")} " +
                $"framesTotal={sessionFrames} dataFrames={sessionFrames - sessionHeartbeats} heartbeats={sessionHeartbeats} " +
                $"worstHeartbeatGap={sessionWorstHeartbeatGap:F0}ms gapsOver{SlowHeartbeatLogMs:F0}ms={sessionSlowHeartbeats} " +
-               $"worstUiLeaseGap={sessionWorstLeaseGap:F0}ms leaseGapsOver{SlowLeaseLogMs:F0}ms={sessionSlowLeases}";
+                $"worstUiLeaseGap={sessionWorstLeaseGap:F0}ms leaseGapsOver{SlowLeaseLogMs:F0}ms={sessionSlowLeases}" +
+               (lastTelemDiag.Length > 0 ? " " + lastTelemDiag : "");
     }
 
     private void ResetWireSession()
@@ -256,13 +257,14 @@ public sealed partial class ControlWindow
                 // instead of 35.5 ms.  No control sequence is consumed, so command
                 // ordering is unaffected.
                 packet = PtpProtocol.EncodeShortHeartbeat((byte)keys);
-            } else if (heartbeat || (epochReady && pendingControlType != 0 && (motionAllowed || pendingControlType is 9 or 10))) {
+            } else if (heartbeat || (epochReady && pendingControlType != 0 && (motionAllowed || pendingControlType is 9 or 10 or 11))) {
                 bool limits = !heartbeat && pendingControlType is 9 or 10;
+                bool telemRate = !heartbeat && pendingControlType == 11;   // output only: taken whether or not motion is allowed
                 if (limits && limitPacket.Length > 0) packet = limitPacket;
                 else {
                     if (controlSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("err.seqExhaustedCtrl"));
                     packet = PtpProtocol.EncodePacket(heartbeat ? (byte)6 : pendingControlType, ++controlSequence,
-                        controlEpoch, limits ? limitBounds : new JointPose(0, 0), heartbeat ? keys : limits ? (ushort)limitAxis : (ushort)0);
+                        controlEpoch, limits ? limitBounds : new JointPose(0, 0), heartbeat ? keys : limits ? (ushort)limitAxis : telemRate ? (ushort)telemRequestedHz : (ushort)0);
                     if (limits) { limitSequence = controlSequence; limitPacket = packet; }
                 }
                 if (!heartbeat) pendingControlType = 0;
