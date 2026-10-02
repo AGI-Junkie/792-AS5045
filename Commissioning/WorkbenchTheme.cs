@@ -82,13 +82,37 @@ internal static class WorkbenchTheme
     };
 
     // Property-grid pieces: a dock caption, a group header, and a "name | value | unit" row.
-    public static Border Caption(string title) => Edge(new TextBlock { Text = title, FontWeight = FontWeights.Bold, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10,0,10,0) }, Head);
-    public static Border GroupHeader(string title, UIElement? trailing = null)
+    public static Border Caption(string key) => Edge(Lang.Bind(new TextBlock { FontWeight = FontWeights.Bold, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10,0,10,0) }, TextBlock.TextProperty, key), Head);
+    // A titled group whose header folds the body away (▾ / ▸); `trailing` sits at the right end of the header.
+    private static readonly ControlTemplate SectionTemplate = (ControlTemplate)XamlReader.Parse("""
+        <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Expander">
+          <DockPanel>
+            <ToggleButton DockPanel.Dock="Top" Content="{TemplateBinding Header}" IsChecked="{Binding IsExpanded, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}" Cursor="Hand">
+              <ToggleButton.Template><ControlTemplate TargetType="ToggleButton">
+                <Border x:Name="bar" Background="#F0F3F7" BorderBrush="#DDE3EA" BorderThickness="0,0,0,1" Padding="6,3,6,3">
+                  <DockPanel>
+                    <TextBlock x:Name="glyph" DockPanel.Dock="Left" Text="▾" Width="16" Foreground="#616E7C" VerticalAlignment="Center"/>
+                    <ContentPresenter VerticalAlignment="Center"/>
+                  </DockPanel>
+                </Border>
+                <ControlTemplate.Triggers>
+                  <Trigger Property="IsChecked" Value="False"><Setter TargetName="glyph" Property="Text" Value="▸"/></Trigger>
+                  <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bar" Property="Background" Value="#E8EDF3"/></Trigger>
+                  <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="bar" Property="BorderBrush" Value="#1F5FBF"/></Trigger>
+                </ControlTemplate.Triggers>
+              </ControlTemplate></ToggleButton.Template>
+            </ToggleButton>
+            <ContentPresenter x:Name="body" Visibility="Collapsed"/>
+          </DockPanel>
+          <ControlTemplate.Triggers><Trigger Property="IsExpanded" Value="True"><Setter TargetName="body" Property="Visibility" Value="Visible"/></Trigger></ControlTemplate.Triggers>
+        </ControlTemplate>
+        """);
+    public static Expander Section(string title, UIElement content, UIElement? trailing = null, bool expanded = true)
     {
-        var dock = new DockPanel { Margin = new Thickness(10,3,6,3) };
-        if (trailing is not null) { DockPanel.SetDock(trailing, Dock.Right); dock.Children.Add(trailing); }
-        dock.Children.Add(new TextBlock { Text = title, FontWeight = FontWeights.Bold, Foreground = Sub, VerticalAlignment = VerticalAlignment.Center });
-        return new() { Background = Group, BorderBrush = Brush("#DDE3EA"), BorderThickness = new Thickness(0,0,0,1), Child = dock };
+        var header = new DockPanel();
+        if (trailing is not null) { DockPanel.SetDock(trailing, Dock.Right); header.Children.Add(trailing); }
+        header.Children.Add(Lang.Bind(new TextBlock { FontWeight = FontWeights.Bold, Foreground = Sub, VerticalAlignment = VerticalAlignment.Center }, TextBlock.TextProperty, title));
+        return new() { Template = SectionTemplate, Header = header, Content = content, IsExpanded = expanded };
     }
     public static Border Row(UIElement label, Control value, string unit = "")
     {
@@ -104,5 +128,13 @@ internal static class WorkbenchTheme
         grid.Children.Add(label); grid.Children.Add(value); grid.Children.Add(u);
         return new() { Background = Brushes.White, BorderBrush = Faint, BorderThickness = new Thickness(0,0,0,1), Child = grid };
     }
+    // A value row with a full-width slider under it: the box shows the exact value and still takes typed input.
+    public static Border SliderRow(UIElement label, Slider slider, TextBox box, string unit = "")
+    {
+        var top = Row(label, box, unit); top.BorderThickness = new Thickness(0);
+        slider.Margin = new Thickness(10,0,10,4); slider.IsMoveToPointEnabled = true;
+        return new() { Background = Brushes.White, BorderBrush = Faint, BorderThickness = new Thickness(0,0,0,1), Child = new StackPanel { Children = { top, slider } } };
+    }
     public static TextBlock Label(string text, Brush? color = null) => new() { Text = text, Foreground = color ?? Sub, TextTrimming = TextTrimming.CharacterEllipsis };
+    public static TextBlock LocalLabel(string key) => Lang.Bind(Lang.Bind(Label(Lang.T(key)), TextBlock.TextProperty, key), FrameworkElement.ToolTipProperty, key);
 }

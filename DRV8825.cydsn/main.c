@@ -72,7 +72,7 @@
  * The STATE line keeps the plain "stage2-v7" token because the host matches it to
  * select the framed transport.  Bump this on every firmware change so a field log
  * can answer "was this fix actually flashed?". */
-#define FW_BUILD_ID                 "stage2-v7-absolute-q2-r2500"
+#define FW_BUILD_ID                 "stage2-v7-absolute-q2-r4000-live"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -89,14 +89,15 @@
     #error "JOG_CMD_HOME must be an odd software-UART byte"
 #endif
 
-/* `r` homes each axis with a fast touch, release/backoff, then slow touch.
+/* `r` homes each axis with a fast touch, release/backoff, slow touch, then the move to straight.
+ * The fast touch and the move to straight run at the operator's global speed and acceleration (g_motionRate/g_motionAccel).
+ * Release/backoff (short moves clear of the sensor) and the slow touch (precision) keep the fixed rates and the
+ * acceleration cap below; the global values can only lower them.
  * Directions are the real-world keyboard directions confirmed on the bench. */
 #define ARM1_HOME_JOG_DIR            (1)     /* d: approach J4-2 / P0[3]    */
 #define ARM2_HOME_JOG_DIR            (1)     /* Right: approach P1[0] NPN    */
-#define HOME_FAST_RATE_USTEP_S       (JOG2_RATE_MAX_USTEP_S) /* commissioning: use the slower jog cap */
+#define HOME_RELEASE_RATE_USTEP_S    (JOG2_RATE_MAX_USTEP_S) /* release and backoff: the slower jog cap, as commissioned */
 #define HOME_SLOW_RATE_USTEP_S       (400u)
-#define HOME_STRAIGHT_RATE_USTEP_S   (JOG1_RATE_MAX_USTEP_S)
-#define HOME2_STRAIGHT_RATE_USTEP_S  (JOG2_RATE_MAX_USTEP_S) /* retain the successfully tested 600 rate */
 #define HOME_BACKOFF_USTEPS          (64u)
 #define HOME_RELEASE_MAX_USTEPS      (800u)
 #define HOME_ACCEL_USTEP_S2         (4000u)
@@ -114,8 +115,8 @@
 /* Numbers the host has to agree on.  Commissioning/DeviceContract.cs holds the same values and
  * build-release.ps1 compares the two, so change them together or the release build fails. */
 #define CFG_RATE_MIN                 (20)     /* configurable jog/home/PTP rate range, microsteps/s    */
-#define CFG_RATE_MAX_AXIS1           (2500)
-#define CFG_RATE_MAX_AXIS2           (2500)
+#define CFG_RATE_MAX_AXIS1           (4000)
+#define CFG_RATE_MAX_AXIS2           (4000)
 #define CFG_ACCEL_MIN                (100)    /* configurable acceleration range, microsteps/s^2       */
 #define CFG_ACCEL_MAX_AXIS1          (20000)
 #define CFG_ACCEL_MAX_AXIS2          (12000)
@@ -143,7 +144,7 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
     (PTP_MIN1_CD < -CFG_JOINT_CD_MAX) || (PTP_MAX1_CD > CFG_JOINT_CD_MAX) || (PTP_MIN2_CD < -CFG_JOINT_CD_MAX) || (PTP_MAX2_CD > CFG_JOINT_CD_MAX))
 #error "PTP requires valid software bounds within +/-180 deg containing straight zero"
 #endif
-#define PTP_RATE_MAX                 (2500u)
+#define PTP_RATE_MAX                 (4000u)
 #define PTP_ACCEL                    (3000u)
 #define PTP_FRAME_BYTES              (17u)
 #define PTP_FRAME_START              (0xD1u)
@@ -340,7 +341,7 @@ static void dbg_puts(const char *s)
     }
 }
 
-static char g_dbg[176];
+static char g_dbg[256];   /* the LINK line alone is ~180 characters */
 #define DBG(s)       dbg_puts(s)
 #define DBGF(...)    do { snprintf(g_dbg, sizeof(g_dbg), __VA_ARGS__); \
                           dbg_puts(g_dbg); } while (0)
@@ -1151,7 +1152,7 @@ static uint32 g_keyMaxGapMs;
 
 /* Whole-path preload: no movement until every numbered node is accepted. */
 #define TRAJ_CAPACITY 2048u
-#define TRAJ_RATE_MAX 2500u
+#define TRAJ_RATE_MAX 4000u
 #define TRAJ_ACCEL_MAX 3000u
 /* Never pulse a trajectory faster than its own rate cap, even when catching up. */
 #define TRAJ_STEP_MIN_US (1000000u / TRAJ_RATE_MAX)
@@ -1248,11 +1249,17 @@ static void jog_stop_now(jog_axis_t *a)
     a->holding = 0u;
 }
 
-static void ptp_invalidate(void)
+/* Forget the held trajectory (and any upload isolation) without touching the reference. */
+static void traj_discard(void)
 {
     if(g_uploadRxQuarantine) { uart_discard_rx(); }
     g_uploadRxQuarantine=0u;
     g_traj.state=0u; g_traj.count=g_traj.expected=g_traj.index=0u;
+}
+
+static void ptp_invalidate(void)
+{
+    traj_discard();
     g_ptp.active = 0u; g_ptp.reference = 0u; g_ptp.referenceSource = 0u; g_ptpRx.active = 0u;
     if (++g_ptp.epoch == 0u) { ++g_ptp.epoch; }
 }
@@ -1503,9 +1510,12 @@ static void stage_enable(void);
 static void jog_home_all(void);
 static void motion_config_status(void);
 
-/* Type 9 shares the control sequence but never changes the reference epoch.
- * Applying ranges requires a stopped, reference-free stage; ENABLE changes the
- * epoch before any motion can start. Exact retries only repeat the receipt. */
+/* Types 9 and 10 share the control sequence but never change the reference epoch. Exact retries only repeat
+ * the receipt.  Ranges (type 9) redefine what "inside" means for a reference, so they need a stopped,
+ * reference-free stage; ENABLE changes the epoch before any motion can start.  Speeds and accelerations
+ * (type 10) only shape the next move, so they are also taken while enabled and referenced, as long as nothing
+ * moves, homes or uploads (advertised as rates_live=1).  A plan the device holds was checked against the old
+ * speeds, so a change drops it and the host must upload again. */
 static void joint_limits_accept(const uint8 *p)
 {
     uint32 seq=ptp_u32(p+1);
@@ -1513,6 +1523,7 @@ static void joint_limits_accept(const uint8 *p)
     int16 min=(int16)ptp_u16(p+9), max=(int16)ptp_u16(p+11);
     uint8 rates=(p[0]==10u);
     uint8 *accepted=rates ? g_ratesAccepted : g_limitsAccepted;
+    uint8 busy;
     if(ptp_u32(p+5)!=g_ptp.epoch) {
         g_rxRejected++; g_ptpEpochRejected++; ptp_announce_epoch();
         JLOG("PTP_LIMITS refused: stale epoch\r\n"); return;
@@ -1523,17 +1534,21 @@ static void joint_limits_accept(const uint8 *p)
        (min < -CFG_JOINT_CD_MAX || max > CFG_JOINT_CD_MAX || min>=max || min>0 || max<0))) {
         g_rxRejected++; JLOG("PTP_LIMITS refused: axis/range\r\n"); return;
     }
-    if(g_motionEnabled || g_home.phase!=HOME_IDLE || !axes_idle() ||
-       g_arm1.holding || g_arm2.holding || g_ptp.reference || g_ptp.active || g_traj.state) {
-        g_rxRejected++; JLOG("PTP_LIMITS refused: stop and clear reference first\r\n"); return;
+    busy=(uint8)(g_home.phase!=HOME_IDLE || !axes_idle() || g_ptp.active || g_traj.state==1u || g_traj.state==3u || g_uploadRxQuarantine);
+    if(rates ? busy : (busy || g_motionEnabled || g_arm1.holding || g_arm2.holding || g_ptp.reference || g_traj.state)) {
+        g_rxRejected++;
+        JLOG(rates ? "PTP_LIMITS refused: moving, homing or uploading\r\n" : "PTP_LIMITS refused: stop and clear reference first\r\n");
+        return;
     }
     if(memcmp(accepted,p,15u)!=0) {
         if(seq<=g_controlSequence) { g_rxRejected++; JLOG("PTP_LIMITS refused: stale sequence\r\n"); return; }
         if(rates) {
             jog_axis_t *a=axis==0u?&g_arm1:&g_arm2;
+            uint8 changed=(uint8)(g_motionRate[axis]!=(uint16)min || g_motionAccel[axis]!=(uint16)max);
             g_motionRate[axis]=(uint16)min; g_motionAccel[axis]=(uint16)max;
             a->rateMax=(uint32)min; a->rateStart=20u;
             a->accel=a->decel=(uint32)max; a->rampRemainder=0u;
+            if(changed && g_traj.state) { traj_discard(); JLOG("TRAJ held plan dropped: speed/accel changed\r\n"); traj_status(); }
         } else { g_jointMinCd[axis]=min; g_jointMaxCd[axis]=max; }
         g_controlSequence=seq; memcpy(accepted,p,15u);
     }
@@ -1619,7 +1634,8 @@ static uint8 traj_accept(const uint8 *p)
         g_traj.velocity[0]=velocity[0]; g_traj.velocity[1]=velocity[1];
         if(g_traj.count==g_traj.expected) { g_traj.state=2u; }
     } else {
-        if(p[0]!=4u || q[0]!=0 || q[1]!=0 || value!=0u || g_traj.state!=2u ||
+        /* state 4 = the held plan already ran once; the nodes are intact, so a fresh RUN (new sequence) repeats it */
+        if(p[0]!=4u || q[0]!=0 || q[1]!=0 || value!=0u || (g_traj.state!=2u && g_traj.state!=4u) ||
            g_traj.count!=g_traj.expected || ptp_u32(p+1)!=g_ptp.sequence+1u ||
            g_arm1.usteps!=g_ptp.origin[0]-ptp_offset(0u,g_traj.nodes[0].q1) ||
            g_arm2.usteps!=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,g_traj.nodes[0].q1,g_traj.nodes[0].q2))) {
@@ -1682,7 +1698,7 @@ static void ptp_accept(void)
         if(p[0]==4u) { g_uploadRxQuarantine=0u; } /* only a validated RUN ends upload isolation */
         g_ptp.sequence=seq; memcpy(g_ptp.accepted,p,15u); traj_status(); return;
     }
-    g_traj.state=0u; g_traj.count=g_traj.expected=g_traj.index=0u;
+    if(g_traj.state!=4u) { g_traj.state=0u; g_traj.count=g_traj.expected=g_traj.index=0u; } /* a finished plan survives the move back to its start */
     g_ptp.target[0]=g_ptp.origin[0]-ptp_offset(0u,q1);
     g_ptp.target[1]=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,q1,q2));
     for(i=0u;i<2u;i++) {
@@ -1853,6 +1869,7 @@ static void home_enter(home_phase_t phase)
     jog_axis_t *a = (g_home.arm == 1u) ? &g_arm1 : &g_arm2;
     int8 toward = (g_home.arm == 1u) ? ARM1_HOME_JOG_DIR : ARM2_HOME_JOG_DIR;
     uint32 rate;
+    uint32 accel;
     uint32 distance;
     g_home.phase = phase;
     g_home.sinceMs = g_jogMs;
@@ -1868,15 +1885,20 @@ static void home_enter(home_phase_t phase)
                         (phase == HOME_STRAIGHT)) ? (int8)-toward : toward;
     if ((phase == HOME_STRAIGHT) && (g_home.arm == 2u))
     { g_home.direction = ARM2_STRAIGHT_JOG_DIR; }
-    rate = (phase == HOME_SLOW) ? HOME_SLOW_RATE_USTEP_S :
-           ((phase == HOME_STRAIGHT) ? ((g_home.arm == 1u) ? HOME_STRAIGHT_RATE_USTEP_S :
-                                       HOME2_STRAIGHT_RATE_USTEP_S) : HOME_FAST_RATE_USTEP_S);
+    /* The fast touch and the move to straight run at the global speed and acceleration.  Everything else (release,
+     * backoff, slow touch, the settle phases that do not step) keeps a fixed rate and the acceleration cap, which the
+     * global values can only lower. */
+    rate = g_motionRate[g_home.arm-1u];
+    accel = g_motionAccel[g_home.arm-1u];
+    if ((phase != HOME_FAST) && (phase != HOME_STRAIGHT))
+    {
+        rate = motion_min(rate, (phase == HOME_SLOW) ? HOME_SLOW_RATE_USTEP_S : HOME_RELEASE_RATE_USTEP_S);
+        accel = motion_min(accel, HOME_ACCEL_USTEP_S2);
+    }
     distance = (phase == HOME_RELEASE) ? HOME_RELEASE_MAX_USTEPS :
                ((phase == HOME_BACKOFF) ? HOME_BACKOFF_USTEPS :
                 ((phase == HOME_STRAIGHT) ? home_straight_steps(g_home.arm) : 0u));
-    rate=motion_min(rate,g_motionRate[g_home.arm-1u]);
     {
-        uint32 accel=motion_min(HOME_ACCEL_USTEP_S2,g_motionAccel[g_home.arm-1u]);
         ramp_init(&g_home.ramp, (int32)distance, rate, accel);
         g_home.ramp.c0=motion_min(600000u,956000u/isqrt32(accel));
         if(g_home.ramp.c0<g_home.ramp.cMin)g_home.ramp.c0=g_home.ramp.cMin;
@@ -2126,7 +2148,7 @@ static void stage_status(void)
     motion_config_status();
     JLOGF("PTP_CHECK final_lsb=%d follow_lsb=%d\r\n",PTP_FINAL_ERROR_LSB,SLIP_FAIL_LSB);
     traj_status();
-    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 q2_absolute=1 proto=%u\r\n",
+    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 proto=%u\r\n",
           (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)PROTO_VERSION);
     /* Frame loss by cause: rx_error only sees UART-level faults, so a frame that
      * simply arrives short must be counted here or it stays invisible. */

@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 
 namespace TwoLinkCommissioning;
 
@@ -260,7 +260,7 @@ public sealed partial class ControlWindow
                 bool limits = !heartbeat && pendingControlType is 9 or 10;
                 if (limits && limitPacket.Length > 0) packet = limitPacket;
                 else {
-                    if (controlSequence == uint.MaxValue) throw new InvalidOperationException("控制序号用尽，请重启设备后重新连接。");
+                    if (controlSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("err.seqExhaustedCtrl"));
                     packet = PtpProtocol.EncodePacket(heartbeat ? (byte)6 : pendingControlType, ++controlSequence,
                         controlEpoch, limits ? limitBounds : new JointPose(0, 0), heartbeat ? keys : limits ? (ushort)limitAxis : (ushort)0);
                     if (limits) { limitSequence = controlSequence; limitPacket = packet; }

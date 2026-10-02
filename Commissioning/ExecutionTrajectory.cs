@@ -16,7 +16,7 @@ public sealed class ExecutionTrajectory
         // Slow the same visible time plan when quantization needs extra margin.
         for (int attempt=0; ; attempt++) {
             try { Nodes=Build(Timing,limits,profile); return; }
-            catch (ArgumentException ex) when(attempt<12 && (ex.Message.Contains("脉冲速度") || ex.Message.Contains("弦线近似"))) {
+            catch (Lang.ValidationException ex) when(attempt<12 && ex.Key is "err.execPulse" or "err.chord") {
                 Timing.Stretch(1.15);
             }
         }
@@ -36,7 +36,7 @@ public sealed class ExecutionTrajectory
                 var pose = PtpProtocol.Quantize(timed.At(time).Pose);
                 int dt = ms - previousTime;
                 if (dt is < DeviceContract.TrajNodeMinMs or > DeviceContract.TrajNodeMaxMs || nodes.Count >= DeviceContract.TrajCapacity)
-                    throw new ArgumentException($"执行轨迹超出 {DeviceContract.TrajCapacity} 点容量或时间间隔范围；请缩短路径。");
+                    throw Lang.Error("err.execCapacity", DeviceContract.TrajCapacity);
                 // Sample the Cartesian chord error after pulse quantization. This is a
                 // planning tolerance, not a claim about measured pen tracking accuracy.
                 var from = PulsePose(nodes[^1].Pose); var to = PulsePose(pose);
@@ -46,12 +46,12 @@ public sealed class ExecutionTrajectory
                     var joint = new JointPose(from.Q1 + (to.Q1 - from.Q1) * u, from.Q2 + (to.Q2 - from.Q2) * u);
                     var expected = timed.At(previousTime / 1000.0 + (time - previousTime / 1000.0) * u).Target;
                     if ((timed.Path.Model.Forward(joint).Tip - expected).Length > 0.15)
-                        throw new ArgumentException("执行轨迹的弦线近似误差超过 0.15 mm；请降低速度或调整图形。");
+                        throw Lang.Error("err.chord");
                 }
                 nodes.Add(new(pose, (ushort)dt)); previousTime = ms;
             }
             // Explicit dwell at rectangle corners and at the final endpoint.
-            if (nodes.Count >= DeviceContract.TrajCapacity) throw new ArgumentException($"执行轨迹超过 {DeviceContract.TrajCapacity} 点容量。");
+            if (nodes.Count >= DeviceContract.TrajCapacity) throw Lang.Error("err.execNodes", DeviceContract.TrajCapacity);
             nodes.Add(new(nodes[^1].Pose, DeviceContract.TrajNodeMinMs));
         }
         var result=nodes.ToArray(); Validate(result, limits, profile); return result;
@@ -71,17 +71,17 @@ public sealed class ExecutionTrajectory
     public static void Validate(ExecutionNode[] nodes, JointLimits limits, MotionProfile? profile = null)
     {
         if (nodes.Length is < 2 or > DeviceContract.TrajCapacity || nodes[0].Milliseconds != 0)
-            throw new ArgumentException("执行轨迹容量或首点无效。");
+            throw Lang.Error("err.execHead");
         int[] previousVelocity = [0, 0]; int totalMs = 0;
         for (int i = 0; i < nodes.Length; i++)
         {
             var n = nodes[i];
             if (!double.IsFinite(n.Pose.Q1) || !double.IsFinite(n.Pose.Q2) ||
                 Math.Abs(n.Pose.Q1) > 180 || Math.Abs(n.Pose.Q2) > 180 || !limits.Contains(n.Pose))
-                throw new ArgumentException($"第 {i+1} 点超出当前关节范围：q1={n.Pose.Q1:F2}°，q2={n.Pose.Q2:F2}°；允许 q1 [{limits.Min1:F2},{limits.Max1:F2}]°、q2 [{limits.Min2:F2},{limits.Max2:F2}]°。请调整图形或关节范围。");
+                throw Lang.Error("err.execRange", i + 1, n.Pose.Q1, n.Pose.Q2, limits.Min1, limits.Max1, limits.Min2, limits.Max2);
             if (i == 0) continue;
             int dt = n.Milliseconds, previousDt = i == 1 ? dt : nodes[i - 1].Milliseconds;
-            if (dt is < DeviceContract.TrajNodeMinMs or > DeviceContract.TrajNodeMaxMs || (totalMs += dt) > DeviceContract.TrajTotalMaxMs) throw new ArgumentException("执行时间无效。");
+            if (dt is < DeviceContract.TrajNodeMinMs or > DeviceContract.TrajNodeMaxMs || (totalMs += dt) > DeviceContract.TrajTotalMaxMs) throw Lang.Error("err.execTime");
             for (int axis = 0; axis < 2; axis++)
             {
                 int maxRate = profile is { } p ? Math.Min(DeviceContract.PlanRateMax,axis==0?p.R1:p.R2) : DeviceContract.PlanRateMax;
@@ -90,7 +90,7 @@ public sealed class ExecutionTrajectory
                 int velocity = d * 1000 / dt;
                 if (Math.Abs(d) * 1000 > maxRate * dt || Math.Abs(velocity - previousVelocity[axis]) * 2000 > maxAccel * (dt + previousDt) ||
                     (i == nodes.Length - 1 && Math.Abs(velocity) * 2000 > maxAccel * dt))
-                    throw new ArgumentException("执行轨迹超过脉冲速度或相邻段速度变化上限；请降低速度。");
+                    throw Lang.Error("err.execPulse");
                 previousVelocity[axis] = velocity;
             }
         }

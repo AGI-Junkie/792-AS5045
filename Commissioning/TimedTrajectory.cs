@@ -21,14 +21,14 @@ public sealed class TimedTrajectory
     internal void Stretch(double factor)
     {
         if (!double.IsFinite(factor) || factor < 1 || Duration * factor > DeviceContract.TrajTotalMaxMs / 1000.0 - 1)
-            throw new ArgumentException($"满足设备上限后的规划超过 {DeviceContract.TrajTotalMaxMs / 1000} 秒，请缩短路径或调整参数。");
+            throw Lang.Error("err.planTooLong", DeviceContract.TrajTotalMaxMs / 1000);
         for (int i=1; i<StopTimes.Length; i++) StopTimes[i] *= factor;
     }
 
     public TimedTrajectory(DrawingTrajectory path, PlanningRates rates)
     {
         if (new[] { rates.Feed, rates.V1, rates.V2, rates.A1, rates.A2 }.Any(v => !double.IsFinite(v) || v < 0.01 || v > 1000))
-            throw new ArgumentException("规划速度与加速度须为 0.01～1000 内的有限正数（不是驱动实测能力）。");
+            throw Lang.Error("err.planRates");
         Path = path; Rates = rates;
         StopTimes = new double[path.Stops.Length]; distances = new double[path.Stops.Length];
         for (int piece = 0; piece < StopTimes.Length - 1; piece++)
@@ -46,7 +46,7 @@ public sealed class TimedTrajectory
                 duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q2 - state.Acceleration.Q1) / rates.A2));
             }
             if (!double.IsFinite(duration) || StopTimes[piece] + duration * 1.05 > DeviceContract.TrajTotalMaxMs / 1000.0)
-                throw new ArgumentException($"离线规划超过 {DeviceContract.TrajTotalMaxMs / 1000} 秒或接近数值奇异点；请调整图形或规划参数。");
+                throw Lang.Error("err.planSlow", DeviceContract.TrajTotalMaxMs / 1000);
             StopTimes[piece + 1] = StopTimes[piece] + duration * 1.05;
             distances[piece + 1] = distances[piece] + PieceLength(piece);
         }
@@ -85,12 +85,12 @@ public sealed class TimedTrajectory
             Q2 = pose.Q2 + 360 * Math.Round((Path.Samples[reference].Pose.Q2 - pose.Q2) / 360)
         };
         if (Path.Limits is { } limits && !limits.Contains(pose))
-            throw new ArgumentException("时间规划采样点超出填写的关节范围，请调整图形或分支。");
+            throw Lang.Error("err.planRange");
         double q1 = pose.Q1 * Rad, q2 = pose.Q2 * Rad;
         double c1 = Path.Model.L1 * Math.Cos(q1), s1 = Path.Model.L1 * Math.Sin(q1);
         double c2 = Path.Model.L2 * Math.Cos(q2), s2 = Path.Model.L2 * Math.Sin(q2);
         double determinant = Path.Model.L1 * Path.Model.L2 * Math.Sin(q2 - q1);
-        if (Math.Abs(Math.Sin(q2 - q1)) < 1e-6) throw new ArgumentException("时间规划经过奇异位形。");
+        if (Math.Abs(Math.Sin(q2 - q1)) < 1e-6) throw Lang.Error("err.planSingular");
         Vector Solve(Vector value) => new((value.X * c2 + s2 * value.Y) / determinant,
             (-s1 * value.Y - value.X * c1) / determinant);
         Vector first = Solve(dp);
@@ -103,7 +103,7 @@ public sealed class TimedTrajectory
 
     public TimedPose At(double time)
     {
-        if (!double.IsFinite(time)) throw new ArgumentException("预览时间须为有限数值。");
+        if (!double.IsFinite(time)) throw Lang.Error("err.previewTime");
         time = Math.Clamp(time, 0, Duration);
         int piece = Array.BinarySearch(StopTimes, time);
         piece = piece < 0 ? ~piece - 1 : Math.Min(piece, StopTimes.Length - 2);

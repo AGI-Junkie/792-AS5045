@@ -290,14 +290,17 @@ static void short_send(uint8 keys, int corrupt) {
 static void limits_send(uint32 seq,uint32 epoch,uint16 axis,int16 min,int16 max) {
     packetType=9;ptp_send(seq,epoch,min,max,axis,5);packetType=1;txq_flush_blocking();
 }
+static void rates_live_test(void);
 static void rates_test(const char *t) {
     uint32 seq,epoch; unsigned i; uint32 before;
-    packetType=10;ptp_send(g_controlSequence+1u,g_ptp.epoch,200,500,0,0);packetType=1;
-    assert(g_motionRate[0]==800); /* enabled configuration is refused */
+    if(!strcmp(t,"rates_live")) { rates_live_test(); return; }
+    /* A held key means the axis is about to move: its speed must not change under it (mode 5: no neutral byte that would release it). */
+    g_arm1.want=1;packetType=10;ptp_send(g_controlSequence+1u,g_ptp.epoch,200,500,0,5);packetType=1;g_arm1.want=0;
+    assert(g_motionRate[0]==800);
     jog_handle_byte(JOG_CMD_STOP);short_send(0,0);txq_flush_blocking();
     seq=g_controlSequence+1u;epoch=g_ptp.epoch;
     packetType=10;
-    ptp_send(seq,epoch,19,500,0,0);ptp_send(seq,epoch,2501,500,0,0);
+    ptp_send(seq,epoch,19,500,0,0);ptp_send(seq,epoch,CFG_RATE_MAX_AXIS1+1,500,0,0);
     ptp_send(seq,epoch,200,99,0,0);ptp_send(seq,epoch,200,20001,0,0);
     ptp_send(seq,epoch-1u,200,500,0,0);
     assert(g_motionRate[0]==800 && g_controlSequence<seq);
@@ -319,6 +322,25 @@ static void rates_test(const char *t) {
         g_home.arm=2;home_enter(HOME_FAST);
         assert(g_home.ramp.cMin==step_period_us(150) && g_home.ramp.c0>=55000);
         home_enter(HOME_SLOW);assert(g_home.ramp.cMin==step_period_us(150));
+        /* The fast touch and the move to straight follow the global speed and acceleration, above the old fixed 600/800 too.
+         * Release, backoff and the slow touch keep their fixed rates (600, 600, 400) and the 4000 acceleration cap; the global
+         * values only lower them. */
+        g_motionRate[0]=3000;g_motionAccel[0]=15000;g_motionRate[1]=1000;g_motionAccel[1]=3000;
+        g_home.arm=1;
+        home_enter(HOME_FAST);assert(g_home.ramp.cMin==step_period_us(3000) && g_home.ramp.c0==motion_min(600000u,956000u/isqrt32(15000u)));
+        home_enter(HOME_STRAIGHT);assert(g_home.ramp.cMin==step_period_us(3000) && g_home.ramp.c0==motion_min(600000u,956000u/isqrt32(15000u)));
+        home_enter(HOME_RELEASE);assert(g_home.ramp.cMin==step_period_us(HOME_RELEASE_RATE_USTEP_S) && g_home.ramp.c0==motion_min(600000u,956000u/isqrt32(HOME_ACCEL_USTEP_S2)));
+        home_enter(HOME_BACKOFF);assert(g_home.ramp.cMin==step_period_us(HOME_RELEASE_RATE_USTEP_S) && g_home.ramp.c0==motion_min(600000u,956000u/isqrt32(HOME_ACCEL_USTEP_S2)));
+        home_enter(HOME_SLOW);assert(g_home.ramp.cMin==step_period_us(HOME_SLOW_RATE_USTEP_S) && g_home.ramp.c0==motion_min(600000u,956000u/isqrt32(HOME_ACCEL_USTEP_S2)));
+        g_home.arm=2;
+        home_enter(HOME_FAST);assert(g_home.ramp.cMin==step_period_us(1000));
+        home_enter(HOME_STRAIGHT);assert(g_home.ramp.cMin==step_period_us(1000) && g_home.ramp.c0==motion_min(600000u,956000u/isqrt32(3000u)));
+        home_enter(HOME_RELEASE);assert(g_home.ramp.cMin==step_period_us(HOME_RELEASE_RATE_USTEP_S));
+        g_motionRate[1]=300;
+        home_enter(HOME_FAST);assert(g_home.ramp.cMin==step_period_us(300));
+        home_enter(HOME_STRAIGHT);assert(g_home.ramp.cMin==step_period_us(300));
+        home_enter(HOME_RELEASE);assert(g_home.ramp.cMin==step_period_us(300)); /* a lower global speed lowers release, backoff and the slow touch too */
+        home_enter(HOME_SLOW);assert(g_home.ramp.cMin==step_period_us(300));
     } else if(!strcmp(t,"rates_traj") && PTP_COMMISSIONED) {
         packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);
         packetType=2;ptp_send(2,g_ptp.epoch,0,0,4,0);
@@ -528,7 +550,7 @@ static void ptp_test(const char *t) {
         assert(!g_ptp.active&&!g_ptp.reference&&!g_ptpRx.active);assert_stopped();return;
     }
     if(!strcmp(t,"ptp_stale_epoch")||!strcmp(t,"ptp_range")||!strcmp(t,"ptp_rate")) {
-        ptp_send(1,!strcmp(t,"ptp_stale_epoch")?epoch-1:epoch,!strcmp(t,"ptp_range")?7000:125,-250,!strcmp(t,"ptp_rate")?2501:200,0);
+        ptp_send(1,!strcmp(t,"ptp_stale_epoch")?epoch-1:epoch,!strcmp(t,"ptp_range")?7000:125,-250,!strcmp(t,"ptp_rate")?PTP_RATE_MAX+1:200,0);
         assert(!g_ptp.active&&p1==simPulse1&&p2==simPulse2);return;
     }
     ptp_send(1,epoch,target1,target2,200,0);assert(g_ptp.active&&g_ptp.sequence==1);
@@ -575,6 +597,58 @@ static void ptp_test(const char *t) {
 }
 static void traj_send(uint8 type, uint32 seq, int16 q1, int16 q2, uint16 value) {
     packetType=type; ptp_send(seq,g_ptp.epoch,q1,q2,value,0); packetType=1u; txq_flush_blocking();
+}
+/* Speeds and accelerations follow an enabled, referenced device while it is idle (rates_live=1); ranges still need a stop.
+ * Mode 5 sends no neutral byte, so a held key or a running move is still there when the packet is judged. */
+static void rates_send(uint32 seq,uint32 epoch,uint16 axis,int16 rate,int16 accel) {
+    packetType=10;ptp_send(seq,epoch,rate,accel,axis,5);packetType=1;txq_flush_blocking();
+}
+static void rates_live_test(void) {
+    uint32 epoch,seq,sequence; unsigned i; int32 u1,u2; int16 min1;
+    short_send(0,0);packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;txq_flush_blocking();
+    assert(g_motionEnabled && g_ptp.reference && g_homed1 && g_homed2);
+    epoch=g_ptp.epoch;u1=g_arm1.usteps;u2=g_arm2.usteps;
+    /* Idle and referenced: taken at once; the reference, the epoch and the position stay. */
+    seq=g_controlSequence+1u;simLogN=0;simLog[0]=0;
+    rates_send(seq,epoch,0,400,1500);
+    assert(g_motionRate[0]==400 && g_motionAccel[0]==1500 && g_arm1.rateMax==400 && g_arm1.accel==1500 && g_controlSequence==seq);
+    assert(g_motionEnabled && g_ptp.reference && g_ptp.epoch==epoch && !simPulse1 && !simPulse2 && g_arm1.usteps==u1 && g_arm2.usteps==u2);
+    assert(strstr(simLog,"PTP_RATES epoch=") && strstr(simLog,"axis=0 min=400 max=1500") && strstr(simLog,"r1=400"));
+    rates_send(seq,epoch,0,400,1500);assert(g_controlSequence==seq && g_motionRate[0]==400); /* exact retry only repeats the receipt */
+    /* Anything moving, homing or uploading refuses, and nothing changes. */
+    for(i=0;i<8;i++) {
+        seq=g_controlSequence+1u;
+        if(i==0)g_home.phase=HOME_FAST;if(i==1)g_ptp.active=1;if(i==2)g_traj.state=1;if(i==3)g_traj.state=3;
+        if(i==4)g_arm1.want=1;if(i==5)g_arm2.moving=1;if(i==6)g_arm1.settleMs=1;if(i==7)g_uploadRxQuarantine=1;
+        rates_send(seq,epoch,0,300,1000);
+        assert(g_controlSequence<seq && g_motionRate[0]==400 && g_motionAccel[0]==1500 && g_arm1.rateMax==400);
+        g_home.phase=HOME_IDLE;g_ptp.active=0;g_traj.state=0;g_arm1.want=0;g_arm2.moving=0;g_arm1.settleMs=0;g_uploadRxQuarantine=0;
+    }
+    /* The closed-loop hold is not motion. */
+    g_arm1.holding=1;seq=g_controlSequence+1u;rates_send(seq,epoch,0,350,1200);
+    assert(g_motionRate[0]==350 && g_motionAccel[0]==1200 && g_controlSequence==seq && g_arm1.holding);g_arm1.holding=0;
+    /* A held plan was checked against the old speeds: the same values keep it, a change drops it. */
+    sequence=g_ptp.sequence;
+    traj_send(2,sequence+1u,0,0,2);traj_send(3,sequence+2u,10,0,250);
+    assert(g_traj.state==2 && g_traj.count==2);
+    seq=g_controlSequence+1u;rates_send(seq,epoch,0,350,1200);
+    assert(g_controlSequence==seq && g_traj.state==2 && g_traj.count==2);
+    simLogN=0;simLog[0]=0;seq=g_controlSequence+1u;rates_send(seq,epoch,0,360,1200);
+    assert(g_motionRate[0]==360 && !g_traj.state && !g_traj.count && g_ptp.reference && g_ptp.epoch==epoch);
+    assert(strstr(simLog,"TRAJ held plan dropped") && strstr(simLog,"TRAJ_STATE state=0"));
+    g_traj.state=4u;g_traj.count=g_traj.expected=2u; /* a plan that already ran */
+    seq=g_controlSequence+1u;rates_send(seq,epoch,0,370,1200);assert(g_motionRate[0]==370 && !g_traj.state);
+    /* Ranges still need a stop and no reference. */
+    min1=g_jointMinCd[0];seq=g_controlSequence+1u;limits_send(seq,epoch,0,-2000,2000);
+    assert(g_controlSequence<seq && g_jointMinCd[0]==min1 && g_motionEnabled && g_ptp.reference);
+    /* A real move: refused while it runs, taken once it has settled, reference intact. */
+    ptp_send(g_ptp.sequence+1u,g_ptp.epoch,20,30,200,0);assert(g_ptp.active);
+    seq=g_controlSequence+1u;rates_send(seq,epoch,1,300,900);assert(g_controlSequence<seq && g_motionRate[1]!=300);
+    for(i=0;i<5000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
+    assert(g_motionEnabled&&!g_ptp.active&&g_ptp.reference);
+    for(i=0;i<100;i++)cycle(1);
+    seq=g_controlSequence+1u;rates_send(seq,epoch,1,300,900);
+    assert(g_motionRate[1]==300 && g_motionAccel[1]==900 && g_arm2.rateMax==300 && g_motionEnabled && g_ptp.reference && g_ptp.epoch==epoch);
 }
 static void traj_rx_fault(const char *t) {
     unsigned i,p1=simPulse1,p2=simPulse2; uint32 epoch=g_ptp.epoch,seq=g_ptp.sequence;
@@ -669,6 +743,18 @@ static void traj_test(const char *t) {
         assert(g_arm1.usteps==origin1-ptp_offset(0,nodes[count-1].q1));
         assert(g_arm2.usteps==origin2-ptp_offset(1,nodes[count-1].q2-nodes[count-1].q1));
         if(!strcmp(t,"traj_host_plan_offset"))assert(abs_i32(cmd_lsb()-g_enc.pos)>=66&&abs_i32(cmd_lsb()-g_enc.pos)<=68&&g_ptp.reference);
+        if(!strcmp(t,"traj_host_plan")) { /* repeat: the finished plan survives the move back to its start and runs again on a fresh sequence */
+            uint32 lastRun=seq;
+            ptp_send(++seq,g_ptp.epoch,nodes[0].q1,nodes[0].q2,200,0);
+            for(i=0;i<200000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
+            assert(g_motionEnabled&&!g_ptp.active&&g_traj.state==4&&g_traj.count==count&&g_arm1.usteps==origin1-ptp_offset(0,nodes[0].q1));
+            traj_send(4,lastRun,0,0,0);assert(!g_ptp.active&&g_traj.state==4); /* the old RUN sequence is stale, not a replay */
+            traj_send(4,++seq,0,0,0);assert(g_ptp.active&&g_traj.state==3);
+            for(i=0;i<650000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
+            assert(g_motionEnabled&&!g_ptp.active&&g_traj.state==4&&g_traj.index==count);
+            assert(g_arm1.usteps==origin1-ptp_offset(0,nodes[count-1].q1));
+            assert(g_arm2.usteps==origin2-ptp_offset(1,nodes[count-1].q2-nodes[count-1].q1));
+        }
         return;
     }
     if(!strcmp(t,"traj_locked")) {
@@ -968,9 +1054,9 @@ int main(int argc,char **argv) {
         /* The LINK line is the only carrier of the host's compatibility contract (docs/PROTOCOL.md section 6). */
         char proto[24]; simLogN=0; simLog[0]=0;
         stage_status(); txq_flush_blocking();
-        sprintf(proto," proto=%u",(unsigned)PROTO_VERSION);
+        sprintf(proto," proto=%u\r\n",(unsigned)PROTO_VERSION); /* with its end of line: the debug buffer must not cut the LINK line short */
         assert(strstr(simLog,"STATE fw=stage2-v7 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
-        assert(strstr(simLog," short_hb=1") && strstr(simLog," joint_limits=1") && strstr(simLog," motion_rates=1") && strstr(simLog," q2_absolute=1"));
+        assert(strstr(simLog," short_hb=1") && strstr(simLog," joint_limits=1") && strstr(simLog," motion_rates=1") && strstr(simLog," rates_live=1") && strstr(simLog," q2_absolute=1"));
         puts(t);return 0;
     }
     if(!strncmp(t,"limits_",7)){limits_test(t);puts(t);return 0;}
@@ -1264,7 +1350,7 @@ int main(int argc,char **argv) {
         for(i=0;i<130000 && g_motionEnabled;i++)cycle(1);
         assert(g_motionEnabled && g_home.phase==phase && g_home.arm==arm);
         assert(g_home.steps>(slow?512u:52000u) && g_jogMs-g_home.sinceMs>120000u);
-        assert(g_home.ramp.cruising && g_home.periodUs==step_period_us(slow?HOME_SLOW_RATE_USTEP_S:HOME_FAST_RATE_USTEP_S));
+        assert(g_home.ramp.cruising && g_home.periodUs==step_period_us(slow?HOME_SLOW_RATE_USTEP_S:g_motionRate[arm-1])); /* the fast touch runs at the global speed */
         if(!strcmp(t,"home_search_stop"))jog_handle_byte(JOG_CMD_STOP);
         else if(!strcmp(t,"home_search_heartbeat"))for(i=0;i<260;i++)cycle(0);
         else if(!strcmp(t,"home_search_limit")){simLimit=1;cycle(1);}
@@ -1458,7 +1544,7 @@ ptp_cases += ['ptp_uart_paced','traj_uart_upload_paced','traj_uart_run_paced']
 ptp_cases += ['ptp_zero','ptp_axis1','ptp_axis2']
 ptp_cases += ['ptp_power_stable','ptp_fast_stall']
 ptp_cases += ['limits_ptp','limits_jog']
-ptp_cases += ['rates_ptp','rates_traj']
+ptp_cases += ['rates_ptp','rates_traj','rates_live']
 ptp_cases += ['ptp_final_'+name for name in ['positive','negative','boundary','over_limit','following','counts']]
 ptp_cases += ['ptp_logged_retry']
 ptp_cases += ['traj_rx_'+name for name in ['retry','ready_retry','repeated','stop','timeout','overrun','overflow','break','parity','mixed','heartbeat','holding','fault','encoder','motion']]
