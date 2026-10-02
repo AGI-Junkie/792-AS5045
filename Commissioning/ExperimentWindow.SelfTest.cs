@@ -53,10 +53,10 @@ internal sealed partial class ExperimentWindow
             bool zh = !Lang.IsEn;
             Check(zh, "the test runs in Chinese");
             var w = new ExperimentWindow(root);
-            Check(w.ListedRuns == 2 && w.ColumnHeaders.Length == 10 && w.ColumnHeaders[0] == "开始时间" && w.ColumnHeaders[6] == "RMSE °", "list and localized headers");
+            Check(w.ListedRuns == 2 && w.ColumnHeaders.Length == 11 && w.ColumnHeaders[0] == "开始时间" && w.ColumnHeaders[6] == "RMSE °", "list and localized headers");
             int rectRow = Enumerable.Range(0, 2).First(i => w.RowText(i).Contains("矩形")), circleRow = 1 - rectRow;
             string rowText = w.RowText(rectRow);
-            Check(rowText.Contains("|图形|矩形|5 / 3|人工伸直零位|完整|") && rowText.Contains("10 Hz") && rowText.EndsWith("|⚠") && w.RowText(circleRow).Contains("|圆|4 / 3|") && !w.RowText(circleRow).EndsWith("⚠"), "row facts: shape, speeds, reference, outcome, telemetry rate and the fault mark: " + rowText);
+            Check(rowText.Contains("|图形|矩形|5 / 3|人工伸直零位|完整|") && rowText.Contains("10 Hz|—|") && rowText.EndsWith("|⚠") && w.RowText(circleRow).Contains("|圆|4 / 3|") && !w.RowText(circleRow).EndsWith("⚠"), "row facts: shape, speeds, reference, outcome, telemetry rate and the fault mark: " + rowText);
             Check(w.ShownRuns == 0 && w.Plots.All(p => p.Series.Count == 0), "nothing is shown until something is selected");
 
             // One recording: the curves, the events, the written summary.

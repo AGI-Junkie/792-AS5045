@@ -190,6 +190,21 @@ public sealed partial class XYPreviewPanel
         Lang.RefreshText(presetNote);
     }
 
+    // The two values the calibration wizard may offer back to the planner, only when its apply buttons are clicked.
+    internal void SetLinkLengths(double length1, double length2)
+    {
+        updating = true;
+        try { l1.Text = Mm(length1); l2.Text = Mm(length2); }
+        finally { updating = false; Refresh(); NotifyLimitsChanged(); }
+    }
+    internal void SetElbowRange(double min, double max)
+    {
+        updating = true;
+        try { elbowMin.Text = Mm(min); elbowMax.Text = Mm(max); }
+        finally { updating = false; Refresh(); NotifyLimitsChanged(); }
+    }
+    internal JointPose? PointTargetPose => pointTarget;
+
     // ---- where each group of parameters stands ----------------------------------------------------------------------
     // Positions in the snapshot: the 21 text fields in ParameterFields order, then shape, branch, direction.
     private static readonly int[] ShapeGroup = [2, 3, 4, 5, 17, 18, 19, 20, 21, 22, 23], SizeGroup = [0, 1], RangeGroup = [6, 7, 8, 9, 15, 16], SpeedGroup = [11, 12, 13, 14];
@@ -267,6 +282,15 @@ public sealed partial class XYPreviewPanel
                 if (!panel.presetNote.Text.Contains("没有运动")) Fail($"{key}：应说明只载入和检查");
             }
             if (requests != 0) Fail("载入方案不得请求任何运动");
+            // The calibration wizard may put measured link lengths and an elbow range into the boxes: the preview is re-planned from them, nothing moves.
+            panel.ChoosePresetForSelfTest("builtin:preset.smallCircle");
+            var before = panel.execution ?? throw new InvalidOperationException("填杆长前应有已检查的图形");
+            panel.SetLinkLengths(181.5, 175.25); panel.SetElbowRange(-147, 155);
+            // The preview is recomputed from the new numbers (same as typing them), so the plan on screen has different joint angles and
+            // would no longer match one already uploaded.
+            if (panel.Model.L1 != 181.5 || panel.Model.L2 != 175.25 || panel.RequestedLimits is not { ElbowMin: -147, ElbowMax: 155 } || panel.execution is not { } after || after == before || after.Nodes[0].Pose == before.Nodes[0].Pose) Fail("向导填入的杆长/肘范围应进入规划参数，并按新数值重新规划");
+            if (requests != 0) Fail("向导填入参数不得请求任何运动");
+            panel.l1.Text = machine[0]; panel.l2.Text = machine[1]; panel.elbowMin.Text = machine[6]; panel.elbowMax.Text = machine[7];   // back to the machine settings the later checks expect
             // Mine: saved under a name, listed, loadable, deletable; bad and reserved names refused.
             panel.ChoosePresetForSelfTest("builtin:preset.smallCircle");
             panel.rotation.Text = "20"; panel.scale.Text = "1.2"; panel.v1.Text = "6.5"; panel.Refresh();

@@ -825,6 +825,8 @@ public sealed partial class ControlWindow : Window
         FeedbackSelfTest(snapshotPath);
         XYPreviewPanel.SelfTest(snapshotPath);
         ExperimentWindow.SelfTest(snapshotPath);
+        Calibrations.SelfTest();
+        CalibrationWindow.SelfTest(snapshotPath);
         var window = new ControlWindow { selfTesting = true };
         static void Check(bool condition, [System.Runtime.CompilerServices.CallerArgumentExpression(nameof(condition))] string? expression = null)
         { if (!condition) throw new InvalidOperationException("UI state check failed: " + expression); }

@@ -30,7 +30,7 @@ public sealed partial class ControlWindow
     private readonly ComboBox telemRateBox = new() { Width = 118, Margin = new Thickness(4, 2, 4, 2) };
     private static readonly int[] TelemChoices = [0, DeviceContract.TelemRateMin, DefaultTelemHz, DeviceContract.TelemRateMax];
     private TabItem? feedbackTab, logTab;
-    private Button? stopButton, refreshButton, folderButton, analysisButton;
+    private Button? stopButton, refreshButton, folderButton, analysisButton, calibrationButton;
     private ExperimentWindow? analysisWindow;
     // One analysis window at a time: asking again brings the open one forward and refreshes its list (a run may have just finished).
     private void OpenAnalysis()
@@ -53,6 +53,7 @@ public sealed partial class ControlWindow
         if (refreshButton is { } refresh) refresh.Content = Lang.T("btn.refreshPorts");
         if (folderButton is { } folder) folder.Content = Lang.T("btn.openData");
         if (analysisButton is { } analysis) analysis.Content = Lang.T("btn.analysis");
+        if (calibrationButton is { } calibration) calibration.Content = Lang.T("btn.calibration");
         readInputs.Content = Lang.T("btn.readInputs");
         if (noteJogManual is { } n1) n1.Text = Lang.T("note.jogManual");
         if (noteJogStop is { } n2) n2.Text = Lang.T("note.jogStop");
@@ -198,7 +199,8 @@ public sealed partial class ControlWindow
         telemRateBox.SelectionChanged += (_,_) => { if (telemRateBox.SelectedIndex >= 0) { desiredTelemHz = TelemChoices[telemRateBox.SelectedIndex]; telemAttempts = 0; UpdateControls(); } };
         telemRateLabel = WorkbenchTheme.Text(Lang.T("lbl.telemRate"), 12, WorkbenchTheme.Sub); telemRateLabel.VerticalAlignment = VerticalAlignment.Center;
         var analysis = MakeButton(Lang.T("btn.analysis")); analysisButton = analysis; analysis.Click += (_,_) => OpenAnalysis();
-        var chartButtons = new WrapPanel(); chartButtons.Children.Add(folder); chartButtons.Children.Add(analysis); chartButtons.Children.Add(telemRateLabel); chartButtons.Children.Add(telemRateBox);
+        var calibrate = MakeButton(Lang.T("btn.calibration")); calibrationButton = calibrate; calibrate.Click += (_,_) => OpenCalibration();
+        var chartButtons = new WrapPanel(); chartButtons.Children.Add(folder); chartButtons.Children.Add(analysis); chartButtons.Children.Add(calibrate); chartButtons.Children.Add(telemRateLabel); chartButtons.Children.Add(telemRateBox);
         Grid.SetRow(chartButtons,3); chart.Children.Add(chartButtons);
         errorPlot.SizeChanged += (_,_) => DrawErrorPlot();
         feedbackTab = new TabItem { Header = Lang.T("tab.feedback"), Content = feedback };

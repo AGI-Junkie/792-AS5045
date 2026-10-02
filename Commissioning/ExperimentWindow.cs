@@ -68,7 +68,7 @@ internal sealed partial class ExperimentWindow : Window
         public required ExperimentRun Run { get; init; }
         public string Time { get; set; } = ""; public string Kind { get; set; } = ""; public string Shape { get; set; } = ""; public string Speed { get; set; } = "";
         public string Reference { get; set; } = ""; public string Status { get; set; } = ""; public string Rmse { get; set; } = ""; public string Peak { get; set; } = "";
-        public string Hz { get; set; } = ""; public string Fault { get; set; } = "";
+        public string Hz { get; set; } = ""; public string Fault { get; set; } = ""; public string Calibration { get; set; } = "";
     }
 
     private readonly string root;
@@ -167,13 +167,13 @@ internal sealed partial class ExperimentWindow : Window
             Speed = s is null ? "—" : $"{s.V1:0.#} / {s.V2:0.#}", Reference = run.Reference,
             Status = run.Complete ? Lang.T("exp.status.complete") : run.Outcome == "interrupted" ? Lang.T("exp.status.interrupted") : Lang.T("exp.status.other", run.Outcome),
             Rmse = run.Rmse is { } r ? r.ToString("0.0000", CultureInfo.InvariantCulture) : "—", Peak = run.Peak is { } p ? p.ToString("0.0000", CultureInfo.InvariantCulture) : "—",
-            Hz = run.TelemetryHz > 0 ? run.TelemetryHz + " Hz" : "~2 Hz", Fault = run.HasFault ? "⚠" : "" };
+            Hz = run.TelemetryHz > 0 ? run.TelemetryHz + " Hz" : "~2 Hz", Fault = run.HasFault ? "⚠" : "", Calibration = run.CalibrationVersion.Length > 0 ? run.CalibrationVersion : "—" };
     }
     private void BuildColumns()
     {
         grid.Columns.Clear();
         (string key, string property, double width)[] columns = [("exp.col.time", nameof(Row.Time), 100), ("exp.col.kind", nameof(Row.Kind), 48), ("exp.col.shape", nameof(Row.Shape), 70), ("exp.col.speed", nameof(Row.Speed), 96),
-            ("exp.col.ref", nameof(Row.Reference), 96), ("exp.col.status", nameof(Row.Status), 110), ("exp.col.rmse", nameof(Row.Rmse), 64), ("exp.col.peak", nameof(Row.Peak), 64), ("exp.col.hz", nameof(Row.Hz), 52), ("exp.col.fault", nameof(Row.Fault), 36)];
+            ("exp.col.ref", nameof(Row.Reference), 96), ("exp.col.status", nameof(Row.Status), 110), ("exp.col.rmse", nameof(Row.Rmse), 64), ("exp.col.peak", nameof(Row.Peak), 64), ("exp.col.hz", nameof(Row.Hz), 52), ("exp.col.cal", nameof(Row.Calibration), 46), ("exp.col.fault", nameof(Row.Fault), 36)];
         foreach (var (key, property, width) in columns)
             grid.Columns.Add(new DataGridTextColumn { Header = Lang.T(key), Binding = new System.Windows.Data.Binding(property), Width = width, SortMemberPath = property });
     }
@@ -305,6 +305,7 @@ internal sealed partial class ExperimentWindow : Window
             string tag = shown.Count == 2 ? (i == 0 ? "A · " : "B · ") : "";
             text.AppendLine(tag + Lang.T("exp.sum.run", run.StartedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture), Lang.T(run.Kind == "point" ? "exp.kind.point" : "exp.kind.trajectory"), ShapeName(run),
                 s?.V1 ?? 0, s?.V2 ?? 0, s?.A1 ?? 0, s?.A2 ?? 0, run.Reference, run.Complete ? Lang.T("exp.status.complete") : run.Outcome == "interrupted" ? Lang.T("exp.status.interrupted") : Lang.T("exp.status.other", run.Outcome)));
+            text.AppendLine(Lang.T("exp.sum.cal", run.CalibrationId.Length > 0 ? run.CalibrationId : Lang.T("exp.sum.noCal")));
             if (a.T.Length == 0) { text.AppendLine(Lang.T("exp.sum.nodata")); text.AppendLine(); continue; }
             text.AppendLine(Lang.T("exp.sum.err", a.Rmse, a.Peak, a.T.Length, run.TelemetryHz > 0 ? run.TelemetryHz + " Hz" : "~2 Hz"));
             if (a.Segments.Length > 0) text.AppendLine(Lang.T("exp.sum.seg", string.Join("  ", a.Segments.Select(g => $"{g.Index}: {g.Rmse:0.0000}"))));
@@ -393,7 +394,7 @@ internal sealed partial class ExperimentWindow : Window
     internal bool Playing => timer.IsEnabled;
     internal void SelectForSelfTest(params int[] indexes) { grid.SelectedItems.Clear(); foreach (int i in indexes) grid.SelectedItems.Add(rows[i]); }
     internal string[] ColumnHeaders => grid.Columns.Select(c => c.Header?.ToString() ?? "").ToArray();
-    internal string RowText(int index) => string.Join("|", new[] { rows[index].Time, rows[index].Kind, rows[index].Shape, rows[index].Speed, rows[index].Reference, rows[index].Status, rows[index].Rmse, rows[index].Peak, rows[index].Hz, rows[index].Fault });
+    internal string RowText(int index) => string.Join("|", new[] { rows[index].Time, rows[index].Kind, rows[index].Shape, rows[index].Speed, rows[index].Reference, rows[index].Status, rows[index].Rmse, rows[index].Peak, rows[index].Hz, rows[index].Calibration, rows[index].Fault });
     internal bool QuietLog { get => quietLog.IsChecked == true; set => quietLog.IsChecked = value; }
     internal void TogglePlayForSelfTest() => TogglePlayback();
 }

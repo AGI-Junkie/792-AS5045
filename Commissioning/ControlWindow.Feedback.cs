@@ -66,7 +66,7 @@ public sealed partial class ControlWindow
         if (telemetry is not { Referenced: true } || ptp is null || telemetry.Epoch != ptp.Epoch ||
             (DateTime.UtcNow-lastTelemetryAt).TotalSeconds >= 2) throw new IOException(Lang.T("fault.experimentMissingFeedback"));
         FinishExperiment("replaced"); errorHistory.Clear(); DrawErrorPlot(); lastExperimentOutcome = null;
-        experiment = new ExperimentRecorder(ExperimentRoot,kind,sequence,ptp.Epoch,xyPreview.Model,xyPreview.SettingsDescription,telemetry.ReferenceName,nodes,Math.Max(0,reportedTelemHz));
+        experiment = new ExperimentRecorder(ExperimentRoot,kind,sequence,ptp.Epoch,xyPreview.Model,xyPreview.SettingsDescription,telemetry.ReferenceName,nodes,Math.Max(0,reportedTelemHz),Calibrations.Active()?.Id);
         experimentPhase = kind; experimentSequence=sequence; experimentCompleting = null; lastExperimentDirectory = experiment.DirectoryPath;
         Append("HOST experiment recording: " + lastExperimentDirectory);
     }

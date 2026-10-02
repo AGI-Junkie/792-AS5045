@@ -49,6 +49,8 @@ public sealed class ExperimentRun
     public double L1 { get; init; } = 180;
     public double L2 { get; init; } = 176.38;
     public bool HasFault { get; init; }
+    public string CalibrationId { get; init; } = "";               // the calibration current when it ran ("" = none recorded)
+    public string CalibrationVersion => CalibrationId.Contains("-v") ? "v" + CalibrationId[(CalibrationId.LastIndexOf("-v", StringComparison.Ordinal) + 2)..] : "";
 }
 
 public sealed record FeedbackRow(DateTime HostUtc, uint DeviceMs, uint Epoch, uint Sequence, string Phase, int Segment, double Q1Command, double Q1Encoder,
@@ -98,7 +100,7 @@ public static class ExperimentArchive
             Directory = directory, Kind = Text(root, "kind"), StartedUtc = startedUtc.ToUniversalTime(), Sequence = (uint)Number(root, "sequence", 0), Reference = Text(root, "reference"),
             Outcome = outcome, Samples = samples, MotionSamples = motion, Rmse = rmse, Peak = peak, TelemetryHz = (int)Number(root, "telemetry_hz", 0),
             Settings = RunSettings.Parse(Text(root, "settings")), L1 = Number(root, "L1", 180), L2 = Number(root, "L2", 176.38),
-            HasFault = File.Exists(Path.Combine(directory, "fault.json")) };
+            HasFault = File.Exists(Path.Combine(directory, "fault.json")), CalibrationId = Text(root, "calibration_id") };
     }
 
     // The table as a CSV (numbers in invariant format), with how well each drawing's plan lines up with what was commanded: the
@@ -106,7 +108,7 @@ public static class ExperimentArchive
     public static string ReportCsv(IEnumerable<ExperimentRun> runs, bool analyse = true)
     {
         static string N(double? v) => v is { } x ? x.ToString("0.######", CultureInfo.InvariantCulture) : "";
-        var csv = new System.Text.StringBuilder("id,started_utc,kind,shape_index,branch,v1_deg_s,v2_deg_s,a1_deg_s2,a2_deg_s2,reference,outcome,q1_rmse_deg,q1_peak_deg,telemetry_hz,samples,motion_samples,has_fault,aligned,align_offset_ms,align_residual_deg,limiting_axes\r\n");
+        var csv = new System.Text.StringBuilder("id,started_utc,kind,shape_index,branch,v1_deg_s,v2_deg_s,a1_deg_s2,a2_deg_s2,reference,outcome,q1_rmse_deg,q1_peak_deg,telemetry_hz,samples,motion_samples,has_fault,calibration_id,aligned,align_offset_ms,align_residual_deg,limiting_axes\r\n");
         foreach (var run in runs)
         {
             var s = run.Settings; string aligned = "", offset = "", residual = "", limiting = "";
@@ -114,7 +116,7 @@ public static class ExperimentArchive
                 try { var a = RunAnalysis.Create(run, Load(run)); aligned = a.Aligned ? "1" : "0"; offset = a.Aligned ? N(a.AlignmentOffsetMs) : ""; residual = a.Aligned ? N(a.AlignmentResidualDeg) : ""; limiting = string.Join("+", a.LimitingAxes); }
                 catch (Exception ex) when (ex is IOException or FormatException or UnauthorizedAccessException) { aligned = "error"; }
             csv.Append(string.Join(",", run.Id, run.StartedUtc.ToString("O", CultureInfo.InvariantCulture), run.Kind, s?.Shape.ToString() ?? "", s?.Branch.ToString() ?? "", N(s?.V1), N(s?.V2), N(s?.A1), N(s?.A2),
-                run.Reference.Replace(',', ';'), run.Outcome.Replace(',', ';').Replace('\r', ' ').Replace('\n', ' '), N(run.Rmse), N(run.Peak), run.TelemetryHz, run.Samples, run.MotionSamples, run.HasFault ? 1 : 0, aligned, offset, residual, limiting)).Append("\r\n");
+                run.Reference.Replace(',', ';'), run.Outcome.Replace(',', ';').Replace('\r', ' ').Replace('\n', ' '), N(run.Rmse), N(run.Peak), run.TelemetryHz, run.Samples, run.MotionSamples, run.HasFault ? 1 : 0, run.CalibrationId, aligned, offset, residual, limiting)).Append("\r\n");
         }
         return csv.ToString();
     }

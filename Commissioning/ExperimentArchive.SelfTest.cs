@@ -9,13 +9,13 @@ public static partial class ExperimentArchiveTests
 {
     // A recording written by the real recorder from a real plan, with telemetry synthesised so the right answers are known:
     // the device clock starts the plan at `startMs`, and arm1's encoder differs from its command by 0.02 deg * sin(2 pi t / 3).
-    internal static string WriteSyntheticRun(string root, DrawingShape shape, double startMs, string settings, out ExecutionTrajectory plan, int hz = 10, double errorAmplitude = 0.02, bool followPlan = true)
+    internal static string WriteSyntheticRun(string root, DrawingShape shape, double startMs, string settings, out ExecutionTrajectory plan, int hz = 10, double errorAmplitude = 0.02, bool followPlan = true, string? calibrationId = null)
     {
         var model = new PlanarArm(180, 176.38);
         // Big enough that the planner is limited by the motors' speed and acceleration, not by the 0.15 mm chord check that stretches tiny shapes.
         var path = DrawingTrajectory.Create(model, shape, 320, -15, shape == DrawingShape.Line ? 350 : shape == DrawingShape.Circle ? 20 : 30, shape == DrawingShape.Line ? 10 : shape == DrawingShape.Circle ? 0 : 24, 0, null);
         plan = new ExecutionTrajectory(new TimedTrajectory(path, new PlanningRates(1000, 5, 3, 10, 6)), new JointLimits(-90, 90, -160, 160));
-        using var recorder = new ExperimentRecorder(root, "trajectory", 7, 5, model, settings, "人工伸直零位", plan.Nodes, hz);
+        using var recorder = new ExperimentRecorder(root, "trajectory", 7, 5, model, settings, "人工伸直零位", plan.Nodes, hz, calibrationId);
         var times = new double[plan.Nodes.Length]; double total = 0;
         for (int i = 0; i < plan.Nodes.Length; i++) { total += plan.Nodes[i].Milliseconds / 1000.0; times[i] = total; }
         var q1 = plan.Nodes.Select(n => n.Pose.Q1).ToArray(); var q2 = plan.Nodes.Select(n => n.Pose.Q2).ToArray();
@@ -48,11 +48,16 @@ public static partial class ExperimentArchiveTests
             const string settings = "shape=2; branch=0; L1=180; L2=176.38; x=320; y=-15; a=30; b=24; feed=136.6; v1=5; v2=3; a1=10; a2=6; min1=-90; max1=90; min2=-160; max2=160; emin=-155; emax=155; c=; rot=0; scale=1; dir=ccw; custom_chars=0";
             string dir = WriteSyntheticRun(root, DrawingShape.Rectangle, 8200, settings, out var plan);
             Thread.Sleep(15);
-            string circle = WriteSyntheticRun(root, DrawingShape.Circle, 31000, settings.Replace("shape=2", "shape=3").Replace("v1=5", "v1=2.5"), out var circlePlan, hz: 2);
+            string circle = WriteSyntheticRun(root, DrawingShape.Circle, 31000, settings.Replace("shape=2", "shape=3").Replace("v1=5", "v1=2.5"), out var circlePlan, hz: 2, calibrationId: "cal-20261002-101500-v3");
             // The list: both recordings, newest first, with what the table shows.
             var (runs, unreadable) = ExperimentArchive.List(root);
             Check(unreadable == 0 && runs.Count == 2 && runs[0].Directory == circle && runs[1].Directory == dir, "newest first, both listed");
             var run = runs[1];
+            // The calibration that was current when it ran travels with the recording: its id in the list, its version in the table and the CSV.
+            Check(runs[0].CalibrationId == "cal-20261002-101500-v3" && runs[0].CalibrationVersion == "v3" && run.CalibrationId == "" && run.CalibrationVersion == "", "a recording remembers which calibration was current");
+            string csvText = ExperimentArchive.ReportCsv(runs, analyse: false); var csvRows = csvText.TrimEnd().Split("\r\n");
+            int calColumn = Array.IndexOf(csvRows[0].Split(','), "calibration_id");
+            Check(calColumn > 0 && csvRows[1].Split(',')[calColumn] == "cal-20261002-101500-v3" && csvRows[2].Split(',')[calColumn] == "", "the report carries the calibration id");
             Check(run.Kind == "trajectory" && run.Complete && run.Reference == "人工伸直零位" && run.TelemetryHz == 10 && runs[0].TelemetryHz == 2 && run.Samples > 50 && run.MotionSamples > 40 && run.Rmse is > 0.01 and < 0.02, "summary fields");
             Check(run.Settings is { Shape: 2, V1: 5, V2: 3, A1: 10, A2: 6, Limits.Min1: -90, Limits.ElbowMax: 155, Clockwise: false, Scale: 1 }, "settings parsed from the recording");
             Check(runs[0].Settings is { Shape: 3, V1: 2.5 }, "second recording's own settings");
