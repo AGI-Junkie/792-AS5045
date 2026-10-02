@@ -28,8 +28,10 @@ public sealed partial class ControlWindow
     private static readonly Regex RatesPattern = new(@"^MOTION_RATES epoch=(\d+) r1=(\d+) r2=(\d+) a1=(\d+) a2=(\d+)$", RegexOptions.CultureInvariant);
     private bool RatesReady => xyPreview.RequestedProfile is { } p && reportedProfile == p;
 
-    private bool LimitsReady => compatible && framedControl && protocolMatches && xyPreview.RequestedLimits is { } wanted && reportedLimits == wanted &&
-        RatesReady && limitAxis < 0 && !limitsAwaitingState;
+    // The device has reported the ranges that are typed, and the speeds that are typed: each on its own, so the panel can say which.
+    private bool RangeConfirmed => compatible && framedControl && protocolMatches && xyPreview.RequestedLimits is { } wanted && reportedLimits == wanted && limitAxis < 0 && !limitsAwaitingState;
+    private bool SpeedConfirmed => compatible && framedControl && protocolMatches && RatesReady && limitAxis < 0 && !limitsAwaitingState;
+    private bool LimitsReady => RangeConfirmed && SpeedConfirmed;
 
     private string LimitsStatus => !protocolMatches ? Lang.T("limits.protoMismatch",
             protocolVersion == 0 ? (Lang.IsEn ? "none" : "无") : protocolVersion.ToString(), DeviceContract.ProtocolVersion.ToString()) :

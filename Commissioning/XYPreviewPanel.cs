@@ -81,6 +81,7 @@ public sealed partial class XYPreviewPanel : UserControl
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path + ".tmp", SaveParameters(), new UTF8Encoding(false));
         File.Move(path + ".tmp", path, true);
+        RememberSaved();
     }
     // The click only fires while a validated plan matches the fields, so what is written is exactly what is uploaded.
     // Best effort and silent: a full disk must not block a motion the operator already approved.
@@ -95,6 +96,7 @@ public sealed partial class XYPreviewPanel : UserControl
         try {
             if (new FileInfo(path).Length > 32768) throw Lang.Error("fault.paramTooBig");
             RestoreParameters(File.ReadAllText(path));
+            RememberSaved();
         } catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException) { operationError=() => Lang.T("fault.paramRestore")+ex.Message; UpdatePointButton(); }
     }
     private bool detailView;   // false = whole arm and reach circle; the default and only view the operator gets
@@ -233,6 +235,7 @@ public sealed partial class XYPreviewPanel : UserControl
         if (previewButton is { } preview) preview.Content = Lang.T("btn.preview");
         if (saveButton is { } save) save.Content = Lang.T("btn.save");
         export.Content = Lang.T("btn.export");
+        RefreshPresetLanguage();
         play.Content = playbackTimer.IsEnabled ? Lang.T("btn.playPause") : Lang.T("btn.play");
         rewind.Content = Lang.T("btn.rewind");
         upload.Content = Lang.T("btn.upload");
@@ -287,7 +290,8 @@ public sealed partial class XYPreviewPanel : UserControl
         StackPanel Group(string title, UIElement? trailing = null, bool expanded = true) {
             var body = new StackPanel(); controls.Children.Add(WorkbenchTheme.Section(title, body, trailing, expanded)); return body;
         }
-        var geometry = Group("section.geometry");
+        var presets = Group("section.presets"); presets.Children.Add(BuildPresetControls());
+        var geometry = Group("section.geometry"); geometry.Children.Add(BuildLamps(ShapeGroup, false));
         geometry.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.shape"), shape));
         geometry.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.branch"), branch));
         geometry.Children.Add(WorkbenchTheme.Row(xLabel, x)); geometry.Children.Add(WorkbenchTheme.Row(yLabel, y));
@@ -295,21 +299,21 @@ public sealed partial class XYPreviewPanel : UserControl
         geometry.Children.Add(cRow = WorkbenchTheme.Row(cLabel, c));
         customLabel.Margin = new Thickness(10,4,10,0); customLabel.Foreground = WorkbenchTheme.Muted; customLabel.TextWrapping = TextWrapping.Wrap;
         geometry.Children.Add(customRow = WorkbenchTheme.Edge(new StackPanel { Children = { customLabel, custom } }, Brushes.White, new Thickness(0,0,0,1)));
-        var transform = Group("section.transform");
+        var transform = Group("section.transform"); transform.Children.Add(BuildLamps(ShapeGroup, false));
         transform.Children.Add(Prop("xy.rotation", rotation, "°")); transform.Children.Add(Prop("xy.scale", scale, "×"));
         transform.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.direction"), direction));
-        var dimensions = Group("section.dimensions");
+        var dimensions = Group("section.dimensions"); dimensions.Children.Add(BuildLamps(SizeGroup, false));
         dimensions.Children.Add(Prop("xy.l1", l1, "mm")); dimensions.Children.Add(Prop("xy.l2", l2, "mm"));
         var rangeHelpIcon = HelpIcon(RangeHelpText());
         rangeHelp.Add(rangeHelpIcon);
-        var ranges = Group("section.limits", rangeHelpIcon);
+        var ranges = Group("section.limits", rangeHelpIcon); ranges.Children.Add(BuildLamps(RangeGroup, true));
         foreach(var (field,name,value) in new[] { (min1,"xy.q1min",-30), (max1,"xy.q1max",30), (min2,"xy.q2min",-60), (max2,"xy.q2max",60),
                      (elbowMin,"xy.elbowMin",-(int)JointLimits.DefaultElbow), (elbowMax,"xy.elbowMax",(int)JointLimits.DefaultElbow) }) {
             ranges.Children.Add(Prop(name, field, "°", name));
             field.ToolTip=Lang.T("xy.rangeField.tip", Lang.T(name), value.ToString());
         }
         speedHelp = HelpIcon(SpeedsHelpText(), "xy.speedHelp.name");
-        var speeds = Group("section.speeds", speedHelp);
+        var speeds = Group("section.speeds", speedHelp); speeds.Children.Add(BuildLamps(SpeedGroup, true));
         speeds.Children.Add(Prop("xy.motor1v", v1, "°/s", "xy.motor1v.name", slider: RateSlider(v1, 0, accel: false)));
         speeds.Children.Add(Prop("xy.motor2v", v2, "°/s", "xy.motor2v.name", "xy.motor2.tip", RateSlider(v2, 1, accel: false)));
         speeds.Children.Add(Prop("xy.motor1a", acc1, "°/s²", "xy.motor1a.name", slider: RateSlider(acc1, 0, accel: true)));
@@ -591,6 +595,7 @@ public sealed partial class XYPreviewPanel : UserControl
         upload.IsEnabled = pointMoveAllowed && limitsMatch && trajectorySupported && execution is not null && atStart;
         // 执行图形 starts what the device holds, so it needs that exact plan to still be the one on screen.
         bool held = uploadedPlan is { } sent && execution is { } shown && sent.Nodes.SequenceEqual(shown.Nodes);
+        planHeld = held; UpdateLamps();
         run.IsEnabled = upload.IsEnabled && held;
         string move = deviceMoveReason;
         if (RequestedLimits is { } currentRange) move += Lang.T("move.currentRange") + Envelope(currentRange);
@@ -913,6 +918,7 @@ public sealed partial class XYPreviewPanel : UserControl
         UnifiedLimitsSelfTest();
         ElbowLimitSelfTest();
         ShapeFieldsSelfTest();
+        PresetSelfTest();
         ShapeDefaultsSelfTest();
         var panel = new XYPreviewPanel();
         panel.ViewportSelfTest();

@@ -110,6 +110,7 @@ public sealed partial class ControlWindow
         devices.Children.Add(enable); devices.Children.Add(manualReference); devices.Children.Add(home);
         toolbar.Children.Add(devices);
         var toolbarBar = WorkbenchTheme.Edge(toolbar); toolbarBar.MinHeight = 48; DockPanel.SetDock(toolbarBar, Dock.Top); shell.Children.Add(toolbarBar);
+        var workflowBar = BuildWorkflowStrip(); DockPanel.SetDock(workflowBar, Dock.Top); shell.Children.Add(workflowBar);
 
         // Body: property grid | preview | live status. The two splitters resize the side columns.
         var body = new Grid(); shell.Children.Add(body);

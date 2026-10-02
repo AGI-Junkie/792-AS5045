@@ -65,7 +65,7 @@ public sealed partial class ControlWindow
         if (selfTesting || !supportsTelemetry) return;
         if (telemetry is not { Referenced: true } || ptp is null || telemetry.Epoch != ptp.Epoch ||
             (DateTime.UtcNow-lastTelemetryAt).TotalSeconds >= 2) throw new IOException(Lang.T("fault.experimentMissingFeedback"));
-        FinishExperiment("replaced"); errorHistory.Clear(); DrawErrorPlot();
+        FinishExperiment("replaced"); errorHistory.Clear(); DrawErrorPlot(); lastExperimentOutcome = null;
         experiment = new ExperimentRecorder(ExperimentRoot,kind,sequence,ptp.Epoch,xyPreview.Model,xyPreview.SettingsDescription,telemetry.ReferenceName,nodes,Math.Max(0,reportedTelemHz));
         experimentPhase = kind; experimentSequence=sequence; experimentCompleting = null; lastExperimentDirectory = experiment.DirectoryPath;
         Append("HOST experiment recording: " + lastExperimentDirectory);
@@ -74,7 +74,7 @@ public sealed partial class ControlWindow
     {
         var recorder = experiment; experiment = null; experimentCompleting = null;
         if (recorder is null) return;
-        recorder.Finish(outcome);
+        recorder.Finish(outcome); RecordExperimentOutcome(outcome, recorder);
         Lang.Text(experimentResult, () => Lang.T("exp.finished", outcome=="complete"?Lang.T("exp.complete"):Lang.T("exp.aborted"), recorder.Samples) +
             (recorder.MotionSamples>0?Lang.T("exp.rmse", recorder.Rmse):Lang.T("exp.noMotion")) +
             Lang.T("exp.savedNote"));

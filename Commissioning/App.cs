@@ -509,7 +509,7 @@ public sealed partial class ControlWindow : Window
             if (!AtStart(plan.Nodes[0].Pose)) { Lang.Text(lastStop, () => Lang.T("fault.notAtStart")); UpdateControls(); return; }
             if ((ulong)pointSequence + (uint)plan.Nodes.Length + 1 > uint.MaxValue) throw new InvalidOperationException(Lang.T("fault.seqExhaustedHome"));
             StartExperiment("trajectory",pointSequence+1,plan.Nodes);
-            uploading = plan; uploaded = null; uploadedRan = false; uploadNext = 0; trajectoryEpoch = ptp.Epoch; uploadStartedAt = DateTime.UtcNow;
+            uploading = plan; uploaded = null; uploadedRan = false; trajectoryRanOnce = false; uploadNext = 0; trajectoryEpoch = ptp.Epoch; uploadStartedAt = DateTime.UtcNow;
             xyPreview.PausePlayback();
             Append($"HOST trajectory upload start nodes={plan.Nodes.Length} duration={plan.Duration:F3}s; no automatic approach");
             SendNextTrajectoryPacket();
@@ -568,7 +568,7 @@ public sealed partial class ControlWindow : Window
             lastTrajectoryAt = DateTime.UtcNow; trajectoryIndex = (int)values[3]; trajectoryTotal = (int)total - 1;
             if (mode == 4) {
                 // The device keeps the nodes after a run (state 4): hold the plan so 执行图形 can repeat it.
-                executing = false; experimentCompleting = "complete"; uploaded = supportsTrajRepeat ? runPlan : null; uploadedRan = uploaded is not null; Append("HOST trajectory complete; firmware arm1 check passed, arm2 commanded only");
+                executing = false; experimentCompleting = "complete"; uploaded = supportsTrajRepeat ? runPlan : null; uploadedRan = uploaded is not null; trajectoryRanOnce = true; Append("HOST trajectory complete; firmware arm1 check passed, arm2 commanded only");
                 // A firmware that does not declare traj_repeat=1 refuses a second RUN of the plan it holds (and stops): upload again instead.
                 if (!supportsTrajRepeat) Append("HOST this firmware cannot repeat a held plan (its LINK line has no traj_repeat=1); upload the plan again to draw it again");
             }
@@ -662,6 +662,7 @@ public sealed partial class ControlWindow : Window
             InvalidateManualReferenceFeedback();
         // The device forgets a loaded plan when its reference epoch changes or it is disabled.
         if (synchronize && uploaded is not null && (!enabled || homing || ptp is not { Referenced: true } || ptp.Epoch != trajectoryEpoch)) uploaded = null;
+        if (synchronize && trajectoryRanOnce && (!enabled || homing || ptp is not { Referenced: true } || ptp.Epoch != trajectoryEpoch)) trajectoryRanOnce = false;
         if (synchronize) xyPreview.SetEditingAllowed(!PointBusy && !homing);
         enable.IsEnabled = LimitsReady && compatible && !enabled && !stopPending && !PointBusy;
         manualReference.IsEnabled = CanManualReference;
@@ -685,6 +686,8 @@ public sealed partial class ControlWindow : Window
             CanPoint ? (supportsTrajectory ? Lang.T("reason.readyTrajectory") :
                 Lang.T("reason.pointOnly")) :
             Lang.T("reason.needRef");
+        pointBlockReason = reason;
+        xyPreview.SetParameterConfirmation(RangeConfirmed, SpeedConfirmed);
         xyPreview.SetPointMoveState(CanPoint, reportedLimits, reason, supportsTrajectory, LimitsReady, uploaded, uploadedRan);
         var devicePose = supportsTelemetry && telemetry is { Referenced: true } && ptp is { Referenced: true } &&
             telemetry.Epoch == ptp.Epoch && telemetry.Sequence == ptp.Sequence && (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2 ? telemetry : null;
@@ -715,6 +718,7 @@ public sealed partial class ControlWindow : Window
         double percent=uploading is {} p?uploadNext*100.0/p.Nodes.Length:executing?trajectoryIndex*100.0/Math.Max(1,trajectoryTotal):0;
         xyPreview.SetDeviceStatus(statusMessage,statusFault,statusBusy,percent,
             stopPending || pendingControl is not null || homing || ptp is { Active: > 0 } && !executing);
+        UpdateWorkflow();
     }
     private void SafeAction(Action action)
     {
@@ -749,6 +753,7 @@ public sealed partial class ControlWindow : Window
         try { Send(0x79); } catch { /* Firmware heartbeat timeout remains the fallback. */ }
         hardwareUart = false; supportsShortHeartbeat = false; connectionBadge.ToolTip = null; lastLinkLine = null;
         try { FinishExperiment("disconnected: " + reason()); } catch(Exception ex) { Lang.Text(experimentResult, () => Lang.T("fault.saveSummary2") + ex.Message); }
+        lastExperimentOutcome = null; trajectoryRanOnce = false;
         try { serial?.Dispose(); } catch { }
         serial = null;
         compatible = enabled = homing = stopPending = false;
@@ -779,6 +784,7 @@ public sealed partial class ControlWindow : Window
         JointLimitsSyncSelfTest();
         LiveRatesSyncSelfTest();
         DiagnosticsSelfTest();
+        WorkflowSelfTest();
         StopRecoverySelfTest();
         ShapeFlowSelfTest();
         // Accumulate step by step: a later failure used to discard every earlier
