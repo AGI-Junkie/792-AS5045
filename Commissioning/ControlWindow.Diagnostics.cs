@@ -82,6 +82,7 @@ public sealed partial class ControlWindow
         supportsTrajRepeat = supportsFaultSnapshot = supportsTelemRate = false;
         reportedTelemHz = -1; telemAttempts = 0; telemRequestedAt = default; lastTelemDiag = "";
         recentTelemetry.Clear(); lastFault = null;
+        lastLatchedStop = null;
     }
 
     // Asks the device for the chosen stream rate once the link is up, and again if it ever reports another one.
@@ -125,6 +126,15 @@ public sealed partial class ControlWindow
     }
 
     // The device's own account of a stop: show it, and keep it with the seconds of telemetry that led up to it.
+    private string? lastLatchedStop;
+    private void HandleLatchedStop(string line)
+    {
+        if(line==lastLatchedStop) return;
+        string snapshot="FAULT_SNAPSHOT " + line["LAST_STOP ".Length..];
+        if(FaultSnapshot.Parse(snapshot) is null) return;
+        lastLatchedStop=line;
+        HandleFaultSnapshot(snapshot); // existing panel and fault.json retain the recovered timing evidence
+    }
     private void HandleFaultSnapshot(string line)
     {
         var snapshot = FaultSnapshot.Parse(line);
@@ -232,6 +242,10 @@ public sealed partial class ControlWindow
             Check(w.faultDetail.Text.Contains("原因待诊断") && w.faultDetail.Text.Contains("图形执行") && w.faultDetail.Text.Contains("不能据此认定"), "the panel must show the phase and say the driver cause is undetermined: " + w.faultDetail.Text);
             w.HandleLine(line.Replace("drv=nfault_undetermined", "drv=ok").Replace("phase=traj_run", "phase=idle").Replace("hb_age_ms=23", "hb_age_ms=300"));
             Check(w.faultDetail.Text.Contains("心跳") && !w.faultDetail.Text.Contains("原因待诊断"), "a non-driver stop must not talk about the driver");
+            string latched=line.Replace("FAULT_SNAPSHOT ","LAST_STOP id=1 ").Replace("reason=","elapsed_us=268001 plan_us=248000 late_us=20001 done=90 total=100 reason=");
+            w.HandleLine(latched); int bundles=Directory.GetDirectories(temp).Length;
+            w.HandleLine(latched);Check(Directory.GetDirectories(temp).Length==bundles && w.lastLatchedStop==latched,"repeated stop evidence must save only once");
+            Check(Directory.GetDirectories(temp).Any(d=>File.ReadAllText(Path.Combine(d,"fault.json")).Contains("elapsed_us=268001")),"recovered stop timing must persist");
             // The ring keeps only what is recent.
             for (int i = 0; i < 1300; i++) w.RememberTelemetry(TelemetrySample.Parse("TELEM t=1 epoch=3 seq=0 ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0")!);
             Check(w.recentTelemetry.Count <= 1200, "the telemetry ring is unbounded");

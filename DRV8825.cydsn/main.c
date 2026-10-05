@@ -76,7 +76,7 @@
 #define ARM2_ENCODER_FEEDBACK       (0u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v9-optional-arm2-feedback"
+#define FW_BUILD_ID                 "stage2-v10-stop-latch"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -356,7 +356,7 @@ static void dbg_puts(const char *s)
     }
 }
 
-static char g_dbg[512];   /* Dual-encoder fault snapshots must retain reason and CRLF. */
+static char g_dbg[768];   /* Stop evidence includes trajectory timing; keep reason and CRLF. */
 #define DBG(s)       dbg_puts(s)
 #define DBGF(...)    do { snprintf(g_dbg, sizeof(g_dbg), __VA_ARGS__); \
                           dbg_puts(g_dbg); } while (0)
@@ -1368,11 +1368,20 @@ static const char *stop_phase(void)
 #define ENC2_LOG_ARGS
 #endif
 
+/* RAM only: repeat evidence while stopped, even if the first TX attempt was dropped.
+ * A later operator STOP while already stopped must not overwrite the initiating fault. */
+static char g_lastStop[800];
+static uint32 g_lastStopId;
 static void fault_snapshot(const char *reason, uint8 driverFault)
 {
+    uint32 elapsedUs=0u, plannedUs=0u;
+    if(g_traj.state==3u && g_traj.index<g_traj.count) {
+        elapsedUs=(g_traj.elapsedCy+SU_ELAPSED(g_traj.clock))/SU_CY_PER_US;
+        plannedUs=(uint32)g_traj.nodes[g_traj.index].ms*1000u;
+    }
     JLOGF("FAULT_SNAPSHOT t=%lu epoch=%lu seq=%lu phase=%s home=%u traj=%u idx=%u/%u ref=%u p1=%ld p2=%ld e1=%ld err=%ld "
         ENC2_LOG_FORMAT
-        "inputs=%u hb_age_ms=%lu hb_max_gap_ms=%lu drv=%s reason=\"%s\"\r\n",
+        "inputs=%u hb_age_ms=%lu hb_max_gap_ms=%lu elapsed_us=%lu plan_us=%lu late_us=%lu done=%lu total=%lu drv=%s reason=\"%s\"\r\n",
           (unsigned long)g_jogMs,(unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,stop_phase(),
           (unsigned)g_home.phase,(unsigned)g_traj.state,(unsigned)g_traj.index,(unsigned)g_traj.count,
           (unsigned)(g_ptp.reference && dual_ready()),
@@ -1381,6 +1390,8 @@ static void fault_snapshot(const char *reason, uint8 driverFault)
         ENC2_LOG_ARGS
           (unsigned)((HARD_LIMIT_ACTIVE()?1u:0u)|(ARM1_HOME_ACTIVE()?2u:0u)|(ARM2_NPN_ACTIVE()?4u:0u)|(FAULT_ACTIVE()?8u:0u)),
           (unsigned long)(g_keysSeen ? (g_jogMs - g_lastKeyMs) : 0u),(unsigned long)g_keyMaxGapMs,
+          (unsigned long)elapsedUs,(unsigned long)plannedUs,(unsigned long)(elapsedUs>plannedUs ? elapsedUs-plannedUs : 0u),
+          (unsigned long)g_ptp.done,(unsigned long)g_ptp.total,
           (driverFault != 0u || FAULT_ACTIVE()) ? "nfault_undetermined" : "ok", reason);
 }
 
@@ -1389,6 +1400,11 @@ static void fault_snapshot(const char *reason, uint8 driverFault)
 static void stage_stop(const char *reason, uint8 driverFault)
 {
     fault_snapshot(reason, driverFault);
+#if (USE_DEBUG_UART != 0u)
+    if(g_motionEnabled || g_home.phase!=HOME_IDLE || !g_lastStop[0]) {
+        snprintf(g_lastStop,sizeof(g_lastStop),"LAST_STOP id=%lu %s",(unsigned long)++g_lastStopId,g_dbg+15);
+    }
+#endif
     JLOGF("STOP context: home=%u arm=%u phase_steps=%lu key_age_ms=%lu key_max_gap_ms=%lu rx_good=%lu late=%lu rejected=%lu\r\n",
           (unsigned)g_home.phase, (unsigned)g_home.arm, (unsigned long)g_home.steps,
           (unsigned long)(g_jogMs - g_lastKeyMs), (unsigned long)g_keyMaxGapMs, (unsigned long)g_rxGood,
@@ -2346,7 +2362,8 @@ static void telem_service(void)
 
 static void stage_status(void)
 {
-    JLOGF("STATE fw=stage2-v9 enabled=%u home=%u homed1=%u homed2=%u fault=%u enc=%u dir=%u enc2=%u dir2=%u arm2fb=%u\r\n",
+    if(!g_motionEnabled && g_lastStop[0]) { JLOG(g_lastStop); } /* priority before ordinary status; retried each stopped status block */
+    JLOGF("STATE fw=stage2-v10 enabled=%u home=%u homed1=%u homed2=%u fault=%u enc=%u dir=%u enc2=%u dir2=%u arm2fb=%u\r\n",
           (unsigned)g_motionEnabled, (unsigned)g_home.phase,
           (unsigned)g_homed1, (unsigned)g_homed2, (unsigned)g_jogFaulted,
           (unsigned)(g_arm1.hasEnc && (g_enc.badStreak == 0u)), (unsigned)g_directionKnown, (unsigned)(g_arm2.hasEnc && !g_enc2.badStreak), (unsigned)g_enc2.directionKnown, (unsigned)ARM2_ENCODER_FEEDBACK);
@@ -2952,7 +2969,7 @@ static void app_init(uint8 encOk)
                   JOG2_ACCEL_USTEP_S2, JOG2_DECEL_USTEP_S2);
 
     /* No startup enable, direction probe, return-to-origin, or holding steps. */
-    JLOG("\r\nSTAGE2 v9 optional arm2 feedback framed control: both drivers disabled, reference unset; use home or explicit manual straight reference\r\n");
+    JLOG("\r\nSTAGE2 v10 latched stop framed control: both drivers disabled, reference unset; use home or explicit manual straight reference\r\n");
     JLOG("INPUT MAP: HOME1=J4-2/P0[3], GLOBAL=J4-1/P0[4], HOME2=NPN/P1[0]\r\n");
     JLOG("C = explicit enable/recheck; R = home; Space/Esc = latched stop\r\n");
     jog_print_inputs();

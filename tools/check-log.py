@@ -31,6 +31,15 @@ def analyse(text):
 
     stops = [s.strip() for s in re.findall(r"STOP: ([^;\r\n]+)", text)]
     protective = [s for s in stops if not s.startswith("operator stop")]
+    recovered = set(re.findall(r'LAST_STOP id=\d+ [^\r\n]+', text))
+    for line in sorted(recovered):
+        reason = re.search(r'reason="([^"]+)"', line)
+        if not reason: continue
+        info.append("锁存停机：" + reason[1])
+        timing = re.search(r'elapsed_us=(\d+) plan_us=(\d+) late_us=(\d+) done=(\d+) total=(\d+)', line)
+        if timing: info.append("停机段耗时 %s us / 计划 %s us；超时 %s us；已走 %s/%s 步" % timing.groups())
+        short_reason = reason[1].split(';', 1)[0]
+        if not short_reason.startswith("operator stop") and short_reason not in protective: protective.append(short_reason)
     if protective:
         fails.append("保护性停机 %d 次：%s" % (len(protective), "；".join(sorted(set(protective)))))
     info.append("人为停止 %d 次" % (len(stops) - len(protective)))

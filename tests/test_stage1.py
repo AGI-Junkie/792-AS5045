@@ -1213,6 +1213,29 @@ static void fuzz_test(uint32 seed) {
 int main(int argc,char **argv) {
     const char *t=argv[1]; unsigned i, p1, p2;
     assert(argc==2);
+    if(!strcmp(t,"stop_latch")) {
+        const char *fill="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n";
+        char saved[800];
+        setup(); txq_flush_blocking(); simLogN=0;simLog[0]=0;
+        g_traj.state=3u;g_traj.count=2u;g_traj.index=1u;g_traj.nodes[1].ms=248u;
+        g_ptp.active=1u;g_ptp.done=90u;g_ptp.total=100u;
+        g_traj.elapsedCy=268001u*SU_CY_PER_US;g_traj.clock=SU_NOW();
+        while(txq_free()>=strlen(fill)) JLOG(fill); /* first stop messages cannot fit */
+        traj_service(); assert(!g_motionEnabled && g_txqDropped);
+        assert(strstr(g_lastStop,"reason=\"trajectory timing overrun\"") && strstr(g_lastStop,"idx=1/2") &&
+               strstr(g_lastStop,"done=90 total=100"));
+        { unsigned long elapsed,planned,late;
+          assert(sscanf(strstr(g_lastStop,"elapsed_us="),"elapsed_us=%lu plan_us=%lu late_us=%lu",&elapsed,&planned,&late)==3);
+          assert(elapsed>268000u && planned==248000u && late==elapsed-planned && late>20000u); }
+        strcpy(saved,g_lastStop);txq_flush_blocking();simLogN=0;simLog[0]=0;
+        stage_status();txq_flush_blocking();assert(strstr(simLog,saved)==simLog);
+        jog_handle_byte(JOG_CMD_STOP);txq_flush_blocking();assert(!strcmp(saved,g_lastStop));
+        simLogN=0;simLog[0]=0;stage_status();txq_flush_blocking();assert(strstr(simLog,saved));
+        sim_keys(0);stage_enable();txq_flush_blocking();simLogN=0;simLog[0]=0;
+        stage_status();txq_flush_blocking();assert(!strstr(simLog,"LAST_STOP")); /* no extra motion-time output */
+        stage_stop("new test stop",0u);assert(g_lastStopId==2u && strstr(g_lastStop,"new test stop"));
+        puts(t);return 0;
+    }
     if(!strcmp(t,"optional_arm2")) {
         assert(!ARM2_ENCODER_FEEDBACK); simBadEncoder2=1;
         assert(app_boot()); setup(); assert(g_arm1.hasEnc && !g_arm2.hasEnc);
@@ -1338,7 +1361,7 @@ int main(int argc,char **argv) {
         sim_run(1);
         assert(!g_motionEnabled && !simPulse1 && !simPulse2);
         assert(g_arm1.hasEnc && !g_enc.trackingLost && g_encMaxGapMs<10u);
-        assert(simWdtFeeds>1000u && strstr(simLog,"STAGE2 v9 optional arm2 feedback framed control"));
+        assert(simWdtFeeds>1000u && strstr(simLog,"STAGE2 v10 latched stop framed control"));
         puts(t);return 0;
     }
     if(!strcmp(t,"dual_snapshot_length")) {
@@ -1377,7 +1400,7 @@ int main(int argc,char **argv) {
         char proto[24]; simLogN=0; simLog[0]=0;
         stage_status(); txq_flush_blocking();
         sprintf(proto," proto=%u\r\n",(unsigned)PROTO_VERSION); /* with its end of line: the debug buffer must not cut the LINK line short */
-        assert(strstr(simLog,"STATE fw=stage2-v9 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
+        assert(strstr(simLog,"STATE fw=stage2-v10 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
         assert(strstr(simLog," short_hb=1") && strstr(simLog," joint_limits=1") && strstr(simLog," motion_rates=1") && strstr(simLog," rates_live=1") && strstr(simLog," q2_absolute=1"));
         assert(strstr(simLog," traj_repeat=1") && strstr(simLog," fault_snapshot=1") && strstr(simLog," telem_hz=0 proto="));
         puts(t);return 0;
@@ -1883,7 +1906,7 @@ ptp_cases += ['traj_'+name for name in ['success','dwell','duplicate','capacity'
     'upload_stop','upload_jog','upload_timeout','crc','ptp_busy','stop','fault','limit','home1','npn','encoder','timeout','overrun','uart_upload','uart_run']]
 ptp_cases += ['manual_'+name for name in ['success','duplicate','stop','old_epoch','disabled','moving','busy','upload','sensor','fault','encoder','timeout','stale','payload','crc']]
 ptp_cases += ['fuzz_%d' % n for n in range(1, 7)]   # the gate's share; long campaigns: --emit-c=DIR and run fuzz_<seed> in parallel
-ptp_cases += ['dual_manual_unknown','dual_ptp_follow']
+ptp_cases += ['dual_manual_unknown','dual_ptp_follow','stop_latch']
 if host_plan is not None: ptp_cases += ['traj_host_plan','traj_manual_plan','traj_host_plan_offset','traj_host_plan_rx_retry']
 if len(sys.argv)>1:
     cases=[c for c in cases if c in sys.argv[1:]]

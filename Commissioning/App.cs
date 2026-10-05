@@ -125,7 +125,7 @@ public sealed partial class ControlWindow : Window
     private static readonly Regex TrajectoryPattern = new(@"^TRAJ_STATE state=([0-4]) count=(\d+) total=(\d+) index=(\d+) seq=(\d+) epoch=(\d+)$", RegexOptions.CultureInvariant);
     private string? lastLinkLine;
     private Func<string> regularStateText = () => Lang.T("state.disconnected");
-    private static readonly Regex StatePattern = new(@"^STATE fw=(?:stage1-v3|stage2-v[1-9]) enabled=([01]) home=([0-7]) homed1=([01]) homed2=([01]) fault=([01]) enc=([01]) dir=([01])(?: enc2=([01]) dir2=([01]))?(?: arm2fb=([01]))?$", RegexOptions.CultureInvariant);
+    private static readonly Regex StatePattern = new(@"^STATE fw=(?:stage1-v3|stage2-v(?:[1-9]|10)) enabled=([01]) home=([0-7]) homed1=([01]) homed2=([01]) fault=([01]) enc=([01]) dir=([01])(?: enc2=([01]) dir2=([01]))?(?: arm2fb=([01]))?$", RegexOptions.CultureInvariant);
 
     public ControlWindow(bool restoreParameters = false)
     {
@@ -356,7 +356,7 @@ public sealed partial class ControlWindow : Window
         {
             compatible = true; lastStateAt = DateTime.UtcNow;
             stage2 = line.StartsWith("STATE fw=stage2-");
-            framedControl = line.StartsWith("STATE fw=stage2-v7 ") || line.StartsWith("STATE fw=stage2-v8 ") || line.StartsWith("STATE fw=stage2-v9 ");
+            framedControl = line.StartsWith("STATE fw=stage2-v7 ") || line.StartsWith("STATE fw=stage2-v8 ") || line.StartsWith("STATE fw=stage2-v9 ") || line.StartsWith("STATE fw=stage2-v10 ");
             heartbeatTimer.Interval = TimeSpan.FromMilliseconds(framedControl ? 8 : 40);
             bool fastLink = framedControl || line.StartsWith("STATE fw=stage2-v6 ");
             if (hardwareUart != fastLink)
@@ -433,6 +433,7 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("TELEM_RATE ")) { ObserveTelemetryRate(line); }
         else if (line.StartsWith("TELEM_DIAG ")) { ObserveTelemetryDiagnostics(line); }
         else if (line.StartsWith("FAULT_SNAPSHOT ")) { HandleFaultSnapshot(line); }
+        else if (line.StartsWith("LAST_STOP ")) { HandleLatchedStop(line); }
         else if (line.StartsWith("PTP_LIMITS ") || line.StartsWith("PTP_RATES ")) { HandleLimitsAck(line); UpdateControls(); }
         else if (line.StartsWith("TRAJ_STATE ")) HandleTrajectoryState(line);
         else if (line.StartsWith("TELEM ")) HandleTelemetry(line);

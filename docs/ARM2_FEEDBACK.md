@@ -1,6 +1,6 @@
 # arm2 编码器反馈交付（2026-10-05）
 
-固件 `stage2-v9-optional-arm2-feedback`，协议 `proto=4`。当前交付默认 `ARM2_ENCODER_FEEDBACK=0`：arm2 编码器未固定时不参与启动、使能、回零、点动、PTP 或轨迹的反馈条件；arm2 按指令计数运行。人工伸直确认不要求 arm2 方向已识别。arm1 编码器仍必须有效。`STATE arm2fb=0` 标记此模式，TELEM/FAULT_SNAPSHOT 不输出 e2/err2，界面 arm2 实测/误差显示 —，记录对应字段留空。固定并验收 arm2 编码器后，将该宏设为 1 并重新构建；启用后仍保留丢反馈停机。
+固件 `stage2-v10-stop-latch`，协议 `proto=4`。当前交付默认 `ARM2_ENCODER_FEEDBACK=0`：arm2 编码器未固定时不参与启动、使能、回零、点动、PTP 或轨迹的反馈条件；arm2 按指令计数运行。人工伸直确认不要求 arm2 方向已识别。arm1 编码器仍必须有效。`STATE arm2fb=0` 标记此模式，TELEM/FAULT_SNAPSHOT 不输出 e2/err2，界面 arm2 实测/误差显示 —，记录对应字段留空。固定并验收 arm2 编码器后，将该宏设为 1 并重新构建；启用后仍保留丢反馈停机。
 
 以下对齐项描述 `ARM2_ENCODER_FEEDBACK=1` 的实现；构建和 GPIO/串口仿真不能代替烧录后的控制验收。没有自动烧录、串口连接、使能或电机运动。
 
