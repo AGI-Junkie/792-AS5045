@@ -64,3 +64,6 @@ __pycache__/
 
 # Hardware-tested firmware builds are archived on purpose (see releases/README.md)
 !releases/**/*.hex
+
+# Local KiCad circuit project
+/circuit/
