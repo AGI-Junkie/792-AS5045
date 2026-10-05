@@ -97,18 +97,30 @@ internal sealed class ReachabilityMask
         Check(Build(arm, new JointLimits(179, 181, 179, 181)).IsReachable(new Point(-arm.OuterRadius, 0)), "q1 跨 180°");
         Check(Build(arm, new JointLimits(359, 361, 299, 301)).IsReachable(
             arm.Forward(new JointPose(0, -60)).Tip), "跨 360° 等价角");
-        Check(Build(arm, new JointLimits(-1, 1, 179, 180)).IsReachable(
+        Check(Build(arm, new JointLimits(-1, 1, 179, 180, -180, 180)).IsReachable(
             arm.Forward(new JointPose(0, 180)).Tip), "正 180° 折叠边界");
-        Check(Build(arm, new JointLimits(-1, 1, -180, -179)).IsReachable(
+        Check(Build(arm, new JointLimits(-1, 1, -180, -179, -180, 180)).IsReachable(
             arm.Forward(new JointPose(0, -180)).Tip), "负 180° 折叠边界");
+        Check(!Build(arm, new JointLimits(-1, 1, 179, 180)).IsReachable(
+            arm.Forward(new JointPose(0, 180)).Tip), "默认肘范围 ±155° 不含 180° 折叠");
         var equal = new PlanarArm(100, 100);
-        Check(Build(equal, new JointLimits(40, 50, -140, -130)).IsReachable(new Point()), "等长连杆原点有合法折叠解");
+        Check(Build(equal, new JointLimits(40, 50, -140, -130, -180, 180)).IsReachable(new Point()), "等长连杆原点有合法折叠解");
+        Check(!Build(equal, new JointLimits(40, 50, -140, -130)).IsReachable(new Point()), "原点折叠要求肘 ±180°，默认肘范围不含");
         Check(!Build(equal, defaults).IsReachable(new Point()), "等长原点仍受 q2 限制");
         var free = Build(arm, null);
         Check(free.IsReachable(new Point(arm.InnerRadius, 0)), "几何内圆边界");
         Check(!free.IsReachable(new Point(arm.InnerRadius - 0.1, 0)), "内圆盲区");
         Check(!mask.Matches(new PlanarArm(181, 176.38), defaults), "杆长改变使缓存失效");
         Check(!mask.Matches(arm, new JointLimits(-31, 30, -60, 60)), "范围改变使缓存失效");
+        Check(!mask.Matches(arm, defaults with { ElbowMax = 90 }), "肘范围改变使缓存失效");
+        // The elbow range alone shapes the region: |elbow| = 90 at r = sqrt(L1^2 + L2^2) = 252, 5.3 deg at r = 356.
+        var wide = new JointLimits(-180, 180, -180, 180);
+        Check(Build(arm, wide with { ElbowMin = 0, ElbowMax = 90 }).IsReachable(new Point(300, 0)), "肘 [0,90]：r=300 取 +65° 分支");
+        Check(!Build(arm, wide with { ElbowMin = 0, ElbowMax = 90 }).IsReachable(new Point(240, 0)), "肘 [0,90]：r=240 需要 >90°");
+        Check(Build(arm, wide with { ElbowMin = -90, ElbowMax = 0 }).IsReachable(new Point(300, 0)), "肘 [-90,0]：取另一分支");
+        Check(Build(arm, wide with { ElbowMin = 10, ElbowMax = 90 }).IsReachable(new Point(350, 0)), "肘 [10,90]：r=350 约 22°");
+        Check(!Build(arm, wide with { ElbowMin = 10, ElbowMax = 90 }).IsReachable(new Point(356, 0)), "肘 [10,90]：接近伸直（<10°）不可达");
+        Check(!Build(arm, wide with { ElbowMin = -20, ElbowMax = 20 }).IsReachable(new Point(300, 0)), "肘 ±20°：r=300 需要 65°");
 
         var image = mask.Bitmap;
         Check(image.IsFrozen && ReferenceEquals(image, mask.Bitmap), "遮罩缓存必须复用冻结图像");

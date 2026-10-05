@@ -1,6 +1,79 @@
+# v10 — 锁存图形中断证据
+
+- 停机快照增加当前轨迹段的计划/实际耗时、超时量和协调步数。停止后优先重复 LAST_STOP，即使首次 TX 丢弃也可恢复；后续总停止不覆盖原故障。
+- 上位机去重保存恢复的快照，日志分析工具识别锁存记录。协议仍为 proto=4，arm2 反馈仍默认关闭；20 ms 门槛和停机行为保持原样。
+- 复现步骤与字段说明见 docs/STOP_DIAG.md；构建不烧录、不连接或驱动硬件。
+
+# v9 — arm2 编码器暂时可选
+
+- 默认关闭 arm2 编码器反馈要求，保留 arm1 反馈与既有保护；无 arm2 反馈时使用指令计数。
+- 人工伸直确认不再被 arm2 方向未识别拦住。
+- proto=4 用 arm2fb 报告模式，缺测字段不生成虚假零值；固定编码器后可重新启用双轴反馈构建。
+
 # 变更记录
 
+## 2026-10-05 — arm2 feedback parity
+
+- `stage2-v8-dual-encoder-feedback` / `proto=3`: 38-clock SSI chain integrated into normal sampling; each motor has independent wrap tracking, polarity learning, following protection, jog hold and measured joint guards. No open-loop fallback. Existing physical stop behavior retained.
+- Both encoders qualify enable/home/PTP/trajectory and final acceptance. Telemetry and fault snapshots now include `e2/err2`; host shows/records/replays measured q2 = measured q1 + measured elbow, with q2 error/RMSE/peak. Older archives retain their original measurement gaps.
+- SSI masks interrupts per bit, permitting UART RX between bits. Current 126°/161.5° calibration parameters retained and regression expectations aligned. Arm2 manual reference requires polarity learned during homing after enable.
+- Software validation and matching artifacts are produced by `build-release.ps1`; no flashing or physical motion. Continuous trajectory correction, physical calibration, real timing and precision acceptance remain: see [arm2 feedback](docs/ARM2_FEEDBACK.md).
+
+
 最新在前。每条写“改了什么、验证到哪一步”；“未烧录”指固件镜像没有下载到板子上。
+
+## 2026-10-02（修复）：流式遥测的序号领先 `PTP_STATE` 时，上位机误报“设备反馈无效”并在上传刚开始时自己发 STOP（上位机；固件不变）
+
+- **现象**（实机，刚烧录流式遥测固件）：上传图形三次都在开始的约 100 ms 内被拒，提示“设备反馈无效或参考代次不匹配；已停止，请重新建立坐标”。停机快照（`Experimentsaults\…-traj_uploadault.json`）显示 `phase=traj_upload idx=0/2`、`reason="operator stop"`、`hb_age_ms=0`、`drv=ok`、`rx_error=0`：设备正常，是主机自己发的 STOP；实验记录里最后一条样本 `seq=2`，停机时设备已是 `seq=4`。
+- **原因**：设备每收下一个上传节点（RUN 也一样）就把 `seq` 往前推，而主机的 `ptp.Sequence` 只随每 500 ms 的 `PTP_STATE` 更新。以前 `TELEM` 只在状态块里、紧跟在 `PTP_STATE` 后面，两者天然一致；改成 10 Hz 独立发送后，上传期间几乎每条 `TELEM` 的 `seq` 都领先，`HandleTelemetry` 把“序号不等”一律当坏反馈，忙的时候就 `Stop()`。我上一轮的测试里 `TELEM` 总是排在 `PTP_STATE` 后面，所以没覆盖到这个情形。
+- **修复**（`ControlWindow.Feedback.cs`）：同一代次下，`seq` 大于最近 `PTP_STATE` 且不超过主机已发出的最大序号，算正常的领先，照常当作反馈使用（`AtStart` 等仍要求序号一致，所以在 `PTP_STATE` 追上之前不会放行下一步）；落后、超过主机发过的最大序号、或代次不同仍然停止。`docs/PROTOCOL.md` 记下了 `seq` 的这个语义。
+- 验证：`ShapeFlowSelfTest` 里每次移动、上传的每个节点、RUN 和运行中都先插入一条领先的流式 `TELEM`（去掉修复后第一个用例就失败，已验证）；`FeedbackSelfTest` 增加三个反例（序号超过主机发出的、序号落后、代次不同）仍会停止；`--self-test`、`--language-self-test` 通过。**还没在板子上重试**——需要关掉正在跑的上位机，换用修复后的构建。
+
+## 2026-10-02（标定）：标定向导——杆长、回零后真实姿态、机械行程、正反向重复定位的测量记录（上位机；固件不变）
+
+- **向导**（`Calibration.cs`、`CalibrationWindow.cs`、`ControlWindow.Calibration.cs`）：“实时反馈与实验”页的“标定向导…”。六步：杆长、回零后的真实姿态（零位偏差、实测笔尖）、机械行程（读设备指令角、给出带内缩余量的肘范围）、正反向重复定位（交替 +/− 的试验表；预备点/目标/记录到位三个按钮，移动走和主窗口“移动”同一道闸）、总结保存、历史。输入框一开始是空的，规划现在用的杆长不会被当成测量值；全 0 又没写别的零位页算“没测”。
+- **统计**：每方向 σx、σy、最大散布；回差＝两个方向平均位置沿趋近方向之差；单向重复性＝较大的最大散布。arm1 编码器在电机侧，看不到减速箱回差，所以回差靠笔尖实测。
+- **保存**：`%LOCALAPPDATA%\TwoLinkCommissioning\Calibrations\cal-<日期时间>-v<版本>.json`，只增不改（写 .tmp 再改名，重名拒绝），`active.txt` 指向当前标定；损坏文件、id 与文件名不符的文件被忽略；不合格的草稿（负杆长、肘范围反了、趋近角越界……）拒绝保存并写明原因。**保存不改变机器，也不补偿**；“采用为杆长/肘范围”只在点按钮时把值填进规划参数框（预览按新数值重新规划，设备上已上传的旧图形和新参数不再一致；肘范围照常经上位机校验再同步给设备）。
+- **实验带上标定编号**：`metadata.json` 记 `calibration_id`，实验列表多一列“标定”（旧记录 —），摘要写出完整编号，导出 CSV 有 `calibration_id` 列。
+- 验证：上位机 `--self-test`（含新增 `Calibrations.SelfTest`、`CalibrationWindow.SelfTest`：用记录动作的假主机走完整个向导——空表单、杆长差、零位判断、肘范围建议与应用、交替试验表、预备点/目标的方向与越界拒绝、设备读数拷贝、统计对照独立算出的沿趋近方向回差、保存两个版本并切换、坏草稿拒绝、保存和切换从不动机器和规划、中英文切换、窗口布局断言；面板层测试：填入杆长/肘范围后预览按新数值重新规划且不请求运动；实验归档测试：编号往返）、`--language-self-test` 通过。截图里发现并修复了一处布局错误（Dock 设在被包裹的内层控件上，页面区域塌成 0 宽）。**没有上板、没有实测；肘范围 ±155° 仍是未测的默认值**——这个向导的“机械行程”一步就是用来量它的。
+
+## 2026-10-02（实验分析）：实验列表、误差曲线、规划速度/加速度、XY 叠加、回放与比较（上位机；固件不变）
+
+- **数据层**（`ExperimentArchive.cs`）：读取已保存的实验（metadata/summary/plan/feedback，旧版也行），解析 `settings` 文本得到图形、速度、范围；损坏的文件夹计数后跳过，反馈文件表头不对直接拒绝而不是读错。`RunAnalysis` 把计划对齐到设备时钟（在 5 ms 网格上找指令与计划最吻合的平移，残差作为可信度），导出事件（起步、拐角停顿、停机）、分段 RMSE、规划速度/加速度（电机2＝q2−q1）、各电机相对设定上限的占用率。用 40 条真实记录检查过：对齐残差约 0.005°，2 Hz 遥测也能对上。
+- **窗口**（`ExperimentWindow.cs`、`PlotView.cs`）：列表（可 Ctrl 选两次叠加比较）、四张共时间轴的曲线（q1 命令/编码器/规划；误差带事件线和故障标记；规划速度；规划加速度，含上限线）、XY 平面（规划/指令/混合三条路径和连杆姿态）、回放（时间轴、播放 0.5×–5×、点曲线跳转）、此刻前后 1 秒的连接日志。每张图写明数据来源，XY 标明不是实测笔尖位置。可导出列表 CSV，命令行 `--experiments-report`。
+- 限速轴的判断如实：占用率 ≥90% 才算接近上限，没有就写“没有电机达到设定上限（最高 x%）：计划被脉冲/弦误差检查放慢”——自检里发现小图形的计划确实会被这些检查拉到上限的一半左右。
+- 验证：上位机 `--self-test`、`--language-self-test` 通过；新用例：用真实记录器和真实计划合成录像（已知时间偏移 8200 ms 与 0.02° 误差）检查对齐误差 ≤10 ms、事件数（矩形 3 个拐角）、RMSE/峰值、限速判断（手工构造恰在上限的计划只判 v1）、旧格式/无 summary/坏行/坏文件夹/表头错误；窗口里列表与本地化、单选/比较的曲线与标记与上限线、故障时刻、游标共享与连杆姿态等于该时刻的命令姿态、日志取自正确的会话并隐藏状态块、回放到末尾停止、中英文切换保持选择、空目录提示。
+
+## 2026-10-02（界面）：操作流程条、命名方案、参数状态灯（上位机；固件不变）
+
+- **操作流程条**：工具栏下一行，连接 → 使能 → 建立参考 → 检查轨迹 → 移到起点 → 上传 → 执行 → 查看结果，每步 ✓/●/○/–，第一个未完成的步骤给出“下一步”：能做就写怎么做，不能做就写具体原因（复用设备给的原因：范围/速度未同步、先总停止、协议不匹配、不在起点、固件不支持上传等）。单点没有上传和执行两步。停止、断开会让它回到相应步骤；执行完成后“查看结果”显示这次记录的 arm1 误差 RMSE 和峰值（并重申 arm2 无编码器、XY 为估算）。
+- **命名方案**：小圆演示、直线测试、重复定位实验（单点），和用户自己的方案（`presets.json`，最多 50 个、名称不超过 40 字符、忽略大小写同名覆盖、内置名称保留、损坏的文件忽略并提示）。选择方案只载入图形/尺寸/变换/速度并检查，不请求任何运动；不改杆长和关节/肘范围。
+- **参数状态灯**：图形、变换、机构尺寸、关节范围、运动参数每组一行，显示 已保存到电脑 / 设备已确认 / 已用于上传的图形。范围和速度的设备确认分开（`RangeConfirmed`/`SpeedConfirmed`，`LimitsReady` 是两者的与），改了速度后能看出是哪个还没确认；设备上图形与屏幕不同时标“与设备上的图形不同”。
+- 验证：上位机 `--self-test`、`--language-self-test` 通过。新用例：流程条走完整条流水线（离线→协议不匹配→已连接→使能→参考→检查失败/通过→移到起点→上传中→已上传→执行中→完成→停止→断开）每一步的状态和提示；方案的载入/保存/覆盖/删除/重读/损坏文件/保留名称；状态灯的保存、分组、设备确认分开、已用于/不同。
+
+## 2026-10-02（遥测）：`stage2-v7-absolute-q2-elbow-r4000-telem`（流式遥测、停机快照、能力声明；固件和上位机都改了，需重新烧录；实机未验证）
+
+- **流式遥测**：新增控制帧 type 11（遥测速率）。0＝只随 500 ms 状态块带（约 2 Hz，和以前一样），5…20 Hz＝已使能期间另外按该速率单独发送 `TELEM`。只改变打印什么，任何时候都接受。流式行**从不占用发送队列的后一半**：队列过半满就跳过这一行并计数（`TELEM_DIAG skipped=`），不丢弃 ACK 和停止信息。`TELEM_DIAG max_us` 记录一次格式化最长耗时——`TELEM` 的格式化和步进脉冲在同一个循环里，**实机上要看这个数和 `key_max_gap_ms`、`loop_max_ms` 有没有因 10–20 Hz 变差**。上位机默认请求 10 Hz（“实时反馈与实验”页里可选 仅状态块/5/10/20 Hz）；设备记录 `telemetry_hz`，面板按约 7 Hz 重绘，记录和停机前缓冲仍收每一个样本。
+- **停机快照**：每次 `stage_stop()` 的第一行是 `FAULT_SNAPSHOT`（阶段、位置、编码器误差、输入、心跳年龄、停止原因）。驱动器 nFAULT 只写 `drv=nfault_undetermined`：该引脚可由过流、过热或欠压触发，**不据此认定过热**。上位机显示快照，并把它和停机前 15 秒的遥测存成 `fault.json`/`pre_fault.csv`（有实验在记录时放进该实验目录，否则放 `Experiments\faults\`）。
+- **能力声明**：`LINK` 新增 `traj_repeat=1`（缓存的图形跑完后接受再次 RUN）、`fault_snapshot=1`、`telem_hz=<当前速率>`（有这个键表示支持 type 11）。不改 `proto`（新增能力位，不改帧格式）。没有 `traj_repeat=1` 的旧固件第二次 RUN 会被拒绝并停止，所以上位机在这类固件上跑完一次后把图形当作用掉了，要求重新上传。`g_dbg` 由 256 加到 320 字节（LINK 约 230 字符、快照约 270）。
+- 验证：固件 C 仿真 372 例全过（新增 `telem_rate`、`telem_rate_invalid`、`telem_stream`、`telem_skip`、`fault_snapshot`；流式按设备时钟计数、队列过半时跳过而不丢弃、关使能即停、快照先于重置并带正确阶段、驱动器停机不解释原因；对队列保护、快照调用、速率校验、使能门限、`traj_repeat` 声明分别做过变异验证）。上位机 `--self-test`、`--language-self-test` 通过（新增：能力解析与断开复位、速率请求/重试/ACK/重试上限、type 11 编码、快照解析与保存、旧固件不重复运行、全部 11 种图形走完整上传/运行流程）。
+
+## 2026-10-02（图形）：新增椭圆、圆弧、圆角矩形、“8”字、正多边形、螺旋、自定义轮廓，以及旋转/缩放/方向（上位机；固件不变）
+
+- 规划器从“直线段＋整圆”改成通用的**参数曲线段**（`PathPiece`：位置、一阶、二阶导数）。`TimedTrajectory` 直接读曲线段的解析导数，所以任何新图形都不用再改时间规划；原来的直线、矩形、圆走同一接口，默认参数下坐标逐位不变（有测试）。
+- 新图形：椭圆（旋转角＝长轴方向）、圆弧（起始角、扫过角度）、圆角矩形（**一整段连续曲线**，用来和矩形的尖角停顿对比）、“8”字/利萨如（整数频率比 2～6）、正多边形（3～12 边，顶点停顿）、螺旋（起止半径、圈数）、自定义轮廓（点列或单条 SVG 路径，M L H V C S Q T Z；多条轮廓因无抬笔被拒绝）。尺寸框随图形变化，第三个尺寸（c）、旋转、缩放（0.01～100）、方向（顺/逆时针）是所有图形共用的“图形变换”。已有图形的下标不变，旧 `parameters.json`（15 或 17 个字段）仍可载入，变换取默认值。
+- 越界检查：直线、矩形、多边形、圆保持精确极值；曲线在每个 1 mm 间隔内再查三个点（约 0.25 mm），带 `ponytail:` 注释说明上限。
+- 新增 `--geometry-self-test`（几秒，不开窗口，只跑几何/规划检查），方便改图形时快速验证。
+- 验证：上位机 `--self-test`、`--language-self-test` 通过。新用例覆盖：每个图形的 IK 往返、采样间距 ≤1 mm、曲线段端点与采样点一致、解析导数与数值差分一致、时间规划起止点、顺/逆时针、旋转/缩放、非法输入（含错误信息指出哪个框）、肘范围对曲线的作用、点列/SVG 解析（含相对命令、曲线拆分、多轮廓/弧命令/语法错误被拒）、保存文件往返与旧文件兼容。未上实机；新图形的实际笔迹和速度表现需要在机器上看。
+
+## 2026-10-02：`stage2-v7-absolute-q2-elbow-r4000-live`，`proto=2`（肘角范围纳入上位机和固件校验；固件和上位机都改了，需重新烧录；实机未验证）
+
+- 起因：q1、q2 是连杆绝对角，肘（电机 2）转过 q2 − q1，两个 q 框只能间接限制它（q1 ±135°、q2 ±155° 时肘可达 ±290°），此前只靠操作者保证。现在肘有自己的最小/最大，**固件和上位机各自独立检查**。
+- 协议：type 9 新增轴 2 = 肘（规则与 q1/q2 相同，同样只在未使能、无参考时接受）；`PTP_STATE` 末尾加 `emin/emax`，缺这两项的行上位机不接受；`PROTO_VERSION`/`ProtocolVersion` 1 → 2，所以 proto=1 的固件会被上位机拒绝运动并提示更新。固件开机默认 ∓155°（`PTP_ELBOW_DEFAULT_CD`），与 `DeviceContract.ElbowDefaultCd` 同值，已加入发布闸门的共享数字核对。
+- 固件：PTP 单点、轨迹 BEGIN/NODE 的 q2 − q1 超出肘范围即拒绝（`PTP refused: joint range/rate`）；`ptp_counts_in_range` 同时检查肘，所以当前位置在范围外时拒绝新的 PTP、运动中越界停止（`PTP time/joint limit`）；电机 2 点动到肘边界后不再向外（只能退回）。arm1 点动不改变肘，不受影响。
+- 上位机：参数分组里新增“肘 最小 / 最大”（留空 ±155°，规则同 q1/q2：含 0、−180…180°、两位小数）；`JointLimits` 增加肘范围，所有 `Contains` 调用（预览红区、轨迹规划、执行计划校验、单点移动、上传前复核）自动按三个范围判定。轨迹检查补了圆形在离基座最近/最远点的肘极值（采样点之间）。姿态读数行显示当前肘角和到两侧边界的余量，越界时标出。拒绝提示、范围概要、轨迹统计、CSV（新增 `elbow_min_deg/elbow_max_deg` 两列）、实验记录里的参数描述都带肘范围。旧版保存的 `parameters.json`（15 个字段）仍可载入，肘取默认值。
+- 没做：肘范围的数值没有实测（README 里有测量办法）；固件里肘范围存在 `g_jointMinCd[2]`/`g_jointMaxCd[2]`；改开机默认值只改 `PTP_ELBOW_DEFAULT_CD` 和 `DeviceContract.ElbowDefaultCd`（闸门核对两者一致）。
+- 验证：固件 C 仿真新增 `limits_elbow`、`limits_elbow_traj`、`limits_elbow_jog`（只有肘能拒绝的单点/BEGIN/NODE、恰在边界允许、点动在肘边界不外推、轴 2 接受/轴 3 拒绝/非法肘范围拒绝，PTP_STATE 回报 emin/emax），并对三处新增检查分别做变异验证（去掉任一处，对应用例失败）；上位机自检新增肘范围同步（只改肘 → 轴 2 请求、ACK 与回报缺一不可、先 q 后肘）、`PtpState` 解析、type 9 轴 2 编码、`JointLimits`/可达区域/轨迹/执行计划/UI 的肘范围用例，以及旧参数文件兼容。
 
 ## 2026-10-01（续二）：`stage2-v7-absolute-q2-r4000-live`（已使能时改速度/加速度立即生效；回零快碰跟随全局速度；固件已改，需重新烧录）
 

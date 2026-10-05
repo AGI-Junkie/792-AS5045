@@ -5,18 +5,20 @@ namespace TwoLinkCommissioning;
 
 public sealed record PtpState(bool Locked, bool Referenced, int Active, uint Epoch, uint Sequence, JointLimits Limits)
 {
-    private static readonly Regex Pattern = new(@"^PTP_STATE lock=([01]) ref=([01]) active=([012]) epoch=(\d+) seq=(\d+) min1=(-?\d+) max1=(-?\d+) min2=(-?\d+) max2=(-?\d+)$", RegexOptions.CultureInvariant);
+    private static readonly Regex Pattern = new(@"^PTP_STATE lock=([01]) ref=([01]) active=([012]) epoch=(\d+) seq=(\d+) min1=(-?\d+) max1=(-?\d+) min2=(-?\d+) max2=(-?\d+) emin=(-?\d+) emax=(-?\d+)$", RegexOptions.CultureInvariant);
     public static PtpState? Parse(string line)
     {
         var m = Pattern.Match(line);
         if (!m.Success || !uint.TryParse(m.Groups[4].Value, out uint epoch) || !uint.TryParse(m.Groups[5].Value, out uint seq)) return null;
-        var values = new int[4];
-        for (int i = 0; i < 4; i++) if (!int.TryParse(m.Groups[i + 6].Value, out values[i])) return null;
+        var values = new int[6];   // min1 max1 min2 max2 elbowMin elbowMax
+        for (int i = 0; i < 6; i++) if (!int.TryParse(m.Groups[i + 6].Value, out values[i])) return null;
         bool locked = m.Groups[1].Value == "1";
-        if (!locked && (values[0] < -DeviceContract.JointLimitCdMax || values[1] > DeviceContract.JointLimitCdMax || values[2] < -DeviceContract.JointLimitCdMax || values[3] > DeviceContract.JointLimitCdMax ||
-            values[0] >= values[1] || values[2] >= values[3] || values[0] > 0 || values[1] < 0 || values[2] > 0 || values[3] < 0)) return null;
+        if (!locked) for (int axis = 0; axis < 3; axis++) {
+            int min = values[axis * 2], max = values[axis * 2 + 1];
+            if (min < -DeviceContract.JointLimitCdMax || max > DeviceContract.JointLimitCdMax || min >= max || min > 0 || max < 0) return null;
+        }
         return new PtpState(locked, m.Groups[2].Value == "1", int.Parse(m.Groups[3].Value), epoch, seq,
-            new JointLimits(values[0] / 100.0, values[1] / 100.0, values[2] / 100.0, values[3] / 100.0));
+            new JointLimits(values[0] / 100.0, values[1] / 100.0, values[2] / 100.0, values[3] / 100.0, values[4] / 100.0, values[5] / 100.0));
     }
 }
 
@@ -66,7 +68,7 @@ public static class PtpProtocol
     }
     public static byte[] EncodePacket(byte type, uint sequence, uint epoch, JointPose pose, ushort value)
     {
-        if (type is < 1 or > 10 || sequence == 0 || epoch == 0 || !double.IsFinite(pose.Q1) ||
+        if (type is < 1 or > 11 || sequence == 0 || epoch == 0 || !double.IsFinite(pose.Q1) ||
             !double.IsFinite(pose.Q2) || Math.Abs(pose.Q1) > 180 || Math.Abs(pose.Q2) > (type==10?DeviceContract.Arm1AccelMax/100.0:180))
             throw Lang.Error("err.motionPacket");
         if (type is >= 6 and <= 8 && (pose.Q1 != 0 || pose.Q2 != 0 || value > (type == 6 ? 15 : 0)))
@@ -75,8 +77,11 @@ public static class PtpProtocol
         if (type == 10 && (value>1 || pose!=Quantize(pose) || pose.Q1<0.2 || pose.Q1>(value==0?DeviceContract.Arm1RateMax:DeviceContract.Arm2RateMax)/100.0 ||
                         pose.Q2<1 || pose.Q2>(value==0?DeviceContract.Arm1AccelMax:DeviceContract.Arm2AccelMax)/100.0))
             throw Lang.Error("err.rateConfig");
+        // Type 11 is the telemetry rate: no angles, and the rate (0 = status block only) in the value.
+        if (type == 11 && (pose.Q1 != 0 || pose.Q2 != 0 || value != 0 && value is < DeviceContract.TelemRateMin or > DeviceContract.TelemRateMax))
+            throw Lang.Error("err.telemRate");
         pose = Quantize(pose);
-        if (type == 9 && (value > 1 || pose.Q1 >= pose.Q2 || pose.Q1 > 0 || pose.Q2 < 0))
+        if (type == 9 && (value > 2 || pose.Q1 >= pose.Q2 || pose.Q1 > 0 || pose.Q2 < 0))   // axis 2 is the elbow
             throw Lang.Error("err.limitContainsZero");
         byte[] packet = new byte[17]; packet[0] = type;
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(1), sequence);
@@ -108,13 +113,30 @@ public static class PtpProtocol
         Check(BinaryPrimitives.ReadInt16LittleEndian(decoded.AsSpan(11)) == 250);
         Check(BinaryPrimitives.ReadUInt16LittleEndian(decoded.AsSpan(13)) == DeviceContract.PlanRateMax);
         Check(BinaryPrimitives.ReadUInt16LittleEndian(decoded.AsSpan(15)) == Crc(decoded.AsSpan(0, 15)));
-        Check(PtpState.Parse("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=-6000 max1=6000 min2=-9000 max2=9000") is { Locked: false, Referenced: true });
-        Check(PtpState.Parse("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=0 max1=0 min2=0 max2=0") is null);
-        Check(PtpState.Parse("PTP_STATE lock=1 ref=0 active=0 epoch=999999999999999 seq=0 min1=0 max1=0 min2=0 max2=0") is null);
-        Check(PtpState.Parse("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=0 min1=-18000 max1=18000 min2=-18000 max2=18000") is not null);
-        Check(PtpState.Parse("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=0 min1=-18001 max1=18000 min2=-18000 max2=18000") is null);
-        Check(EncodePacket(9, 1, 7, new(-180, 180), 1).Length == 36);
-        foreach (var invalid in new[] { (new JointPose(-30,30), (ushort)2), (new JointPose(1,30), (ushort)0),
+        Check(PtpState.Parse("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-9000 emax=12000") is
+            { Locked: false, Referenced: true, Limits: { ElbowMin: -90, ElbowMax: 120, Min2: -90 } });
+        Check(PtpState.Parse("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=0 max1=0 min2=0 max2=0 emin=0 emax=0") is null);
+        Check(PtpState.Parse("PTP_STATE lock=1 ref=0 active=0 epoch=999999999999999 seq=0 min1=0 max1=0 min2=0 max2=0 emin=0 emax=0") is null);
+        Check(PtpState.Parse("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=0 min1=-18000 max1=18000 min2=-18000 max2=18000 emin=-18000 emax=18000") is not null);
+        Check(PtpState.Parse("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=0 min1=-18001 max1=18000 min2=-18000 max2=18000 emin=-18000 emax=18000") is null);
+        // A firmware that does not report the elbow range (proto 1) cannot be trusted with it, and a bad elbow range is refused like a bad box.
+        Check(PtpState.Parse("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000") is null);
+        foreach (string bad in new[] { "emin=-18001 emax=100", "emin=-100 emax=18001", "emin=100 emax=200", "emin=-200 emax=-100", "emin=5 emax=5", "emin=100 emax=-100" })
+            Check(PtpState.Parse("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 " + bad) is null);
+        Check(EncodePacket(9, 1, 7, new(-180, 180), 1).Length == 36 && EncodePacket(9, 1, 7, new(-155, 155), 2).Length == 36);
+        // Type 11: the stream rate is 0 or 5..20 Hz and carries no angles.
+        var rateWire = EncodePacket(11, 3, 7, new JointPose(0, 0), 10);
+        var rateBytes = new byte[17];
+        for (int i = 0; i < 17; i++) rateBytes[i] = (byte)(((rateWire[1 + i * 2] >> 1) & 15) | (((rateWire[2 + i * 2] >> 1) & 15) << 4));
+        Check(rateWire.Length == 36 && rateBytes[0] == 11 && BinaryPrimitives.ReadUInt16LittleEndian(rateBytes.AsSpan(13)) == 10 && BinaryPrimitives.ReadUInt16LittleEndian(rateBytes.AsSpan(15)) == Crc(rateBytes.AsSpan(0, 15)));
+        Check(EncodePacket(11, 1, 7, new JointPose(0, 0), 0).Length == 36 && EncodePacket(11, 1, 7, new JointPose(0, 0), 20).Length == 36);
+        foreach (var (pose, rate) in new[] { (new JointPose(0, 0), (ushort)4), (new JointPose(0, 0), (ushort)21), (new JointPose(1, 0), (ushort)10), (new JointPose(0, 1), (ushort)10) })
+        {
+            bool refused = false;
+            try { EncodePacket(11, 1, 7, pose, rate); } catch (ArgumentException) { refused = true; }
+            Check(refused);
+        }
+        foreach (var invalid in new[] { (new JointPose(-30,30), (ushort)3), (new JointPose(1,30), (ushort)0),
             (new JointPose(-30,-1), (ushort)0), (new JointPose(0,0), (ushort)0),
             (new JointPose(-180.01,30), (ushort)0), (new JointPose(-30,30.001), (ushort)0) }) {
             bool rejected = false;

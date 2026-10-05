@@ -10,10 +10,12 @@ public sealed partial class ControlWindow
     private static void ShapeFlowSelfTest()
     {
         static void Check(bool ok, string shape, string why) { if (!ok) throw new InvalidOperationException($"Shape flow ({shape}): {why}"); }
-        string[] names = ["单点", "直线", "矩形", "圆"];
-        for (int shape = 0; shape < 4; shape++)
+        string[] names = ["单点", "直线", "矩形", "圆", "椭圆", "圆弧", "圆角矩形", "“8”字", "正多边形", "螺旋", "自定义轮廓"];
+        foreach (bool repeats in new[] { true, false })
+        for (int shape = 0; shape < names.Length; shape++)
         {
-            string name = names[shape];
+            if (!repeats && shape is not (1 or 3)) continue;   // one open and one closed shape show what an old firmware changes
+            string name = names[shape] + (repeats ? "" : "（旧固件）");
             var w = new ControlWindow { selfTesting = true };
             try
             {
@@ -21,19 +23,24 @@ public sealed partial class ControlWindow
                 panel.SelectShapeForSelfTest(shape); panel.LoadExampleForSelfTest();
                 Check(panel.TargetForSelfTest is not null && (shape == 0 || panel.Plan is not null), name, "example is not a valid, executable plan: " + panel.ResultForSelfTest);
                 const uint epoch = 4; uint seq = 1;
+                if (!repeats) w.TestLine($"LINK uart=hw baud=115200 fw=stage2-v7-old short_hb=1 joint_limits=1 motion_rates=1 q2_absolute=1 traj_repeat=0 proto={DeviceContract.ProtocolVersion}");
                 void Device(JointPose at) {
                     w.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-                    w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch={epoch} seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+                    w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch={epoch} seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
                     if (!w.protocolMatches) w.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
-                    w.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, at)} p2={ExecutionTrajectory.Counts(1, at)} e1=0 err=0 inputs=0 drops=0");
+                    w.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, at)} p2={ExecutionTrajectory.Counts(1, at)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
                     w.UpdateControls();
                 }
+                // The 10 Hz stream: the device's sequence moves on the moment it accepts a command, before the next PTP_STATE says so.
+                void Stream(uint at, JointPose pose) => w.TestLine($"TELEM t=20 epoch={epoch} seq={at} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, pose)} p2={ExecutionTrajectory.Counts(1, pose)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
                 void Click(Button button) => button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
                 void MoveThere(JointPose target) {
                     Click(panel.MoveButton);
                     Check(w.pendingPoint != 0 && w.pointWire.Count == 36, name, "低速移到起点 did not queue a move");
                     uint moving = w.pendingPoint;
-                    w.TestLine($"PTP_STATE lock=0 ref=1 active=1 epoch={epoch} seq={moving} min1=-3000 max1=3000 min2=-6000 max2=6000");
+                    Stream(moving, target);   // accepted, PTP_STATE not here yet
+                    Check(w.pendingPoint == moving && w.ptp is not null, name, "streamed telemetry ahead of PTP_STATE stopped a point move");
+                    w.TestLine($"PTP_STATE lock=0 ref=1 active=1 epoch={epoch} seq={moving} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
                     Check(w.pendingPoint == 0, name, "the move was not acknowledged by its PTP_STATE");
                     seq = moving; Device(target);   // arrived: idle again at the target with matching telemetry
                 }
@@ -51,6 +58,8 @@ public sealed partial class ControlWindow
                 uint last = 0;
                 for (int i = 0; i < n; i++) {
                     uint s = last = w.pendingPoint;
+                    Stream(s, start);   // the device took node i; the ack and PTP_STATE are still on their way
+                    Check(w.uploading is not null && w.ptp is not null, name, $"streamed telemetry ahead of PTP_STATE stopped the upload at node {i}");
                     w.TestLine($"TRAJ_STATE state={(i + 1 == n ? 2 : 1)} count={i + 1} total={n} index=0 seq={s} epoch={epoch}");
                 }
                 seq = last; Device(start);
@@ -58,12 +67,22 @@ public sealed partial class ControlWindow
                 Check(panel.RunButton.IsEnabled && panel.UploadButton.IsEnabled && !panel.MoveButton.IsEnabled, name, "held plan: run and re-upload open, single moves closed");
                 Click(panel.RunButton);
                 Check(w.uploading is not null && w.pendingPoint == last + 1 && w.uploaded is null, name, "执行图形 did not send RUN as the next sequence");
+                Stream(w.pendingPoint, start);
+                Check(w.uploading is not null && w.ptp is not null, name, "streamed telemetry stopped the RUN request");
                 w.TestLine($"TRAJ_STATE state=3 count={n} total={n} index=1 seq={w.pendingPoint} epoch={epoch}");
                 Check(w.executing && w.uploading is null, name, "RUN was not acknowledged");
                 uint run = w.trajectoryRunSequence;
+                Stream(run, start); Stream(run, start);
+                Check(w.executing && w.ptp is not null, name, "streamed telemetry stopped a run");
                 w.TestLine($"TRAJ_STATE state=4 count={n} total={n} index={n} seq={run} epoch={epoch}");
                 Check(!w.executing, name, "completion was not recognized");
                 var end = plan.Nodes[^1].Pose; seq = run; Device(end);
+                if (!repeats)
+                {
+                    // The device would refuse a second RUN of the plan it holds (and stop), so the host must not offer it.
+                    Check(w.uploaded is null && !w.uploadedRan && !panel.RunButton.IsEnabled, name, "an old firmware's finished plan must be consumed, not offered again");
+                    continue;
+                }
                 bool closed = ExecutionTrajectory.Counts(0, end) == ExecutionTrajectory.Counts(0, start) && ExecutionTrajectory.Counts(1, end) == ExecutionTrajectory.Counts(1, start);
                 Check(w.uploaded == plan && w.uploadedRan, name, "a finished plan must stay held for a repeat");
                 if (closed) Check(panel.UploadButton.IsEnabled && panel.RunButton.IsEnabled, name, "a closed shape ends at its start: run again without moving");

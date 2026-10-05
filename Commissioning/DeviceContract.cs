@@ -37,14 +37,21 @@ public static class DeviceContract
     public const int TrajNodeMaxMs = 500;           // TRAJ_NODE_MAX_MS
     public const int TrajTotalMaxMs = 600000;       // TRAJ_TOTAL_MAX_MS
 
+    // Streamed position telemetry (control type 11): 0 = only the 500 ms status block, otherwise this many TELEM lines a second.
+    public const int TelemRateMin = 5;              // TELEM_HZ_MIN
+    public const int TelemRateMax = 20;             // TELEM_HZ_MAX
+
     // Joint limits are 0.01 degree units within +/-180 degrees; the heartbeat deadline is the firmware's.
     public const int JointLimitCdMax = 18000;       // CFG_JOINT_CD_MAX
+    // The elbow is motor 2's own angle q2 - q1.  Its range is a third entry of the joint limits (type 9, axis 2); this is
+    // the firmware's boot value and the host's value for an empty field.  Provisional, NOT a measured mechanical stroke.
+    public const int ElbowDefaultCd = 15500;        // PTP_ELBOW_DEFAULT_CD
     public const int DeadmanMs = 250;               // JOG_DEADMAN_MS
 
     // Version of the wire contract (docs/PROTOCOL.md).  The firmware reports it as proto=<n> in the LINK line and
     // the host refuses to move a machine whose number differs.  Bump both sides when a frame format, a field's
     // meaning, the sequence/epoch rules or the coordinate convention changes.
-    public const int ProtocolVersion = 1;           // PROTO_VERSION
+    public const int ProtocolVersion = 4;           // PROTO_VERSION
 
     // Every constant above as NAME=value lines, for the release gate.
     public static string[] Lines() => typeof(DeviceContract)

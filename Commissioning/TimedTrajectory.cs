@@ -52,9 +52,7 @@ public sealed class TimedTrajectory
         }
     }
 
-    private double PieceLength(int piece) => Path.CircleCenter is { } center ?
-        2 * Math.PI * (Path.Samples[0].Target - center).Length :
-        (Path.Samples[Path.Stops[piece + 1]].Target - Path.Samples[Path.Stops[piece]].Target).Length;
+    private double PieceLength(int piece) => Path.Pieces[piece].Length;
 
     private TimedPose EvaluatePiece(int piece, double z, double duration)
     {
@@ -62,21 +60,8 @@ public sealed class TimedTrajectory
         double u = z * z * z * (10 + z * (-15 + 6 * z));
         double du = 30 * z * z * (1 - z) * (1 - z) / duration;
         double ddu = 60 * z * (1 - z) * (1 - 2 * z) / (duration * duration);
-        Point target; Vector dp, ddp;
-        if (Path.CircleCenter is { } center)
-        {
-            double radius = (Path.Samples[0].Target - center).Length;
-            double angle = 2 * Math.PI * u;
-            Vector radial = new(radius * Math.Cos(angle), radius * Math.Sin(angle));
-            target = center + radial;
-            dp = new Vector(-radial.Y, radial.X) * (2 * Math.PI);
-            ddp = -radial * (4 * Math.PI * Math.PI);
-        }
-        else
-        {
-            Point start = Path.Samples[Path.Stops[piece]].Target, end = Path.Samples[Path.Stops[piece + 1]].Target;
-            dp = end - start; ddp = new Vector(); target = start + dp * u;
-        }
+        // The stroke's own position and first/second derivative in its parameter u (a line, the full circle, any curve).
+        var (target, dp, ddp) = Path.Pieces[piece].At(u);
         var poses = Path.Model.Inverse(target.X, target.Y);
         JointPose pose = poses[Math.Min(Path.Branch, poses.Length - 1)];
         int reference = (int)Math.Round(Path.Stops[piece] + (Path.Stops[piece + 1] - Path.Stops[piece]) * u);
@@ -138,7 +123,7 @@ public sealed class TimedTrajectory
         var model = new PlanarArm(180, 176.38);
         var rates = new PlanningRates(20, 5, 3, 10, 6);
         foreach (int branch in new[] { 0, 1 })
-        foreach (var shape in Enum.GetValues<DrawingShape>())
+        foreach (var shape in new[] { DrawingShape.Line, DrawingShape.Rectangle, DrawingShape.Circle })
         {
             var path = DrawingTrajectory.Create(model, shape, 220, 20, shape == DrawingShape.Line ? 250 : 30, 40, branch);
             var motion = new TimedTrajectory(path, rates);
@@ -168,7 +153,7 @@ public sealed class TimedTrajectory
             var slower = new TimedTrajectory(path, new PlanningRates(10, 2.5, 1.5, 2.5, 1.5));
             Check(Math.Abs(slower.Duration - 2 * motion.Duration) < 1e-7, "time scaling");
             var rows = motion.ToCsv().Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
-            Check(rows.All(r => r.Split(',').Length == 27), "CSV columns");
+            Check(rows.All(r => r.Split(',').Length == 29), "CSV columns");
         }
         var circle = DrawingTrajectory.Create(model, DrawingShape.Circle, 0, 0, 100, 0, 0);
         var turn = new TimedTrajectory(circle, rates);

@@ -17,18 +17,30 @@ public sealed partial class ControlWindow
     private readonly TextBox experimentResult = new() { IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent, TextWrapping = TextWrapping.Wrap, Text = Lang.T("live.experimentHint"), FontSize = 12 };
     private readonly Canvas errorPlot = new() { Background = WorkbenchTheme.Bar, ClipToBounds = true };
     private readonly Queue<double> errorHistory = new();
+    private readonly Queue<double> errorHistory2 = new();
     private readonly Button readInputs = MakeButton(Lang.T("btn.readInputs"));
     private readonly Expander diagnostics = new() { Header=Lang.T("diag.header"), IsExpanded=true, Background=WorkbenchTheme.Head, BorderBrush=WorkbenchTheme.Line, BorderThickness=new Thickness(0,1,0,0), Padding=new Thickness(0) };
-    private static string[] JointNames => [Lang.T("joint.q1cmd"), Lang.T("joint.q1enc"), Lang.T("joint.q1err"), Lang.T("joint.q2cmd"), Lang.T("joint.x"), Lang.T("joint.y"), Lang.T("joint.drops")];
-    private static readonly string[] JointUnits = ["°","°","°","°","mm","mm",""];
+    private static string[] JointNames => [Lang.T("joint.q1cmd"), Lang.T("joint.q1enc"), Lang.T("joint.q1err"), Lang.T("joint.q2cmd"), Lang.T("joint.q2enc"), Lang.T("joint.q2err"), Lang.T("joint.x"), Lang.T("joint.y"), Lang.T("joint.drops")];
+    private static readonly string[] JointUnits = ["°","°","°","°","°","°","mm","mm",""];
     private static string[] LedNames => [Lang.T("led.enable"), Lang.T("led.ref"), Lang.T("led.limits"), Lang.T("led.arm1"), Lang.T("led.arm2"), Lang.T("led.fault")];
-    private readonly TextBlock[] jointValues = Enumerable.Range(0, 7).Select(_ => new TextBlock { Text = "—", FontFamily = WorkbenchTheme.Mono, TextAlignment = TextAlignment.Right, VerticalAlignment = VerticalAlignment.Center }).ToArray();
+    private readonly TextBlock[] jointValues = Enumerable.Range(0, JointNames.Length).Select(_ => new TextBlock { Text = "—", FontFamily = WorkbenchTheme.Mono, TextAlignment = TextAlignment.Right, VerticalAlignment = VerticalAlignment.Center }).ToArray();
     private readonly Ellipse[] leds = Enumerable.Range(0, 6).Select(_ => new Ellipse { Width = 10, Height = 10, Fill = WorkbenchTheme.Idle, VerticalAlignment = VerticalAlignment.Center }).ToArray();
     private TextBlock[] jointNameBlocks = [];
     private TextBlock[] ledNameBlocks = [];
-    private TextBlock? chartTitleBlock, chartNoteBlock;
+    private TextBlock? chartTitleBlock, chartNoteBlock, telemRateLabel;
+    private readonly ComboBox telemRateBox = new() { Width = 118, Margin = new Thickness(4, 2, 4, 2) };
+    private static readonly int[] TelemChoices = [0, DeviceContract.TelemRateMin, DefaultTelemHz, DeviceContract.TelemRateMax];
     private TabItem? feedbackTab, logTab;
-    private Button? stopButton, refreshButton, folderButton;
+    private Button? stopButton, refreshButton, folderButton, analysisButton, calibrationButton;
+    private ExperimentWindow? analysisWindow;
+    // One analysis window at a time: asking again brings the open one forward and refreshes its list (a run may have just finished).
+    private void OpenAnalysis()
+    {
+        if (analysisWindow is { IsLoaded: true } open) { open.Activate(); return; }
+        analysisWindow = new ExperimentWindow(ExperimentRoot) { Owner = this };
+        analysisWindow.Closed += (_,_) => analysisWindow = null;
+        analysisWindow.Show();
+    }
     private TextBlock? noteJogManual, noteJogStop;
     private string? lastExperimentDirectory;
     private void RefreshLanguageLayout()
@@ -41,16 +53,20 @@ public sealed partial class ControlWindow
         if (stopButton is { } stop) stop.Content = Lang.T("btn.stop");
         if (refreshButton is { } refresh) refresh.Content = Lang.T("btn.refreshPorts");
         if (folderButton is { } folder) folder.Content = Lang.T("btn.openData");
+        if (analysisButton is { } analysis) analysis.Content = Lang.T("btn.analysis");
+        if (calibrationButton is { } calibration) calibration.Content = Lang.T("btn.calibration");
         readInputs.Content = Lang.T("btn.readInputs");
         if (noteJogManual is { } n1) n1.Text = Lang.T("note.jogManual");
         if (noteJogStop is { } n2) n2.Text = Lang.T("note.jogStop");
         if (chartTitleBlock is { } ct) ct.Text = Lang.T("chart.title");
         if (chartNoteBlock is { } cn) cn.Text = Lang.T("note.chart");
+        if (telemRateLabel is { } tl) tl.Text = Lang.T("lbl.telemRate");
+        Lang.RefreshText(faultDetail);
         if (feedbackTab is { } ft) ft.Header = Lang.T("tab.feedback");
         if (logTab is { } lt) { lt.Header = Lang.T("tab.log"); lt.ToolTip = Lang.T("tab.log.tip"); }
-        if (jointNameBlocks.Length == 7) {
+        if (jointNameBlocks.Length == JointNames.Length) {
             string[] names = JointNames;
-            for (int i = 0; i < 7; i++) jointNameBlocks[i].Text = names[i];
+            for (int i = 0; i < JointNames.Length; i++) jointNameBlocks[i].Text = names[i];
         }
         if (ledNameBlocks.Length == 6) {
             string[] names = LedNames;
@@ -106,6 +122,7 @@ public sealed partial class ControlWindow
         devices.Children.Add(enable); devices.Children.Add(manualReference); devices.Children.Add(home);
         toolbar.Children.Add(devices);
         var toolbarBar = WorkbenchTheme.Edge(toolbar); toolbarBar.MinHeight = 48; DockPanel.SetDock(toolbarBar, Dock.Top); shell.Children.Add(toolbarBar);
+        var workflowBar = BuildWorkflowStrip(); DockPanel.SetDock(workflowBar, Dock.Top); shell.Children.Add(workflowBar);
 
         // Body: property grid | preview | live status. The two splitters resize the side columns.
         var body = new Grid(); shell.Children.Add(body);
@@ -135,7 +152,7 @@ public sealed partial class ControlWindow
         var side = new StackPanel();
         StackPanel Group(string title) { var group = new StackPanel(); side.Children.Add(WorkbenchTheme.Section(title, group)); return group; }
         var jointGroup = Group("section.joints");
-        jointNameBlocks = new TextBlock[7];
+        jointNameBlocks = new TextBlock[JointNames.Length];
         string[] jnames = JointNames;
         for(int i = 0; i < jnames.Length; i++) {
             var row = new Grid { Margin = new Thickness(10,3,10,3) };
@@ -156,6 +173,7 @@ public sealed partial class ControlWindow
         state.FontSize = 12; state.Margin = new Thickness(10,6,10,2); inputGroup.Children.Add(state);
         inputs.FontSize = 11; inputs.Foreground = WorkbenchTheme.Muted; inputs.Margin = new Thickness(10,2,10,2); inputGroup.Children.Add(inputs);
         lastStop.FontSize = 12; lastStop.Margin = new Thickness(10,2,10,2); inputGroup.Children.Add(lastStop);
+        inputGroup.Children.Add(faultDetail);
         readInputs.Click += (_,_) => SafeAction(() => { Send((byte)'i'); Send((byte)'e'); Send((byte)'s'); }); readInputs.Margin = new Thickness(10,6,10,6); inputGroup.Children.Add(readInputs);
         var jogGroup = Group("section.jog");
         noteJogManual = Note(Lang.T("note.jogManual")); jogGroup.Children.Add(noteJogManual);
@@ -176,7 +194,15 @@ public sealed partial class ControlWindow
         chartTitleBlock=WorkbenchTheme.Text(Lang.T("chart.title"),12,WorkbenchTheme.Sub); chart.Children.Add(chartTitleBlock);
         Grid.SetRow(errorPlot,1); chart.Children.Add(errorPlot);
         chartNoteBlock=WorkbenchTheme.Text(Lang.T("note.chart"),11,WorkbenchTheme.Muted); Grid.SetRow(chartNoteBlock,2); chart.Children.Add(chartNoteBlock);
-        var folder = MakeButton(Lang.T("btn.openData")); folderButton = folder; folder.Click += (_,_) => OpenDataFolder(); Grid.SetRow(folder,3); chart.Children.Add(folder);
+        var folder = MakeButton(Lang.T("btn.openData")); folderButton = folder; folder.Click += (_,_) => OpenDataFolder();
+        foreach (int hz in TelemChoices) telemRateBox.Items.Add(Lang.Bind(new ComboBoxItem { Tag = hz }, ContentControl.ContentProperty, hz == 0 ? "telem.status" : hz == DefaultTelemHz ? "telem.hz10" : hz == DeviceContract.TelemRateMin ? "telem.hz5" : "telem.hz20"));
+        telemRateBox.SelectedIndex = Array.IndexOf(TelemChoices, DefaultTelemHz);
+        telemRateBox.SelectionChanged += (_,_) => { if (telemRateBox.SelectedIndex >= 0) { desiredTelemHz = TelemChoices[telemRateBox.SelectedIndex]; telemAttempts = 0; UpdateControls(); } };
+        telemRateLabel = WorkbenchTheme.Text(Lang.T("lbl.telemRate"), 12, WorkbenchTheme.Sub); telemRateLabel.VerticalAlignment = VerticalAlignment.Center;
+        var analysis = MakeButton(Lang.T("btn.analysis")); analysisButton = analysis; analysis.Click += (_,_) => OpenAnalysis();
+        var calibrate = MakeButton(Lang.T("btn.calibration")); calibrationButton = calibrate; calibrate.Click += (_,_) => OpenCalibration();
+        var chartButtons = new WrapPanel(); chartButtons.Children.Add(folder); chartButtons.Children.Add(analysis); chartButtons.Children.Add(calibrate); chartButtons.Children.Add(telemRateLabel); chartButtons.Children.Add(telemRateBox);
+        Grid.SetRow(chartButtons,3); chart.Children.Add(chartButtons);
         errorPlot.SizeChanged += (_,_) => DrawErrorPlot();
         feedbackTab = new TabItem { Header = Lang.T("tab.feedback"), Content = feedback };
         tabs.Items.Add(feedbackTab);
@@ -204,9 +230,10 @@ public sealed partial class ControlWindow
         var v = Enumerable.Repeat("—", JointNames.Length).ToArray();
         if (sample is { Referenced: true }) {
             v[0] = $"{sample.Command.Q1:F3}"; v[1] = $"{sample.Measured1:F3}"; v[2] = $"{sample.Error1:+0.000;-0.000;0.000}"; v[3] = $"{sample.Command.Q2:F3}";
-            try { var tip = xyPreview.Model.Forward(sample.Command).Tip; v[4] = $"{tip.X:F2}"; v[5] = $"{tip.Y:F2}"; } catch (ArgumentException) { /* invalid link lengths: leave the estimate blank */ }
+            if(sample.Measured2 is double q2 && sample.Error2 is double error2) { v[4] = $"{q2:F3}"; v[5] = $"{error2:+0.000;-0.000;0.000}"; }
+            try { var tip = xyPreview.Model.Forward(new(sample.Measured1, (sample.Measured2 ?? sample.Measured1 + sample.Command.Q2 - sample.Command.Q1))).Tip; v[6] = $"{tip.X:F2}"; v[7] = $"{tip.Y:F2}"; } catch (ArgumentException) { /* invalid link lengths: leave the estimate blank */ }
         }
-        if (sample is not null) v[6] = sample.Drops.ToString();
+        if (sample is not null) v[8] = sample.Drops.ToString();
         for (int i = 0; i < v.Length; i++) jointValues[i].Text = v[i];
         for (int bit = 0; bit < 4; bit++) leds[2 + bit].Fill = sample is null ? WorkbenchTheme.Idle : (sample.Inputs >> bit & 1) == 0 ? WorkbenchTheme.Ok : WorkbenchTheme.Red;
     }
@@ -218,11 +245,14 @@ public sealed partial class ControlWindow
     private void DrawErrorPlot()
     {
         errorPlot.Children.Clear(); double w = Math.Max(50,errorPlot.ActualWidth), h = Math.Max(24,errorPlot.ActualHeight);
-        double scale = Math.Max(0.02,errorHistory.Select(Math.Abs).DefaultIfEmpty().Max());
+        double scale = Math.Max(0.02,errorHistory.Concat(errorHistory2).Select(Math.Abs).DefaultIfEmpty().Max());
         errorPlot.Children.Add(new Line { X1 = 0, X2 = w, Y1 = h/2, Y2 = h/2, Stroke = WorkbenchTheme.Line });
         var line = new Polyline { Stroke = WorkbenchTheme.Teal, StrokeThickness = 2 };
         int i = 0; foreach(double e in errorHistory) line.Points.Add(new Point(8 + i++ * (w-16)/Math.Max(1,errorHistory.Count-1),h/2-e/scale*(h/2-10)));
         errorPlot.Children.Add(line);
+        var second = new Polyline { Stroke = WorkbenchTheme.Blue, StrokeThickness = 2 };
+        i = 0; foreach(double e in errorHistory2) second.Points.Add(new Point(8 + i++ * (w-16)/Math.Max(1,errorHistory2.Count-1),h/2-e/scale*(h/2-10)));
+        errorPlot.Children.Add(second);
         var label = WorkbenchTheme.Text($"±{scale:F3}°",10,WorkbenchTheme.Muted); errorPlot.Children.Add(label);
     }
     private void SaveWorkbenchSnapshot(string path, double width, double height)

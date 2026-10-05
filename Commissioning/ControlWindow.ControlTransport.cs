@@ -203,7 +203,8 @@ public sealed partial class ControlWindow
         return $"HOST session: fw={lastFirmwareBuild} heartbeat={(supportsShortHeartbeat ? "compact6B/20ms" : "legacy36B/40ms")} " +
                $"framesTotal={sessionFrames} dataFrames={sessionFrames - sessionHeartbeats} heartbeats={sessionHeartbeats} " +
                $"worstHeartbeatGap={sessionWorstHeartbeatGap:F0}ms gapsOver{SlowHeartbeatLogMs:F0}ms={sessionSlowHeartbeats} " +
-               $"worstUiLeaseGap={sessionWorstLeaseGap:F0}ms leaseGapsOver{SlowLeaseLogMs:F0}ms={sessionSlowLeases}";
+                $"worstUiLeaseGap={sessionWorstLeaseGap:F0}ms leaseGapsOver{SlowLeaseLogMs:F0}ms={sessionSlowLeases}" +
+               (lastTelemDiag.Length > 0 ? " " + lastTelemDiag : "");
     }
 
     private void ResetWireSession()
@@ -256,13 +257,14 @@ public sealed partial class ControlWindow
                 // instead of 35.5 ms.  No control sequence is consumed, so command
                 // ordering is unaffected.
                 packet = PtpProtocol.EncodeShortHeartbeat((byte)keys);
-            } else if (heartbeat || (epochReady && pendingControlType != 0 && (motionAllowed || pendingControlType is 9 or 10))) {
+            } else if (heartbeat || (epochReady && pendingControlType != 0 && (motionAllowed || pendingControlType is 9 or 10 or 11))) {
                 bool limits = !heartbeat && pendingControlType is 9 or 10;
+                bool telemRate = !heartbeat && pendingControlType == 11;   // output only: taken whether or not motion is allowed
                 if (limits && limitPacket.Length > 0) packet = limitPacket;
                 else {
                     if (controlSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("err.seqExhaustedCtrl"));
                     packet = PtpProtocol.EncodePacket(heartbeat ? (byte)6 : pendingControlType, ++controlSequence,
-                        controlEpoch, limits ? limitBounds : new JointPose(0, 0), heartbeat ? keys : limits ? (ushort)limitAxis : (ushort)0);
+                        controlEpoch, limits ? limitBounds : new JointPose(0, 0), heartbeat ? keys : limits ? (ushort)limitAxis : telemRate ? (ushort)telemRequestedHz : (ushort)0);
                     if (limits) { limitSequence = controlSequence; limitPacket = packet; }
                 }
                 if (!heartbeat) pendingControlType = 0;
@@ -305,7 +307,7 @@ public sealed partial class ControlWindow
             }
             try {
                 window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-                window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000");
+                window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
                 window.supportsShortHeartbeat = true;
                 // A closed port exercises the connected STOP state without opening hardware.
                 window.serial = new System.IO.Ports.SerialPort();
@@ -344,14 +346,14 @@ public sealed partial class ControlWindow
                 window.PublishHeartbeatLease(); window.ForceHeartbeatNow(); window.WireWriterStep(Write);
                 Check(frames[^1].Length == 6 && window.ptp is null && !window.enable.IsEnabled,
                     "heartbeat did not resume independently of motion/range confirmation");
-                window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=10 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000");
+                window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=10 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
                 window.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1 short_hb=1");
                 window.RequestEnable();
                 Check(window.pendingControlType == 7, "confirmed range did not permit enable");
                 window.lastTelemetryAt = DateTime.UtcNow.AddSeconds(-3);
                 window.CheckTelemetryTimeout(DateTime.UtcNow);
                 Check(window.pendingControlType == 7, "old telemetry timestamp cancelled the enable request");
-                window.TestLine("TELEM t=10 epoch=10 seq=1 ref=0 source=0 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+                window.TestLine("TELEM t=10 epoch=10 seq=1 ref=0 source=0 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
                 Check(window.pendingControlType == 7, "unreferenced telemetry cancelled the enable request");
                 window.PublishHeartbeatLease(); window.WireWriterStep(Write);
                 Check(window.WireWriterStep(Write), "enable failed after full range confirmation");
@@ -402,7 +404,7 @@ public sealed partial class ControlWindow
         try {
             window.TestLine("STATE fw=stage2-v7 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
             window.TestLine("CONTROL seq=9");
-            window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=1 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000");
+            window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=1 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             window.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
             if (!window.framedControl || !window.hardwareUart || window.heartbeatTimer.Interval.TotalMilliseconds != 8)
                 throw new InvalidOperationException("v7 transport not selected");
@@ -427,7 +429,7 @@ public sealed partial class ControlWindow
             if (frames.Count != 2 || Type(frames[0]) != 6 || Type(frames[1]) != 7)
                 throw new InvalidOperationException("Enable did not follow a complete idle heartbeat");
             window.pendingControlType = 8;
-            window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=2 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000");
+            window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=2 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             for (elapsed = 16; elapsed <= 24; elapsed += 8)
                 window.FlushControlTransport(Write, start + elapsed * Stopwatch.Frequency / 1000, 0, 2);
             if (frames.Count != 4 || Type(frames[2]) != 6 || Type(frames[3]) != 8)
@@ -462,7 +464,7 @@ public sealed partial class ControlWindow
         var window = new ControlWindow { selfTesting = true };
         try {
             window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-            window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=4 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000");
+            window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=4 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             if (window.supportsShortHeartbeat)
                 throw new InvalidOperationException("Compact heartbeat selected without a capability line");
             window.TestLine($"LINK uart=hw baud=115200 rx_overflow=0 rx_error=0 tx_dropped=0 fw=stage2-v7-absolute-q2 short_hb=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion}");

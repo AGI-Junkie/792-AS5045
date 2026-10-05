@@ -32,20 +32,30 @@ public sealed partial class ControlWindow
     private void HandleTelemetry(string line)
     {
         var sample = TelemetrySample.Parse(line);
-        if (!supportsTelemetry || sample is null || ptp is null || sample.Epoch != ptp.Epoch || sample.Sequence != ptp.Sequence) {
+        // A streamed line may be ahead of the last PTP_STATE: the device moves its sequence on as soon as it accepts a command this host sent
+        // (every node of an upload, the RUN), while PTP_STATE only comes twice a second. Ahead, but never past what the host has issued, is normal;
+        // behind it, past it, or another epoch is not.
+        bool ahead = sample is not null && ptp is not null && sample.Sequence > ptp.Sequence && sample.Sequence <= pointSequence;
+        if (!supportsTelemetry || sample is null || (arm2FeedbackEnabled && (sample.Encoder2 is null || sample.Slip2 is null)) || ptp is null || sample.Epoch != ptp.Epoch || (sample.Sequence != ptp.Sequence && !ahead)) {
             // Enable/home establish their own reference; telemetry can arrive before PTP_STATE.
             if (supportsTelemetry && pendingControl is null && (PointBusy || executing)) { Lang.Text(lastStop, () => Lang.T("fault.badTelemetry")); Stop(); }
             return;
         }
-        if (telemetry?.Epoch != sample.Epoch) errorHistory.Clear();
+        if (telemetry?.Epoch != sample.Epoch) { errorHistory.Clear(); errorHistory2.Clear(); }
+        if(!arm2FeedbackEnabled) sample=sample with { Encoder2=null, Slip2=null };
         telemetry = sample; lastTelemetryAt = DateTime.UtcNow;
+        RememberTelemetry(sample);
+        // Streamed at 10-20 Hz the panel repaints at about 7 Hz; the recorder and the pre-fault buffer still get every sample.
+        bool paint = reportedTelemHz < 10 || (lastTelemetryAt - lastFeedbackPaintAt).TotalMilliseconds >= StreamPaintMs;
+        if (paint) lastFeedbackPaintAt = lastTelemetryAt;
         if (sample.Referenced) {
-            ShowFeedback(sample, () => Lang.T("status.ref") + sample.ReferenceName);
-            errorHistory.Enqueue(sample.Error1); while(errorHistory.Count > 120) errorHistory.Dequeue(); DrawErrorPlot();
+            if (paint) ShowFeedback(sample, () => Lang.T("status.ref") + sample.ReferenceName + (arm2FeedbackEnabled ? "" : Lang.T("live.arm2Optional")));
+            if(sample.Error2 is double error2) errorHistory2.Enqueue(error2); while(errorHistory2.Count > 600) errorHistory2.Dequeue();
+            errorHistory.Enqueue(sample.Error1); while(errorHistory.Count > 600) errorHistory.Dequeue(); if (paint) DrawErrorPlot();
             if (experiment is { } recorder) {
                 recorder.Record(sample,uploading is not null ? "upload" : uploaded is not null ? "ready" : experimentPhase=="trajectory" ? "drawing" : "point",trajectoryIndex);
                 Lang.Text(experimentResult, () => recorder.MotionSamples==0 ? Lang.T("exp.savedWaiting", recorder.Samples) :
-                    Lang.T("exp.live", recorder.Samples, recorder.Rmse, recorder.Peak));
+                    recorder.MotionSamples2 > 0 ? Lang.T("exp.live", recorder.Samples, recorder.Rmse, recorder.Peak, recorder.Rmse2, recorder.Peak2) : Lang.T("exp.liveArm1", recorder.Samples, recorder.Rmse, recorder.Peak));
                 if(experimentPhase=="point" && pendingPoint==0 && ptp.Active==0 && sample.Sequence==experimentSequence) experimentCompleting="complete";
                 if (experimentCompleting is { } outcome) FinishExperiment(outcome);
             }
@@ -61,8 +71,8 @@ public sealed partial class ControlWindow
         if (selfTesting || !supportsTelemetry) return;
         if (telemetry is not { Referenced: true } || ptp is null || telemetry.Epoch != ptp.Epoch ||
             (DateTime.UtcNow-lastTelemetryAt).TotalSeconds >= 2) throw new IOException(Lang.T("fault.experimentMissingFeedback"));
-        FinishExperiment("replaced"); errorHistory.Clear(); DrawErrorPlot();
-        experiment = new ExperimentRecorder(ExperimentRoot,kind,sequence,ptp.Epoch,xyPreview.Model,xyPreview.SettingsDescription,telemetry.ReferenceName,nodes);
+        FinishExperiment("replaced"); errorHistory.Clear(); errorHistory2.Clear(); DrawErrorPlot(); lastExperimentOutcome = null;
+        experiment = new ExperimentRecorder(ExperimentRoot,kind,sequence,ptp.Epoch,xyPreview.Model,xyPreview.SettingsDescription,telemetry.ReferenceName,nodes,Math.Max(0,reportedTelemHz),Calibrations.Active()?.Id, arm2FeedbackEnabled);
         experimentPhase = kind; experimentSequence=sequence; experimentCompleting = null; lastExperimentDirectory = experiment.DirectoryPath;
         Append("HOST experiment recording: " + lastExperimentDirectory);
     }
@@ -70,9 +80,9 @@ public sealed partial class ControlWindow
     {
         var recorder = experiment; experiment = null; experimentCompleting = null;
         if (recorder is null) return;
-        recorder.Finish(outcome);
+        recorder.Finish(outcome); RecordExperimentOutcome(outcome, recorder);
         Lang.Text(experimentResult, () => Lang.T("exp.finished", outcome=="complete"?Lang.T("exp.complete"):Lang.T("exp.aborted"), recorder.Samples) +
-            (recorder.MotionSamples>0?Lang.T("exp.rmse", recorder.Rmse):Lang.T("exp.noMotion")) +
+            (recorder.MotionSamples>0?Lang.T("exp.rmse", recorder.Rmse) + (recorder.MotionSamples2>0 ? Lang.T("exp.rmse2", recorder.Rmse2) : ""):Lang.T("exp.noMotion")) +
             Lang.T("exp.savedNote"));
         diagnostics.IsExpanded = true;
         Append("HOST experiment " + outcome + ": " + recorder.DirectoryPath);
@@ -100,22 +110,48 @@ public sealed partial class ControlWindow
             w.SaveWorkbenchSnapshot(Path.Combine(Path.GetDirectoryName(snapshotPath)!,name),1100,760);
         }
         void Ready(uint epoch=4, uint seq=1) {
-            w.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-            w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch={epoch} seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+            w.TestLine("STATE fw=stage2-v8 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1 enc2=1 dir2=1");
+            w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch={epoch} seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             if(!w.protocolMatches) w.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
-            w.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+            w.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
         }
+        w.TestLine("STATE fw=stage2-v9 enabled=1 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0 enc2=0 dir2=0 arm2fb=0");
+        w.TestLine($"LINK fw=stage2-v9-optional-arm2-feedback q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
+        w.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=3 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
+        Check(w.CanManualReference && w.manualReference.IsEnabled); w.RequestManualReference(); uint optionalSeq=w.pendingPoint;
+        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=4 seq={optionalSeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
+        w.TestLine("STATE fw=stage2-v9 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1 enc2=0 dir2=0 arm2fb=0");
+        w.TestLine($"TELEM t=10 epoch=4 seq={optionalSeq} ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+        Check(w.CanPoint && w.telemetry!.Measured2 is null && w.jointValues[4].Text=="—" && !w.manualReferencePending);
         Ready(); Check(w.CanPoint && w.AtStart(new(0,0)) && !w.AtStart(new(1,0)));
+        w.TestLine("STATE fw=stage2-v8 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1 enc2=0 dir2=1");
+        Check(!w.CanPoint && !w.hardwareReady);
+        Ready(); w.RequestPoint(new(1,1));
+        w.TestLine($"TELEM t=11 epoch=4 seq={w.pendingPoint} ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+        Check(w.pendingPoint==0 && w.ptp is null); // proto3 requires both rotor measurements
+        Ready();
         w.lastTelemetryAt=DateTime.UtcNow.AddSeconds(-3); Check(!w.CanPoint && !w.AtStart(new(0,0)));
         Ready(); w.RequestPoint(new(1,1)); uint seq=w.pendingPoint; int n=w.pointWire.Count;
         w.RequestPoint(new(2,2)); Check(w.pendingPoint==seq && w.pointWire.Count==n); // double click
-        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=99 seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=99 seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(w.pendingPoint==0 && w.pointWire.Count==0 && w.ptp is null); // wrong reference cancels, never ACKs
         Ready(5,3); w.RequestPoint(new(1,1)); w.TestLine("TELEM broken"); Check(w.pendingPoint==0 && w.ptp is null);
-        Ready(6,4); w.TestLine("TELEM t=11 epoch=6 seq=4 ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=1 drops=0"); Check(!w.CanPoint);
+        Ready(6,4); w.TestLine("TELEM t=11 epoch=6 seq=4 ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=1 drops=0"); Check(!w.CanPoint);
+        // Streamed telemetry: ahead of the last PTP_STATE by what the host has sent is normal; behind it or past what was sent is a bad feedback.
+        string Streamed(uint epoch, uint at) => $"TELEM t=12 epoch={epoch} seq={at} ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0";
+        Ready(40,1); w.RequestPoint(new(1,1)); uint sent=w.pendingPoint; Check(sent>1);
+        w.TestLine(Streamed(40,sent));
+        Check(w.pendingPoint==sent && w.ptp is not null && w.telemetry!.Sequence==sent && !w.AtStart(new(0,0)));   // taken as feedback, but not "settled" until PTP_STATE catches up
+        w.TestLine(Streamed(40,sent+1));
+        Check(w.pendingPoint==0 && w.ptp is null);   // the device claims a command the host never sent
+        Ready(41,50); w.RequestPoint(new(1,1)); Check(w.pendingPoint>50);
+        w.TestLine(Streamed(41,49));
+        Check(w.pendingPoint==0 && w.ptp is null);   // the device went backwards
+        Ready(42,60); w.RequestPoint(new(1,1)); uint other=w.pendingPoint; w.TestLine(Streamed(43,other));
+        Check(w.pendingPoint==0 && w.ptp is null);   // another reference epoch
         Ready(7,5); w.RequestPoint(new(1,1)); w.Disconnect("test unplug"); Check(w.pendingPoint==0 && w.pointWire.Count==0 && !w.CanPoint && !w.compatible);
         w.TestLine("STATE fw=stage2-v7 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
-        w.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=5 min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=7 seq=5 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         w.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
         w.RequestEnable(); Check(w.pendingControl=="使能" && !w.enable.IsEnabled && !w.home.IsEnabled);
         w.CheckControlTimeout(w.controlRequestedAt.AddSeconds(3)); Check(w.pendingControl is null && w.lastStop.Text.Contains("未收到确认"));
@@ -127,16 +163,16 @@ public sealed partial class ControlWindow
             w.manualReference.Content.ToString()=="人工确认当前位置为伸直零位");
         Snapshot("manual-reference-waiting.png");
         w.RequestManualReference(); Check(w.pendingPoint==manualSeq && w.pointWire.Count==36); // repeated click never re-zeroes
-        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=20 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=20 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(w.manualReferencePending && !w.manualReference.IsEnabled && w.manualReference.Background==WorkbenchTheme.Blue); // matching seq alone is not an ACK
-        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(!w.manualReferencePending && w.manualReference.IsEnabled && w.manualReference.Background==WorkbenchTheme.Teal &&
             w.manualReference.BorderBrush==WorkbenchTheme.Teal && w.manualReference.Content.ToString()=="人工确认当前位置为伸直零位");
         Ready(21,manualSeq); Check(w.manualReference.Background==WorkbenchTheme.Teal); Check(w.xyPreview.FollowsDevice); // normal telemetry does not flash away success
         Snapshot("manual-reference-confirmed.png");
         Ready(22,manualSeq); Check(w.manualReference.Background==WorkbenchTheme.Blue); // a new reference is not the acknowledged one
         w.RequestManualReference(); manualSeq=w.pendingPoint;
-        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=23 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=23 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         w.TestLine("STOP: UART receive error/overflow"); Check(w.manualReference.Background==WorkbenchTheme.Blue);
         Snapshot("manual-reference-invalid.png");
         Ready(24,manualSeq); w.RequestManualReference(); w.TestLine("PTP refused: not homed/idle/healthy");
@@ -146,7 +182,7 @@ public sealed partial class ControlWindow
         Ready(26,manualSeq); w.RequestManualReference(); w.Disconnect("test unplug");
         Check(!w.manualReference.IsEnabled && w.manualReference.Background==WorkbenchTheme.Blue);
         Ready(27,manualSeq); w.RequestManualReference(); manualSeq=w.pendingPoint;
-        w.TestLine($"PTP_STATE lock=0 ref=0 active=0 epoch=28 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        w.TestLine($"PTP_STATE lock=0 ref=0 active=0 epoch=28 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(!w.manualReferencePending && !w.manualReference.IsEnabled && w.manualReference.Background==WorkbenchTheme.Blue);
         Ready(29,manualSeq); w.RequestPoint(new(1,1));
         w.TestLine("STOP: DEADMAN host heartbeat timeout; position invalid, release keys then C to enable");

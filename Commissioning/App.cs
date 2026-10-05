@@ -31,6 +31,22 @@ public sealed class App : Application
             }
             catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
         }
+        // The pure geometry and planning checks alone (a few seconds, no window): quick feedback while changing shapes or timing.
+        if (args.Contains("--geometry-self-test"))
+        {
+            try { Lang.PersistChanges = false; Lang.Set(false, persist: false); PlanarArm.SelfTest(); DrawingTrajectory.SelfTest(); TimedTrajectory.SelfTest(); ExecutionTrajectory.SelfTest(); ReachabilityMask.SelfTest(); ExperimentArchiveTests.SelfTest(); return 0; }
+            catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
+        }
+        // The experiment table of any folder as a CSV, with the plan/sample alignment check; no window.
+        int report = Array.IndexOf(args, "--experiments-report");
+        if (report >= 0)
+        {
+            if (report + 2 >= args.Length) return 2;
+            var (runs, unreadable) = ExperimentArchive.List(args[report + 1]);
+            File.WriteAllText(args[report + 2], ExperimentArchive.ReportCsv(runs), new UTF8Encoding(true));
+            Console.Error.WriteLine($"{runs.Count} experiments, {unreadable} unreadable");
+            return 0;
+        }
         // Line-quality experiment against a real firmware on a serial port; see docs/UART_DIAGNOSIS.md.
         int stress = Array.IndexOf(args, "--uart-stress");
         if (stress >= 0) return UartStress.Run(args[(stress + 1)..]);
@@ -79,6 +95,8 @@ public sealed partial class ControlWindow : Window
     private PtpState? ptp;
     private DateTime lastPtpAt, pointRequestedAt;
     private bool stage2, homed, feedbackReady, hardwareReady, supportsManualReference, manualReferencePending;
+    private bool manualPolarityReady;
+    private bool arm2FeedbackEnabled = true;
     private uint pointSequence, pendingPoint;
     private readonly Queue<byte> pointWire = new();
     private byte[] pointPacket = [];
@@ -107,7 +125,7 @@ public sealed partial class ControlWindow : Window
     private static readonly Regex TrajectoryPattern = new(@"^TRAJ_STATE state=([0-4]) count=(\d+) total=(\d+) index=(\d+) seq=(\d+) epoch=(\d+)$", RegexOptions.CultureInvariant);
     private string? lastLinkLine;
     private Func<string> regularStateText = () => Lang.T("state.disconnected");
-    private static readonly Regex StatePattern = new(@"^STATE fw=(?:stage1-v3|stage2-v[1234567]) enabled=([01]) home=([0-7]) homed1=([01]) homed2=([01]) fault=([01]) enc=([01]) dir=([01])$", RegexOptions.CultureInvariant);
+    private static readonly Regex StatePattern = new(@"^STATE fw=(?:stage1-v3|stage2-v(?:[1-9]|10)) enabled=([01]) home=([0-7]) homed1=([01]) homed2=([01]) fault=([01]) enc=([01]) dir=([01])(?: enc2=([01]) dir2=([01]))?(?: arm2fb=([01]))?$", RegexOptions.CultureInvariant);
 
     public ControlWindow(bool restoreParameters = false)
     {
@@ -194,7 +212,7 @@ public sealed partial class ControlWindow : Window
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Referenced: true, Epoch: > 0 } &&
         (DateTime.UtcNow - lastPtpAt).TotalSeconds < 2 && (!supportsTelemetry ||
         telemetry is { Referenced: true, Inputs: 0 } && telemetry.Epoch == ptp.Epoch && (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2);
-    private bool CanManualReference => LimitsReady && supportsManualReference && compatible && enabled && hardwareReady && !homing && !stopPending && !PointBusy && uploaded is null &&
+    private bool CanManualReference => LimitsReady && supportsManualReference && manualPolarityReady && compatible && enabled && hardwareReady && !homing && !stopPending && !PointBusy && uploaded is null &&
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Epoch: > 0 } &&
         (DateTime.UtcNow - lastPtpAt).TotalSeconds < 2;
     private bool CanJog => LimitsReady && compatible && enabled && !homing && !stopPending && !PointBusy && IsActive && (DateTime.UtcNow - lastStateAt).TotalSeconds < 2;
@@ -338,7 +356,7 @@ public sealed partial class ControlWindow : Window
         {
             compatible = true; lastStateAt = DateTime.UtcNow;
             stage2 = line.StartsWith("STATE fw=stage2-");
-            framedControl = line.StartsWith("STATE fw=stage2-v7 ");
+            framedControl = line.StartsWith("STATE fw=stage2-v7 ") || line.StartsWith("STATE fw=stage2-v8 ") || line.StartsWith("STATE fw=stage2-v9 ") || line.StartsWith("STATE fw=stage2-v10 ");
             heartbeatTimer.Interval = TimeSpan.FromMilliseconds(framedControl ? 8 : 40);
             bool fastLink = framedControl || line.StartsWith("STATE fw=stage2-v6 ");
             if (hardwareUart != fastLink)
@@ -352,8 +370,12 @@ public sealed partial class ControlWindow : Window
             supportsTrajectory = supportsManualReference || line.StartsWith("STATE fw=stage2-v2 ");
             if (!stage2) { ptp = null; reportedLimits = null; reportedProfile = null; }
             homed = match.Groups[3].Value == "1" && match.Groups[4].Value == "1";
-            hardwareReady = match.Groups[5].Value == "0" && match.Groups[6].Value == "1";
-            feedbackReady = hardwareReady && match.Groups[7].Value == "1";
+            arm2FeedbackEnabled = !match.Groups[10].Success || match.Groups[10].Value == "1";
+            hardwareReady = match.Groups[5].Value == "0" && match.Groups[6].Value == "1" &&
+                (!arm2FeedbackEnabled || !match.Groups[8].Success || match.Groups[8].Value == "1");
+            feedbackReady = hardwareReady && match.Groups[7].Value == "1" &&
+                (!arm2FeedbackEnabled || !match.Groups[8].Success || match.Groups[9].Value == "1");
+            manualPolarityReady = !arm2FeedbackEnabled || !match.Groups[8].Success || match.Groups[9].Value == "1";
             enabled = match.Groups[1].Value == "1"; homing = match.Groups[2].Value != "0";
             if ((pendingControl == "使能" && enabled) || (pendingControl == "回零" && homing)) pendingControl = null;
             if (pendingPoint != 0 && (!enabled || !hardwareReady || homing)) Stop();
@@ -408,6 +430,10 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("CONTROL seq=") && uint.TryParse(line.AsSpan(12), out uint lastControl))
             lock (wireSync) { controlSequence = Math.Max(controlSequence, lastControl); }
         else if (line.StartsWith("MOTION_RATES ")) { ObserveMotionRates(line); }
+        else if (line.StartsWith("TELEM_RATE ")) { ObserveTelemetryRate(line); }
+        else if (line.StartsWith("TELEM_DIAG ")) { ObserveTelemetryDiagnostics(line); }
+        else if (line.StartsWith("FAULT_SNAPSHOT ")) { HandleFaultSnapshot(line); }
+        else if (line.StartsWith("LAST_STOP ")) { HandleLatchedStop(line); }
         else if (line.StartsWith("PTP_LIMITS ") || line.StartsWith("PTP_RATES ")) { HandleLimitsAck(line); UpdateControls(); }
         else if (line.StartsWith("TRAJ_STATE ")) HandleTrajectoryState(line);
         else if (line.StartsWith("TELEM ")) HandleTelemetry(line);
@@ -429,6 +455,7 @@ public sealed partial class ControlWindow : Window
             supportsMotionRates = line.Split(' ').Contains("motion_rates=1");
             supportsLiveRates = line.Split(' ').Contains("rates_live=1");
             supportsJointLimits = line.Split(' ').Contains("joint_limits=1");
+            ReadCapabilities(line.Split(' '));
             // Compatibility is the numeric wire-contract version, not the build id: a new build with the same
             // contract stays usable, and a changed contract is refused even if the build id did not change.
             protocolVersion = line.Split(' ').Where(w => w.StartsWith("proto=", StringComparison.Ordinal))
@@ -499,7 +526,7 @@ public sealed partial class ControlWindow : Window
             if (!AtStart(plan.Nodes[0].Pose)) { Lang.Text(lastStop, () => Lang.T("fault.notAtStart")); UpdateControls(); return; }
             if ((ulong)pointSequence + (uint)plan.Nodes.Length + 1 > uint.MaxValue) throw new InvalidOperationException(Lang.T("fault.seqExhaustedHome"));
             StartExperiment("trajectory",pointSequence+1,plan.Nodes);
-            uploading = plan; uploaded = null; uploadedRan = false; uploadNext = 0; trajectoryEpoch = ptp.Epoch; uploadStartedAt = DateTime.UtcNow;
+            uploading = plan; uploaded = null; uploadedRan = false; trajectoryRanOnce = false; uploadNext = 0; trajectoryEpoch = ptp.Epoch; uploadStartedAt = DateTime.UtcNow;
             xyPreview.PausePlayback();
             Append($"HOST trajectory upload start nodes={plan.Nodes.Length} duration={plan.Duration:F3}s; no automatic approach");
             SendNextTrajectoryPacket();
@@ -558,7 +585,10 @@ public sealed partial class ControlWindow : Window
             lastTrajectoryAt = DateTime.UtcNow; trajectoryIndex = (int)values[3]; trajectoryTotal = (int)total - 1;
             if (mode == 4) {
                 // The device keeps the nodes after a run (state 4): hold the plan so 执行图形 can repeat it.
-                executing = false; experimentCompleting = "complete"; uploaded = runPlan; uploadedRan = true; Append("HOST trajectory complete; firmware arm1 check passed, arm2 commanded only"); }
+                executing = false; experimentCompleting = "complete"; uploaded = supportsTrajRepeat ? runPlan : null; uploadedRan = uploaded is not null; trajectoryRanOnce = true; Append("HOST trajectory complete; firmware checks passed for both motor encoders");
+                // A firmware that does not declare traj_repeat=1 refuses a second RUN of the plan it holds (and stops): upload again instead.
+                if (!supportsTrajRepeat) Append("HOST this firmware cannot repeat a held plan (its LINK line has no traj_repeat=1); upload the plan again to draw it again");
+            }
         }
         // The device dropped the plan it held (new speeds invalidate it): forget it too, or 执行图形 would offer a plan that is gone.
         if (mode == 0 && uploaded is not null && uploading is null && !executing) { uploaded = null; uploadedRan = false; Append("HOST the device dropped the held plan; upload it again"); }
@@ -643,12 +673,13 @@ public sealed partial class ControlWindow : Window
     }
     private void UpdateControls(bool synchronize = true)
     {
-        if (synchronize) SynchronizeJointLimits(DateTime.UtcNow);
+        if (synchronize) { SynchronizeJointLimits(DateTime.UtcNow); SynchronizeTelemetryRate(DateTime.UtcNow); }
         Volatile.Write(ref limitsMotionAllowed, LimitsReady ? 1 : 0);
         if (synchronize && manualReferenceConfirmedEpoch!=0 && (!enabled || homing || ptp is not { Referenced:true } || ptp.Epoch!=manualReferenceConfirmedEpoch))
             InvalidateManualReferenceFeedback();
         // The device forgets a loaded plan when its reference epoch changes or it is disabled.
         if (synchronize && uploaded is not null && (!enabled || homing || ptp is not { Referenced: true } || ptp.Epoch != trajectoryEpoch)) uploaded = null;
+        if (synchronize && trajectoryRanOnce && (!enabled || homing || ptp is not { Referenced: true } || ptp.Epoch != trajectoryEpoch)) trajectoryRanOnce = false;
         if (synchronize) xyPreview.SetEditingAllowed(!PointBusy && !homing);
         enable.IsEnabled = LimitsReady && compatible && !enabled && !stopPending && !PointBusy;
         manualReference.IsEnabled = CanManualReference;
@@ -672,6 +703,8 @@ public sealed partial class ControlWindow : Window
             CanPoint ? (supportsTrajectory ? Lang.T("reason.readyTrajectory") :
                 Lang.T("reason.pointOnly")) :
             Lang.T("reason.needRef");
+        pointBlockReason = reason;
+        xyPreview.SetParameterConfirmation(RangeConfirmed, SpeedConfirmed);
         xyPreview.SetPointMoveState(CanPoint, reportedLimits, reason, supportsTrajectory, LimitsReady, uploaded, uploadedRan);
         var devicePose = supportsTelemetry && telemetry is { Referenced: true } && ptp is { Referenced: true } &&
             telemetry.Epoch == ptp.Epoch && telemetry.Sequence == ptp.Sequence && (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2 ? telemetry : null;
@@ -702,6 +735,7 @@ public sealed partial class ControlWindow : Window
         double percent=uploading is {} p?uploadNext*100.0/p.Nodes.Length:executing?trajectoryIndex*100.0/Math.Max(1,trajectoryTotal):0;
         xyPreview.SetDeviceStatus(statusMessage,statusFault,statusBusy,percent,
             stopPending || pendingControl is not null || homing || ptp is { Active: > 0 } && !executing);
+        UpdateWorkflow();
     }
     private void SafeAction(Action action)
     {
@@ -721,6 +755,7 @@ public sealed partial class ControlWindow : Window
         try { var summary = WireSessionSummary(); if (summary.Length > 0) Append(summary); } catch { }
         ResetWireSession();
         ResetControlTransport();
+        ResetDiagnostics();
         CancelLimitSync();
         reportedLimits = null; reportedProfile = null; supportsJointLimits = supportsMotionRates = supportsLiveRates = protocolMatches = limitsAwaitingState = false; protocolVersion = 0; reportedProfile=null; limitSyncError = "";
         lock (wireSync) { reportedEpoch = 0; waitingStopEpoch = false; }
@@ -735,11 +770,12 @@ public sealed partial class ControlWindow : Window
         try { Send(0x79); } catch { /* Firmware heartbeat timeout remains the fallback. */ }
         hardwareUart = false; supportsShortHeartbeat = false; connectionBadge.ToolTip = null; lastLinkLine = null;
         try { FinishExperiment("disconnected: " + reason()); } catch(Exception ex) { Lang.Text(experimentResult, () => Lang.T("fault.saveSummary2") + ex.Message); }
+        lastExperimentOutcome = null; trajectoryRanOnce = false;
         try { serial?.Dispose(); } catch { }
         serial = null;
         compatible = enabled = homing = stopPending = false;
         pending.Clear(); Lang.Text(state, reason); regularStateText = reason; Lang.Text(inputs, () => Lang.T("fault.inputsInvalid"));
-        ShowFeedback(null, () => Lang.T("fault.unplugReason")); errorHistory.Clear(); DrawErrorPlot();
+        ShowFeedback(null, () => Lang.T("fault.unplugReason")); errorHistory.Clear(); errorHistory2.Clear(); DrawErrorPlot();
         connect.Content = Lang.T("btn.connect"); ports.IsEnabled = true; UpdateControls();
         try { Append("HOST " + reason()); } catch { }
         try { recording?.Dispose(); } catch { }
@@ -764,6 +800,8 @@ public sealed partial class ControlWindow : Window
         MotionProfileSelfTest();
         JointLimitsSyncSelfTest();
         LiveRatesSyncSelfTest();
+        DiagnosticsSelfTest();
+        WorkflowSelfTest();
         StopRecoverySelfTest();
         ShapeFlowSelfTest();
         // Accumulate step by step: a later failure used to discard every earlier
@@ -790,8 +828,12 @@ public sealed partial class ControlWindow : Window
         ShortHeartbeatSelfTest();
         ExecutionTrajectory.SelfTest();
         ExperimentRecorder.SelfTest();
+        ExperimentArchiveTests.SelfTest();
         FeedbackSelfTest(snapshotPath);
         XYPreviewPanel.SelfTest(snapshotPath);
+        ExperimentWindow.SelfTest(snapshotPath);
+        Calibrations.SelfTest();
+        CalibrationWindow.SelfTest(snapshotPath);
         var window = new ControlWindow { selfTesting = true };
         static void Check(bool condition, [System.Runtime.CompilerServices.CallerArgumentExpression(nameof(condition))] string? expression = null)
         { if (!condition) throw new InvalidOperationException("UI state check failed: " + expression); }
@@ -806,7 +848,7 @@ public sealed partial class ControlWindow : Window
         void Arm(int epoch, uint seq = 0) {
             var r = window.xyPreview.RequestedProfile!.Value;
             window.TestLine($"MOTION_RATES epoch={epoch} r1={r.R1} r2={r.R2} a1={r.A1} a2={r.A2}");
-            window.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=1 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+            window.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=1 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
         }
         Check(!window.enable.IsEnabled && !window.home.IsEnabled);
         window.TestLine("STATE fw=stage2-v6 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
@@ -862,22 +904,22 @@ public sealed partial class ControlWindow : Window
         Check(!window.enable.IsEnabled && !window.home.IsEnabled && !window.stopPending);
         window.xyPreview.RestoreLimitsForSelfTest("-60", "60", "-90", "90");
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-        window.TestLine("PTP_STATE lock=1 ref=1 active=0 epoch=7 seq=0 min1=0 max1=0 min2=0 max2=0");
+        window.TestLine("PTP_STATE lock=1 ref=1 active=0 epoch=7 seq=0 min1=0 max1=0 min2=0 max2=0 emin=0 emax=0");
         Check(!window.CanPoint);
-        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=0 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         Check(!window.CanPoint); // matching limits cannot override missing q2 capability
         window.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
         Check(!window.CanPoint); // the device has not confirmed the requested rates yet
         { var r = window.xyPreview.RequestedProfile!.Value; window.TestLine($"MOTION_RATES epoch=7 r1={r.R1} r2={r.R2} a1={r.A1} a2={r.A2}"); }
         Check(!window.CanPoint); // no telemetry for this reference yet
-        window.TestLine("TELEM t=10 epoch=7 seq=0 ref=1 source=1 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+        window.TestLine("TELEM t=10 epoch=7 seq=0 ref=1 source=1 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
         Check(window.CanPoint);
         window.RequestPoint(new JointPose(1.25, -2.5));
         Check(window.pendingPoint==1 && window.pointWire.Count==36 && !window.CanPoint && !window.home.IsEnabled);
         window.Stop(); Check(window.pendingPoint==0 && window.pointWire.Count==0 && !window.CanPoint);
-        window.TestLine("PTP_STATE lock=0 ref=1 active=1 epoch=7 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=1 epoch=7 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         Check(!window.CanPoint && !window.home.IsEnabled);
-        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=7 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         Arm(7, 1);
         Check(window.CanPoint);
         // Compact re-announcement: the firmware repeats this after a reference epoch
@@ -886,18 +928,18 @@ public sealed partial class ControlWindow : Window
         Check(window.ptp is { Epoch: 9 }, "compact epoch announcement was not adopted");
         window.TestLine("PTP_EPOCH nonsense");
         Check(window.ptp is { Epoch: 9 }, "malformed epoch announcement changed the epoch");
-        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         window.lastPtpAt = DateTime.UtcNow.AddSeconds(-3); Check(!window.CanPoint);
         window.TestLine("PTP_STATE malformed"); Check(!window.CanPoint);
         window.xyPreview.RestoreLimitsForSelfTest("-30", "30", "-60", "60");
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
-        window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=20 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=20 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(window.CanManualReference && window.manualReference.IsEnabled && !window.CanPoint);
         window.RequestManualReference();
         uint manualSeq = window.pendingPoint;
         Check(window.manualReferencePending && window.pointWire.Count == 36 && !window.CanManualReference);
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={manualSeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Arm(21, manualSeq);
         Check(window.CanPoint && !window.manualReferencePending && window.pointWire.Count == 0);
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
@@ -919,35 +961,35 @@ public sealed partial class ControlWindow : Window
         Check(window.pendingPoint == 0 && window.pointWire.Count == 0);
         window.RetryPendingPoint(window.pointRequestedAt.AddSeconds(4));
         Check(window.pointWire.Count == 0); // timeout cannot restart anything
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=21 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         window.RequestPoint(new JointPose(-21.95, 44.37));
         retrySeq = window.pendingPoint;
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=1 epoch=21 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=1 epoch=21 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         window.RetryPendingPoint(window.pointRequestedAt.AddMilliseconds(1100));
         Check(window.pendingPoint == 0 && window.pointWire.Count == 0); // ACK cancels retransmission
         window.TestLine("STOP: driver fault");
         Check(window.ptp is null && window.pointWire.Count == 0);
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=22 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=22 seq={retrySeq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         window.RequestPoint(new JointPose(-21.95, 44.37));
         window.TestLine("PTP refused: joint range/rate");
         window.RetryPendingPoint(window.pointRequestedAt.AddSeconds(1));
         Check(window.pendingPoint == 0 && window.pointWire.Count == 0); // genuine refusal never retries
         window.Stop(); Check(!window.CanPoint && !window.CanManualReference);
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=0 homed2=0 fault=0 enc=0 dir=0");
-        window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=22 seq=2 min1=-3000 max1=3000 min2=-6000 max2=6000");
+        window.TestLine("PTP_STATE lock=0 ref=0 active=0 epoch=22 seq=2 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
         Check(!window.CanManualReference);
         var path = DrawingTrajectory.Create(new PlanarArm(180, 176.38), DrawingShape.Circle, 340, 0, 5, 0, 0, null);
         var execution = new ExecutionTrajectory(new TimedTrajectory(path, new PlanningRates(20, 5, 3, 10, 6)), new JointLimits(-30, 30, -60, 60));
         window.xyPreview.RestoreLimitsForSelfTest("-60", "60", "-90", "90");
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=8 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000");
-        void StartSample(uint epoch, uint seq) => window.TestLine($"TELEM t=1000 epoch={epoch} seq={seq} ref=1 source=2 p1={ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose)} p2={ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose)} e1=0 err=0 inputs=0 drops=0");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=8 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
+        void StartSample(uint epoch, uint seq) => window.TestLine($"TELEM t=1000 epoch={epoch} seq={seq} ref=1 source=2 p1={ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose)} p2={ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
         window.RequestTrajectory(execution); Check(window.uploading is null); // missing position feedback
         StartSample(8,1);
         window.RequestTrajectory(execution);
         Check(window.uploading is not null && window.pointWire.Count == 36 && !window.CanPoint && !window.home.IsEnabled);
         uint first = window.pendingPoint;
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={first} min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={first} min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         Check(window.pendingPoint == first && window.uploadNext == 0); // PTP status is not a node acknowledgement
         uint lastSeq = 0;
         for (int i = 0; i < execution.Nodes.Length; i++) {
@@ -960,7 +1002,7 @@ public sealed partial class ControlWindow : Window
             }
         }
         Check(window.uploading is null && window.uploaded == execution && !window.executing && window.pointWire.Count == 0 && window.CanPoint); // fully loaded, nothing moves
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={lastSeq} min1=-6000 max1=6000 min2=-9000 max2=9000"); StartSample(8, lastSeq); // the device reports the last node as its sequence
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={lastSeq} min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500"); StartSample(8, lastSeq); // the device reports the last node as its sequence
         window.RequestPoint(new JointPose(1, 1)); window.RequestManualReference();
         Check(window.pendingPoint == 0 && window.pointWire.Count == 0 && !window.CanManualReference); // the device refuses other moves while it holds a plan
         window.RequestExecute(); Check(window.uploading is not null && window.uploaded is null && window.pendingPoint != 0 && window.pointWire.Count == 36);
@@ -968,18 +1010,18 @@ public sealed partial class ControlWindow : Window
         Check(window.uploading is null && window.executing && window.pointWire.Count == 0 && window.pendingPoint == 0);
         window.TestLine($"TRAJ_STATE state=4 count={execution.Nodes.Length} total={execution.Nodes.Length} index={execution.Nodes.Length} seq={window.trajectoryRunSequence} epoch=8");
         Check(!window.executing && window.uploaded == execution && window.uploadedRan); // the device keeps a finished plan
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={window.trajectoryRunSequence} min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={window.trajectoryRunSequence} min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         StartSample(8,window.trajectoryRunSequence);
         window.RequestExecute(); Check(window.uploading is not null && window.uploaded is null && window.pointWire.Count == 36); // repeat: RUN only, no upload
         window.TestLine($"TRAJ_STATE state=3 count={execution.Nodes.Length} total={execution.Nodes.Length} index=1 seq={window.pendingPoint} epoch=8");
         window.TestLine($"TRAJ_STATE state=4 count={execution.Nodes.Length} total={execution.Nodes.Length} index={execution.Nodes.Length} seq={window.trajectoryRunSequence} epoch=8");
         Check(!window.executing && window.uploaded == execution && window.uploadedRan);
-        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={window.trajectoryRunSequence} min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={window.trajectoryRunSequence} min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         StartSample(8,window.trajectoryRunSequence);
         window.RequestTrajectory(execution); Check(window.uploading is not null);
         window.Stop(); Check(window.uploading is null && window.pointWire.Count == 0 && window.pendingPoint == 0);
         window.uploaded = execution; window.UpdateControls(); Check(window.uploaded is null); // no reference, no held plan
-        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=9999 min1=-6000 max1=6000 min2=-9000 max2=9000");
+        window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=9 seq=9999 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         StartSample(9,9999);
         window.RequestTrajectory(execution);
         window.TestLine($"TRAJ_STATE state=1 count=2 total={execution.Nodes.Length} index=0 seq={window.pendingPoint} epoch=9");
@@ -997,10 +1039,10 @@ public sealed partial class ControlWindow : Window
                 foreach(var n in extraPlan.Nodes) { extra.Write((short)Math.Round(n.Pose.Q1*100)); extra.Write((short)Math.Round(n.Pose.Q2*100)); extra.Write(n.Milliseconds); }
             }
             window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
-            window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=30 seq=10000 min1=-3000 max1=3000 min2=-6000 max2=6000");
+            window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=30 seq=10000 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             int p1=ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose), p2=ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose);
             window.errorHistory.Clear();
-            for(int i=0;i<40;i++) window.TestLine($"TELEM t={i*500} epoch=30 seq=10000 ref=1 source=2 p1={p1} p2={p2} e1={(int)Math.Round(p1*2.56)+i%9-4} err=0 inputs=0 drops=0");
+            for(int i=0;i<40;i++) window.TestLine($"TELEM t={i*500} epoch=30 seq=10000 ref=1 source=2 p1={p1} p2={p2} e1={(int)Math.Round(p1*2.56)+i%9-4} err=0 e2=0 err2=0 inputs=0 drops=0");
             Lang.Text(window.lastStop, () => ""); window.connectionBadge.Text="离线界面检查 · 模拟数据";
             string dir=Path.GetDirectoryName(snapshotPath)!;
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench.png"),1380,930);
@@ -1046,7 +1088,7 @@ public sealed partial class ControlWindow : Window
             // The solid arm tracks the device even when it differs from the plan; the plan stays as a dashed ghost.
             window.xyPreview.FitView(false);
             var away = new JointPose(10, 25);
-            window.TestLine($"TELEM t=30000 epoch=30 seq=10000 ref=1 source=2 p1={ExecutionTrajectory.Counts(0,away)} p2={ExecutionTrajectory.Counts(1,away)} e1=0 err=0 inputs=0 drops=0");
+            window.TestLine($"TELEM t=30000 epoch=30 seq=10000 ref=1 source=2 p1={ExecutionTrajectory.Counts(0,away)} p2={ExecutionTrajectory.Counts(1,away)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-device-moved.png"),1380,930);
         }
         window.Close();

@@ -30,7 +30,7 @@ public sealed partial class ControlWindow
         window.heartbeatTimer.Tick -= window.OnHeartbeatTick;
         var seed = new StringBuilder();
         while (seed.Length < 92000)
-            seed.AppendLine("[19:30:19.432] TELEM t=49000 epoch=2 seq=1 ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+            seed.AppendLine("[19:30:19.432] TELEM t=49000 epoch=2 seq=1 ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
         window.log.Text = seed.ToString();
         var tabs = (TabControl)window.diagnostics.Content;
         var clock = new Stopwatch();
@@ -85,7 +85,7 @@ public sealed partial class ControlWindow
             if (clock.ElapsedMilliseconds >= batch * 500) {
                 string[] lines = [
                     $"STATE fw=stage2-v{(framed ? 7 : 6)} enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1",
-                    "PTP_STATE lock=0 ref=1 active=0 epoch=2 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000",
+                    "PTP_STATE lock=0 ref=1 active=0 epoch=2 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500",
                     "TRAJ_STATE state=0 count=0 total=0 index=0 seq=1 epoch=2",
                     "LINK uart=hw baud=115200 rx_overflow=0 rx_error=0 tx_dropped=0",
                     $"TELEM t={49000 + batch * 500} epoch=2 seq=1 ref=1 source=2 p1=0 p2=0 e1={batch % 3 - 1} err=0 inputs=0 drops=0"

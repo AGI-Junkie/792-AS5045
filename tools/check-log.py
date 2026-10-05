@@ -17,6 +17,7 @@ from pathlib import Path
 
 KEY_GAP_MAX_MS = 100   # WORKBENCH_HARDENING.md: acceptance is key_max_gap_ms <= 100 (0.4 x the 250 ms firmware deadman)
 LEASE_WARN_MS = 150    # host UI lease gap; the host stops heartbeating at 200 ms (LeaseStopMs)
+TELEM_COST_WARN_US = 1000   # one streamed TELEM line formats in the step-pulse loop: over 1 ms is worth a look
 
 
 def analyse(text):
@@ -30,6 +31,15 @@ def analyse(text):
 
     stops = [s.strip() for s in re.findall(r"STOP: ([^;\r\n]+)", text)]
     protective = [s for s in stops if not s.startswith("operator stop")]
+    recovered = set(re.findall(r'LAST_STOP id=\d+ [^\r\n]+', text))
+    for line in sorted(recovered):
+        reason = re.search(r'reason="([^"]+)"', line)
+        if not reason: continue
+        info.append("锁存停机：" + reason[1])
+        timing = re.search(r'elapsed_us=(\d+) plan_us=(\d+) late_us=(\d+) done=(\d+) total=(\d+)', line)
+        if timing: info.append("停机段耗时 %s us / 计划 %s us；超时 %s us；已走 %s/%s 步" % timing.groups())
+        short_reason = reason[1].split(';', 1)[0]
+        if not short_reason.startswith("operator stop") and short_reason not in protective: protective.append(short_reason)
     if protective:
         fails.append("保护性停机 %d 次：%s" % (len(protective), "；".join(sorted(set(protective)))))
     info.append("人为停止 %d 次" % (len(stops) - len(protective)))
@@ -43,6 +53,8 @@ def analyse(text):
         if last[2] > first[2]:
             warns.append("tx_dropped 增加 %d（状态/回执可能被丢）" % (last[2] - first[2]))
 
+    if "arm2fb=0" in text: info.append("arm2 反馈未启用：按指令计数，无 arm2 实测误差")
+
     enable = text.find("ENABLE OK")
     if enable < 0:
         info.append("本次日志没有使能，不评估心跳余量")
@@ -53,6 +65,29 @@ def analyse(text):
         elif gaps:
             info.append("key_max_gap_ms 最大 %d（线 %d）" % (max(gaps), KEY_GAP_MAX_MS))
 
+    # Streamed telemetry: its cost is what has to be checked on the machine (TELEM_DIAG max_us, loop/tick lag, heartbeat gap).
+    diags = re.findall(r"TELEM_DIAG hz=(\d+) sent=(\d+) skipped=(\d+) max_us=(\d+)", text)
+    if diags:
+        first, last = [tuple(map(int, m)) for m in (diags[0], diags[-1])]
+        hz = max(d[0] for d in map(lambda m: tuple(map(int, m)), diags))
+        if hz == 0:
+            info.append("遥测流未开启（只有状态块里的 TELEM）")
+        else:
+            info.append("遥测流 %d Hz：本次日志发送 %d 行，跳过 %d 行，一次格式化最长 %d µs" % (hz, last[1] - first[1], last[2] - first[2], last[3]))
+            if last[2] > first[2]:
+                warns.append("遥测流跳过 %d 行（发送队列过半满，说明串口输出很满）" % (last[2] - first[2]))
+            if last[3] > TELEM_COST_WARN_US:
+                warns.append("流式遥测一次格式化最长 %d µs（超过 %d），可能影响步进脉冲时序" % (last[3], TELEM_COST_WARN_US))
+            loops = [int(x) for pair in re.findall(r"TIMING loop_max_ms=(\d+) tick_lag_max_ms=(\d+)", text) for x in pair]
+            if loops:
+                info.append("流式遥测期间 loop_max_ms/tick_lag_max_ms 最大 %d" % max(loops))
+
+    # The firmware's own account of each stop; a driver nFAULT is never explained, because the pin cannot say which cause.
+    for m in re.finditer(r"FAULT_SNAPSHOT .*?phase=(\S+) .*?drv=(\S+) reason=\"([^\"\r\n]*)", text):
+        if m.group(1) != "disabled" and not m.group(3).startswith("operator stop"):
+            note = "；驱动器 nFAULT 有效，原因待诊断（过流/过热/欠压无法区分）" if m.group(2) != "ok" else ""
+            info.append("停机快照：阶段 %s，%s%s" % (m.group(1), m.group(3), note))
+
     leases = [int(v) for v in re.findall(r"HOST UI lease gap max=(\d+)", text)]
     leases += [int(v) for v in re.findall(r"worstUiLeaseGap=(\d+)ms", text)]
     if leases and max(leases) > LEASE_WARN_MS:
@@ -61,6 +96,9 @@ def analyse(text):
     for err, limit in re.findall(r"PTP done seq=\d+;.*?error_lsb=(-?\d+) final_limit_lsb=(\d+)", text):
         if abs(int(err)) > int(limit):
             fails.append("终点误差 %s LSB 超过限 %s" % (err, limit))
+    for err1, err2, limit in re.findall(r"PTP done seq=\d+;.*?error1_lsb=(-?\d+)(?: error2_lsb=(-?\d+))? final_limit_lsb=(\d+)", text):
+        for axis, err in enumerate((err1, err2), 1):
+            if err and abs(int(err)) > int(limit): fails.append("arm%d 终点误差 %s LSB 超过限 %s" % (axis, err, limit))
     done = len(set(re.findall(r"TRAJ_STATE state=4 [^\n]*?seq=(\d+)", text)))
     info.append("完整执行轨迹 %d 条" % done)
     return fails, warns, info
@@ -98,6 +136,15 @@ def self_test():
     assert verdict(replace={base[6]: base[6].replace("tx_dropped=5", "tx_dropped=6")}) == (False, True), "tx_dropped increase must only warn"
     assert verdict("[10:00:06] HOST UI lease gap max=208 ms") == (False, True), "long UI lease gap must only warn"
     assert analyse("no firmware lines at all")[1], "missing fw id must warn"
+    diag = "[10:00:02.500] TELEM_DIAG hz=%d sent=%d skipped=%d max_us=%d"
+    # The counters are cumulative since power-up, so a stream is judged by its increase between two reports.
+    assert verdict(diag % (10, 20, 0, 300), diag % (10, 60, 0, 300)) == (False, False), "a cheap, unskipped stream must pass quietly"
+    assert verdict(diag % (10, 20, 0, 300), diag % (10, 60, 2, 300)) == (False, True), "skipped stream lines must warn"
+    assert verdict(diag % (20, 40, 0, 1500)) == (False, True), "a slow TELEM format must warn"
+    assert "遥测流未开启" in "".join(analyse("\n".join(base + [diag % (0, 0, 0, 0)]))[2]), "hz=0 must say the stream is off"
+    snap = '[10:00:06] FAULT_SNAPSHOT t=1500 epoch=3 seq=4 phase=traj_run home=0 traj=3 idx=1/3 ref=1 p1=1 p2=2 e1=3 err=0 inputs=8 hb_age_ms=23 hb_max_gap_ms=41 drv=nfault_undetermined reason="DRV8825 nFAULT; drivers OFF"'
+    assert "原因待诊断" in "".join(analyse("\n".join(base + [snap]))[2]), "a driver stop must be reported as undiagnosed"
+    assert "过热" not in "".join(analyse("\n".join(base + [snap.replace("nfault_undetermined", "ok")]))[2]), "a non-driver stop must not mention overheating"
     print("check-log self-test passed")
 
 

@@ -1,11 +1,11 @@
 /* ========================================================================
- * AS5045 + DRV8825: two-joint arm firmware (stage2-v7)
+ * AS5045 + DRV8825: two-joint arm firmware (stage2-v8)
  * Target: CY8CKIT-059 (PSoC 5LP) @ 24 MHz BUS_CLK, GPIO + UDB host UART.
  *
  * MECHANICS: arm1 = 42 mm 1.8 deg stepper on DRV2 / stepper2 behind a 40:1
  * gearbox.  The AS5045 magnet sits on the MOTOR REAR SHAFT, so the encoder
  * measures the rotor, not the gearbox output.  arm2 = 28 mm stepper on DRV1 /
- * stepper1 (51.06:1), open loop.
+ * stepper1 (51.06:1), with a second motor-shaft AS5045 in the SSI chain.
  *
  *   1 output degree  = 40 motor degrees = 455.1 encoder LSB      (arm1)
  *   1 microstep(1/8) = 0.225 motor deg  = 2.56 LSB = 0.005625 output degree
@@ -48,7 +48,7 @@
 
 /* Physical directions confirmed on the bench: left DIR=0 for both axes.
  * Encoder polarity is learned only during manually requested homing.
- * This stage requires arm1 encoder feedback; there is no automatic fallback. */
+ * This stage requires both motor encoders; there is no automatic fallback. */
 #define ARM2_LEFT_DIR_LEVEL         (0u)
 #define ARM1_LEFT_DIR_LEVEL         (0u)
 
@@ -72,13 +72,18 @@
  * The STATE line keeps the plain "stage2-v7" token because the host matches it to
  * select the framed transport.  Bump this on every firmware change so a field log
  * can answer "was this fix actually flashed?". */
-#define FW_BUILD_ID                 "stage2-v7-absolute-q2-r4000-live"
+#ifndef ARM2_ENCODER_FEEDBACK
+#define ARM2_ENCODER_FEEDBACK       (0u) /* Enable only after the encoder/magnet is fixed and commissioned. */
+#endif
+
+#define FW_BUILD_ID                 "stage2-v10-stop-latch"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
  * above can change freely.  Bump it (and the host constant) whenever a frame format, a field's meaning,
- * the sequence/epoch rules or the coordinate convention changes. */
-#define PROTO_VERSION               (1u)
+ * the sequence/epoch rules or the coordinate convention changes.  2: PTP_STATE carries emin/emax and type 9
+ * accepts axis 2, the elbow range (q2 - q1, i.e. motor 2's own travel). */
+#define PROTO_VERSION               (4u)
 
 /* The software UART only accepts odd bytes.  jog.ps1 maps physical R to this
  * otherwise-unused wire byte, because ASCII 'r' (0x72) is even. */
@@ -106,8 +111,8 @@
 #define HOME_SETTLE_MS               (50u)
 #define HOME_ZERO_SAMPLES            (12u)
 #define HOME_ZERO_SAMPLE_MS          (1u)
-#define ARM1_STRAIGHT_OUT_DEG10      (1270)   /* temporary visual correction: 125 + 2 deg */
-#define ARM2_STRAIGHT_OUT_DEG10      (1630)   /* temporary visual correction: 160 + 3 deg */
+#define ARM1_STRAIGHT_OUT_DEG10      (1260)   /* temporary visual correction: 125 + 1 deg */
+#define ARM2_STRAIGHT_OUT_DEG10      (1615)   /* temporary visual correction: 160 + 1.5 deg */
 #define ARM2_STRAIGHT_JOG_DIR        (-1)    /* user confirmed: Left */
 #define ARM2_MOTOR_FULLSTEPS_REV     (200)   /* Anaheim 11YPG302S-LW4-R51, 1.8 deg */
 #define ARM2_GEAR_RATIO_X100         (5106)  /* maker R51 table: 51.06:1, direct drive */
@@ -143,6 +148,16 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
     (PTP_MIN1_CD > 0) || (PTP_MAX1_CD < 0) || (PTP_MIN2_CD > 0) || (PTP_MAX2_CD < 0) || \
     (PTP_MIN1_CD < -CFG_JOINT_CD_MAX) || (PTP_MAX1_CD > CFG_JOINT_CD_MAX) || (PTP_MIN2_CD < -CFG_JOINT_CD_MAX) || (PTP_MAX2_CD > CFG_JOINT_CD_MAX))
 #error "PTP requires valid software bounds within +/-180 deg containing straight zero"
+#endif
+/* Elbow (motor 2, q2 - q1) range, 0.01 deg.  Like the boxes above this is a provisional software bound, NOT a
+ * measured mechanical stroke; the host overwrites it (type 9, axis 2) before any motion is allowed.  The value
+ * is the same as the host's DeviceContract.ElbowDefaultCd. */
+#define PTP_ELBOW_DEFAULT_CD         (15500)
+#define PTP_MINE_CD                  (-PTP_ELBOW_DEFAULT_CD)
+#define PTP_MAXE_CD                  (PTP_ELBOW_DEFAULT_CD)
+#if PTP_COMMISSIONED && (PTP_MINE_CD >= PTP_MAXE_CD || PTP_MINE_CD > 0 || PTP_MAXE_CD < 0 || \
+    PTP_MINE_CD < -CFG_JOINT_CD_MAX || PTP_MAXE_CD > CFG_JOINT_CD_MAX)
+#error "PTP requires an elbow bound within +/-180 deg containing straight zero"
 #endif
 #define PTP_RATE_MAX                 (4000u)
 #define PTP_ACCEL                    (3000u)
@@ -341,7 +356,7 @@ static void dbg_puts(const char *s)
     }
 }
 
-static char g_dbg[256];   /* the LINK line alone is ~180 characters */
+static char g_dbg[768];   /* Stop evidence includes trajectory timing; keep reason and CRLF. */
 #define DBG(s)       dbg_puts(s)
 #define DBGF(...)    do { snprintf(g_dbg, sizeof(g_dbg), __VA_ARGS__); \
                           dbg_puts(g_dbg); } while (0)
@@ -385,6 +400,7 @@ static int32 out_deg10_to_lsb(int32 deg10)
 }
 
 /* Motor-side encoder LSB -> output-shaft degrees, hundredths. */
+static int32 lsb_to_out_deg100(int32 lsb) __attribute__((unused));
 static int32 lsb_to_out_deg100(int32 lsb)
 {
     return (int32)(((int64)lsb * 36000) / ((int64)ENCODER_CPR * GEAR_RATIO));
@@ -446,6 +462,38 @@ static uint32 as5045_read_raw(void)
     return (value & FRAME_MASK);
 }
 
+/* Daisy chain diagnostic: 2 x 19 clocks (18 data + 1 dummy per device).
+ * Board 1 (wired to the MCU) comes first, board 2 second. Not used by the
+ * closed loop; that still reads 18 bits from board 1 only. */
+static void as5045_read_chain(uint32 *first, uint32 *second)
+{
+    uint32 a = 0u, b = 0u;
+    uint8 i, ints;
+    uint32 started, cost;
+
+    CyPins_ClearPin(PIN_CSN);
+    delay_us(2u);
+    for (i = 0u; i < 38u; i++)
+    {
+        uint32 bit;
+        ints=CyEnterCriticalSection(); started=SU_NOW();
+        CyPins_ClearPin(PIN_CLK);
+        delay_us(SSI_HALF_US);
+        CyPins_SetPin(PIN_CLK);
+        delay_us(SSI_SAMPLE_US);
+        bit = (CyPins_ReadPin(PIN_DO) != 0u) ? 1u : 0u;
+        if (i < 18u)       { a = (a << 1) | bit; }
+        else if (i >= 19u && i < 37u) { b = (b << 1) | bit; } /* skip dummy bits 18 and 37 */
+        delay_us(SSI_HALF_US - SSI_SAMPLE_US);
+        cost=SU_ELAPSED(started); if(cost>g_encIrqMaxCy) { g_encIrqMaxCy=cost; }
+        CyExitCriticalSection(ints);
+    }
+    CyPins_SetPin(PIN_CSN);
+    delay_us(2u);
+    *first = a & FRAME_MASK;
+    *second = b & FRAME_MASK;
+}
+
 static uint8 frame_parity_ok(uint32 frame)
 {
     uint32 value = frame & FRAME_MASK;
@@ -467,9 +515,9 @@ static int16_t angle_delta(uint16 now, uint16 previous)
     return delta;
 }
 
-static void as5045_read(as5045_t *sample)
+static void as5045_decode(as5045_t *sample, uint32 raw)
 {
-    sample->raw     = as5045_read_raw();
+    sample->raw     = raw;
     sample->angle   = (uint16)((sample->raw >> 6) & ENCODER_MASK);
     sample->ocf     = (uint8)((sample->raw >> 5) & 1u);
     sample->cof     = (uint8)((sample->raw >> 4) & 1u);
@@ -479,6 +527,8 @@ static void as5045_read(as5045_t *sample)
     sample->par     = (uint8)(sample->raw & 1u);
     sample->par_ok  = frame_parity_ok(sample->raw);
 }
+
+static void as5045_read(as5045_t *sample) { as5045_decode(sample, as5045_read_raw()); }
 
 #define ST_OK                       (0u)
 #define ST_DO_HIGH                  (1u)
@@ -528,22 +578,8 @@ static uint8 encoder_state_valid(uint8 code)
     return ((code == ST_OK) || (code == ST_FIELD)) ? 1u : 0u;
 }
 
-static uint8 encoder_get_valid(as5045_t *sample)
-{
-    uint8 attempt;
-    for (attempt = 0u; attempt < ENCODER_READ_RETRIES; attempt++)
-    {
-        if(attempt!=0u) { g_encRetries++; }
-        as5045_read(sample);
-        if (encoder_state_valid(classify(sample)) != 0u) { return 1u; }
-        CyDelay(1u);
-    }
-    return 0u;
-}
-
 /* ====================== multi-turn position tracking ==================== */
-static int32 g_cmdUsteps;       /* net microsteps issued since the origin */
-static int32 g_cmdLsbX100;
+/* Command and measured rotor state are independent for each axis. */
 #define ENC_MAX_GAP_MS (100u)
 #define ENC_JUMP_MARGIN_LSB (SLIP_FAIL_LSB)
 /* The rotor must never move half a turn (2048 LSB) between two accepted samples, or the wrap direction is
@@ -559,86 +595,108 @@ typedef struct
     uint8  trackingLost;
     uint32 lastMs;
     int32 lastCmd;
+    int32 cmdUsteps, cmdLsbX100;
+    uint8 incDir, directionKnown;
+    int32 softCenter, origin;
 } enc_t;
 
-static enc_t g_enc;
+static enc_t g_enc, g_enc2;
+#define g_cmdUsteps (g_enc.cmdUsteps)
+#define g_cmdLsbX100 (g_enc.cmdLsbX100)
 
 /* One measurement update. Returns 0 when the frame was unusable; the caller
  * decides whether the streak is long enough to be a fault. */
-static uint8 enc_sample(void)
+static uint8 enc_update(enc_t *e, const as5045_t *sample, uint8 valid)
 {
-    as5045_t s;
     uint32 now, gap;
     int32 delta;
     int64 commanded, position;
 
-    if(g_enc.trackingLost) { g_enc.badStreak=ENC_BAD_LIMIT; return 0u; }
+    if(e->trackingLost) { e->badStreak=ENC_BAD_LIMIT; return 0u; }
 
-    if (encoder_get_valid(&s) == 0u)
+    if (valid == 0u)
     {
-        if (g_enc.badStreak < 0xFFu) { g_enc.badStreak++; }
+        if (e->badStreak < 0xFFu) { e->badStreak++; }
         return 0u;
     }
-    g_enc.badStreak = 0u;
+    e->badStreak = 0u;
 
-    if (g_enc.primed == 0u)
+    if (e->primed == 0u)
     {
-        g_enc.lastAngle = s.angle;
-        g_enc.primed = 1u;
+        e->lastAngle = sample->angle;
+        e->primed = 1u;
     }
     else
     {
-        now=wall_ms(); gap=now-g_enc.lastMs;
+        now=wall_ms(); gap=now-e->lastMs;
         if(gap>g_encMaxGapMs) { g_encMaxGapMs=gap; }
-        delta=(int32)angle_delta(s.angle, g_enc.lastAngle);
-        commanded=(int64)g_cmdUsteps-g_enc.lastCmd;
+        delta=(int32)angle_delta(sample->angle, e->lastAngle);
+        commanded=(int64)e->cmdUsteps-e->lastCmd;
         if(commanded<0) { commanded=-commanded; }
-        position=(int64)g_enc.pos+delta;
+        position=(int64)e->pos+delta;
         /* At the configured maximum 6000 usteps/s, 100 ms plus the margin
          * stays below half a motor turn. A lost turn cannot be reconstructed. */
         if(gap>ENC_MAX_GAP_MS ||
            abs_i32(delta)>(int32)((MOVE_RATE_MAX_USTEP_S*(uint32)LSB_PER_USTEP_X100*(gap+1u))/100000u)+ENC_JUMP_MARGIN_LSB ||
            abs_i32(delta)>commanded*LSB_PER_USTEP_X100/100+ENC_JUMP_MARGIN_LSB ||
-           position>INT32_MAX || position<INT32_MIN) {
-            g_enc.trackingLost=1u; g_enc.badStreak=ENC_BAD_LIMIT; g_encRejected++;
+           position>INT32_MAX/100 || position<INT32_MIN/100) {
+            e->trackingLost=1u; e->badStreak=ENC_BAD_LIMIT; g_encRejected++;
             return 0u;
         }
-        g_enc.pos = (int32)position;
-        g_enc.lastAngle = s.angle;
+        e->pos = (int32)position;
+        e->lastAngle = sample->angle;
     }
-    g_enc.lastMs=wall_ms(); g_enc.lastCmd=g_cmdUsteps;
+    e->lastMs=wall_ms(); e->lastCmd=e->cmdUsteps;
     {
-        int64 following=(int64)g_cmdLsbX100/100-g_enc.pos;
+        int64 following=(int64)e->cmdLsbX100/100-e->pos;
         if(following<0) { following=-following; }
         if((uint64_t)following>g_followPeakLsb) { g_followPeakLsb=(uint32)following; }
     }
     return 1u;
 }
 
+/* One shared 38-clock transaction; a bad axis never advances its position. */
+static uint8 enc_sample(void)
+{
+    as5045_t a, b;
+    uint32 raw1, raw2;
+    uint8 i, v1=0u, v2=0u, ok1, ok2;
+    for(i=0u;i<ENCODER_READ_RETRIES;i++) {
+        if(i) { g_encRetries++; }
+        as5045_read_chain(&raw1,&raw2);
+        as5045_decode(&a,raw1); as5045_decode(&b,raw2);
+        v1=encoder_state_valid(classify(&a)); v2=encoder_state_valid(classify(&b));
+        if(v1 && (!ARM2_ENCODER_FEEDBACK || v2)) { break; }
+    }
+    ok1=enc_update(&g_enc,&a,v1); ok2=enc_update(&g_enc2,&b,v2);
+    return ok1 && (!ARM2_ENCODER_FEEDBACK || ok2);
+}
+
 /* Average 12 samples relative to the first angle so the average also works
  * when the wrap lies inside the group. Used once, to set the origin. */
 static uint8 enc_set_origin(void)
 {
+    uint16 reference[2]={0u,0u};
+    int32 sum[2]={0,0};
+    uint8 i, axis;
+    uint32 raw[2];
     as5045_t sample;
-    uint16 reference = 0u;
-    int32 sum = 0;
-    uint8 i;
-
-    for (i = 0u; i < 12u; i++)
-    {
-        if (encoder_get_valid(&sample) == 0u) { return 0u; }
-        if (i == 0u) { reference = sample.angle; }
-        sum += (int32)angle_delta(sample.angle, reference);
+    for(i=0u;i<12u;i++) {
+        as5045_read_chain(&raw[0],&raw[1]);
+        for(axis=0u;axis<(ARM2_ENCODER_FEEDBACK ? 2u : 1u);axis++) {
+            as5045_decode(&sample,raw[axis]);
+            if(!encoder_state_valid(classify(&sample))) { return 0u; }
+            if(!i) { reference[axis]=sample.angle; }
+            sum[axis]+=angle_delta(sample.angle,reference[axis]);
+        }
         CyDelay(1u);
     }
-
-    g_enc.lastAngle = (uint16)(((int32)reference + (sum / 12) + ENCODER_CPR) %
-                               ENCODER_CPR);
-    g_enc.pos       = 0;
-    g_enc.primed    = 1u;
-    g_enc.badStreak = 0u;
-    g_enc.trackingLost=0u;
-    g_enc.lastMs=wall_ms(); g_enc.lastCmd=g_cmdUsteps;
+    for(axis=0u;axis<(ARM2_ENCODER_FEEDBACK ? 2u : 1u);axis++) {
+        enc_t *e=axis ? &g_enc2 : &g_enc;
+        e->lastAngle=(uint16)(((int32)reference[axis]+sum[axis]/12+ENCODER_CPR)%ENCODER_CPR);
+        e->pos=0; e->primed=1u; e->badStreak=0u; e->trackingLost=0u;
+        e->lastMs=wall_ms(); e->lastCmd=e->cmdUsteps;
+    }
     return 1u;
 }
 
@@ -646,17 +704,19 @@ static uint8 enc_set_origin(void)
 
 static int32 cmd_lsb(void)      { return g_cmdLsbX100 / 100; }
 
-static void cmd_reset_to_measured(void)
+static void cmd_reset_axis(enc_t *e)
 {
-    g_cmdLsbX100 = g_enc.pos * 100;
-    g_cmdUsteps  = lsb_to_usteps(g_enc.pos);
-    g_enc.lastCmd=g_cmdUsteps;
+    e->cmdLsbX100 = e->pos * 100;
+    e->cmdUsteps  = lsb_to_usteps(e->pos);
+    e->lastCmd=e->cmdUsteps;
 }
+
+static void cmd_reset_to_measured(void) { cmd_reset_axis(&g_enc); }
 
 /* commanded - measured, with the AS5045 output delay taken out.
  * At 6000 ustep/s the 384 us slow-mode delay alone is 6 LSB, which would
  * otherwise eat 20% of the slip warning margin. */
-static int32 slip_lsb(int8 sign, uint32 periodUs)
+static int32 slip_axis(enc_t *e, int8 sign, uint32 periodUs)
 {
     int32 lag = 0;
 
@@ -670,13 +730,13 @@ static int32 slip_lsb(int8 sign, uint32 periodUs)
 #else
     (void)sign; (void)periodUs;
 #endif
-    return cmd_lsb() - (g_enc.pos + lag);
+    return e->cmdLsbX100/100 - (e->pos + lag);
 }
 
 /* ============================== LED status ============================== */
 /* ============================= DRV8825 #2 =============================== */
 static uint8 g_last_dir_level = 0xFFu;
-static uint8 g_encIncDir      = 1u;   /* DIR level that increases the count */
+#define g_encIncDir (g_enc.incDir)
 static uint8 g_arm1HomeActive;
 static uint8 g_arm2HomeActive;
 
@@ -917,7 +977,7 @@ static void hw_init(void)
  * After polarity learning, soft limits use measured position; after home
  * their center is the verified straight position, while zero stays at P0[3].
  *
- * arm2 has no encoder: open loop, its net microstep count is reported.
+ * arm2 shares encoder validation, following protection and jog hold with arm1.
  */
 
 /* Receive statistics: accepted heartbeats, overflow events, UART errors,
@@ -964,6 +1024,11 @@ static void txq_puts(const char *s)
 static uint8 txq_pending(void)
 {
     return (g_txqHead != g_txqTail) ? 1u : 0u;
+}
+
+static uint16 txq_free(void)
+{
+    return (uint16)((g_txqTail + TXQ_SIZE - g_txqHead - 1u) % TXQ_SIZE);
 }
 
 static void txq_send_one(void)
@@ -1035,6 +1100,7 @@ static void uart_discard_rx(void)
 }
 #else
 static uint8 txq_pending(void)       { return 0u; }
+static uint16 txq_free(void)         { return 0u; }
 static void  txq_send_one(void)      { }
 static void  txq_flush_blocking(void){ }
 static int16 uart_rx_service(void)     { return -1; }
@@ -1046,7 +1112,7 @@ static void uart_discard_rx(void)      { }
 /* ----------------------------- jog axes --------------------------------- */
 #define JOG_TICK_CY                 (JOG_TICK_US * SU_CY_PER_US)
 #define JOG_ENC_SAMPLE_CY           (JOG_ENC_SAMPLE_US * SU_CY_PER_US)
-#define JOG_ENC_READ_US             (130u)   /* one AS5045 frame + margin  */
+#define JOG_ENC_READ_US             (360u)   /* dual AS5045 frame + GPIO overhead margin */
 #define JOG_TX_BYTE_US              (10u)    /* enqueue only; UART shifts independently */
 
 typedef struct
@@ -1055,7 +1121,7 @@ typedef struct
     uint32 pinStep;
     uint32 pinDir;
     uint8  stepIdleHigh;    /* 1: idle high / low pulse (stepper2 style)   */
-    uint8  hasEnc;          /* arm1: closed track on the AS5045            */
+    uint8  hasEnc;          /* both axes: closed track on AS5045            */
     uint8  leftDirLevel;    /* open-loop axes: DIR level that means "left" */
     uint8  lastDirLevel;    /* 0xFF = unknown, forces a DIR write          */
     uint8  invert;          /* run-time direction inversion ('1' / '2')    */
@@ -1076,7 +1142,7 @@ typedef struct
     int32  peakSlip;        /* worst slip of the current press, LSB        */
     uint8  derates;
     uint16 settleMs;        /* >0: just stopped, rotor still ringing       */
-    uint8  holding;         /* arm1: closed-loop hold at holdTarget        */
+    uint8  holding;         /* closed-loop hold at holdTarget        */
     int32  holdTarget;
     uint32 holdCooldownMs;
     uint32 statusMs;        /* ms since the last status line               */
@@ -1084,6 +1150,14 @@ typedef struct
 
 static jog_axis_t g_arm1;
 static jog_axis_t g_arm2;
+static enc_t *axis_encoder(const jog_axis_t *a) { return a==&g_arm2 ? &g_enc2 : &g_enc; }
+static int32 encoder_deg100(const jog_axis_t *a, int32 lsb) {
+    return (int32)((int64)lsb*3600000/(ENCODER_CPR*(a==&g_arm2 ? ARM2_GEAR_RATIO_X100 : GEAR_RATIO*100)));
+}
+static uint8 dual_ready(void) {
+    return g_arm1.hasEnc && g_enc.directionKnown && !g_enc.badStreak &&
+        (!ARM2_ENCODER_FEEDBACK || (g_arm2.hasEnc && g_enc2.directionKnown && !g_enc2.badStreak));
+}
 static uint32 g_jogMs;          /* latest monotonic hardware time, not loop ticks */
 static uint32 g_loopMaxMs, g_tickMaxLagMs;
 static uint32 g_lastKeyMs;      /* last valid key byte                   */
@@ -1098,24 +1172,35 @@ static uint8  g_homeNeedKeyRelease;
 static uint8  g_arm1HomeLatched;
 static uint8  g_arm2NpnLatched;
 static uint8  g_motionEnabled;
-static uint8  g_directionKnown;
+#define g_directionKnown (g_enc.directionKnown)
 static uint8  g_homed1;
 static uint8  g_homed2;
-static int32  g_arm1SoftCenter;
-/* Volatile operator settings: boot restores defaults; stop/enable retain them. */
-static int16 g_jointMinCd[2] = { PTP_MIN1_CD, PTP_MIN2_CD };
-static int16 g_jointMaxCd[2] = { PTP_MAX1_CD, PTP_MAX2_CD };
+#define g_arm1SoftCenter (g_enc.softCenter)
+/* Volatile operator settings: boot restores defaults; stop/enable retain them.  Index 0/1 bound the link angles
+ * q1/q2; index 2 bounds the elbow q2 - q1, which is what motor 2 actually travels. */
+#define JOINT_ELBOW                 (2u)
+static int16 g_jointMinCd[3] = { PTP_MIN1_CD, PTP_MIN2_CD, PTP_MINE_CD };
+static int16 g_jointMaxCd[3] = { PTP_MAX1_CD, PTP_MAX2_CD, PTP_MAXE_CD };
 static uint8 g_limitsAccepted[15];
 static uint16 g_motionRate[2] = { JOG1_RATE_MAX_USTEP_S, JOG2_RATE_MAX_USTEP_S };
 static uint16 g_motionAccel[2] = { JOG1_ACCEL_USTEP_S2, JOG2_ACCEL_USTEP_S2 };
 static uint8 g_ratesAccepted[15];
+/* Position telemetry stream (control type 11).  0 = the TELEM line only rides in the 500 ms status block, as before;
+ * 5..20 Hz = a standalone TELEM line at that rate while enabled.  It never takes the last half of the transmit queue:
+ * when the queue is that full the line is skipped (counted), so ACKs and stop messages keep their room. */
+#define TELEM_HZ_MIN                (5u)
+#define TELEM_HZ_MAX                (20u)
+#define TELEM_MIN_FREE_BYTES        (1024u)
+static uint8  g_telemHz;
+static uint8  g_telemAccepted[15];
+static uint32 g_telemLastMs, g_telemSent, g_telemSkipped, g_telemMaxCy;
 static uint32 motion_min(uint32 a, uint32 b) { return a < b ? a : b; }
 
 static struct {
     uint8 active; /* 1 moving, 2 settling */
     uint8 reference;
     uint8 referenceSource; /* 1 switch homing, 2 operator-defined straight pose */
-    int32 encoderOrigin;
+    int32 encoderOrigin; /* arm1 compatibility field */
     uint32 epoch;
     uint32 sequence;
     uint32 sinceMs, settleMs, lastStep, periodUs;
@@ -1264,10 +1349,62 @@ static void ptp_invalidate(void)
     if (++g_ptp.epoch == 0u) { ++g_ptp.epoch; }
 }
 
+/* What the machine was doing when a stop began, as one key=value line printed BEFORE anything is reset.  It states
+ * only what is known: the nFAULT pin cannot tell over-current from over-temperature or under-voltage, so a driver
+ * stop says drv=nfault_undetermined and nothing more.  Positions are as in TELEM (relative to the reference). */
+static const char *stop_phase(void)
+{
+    if (g_home.phase != HOME_IDLE) { return "home"; }
+    if (g_ptp.active) { return g_traj.state == 3u ? "traj_run" : "ptp"; }
+    if (g_traj.state == 1u) { return "traj_upload"; }
+    if (g_arm1.moving || g_arm2.moving || g_arm1.want || g_arm2.want) { return "jog"; }
+    return g_motionEnabled ? "idle" : "disabled";
+}
+#if ARM2_ENCODER_FEEDBACK
+#define ENC2_LOG_FORMAT "e2=%ld err2=%ld "
+#define ENC2_LOG_ARGS (long)((g_enc2.pos-g_enc2.origin)*(g_enc2.incDir==ARM2_LEFT_DIR_LEVEL?1:-1)), (long)(g_enc2.cmdLsbX100/100-g_enc2.pos),
+#else
+#define ENC2_LOG_FORMAT ""
+#define ENC2_LOG_ARGS
+#endif
+
+/* RAM only: repeat evidence while stopped, even if the first TX attempt was dropped.
+ * A later operator STOP while already stopped must not overwrite the initiating fault. */
+static char g_lastStop[800];
+static uint32 g_lastStopId;
+static void fault_snapshot(const char *reason, uint8 driverFault)
+{
+    uint32 elapsedUs=0u, plannedUs=0u;
+    if(g_traj.state==3u && g_traj.index<g_traj.count) {
+        elapsedUs=(g_traj.elapsedCy+SU_ELAPSED(g_traj.clock))/SU_CY_PER_US;
+        plannedUs=(uint32)g_traj.nodes[g_traj.index].ms*1000u;
+    }
+    JLOGF("FAULT_SNAPSHOT t=%lu epoch=%lu seq=%lu phase=%s home=%u traj=%u idx=%u/%u ref=%u p1=%ld p2=%ld e1=%ld err=%ld "
+        ENC2_LOG_FORMAT
+        "inputs=%u hb_age_ms=%lu hb_max_gap_ms=%lu elapsed_us=%lu plan_us=%lu late_us=%lu done=%lu total=%lu drv=%s reason=\"%s\"\r\n",
+          (unsigned long)g_jogMs,(unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,stop_phase(),
+          (unsigned)g_home.phase,(unsigned)g_traj.state,(unsigned)g_traj.index,(unsigned)g_traj.count,
+          (unsigned)(g_ptp.reference && dual_ready()),
+          (long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
+          (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),(long)(cmd_lsb()-g_enc.pos),
+        ENC2_LOG_ARGS
+          (unsigned)((HARD_LIMIT_ACTIVE()?1u:0u)|(ARM1_HOME_ACTIVE()?2u:0u)|(ARM2_NPN_ACTIVE()?4u:0u)|(FAULT_ACTIVE()?8u:0u)),
+          (unsigned long)(g_keysSeen ? (g_jogMs - g_lastKeyMs) : 0u),(unsigned long)g_keyMaxGapMs,
+          (unsigned long)elapsedUs,(unsigned long)plannedUs,(unsigned long)(elapsedUs>plannedUs ? elapsedUs-plannedUs : 0u),
+          (unsigned long)g_ptp.done,(unsigned long)g_ptp.total,
+          (driverFault != 0u || FAULT_ACTIVE()) ? "nfault_undetermined" : "ok", reason);
+}
+
 /* Protective stops retain holding current unless the driver itself faults.
  * The explicit operator STOP also disables both drivers at its command entry. */
 static void stage_stop(const char *reason, uint8 driverFault)
 {
+    fault_snapshot(reason, driverFault);
+#if (USE_DEBUG_UART != 0u)
+    if(g_motionEnabled || g_home.phase!=HOME_IDLE || !g_lastStop[0]) {
+        snprintf(g_lastStop,sizeof(g_lastStop),"LAST_STOP id=%lu %s",(unsigned long)++g_lastStopId,g_dbg+15);
+    }
+#endif
     JLOGF("STOP context: home=%u arm=%u phase_steps=%lu key_age_ms=%lu key_max_gap_ms=%lu rx_good=%lu late=%lu rejected=%lu\r\n",
           (unsigned)g_home.phase, (unsigned)g_home.arm, (unsigned long)g_home.steps,
           (unsigned long)(g_jogMs - g_lastKeyMs), (unsigned long)g_keyMaxGapMs, (unsigned long)g_rxGood,
@@ -1360,7 +1497,8 @@ static uint8 jog_safety_blocked(void)
  * helper maps a wanted encoder direction back to a motion sign. */
 static int8 jog_enc_sign(const jog_axis_t *a, int8 s)
 {
-    int8 k = (a->leftDirLevel == g_encIncDir) ? -1 : 1;
+    enc_t *e=axis_encoder(a);
+    int8 k = (a->leftDirLevel == e->incDir) ? -1 : 1;
     if (a->invert != 0u) { k = (int8)(-k); }
     return (int8)(s * k);
 }
@@ -1383,6 +1521,7 @@ static const char *jog_dir_name(int8 s)
 static uint8 joint_step_allowed(const jog_axis_t *a, int8 s);
 static void jog_step(jog_axis_t *a, int8 s)
 {
+    enc_t *e=axis_encoder(a);
     uint8 lvl = jog_dir_level(a, s);
 
     if ((g_motionEnabled == 0u) || FAULT_ACTIVE() || HARD_LIMIT_ACTIVE() ||
@@ -1400,9 +1539,9 @@ static void jog_step(jog_axis_t *a, int8 s)
     a->usteps += s;
     if (a->hasEnc != 0u)
     {
-        int8 e = jog_enc_sign(a, s);
-        g_cmdLsbX100 += (int32)e * LSB_PER_USTEP_X100;
-        g_cmdUsteps  += e;
+        int8 sign = jog_enc_sign(a, s);
+        e->cmdLsbX100 += (int32)sign * LSB_PER_USTEP_X100;
+        e->cmdUsteps  += sign;
     }
 }
 
@@ -1473,7 +1612,9 @@ static uint8 ptp_counts_in_range(uint8 axis, int32 count)
     int32 q1=ptp_angle_from_counts(0u,axis==0u?count:g_arm1.usteps);
     int32 q2=q1+ptp_angle_from_counts(1u,axis==1u?count:g_arm2.usteps);
     int32 value=axis==0u ? q1 : q2;
-    return value>=g_jointMinCd[axis] && value<=g_jointMaxCd[axis];
+    int32 elbow=q2-q1;
+    return value>=g_jointMinCd[axis] && value<=g_jointMaxCd[axis] &&
+           elbow>=g_jointMinCd[JOINT_ELBOW] && elbow<=g_jointMaxCd[JOINT_ELBOW];
 }
 static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
 {
@@ -1489,12 +1630,17 @@ static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
                     (s>0 && a->usteps>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[0])))) return 0u;
     if(axis==1u && ((s<0 && a->usteps<=g_ptp.origin[1]-ptp_offset(1u,g_jointMaxCd[1]-q1)) ||
                     (s>0 && a->usteps>=g_ptp.origin[1]-ptp_offset(1u,g_jointMinCd[1]-q1)))) return 0u;
+    /* The elbow is motor 2's own angle, so its range bounds that motor directly. */
+    if(axis==1u && ((s<0 && a->usteps<=g_ptp.origin[1]-ptp_offset(1u,g_jointMaxCd[JOINT_ELBOW])) ||
+                    (s>0 && a->usteps>=g_ptp.origin[1]-ptp_offset(1u,g_jointMinCd[JOINT_ELBOW])))) return 0u;
     if(axis==0u && ((s<0 && g_arm1.usteps<=g_ptp.origin[0]-ptp_offset(0u,g_jointMaxCd[1]-elbow)) ||
                     (s>0 && g_arm1.usteps>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[1]-elbow)))) return 0u;
-    if(a->hasEnc) {
-        int64 measured=((int64)g_enc.pos-g_arm1SoftCenter)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)*36000;
-        if((s<0 && measured>=(int64)g_jointMaxCd[axis]*ENCODER_CPR*GEAR_RATIO) ||
-           (s>0 && measured<=(int64)g_jointMinCd[axis]*ENCODER_CPR*GEAR_RATIO)) { return 0u; }
+    if(dual_ready()) {
+        int32 m1=(int32)(((int64)g_enc.pos-g_enc.softCenter)*(g_enc.incDir==ARM1_LEFT_DIR_LEVEL?1:-1)*36000/(ENCODER_CPR*GEAR_RATIO));
+        int32 me=ARM2_ENCODER_FEEDBACK ? (int32)(((int64)g_enc2.pos-g_enc2.softCenter)*(g_enc2.incDir==ARM2_LEFT_DIR_LEVEL?1:-1)*3600000/(ENCODER_CPR*ARM2_GEAR_RATIO_X100)) : elbow;
+        int32 m2=m1+me;
+        if((s<0 && (m2>=g_jointMaxCd[1] || (axis ? me>=g_jointMaxCd[2] : m1>=g_jointMaxCd[0]))) ||
+           (s>0 && (m2<=g_jointMinCd[1] || (axis ? me<=g_jointMinCd[2] : m1<=g_jointMinCd[0])))) { return 0u; }
     }
     return 1u;
 }
@@ -1528,7 +1674,7 @@ static void joint_limits_accept(const uint8 *p)
         g_rxRejected++; g_ptpEpochRejected++; ptp_announce_epoch();
         JLOG("PTP_LIMITS refused: stale epoch\r\n"); return;
     }
-    if(!seq || axis>1u || (rates ?
+    if(!seq || axis>(rates ? 1u : JOINT_ELBOW) || (rates ?
        (min<CFG_RATE_MIN || min>(axis==0u?CFG_RATE_MAX_AXIS1:CFG_RATE_MAX_AXIS2) ||
         max<CFG_ACCEL_MIN || max>(axis==0u?CFG_ACCEL_MAX_AXIS1:CFG_ACCEL_MAX_AXIS2)) :
        (min < -CFG_JOINT_CD_MAX || max > CFG_JOINT_CD_MAX || min>=max || min>0 || max<0))) {
@@ -1555,6 +1701,28 @@ static void joint_limits_accept(const uint8 *p)
     JLOGF("%s epoch=%lu seq=%lu axis=%u min=%d max=%d\r\n",rates?"PTP_RATES":"PTP_LIMITS",
           (unsigned long)g_ptp.epoch,(unsigned long)seq,(unsigned)axis,(int)min,(int)max);
     motion_config_status(); /* configuration ACKs need no full diagnostic burst */
+}
+
+/* Type 11: how often position telemetry is streamed (0 = off, else 5..20 Hz).  It only changes what is printed, so
+ * it is taken at any time (enabled, moving, uploading).  The epoch and sequence rules are the usual ones; an exact
+ * retry only repeats the receipt. */
+static void telem_rate_accept(const uint8 *p)
+{
+    uint32 seq=ptp_u32(p+1);
+    uint16 hz=ptp_u16(p+13);
+    if(ptp_u32(p+5)!=g_ptp.epoch) {
+        g_rxRejected++; g_ptpEpochRejected++; ptp_announce_epoch();
+        JLOG("TELEM_RATE refused: stale epoch\r\n"); return;
+    }
+    if(!seq || ptp_u16(p+9) || ptp_u16(p+11) || (hz!=0u && (hz<TELEM_HZ_MIN || hz>TELEM_HZ_MAX))) {
+        g_rxRejected++; JLOG("TELEM_RATE refused: rate\r\n"); return;
+    }
+    if(memcmp(g_telemAccepted,p,15u)!=0) {
+        if(seq<=g_controlSequence) { g_rxRejected++; JLOG("TELEM_RATE refused: stale sequence\r\n"); return; }
+        g_telemHz=(uint8)hz; g_telemLastMs=g_jogMs;
+        g_controlSequence=seq; memcpy(g_telemAccepted,p,15u);
+    }
+    JLOGF("TELEM_RATE epoch=%lu seq=%lu hz=%u\r\n",(unsigned long)g_ptp.epoch,(unsigned long)seq,(unsigned)g_telemHz);
 }
 
 /* A separate sequence lets periodic input leases coexist with contiguous
@@ -1655,6 +1823,7 @@ static void ptp_accept(void)
     jog_axis_t *axes[2]; axes[0]=&g_arm1; axes[1]=&g_arm2;
     if (ptp_crc(p,15u) != ptp_u16(p+15)) { g_ptpRxDropped++; g_ptpRxCrc++; JLOG("PTP RX dropped: CRC\r\n"); return; }
     if (p[0]==9u || p[0]==10u) { joint_limits_accept(p); return; }
+    if (p[0]==11u) { telem_rate_accept(p); return; }
     if (p[0]>=6u && p[0]<=8u) { control_accept(p); return; }
     if (p[0] < 1u || p[0] > 5u) { JLOG("PTP refused: version\r\n"); return; }
     if (!PTP_COMMISSIONED) { JLOG("PTP refused: commissioning lock\r\n"); return; }
@@ -1666,7 +1835,7 @@ static void ptp_accept(void)
         JLOGF("PTP duplicate seq=%lu; not restarted\r\n",(unsigned long)seq); stage_status(); return;
     }
     if (seq == 0u || seq <= g_ptp.sequence) { JLOG("PTP refused: stale sequence\r\n"); return; }
-    if (!g_motionEnabled || (p[0]!=5u && (!g_homed1 || !g_homed2 || !g_directionKnown)) || !g_arm1.hasEnc ||
+    if (!g_motionEnabled || (p[0]!=5u && (!g_homed1 || !g_homed2 || !dual_ready())) || (!g_arm1.hasEnc || (ARM2_ENCODER_FEEDBACK && !g_arm2.hasEnc)) ||
         g_home.phase != HOME_IDLE || g_ptp.active || (p[0]==1u && (g_traj.state==1u || g_traj.state==2u)) ||
         !host_input_idle() || !axes_idle() || !motion_inputs_clear() || !home_inputs_clear()) {
         JLOG("PTP refused: not homed/idle/healthy\r\n"); return;
@@ -1675,23 +1844,25 @@ static void ptp_accept(void)
         if(q1!=0 || q2!=0 || rate!=0u || g_traj.state==1u || g_traj.state==2u) {
             JLOG("PTP refused: manual reference payload/busy\r\n"); return;
         }
+        if(ARM2_ENCODER_FEEDBACK && !g_enc2.directionKnown) { JLOG("MANUAL REF refused: home first to learn arm2 encoder polarity\r\n"); return; }
         if(!enc_sample()) { stage_stop("manual reference encoder invalid",0u); return; }
         jog_stop_now(&g_arm1); jog_stop_now(&g_arm2);
         ptp_invalidate(); /* discard old targets and increment reference epoch */
         g_encIncDir=MANUAL_ENC_INC_DIR; g_directionKnown=1u;
-        cmd_reset_to_measured(); g_arm1SoftCenter=g_enc.pos;
+        cmd_reset_to_measured(); cmd_reset_axis(&g_enc2); g_arm1SoftCenter=g_enc.pos; g_enc2.softCenter=g_enc2.pos;
         g_ptp.origin[0]=g_arm1.usteps; g_ptp.origin[1]=g_arm2.usteps;
-        g_ptp.encoderOrigin=g_enc.pos; g_ptp.referenceSource=2u;
+        g_ptp.encoderOrigin=g_enc.pos; g_enc.origin=g_enc.pos; g_enc2.origin=g_enc2.pos; g_ptp.referenceSource=2u;
         g_homed1=g_homed2=g_ptp.reference=1u; /* operator-defined reference, NOT sensor homing */
         g_ptp.sequence=seq; memcpy(g_ptp.accepted,p,15u);
         JLOG("MANUAL REF OK: operator declares current pose q1=q2=0 straight; no motion; NOT sensor homed\r\n");
         stage_status(); return;
     }
-    if (q1 < g_jointMinCd[0] || q1 > g_jointMaxCd[0] || q2 < g_jointMinCd[1] || q2 > g_jointMaxCd[1] || (p[0]==1u && (rate < (uint32)CFG_RATE_MIN || rate > PTP_RATE_MAX)) ||
+    if (q1 < g_jointMinCd[0] || q1 > g_jointMaxCd[0] || q2 < g_jointMinCd[1] || q2 > g_jointMaxCd[1] ||
+        q2-q1 < g_jointMinCd[JOINT_ELBOW] || q2-q1 > g_jointMaxCd[JOINT_ELBOW] || (p[0]==1u && (rate < (uint32)CFG_RATE_MIN || rate > PTP_RATE_MAX)) ||
         !ptp_counts_in_range(0u,g_arm1.usteps) || !ptp_counts_in_range(1u,g_arm2.usteps)) {
         JLOG("PTP refused: joint range/rate\r\n"); return;
     }
-    if (!enc_sample() || abs_i32(cmd_lsb()-g_enc.pos) >= SLIP_FAIL_LSB) { stage_stop("PTP start encoder mismatch",0u); return; }
+    if (!enc_sample() || (abs_i32(cmd_lsb()-g_enc.pos) >= SLIP_FAIL_LSB || (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>=SLIP_FAIL_LSB))) { stage_stop("PTP start encoder mismatch",0u); return; }
     jog_stop_now(&g_arm1); jog_stop_now(&g_arm2);
     if(p[0]!=1u) {
         if(!traj_accept(p)) { return; }
@@ -1842,16 +2013,22 @@ static void ptp_service(void)
     if (FAULT_ACTIVE()) { stage_stop("PTP nFAULT",1u); return; }
     if (HARD_LIMIT_ACTIVE() || ARM1_HOME_ACTIVE() || ARM2_NPN_ACTIVE()) { stage_stop("PTP limit/home sensor",0u); return; }
     if (g_jogMs-g_ptp.sinceMs>600000u || !ptp_counts_in_range(0u,g_arm1.usteps) || !ptp_counts_in_range(1u,g_arm2.usteps)) { stage_stop("PTP time/joint limit",0u); return; }
-    if (!g_arm1.hasEnc || g_enc.badStreak) { return; } /* shared encoder watchdog will latch stop */
-    if (abs_i32(cmd_lsb()-g_enc.pos)>=SLIP_FAIL_LSB) { stage_stop("PTP encoder following error",0u); return; }
+    if (!g_arm1.hasEnc || g_enc.badStreak || (ARM2_ENCODER_FEEDBACK && (!g_arm2.hasEnc || g_enc2.badStreak))) { return; } /* shared encoder watchdog will latch stop */
+    if ((abs_i32(cmd_lsb()-g_enc.pos)>=SLIP_FAIL_LSB || (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>=SLIP_FAIL_LSB))) { stage_stop("PTP encoder following error",0u); return; }
     if (g_ptp.active==2u) {
         if (g_jogMs-g_ptp.settleMs<HOME_SETTLE_MS) { return; }
-        if (!enc_sample() || abs_i32(cmd_lsb()-g_enc.pos)>PTP_FINAL_ERROR_LSB ||
+        if (!enc_sample() || abs_i32(cmd_lsb()-g_enc.pos)>PTP_FINAL_ERROR_LSB || (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>PTP_FINAL_ERROR_LSB) ||
             g_arm1.usteps!=g_ptp.target[0] || g_arm2.usteps!=g_ptp.target[1]) { stage_stop("PTP final position mismatch",0u); return; }
         g_ptp.active=0u;
         if(g_traj.state==3u) { g_traj.state=4u; }
-        JLOGF("PTP done seq=%lu; arm1 encoder checked, arm2 commanded only; error_lsb=%ld final_limit_lsb=%d\r\n",
+#if ARM2_ENCODER_FEEDBACK
+        JLOGF("PTP done seq=%lu; enabled motor encoders checked; error1_lsb=%ld error2_lsb=%ld final_limit_lsb=%d\r\n",
+              (unsigned long)g_ptp.sequence,(long)(cmd_lsb()-g_enc.pos),
+        (long)(g_enc2.cmdLsbX100/100-g_enc2.pos),PTP_FINAL_ERROR_LSB);
+#else
+        JLOGF("PTP done seq=%lu; arm1 encoder checked; arm2 commanded steps without feedback; error1_lsb=%ld final_limit_lsb=%d\r\n",
               (unsigned long)g_ptp.sequence,(long)(cmd_lsb()-g_enc.pos),PTP_FINAL_ERROR_LSB);
+#endif
         stage_status(); return;
     }
     if(g_traj.state==3u) { traj_service(); return; }
@@ -1878,7 +2055,7 @@ static void home_enter(home_phase_t phase)
     g_home.zeroSamples = 0u;
     g_home.zeroSum = 0;
     g_home.lastStep = SU_NOW();
-    g_home.probePos = g_enc.pos;
+    g_home.probePos = axis_encoder(a)->pos;
     g_home.probeSteps = a->usteps;
     g_home.probeNextSteps = DIR_PROBE_USTEPS;
     g_home.direction = ((phase == HOME_RELEASE) || (phase == HOME_BACKOFF) ||
@@ -1928,6 +2105,7 @@ static void home_start_axis(uint8 arm)
 
 static uint8 home_set_zero(jog_axis_t *a)
 {
+    enc_t *e=axis_encoder(a);
     if (a->hasEnc != 0u)
     {
         uint16 mean;
@@ -1936,14 +2114,14 @@ static uint8 home_set_zero(jog_axis_t *a)
             ((g_jogMs - g_home.zeroSampleMs) < HOME_ZERO_SAMPLE_MS)) { return 0u; }
         if (enc_sample() == 0u) { stage_stop("HOME zero: encoder invalid", 0u); return 0u; }
         g_home.zeroSampleMs = g_jogMs;
-        if (g_home.zeroSamples == 0u) { g_home.zeroReference = g_enc.lastAngle; }
-        g_home.zeroSum += angle_delta(g_enc.lastAngle, g_home.zeroReference);
+        if (g_home.zeroSamples == 0u) { g_home.zeroReference = e->lastAngle; }
+        g_home.zeroSum += angle_delta(e->lastAngle, g_home.zeroReference);
         if (++g_home.zeroSamples < HOME_ZERO_SAMPLES) { return 0u; }
         mean = (uint16)(((int32)g_home.zeroReference +
                         g_home.zeroSum / (int32)HOME_ZERO_SAMPLES + ENCODER_CPR) % ENCODER_CPR);
         /* Preserve the latest reading relative to the averaged origin. */
-        g_enc.pos = angle_delta(g_enc.lastAngle, mean);
-        cmd_reset_to_measured();
+        e->pos = angle_delta(e->lastAngle, mean);
+        cmd_reset_axis(e);
         JLOGF("HOME arm1 averaged origin: samples=%u raw=%u lsb (motor single-turn)\r\n",
               (unsigned)g_home.zeroSamples, (unsigned)mean);
     }
@@ -1955,7 +2133,7 @@ static uint8 home_set_zero(jog_axis_t *a)
 
 static void jog_home_all(void)
 {
-    if ((g_motionEnabled == 0u) || (g_arm1.hasEnc == 0u) ||
+    if ((g_motionEnabled == 0u) || ((g_arm1.hasEnc == 0u) || (ARM2_ENCODER_FEEDBACK && g_arm2.hasEnc == 0u)) ||
         !host_input_idle() || !axes_idle() ||
         (g_home.phase != HOME_IDLE) || g_ptp.active || !motion_inputs_clear())
     {
@@ -1966,7 +2144,7 @@ static void jog_home_all(void)
     jog_stop_now(&g_arm2);
     ptp_invalidate();
     if (enc_sample() == 0u) { stage_stop("HOME start: encoder invalid", 0u); return; }
-    cmd_reset_to_measured();
+    cmd_reset_to_measured(); cmd_reset_axis(&g_enc2);
     g_homed1 = 0u;
     g_homed2 = 0u;
     g_homeNeedKeyRelease = 1u;
@@ -1977,6 +2155,7 @@ static void jog_home_all(void)
 static void home_service(void)
 {
     jog_axis_t *a;
+    enc_t *e;
     uint8 sensor;
     uint8 reached;
     uint32 maxSteps;
@@ -1993,17 +2172,18 @@ static void home_service(void)
     { stage_stop("HOME phase time limit", 0u); return; }
 
     a = (g_home.arm == 1u) ? &g_arm1 : &g_arm2;
+    e=axis_encoder(a);
     sensor = home_sensor_active(g_home.arm);
 
     /* Learn polarity from real motion in the already requested direction.
      * Do not move at boot just to discover encoder polarity. */
-    if ((g_home.arm == 1u) && (g_directionKnown == 0u) &&
+    if ((a->hasEnc != 0u) && (e->directionKnown == 0u) &&
         ((uint32)abs_i32(a->usteps - g_home.probeSteps) >= g_home.probeNextSteps))
     {
         /* Wait for a fresh, settled-enough sample before issuing more steps. */
         if (SU_ELAPSED(g_home.lastStep) < (HOME_PROBE_SETTLE_US * SU_CY_PER_US)) { return; }
         if (enc_sample() == 0u) { stage_stop("HOME direction: encoder invalid", 0u); return; }
-        delta = g_enc.pos - g_home.probePos;
+        delta = e->pos - g_home.probePos;
         JLOGF("HOME direction sample: steps=%lu delta=%ld lsb\r\n",
               (unsigned long)g_home.probeNextSteps, (long)delta);
         if ((abs_i32(delta) < DIR_PROBE_MIN_LSB) &&
@@ -2014,15 +2194,20 @@ static void home_service(void)
         }
         if ((abs_i32(delta) < DIR_PROBE_MIN_LSB) || (abs_i32(delta) >= SLIP_FAIL_LSB))
         { stage_stop("HOME direction: no credible rotor motion; check VMOT/motor/encoder", 0u); return; }
-        g_encIncDir = (delta > 0) ? jog_dir_level(a, g_home.direction) :
+        e->incDir = (delta > 0) ? jog_dir_level(a, g_home.direction) :
                          (uint8)!jog_dir_level(a, g_home.direction);
-        g_directionKnown = 1u;
-        cmd_reset_to_measured();
-        JLOGF("HOME encoder polarity learned: increase DIR=%u\r\n", (unsigned)g_encIncDir);
+        e->directionKnown = 1u;
+        cmd_reset_axis(e);
+        JLOGF("HOME encoder polarity learned: increase DIR=%u\r\n", (unsigned)e->incDir);
     }
-    if ((g_directionKnown != 0u) &&
-        (abs_i32(cmd_lsb() - g_enc.pos) >= SLIP_FAIL_LSB))
+    if ((a->hasEnc != 0u) && (e->directionKnown != 0u) &&
+        (abs_i32((e->cmdLsbX100/100) - e->pos) >= SLIP_FAIL_LSB))
     { stage_stop("HOME encoder following error", 0u); return; }
+
+    /* The already homed axis must also stay credible while the other homes. */
+    if ((g_enc.directionKnown && abs_i32(cmd_lsb()-g_enc.pos)>=SLIP_FAIL_LSB) ||
+        (g_enc2.directionKnown && (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>=SLIP_FAIL_LSB)))
+    { stage_stop("HOME stationary/moving encoder following error",0u); return; }
 
     if ((g_home.phase == HOME_SETTLE) || (g_home.phase == HOME_STRAIGHT_SETTLE))
     {
@@ -2034,28 +2219,32 @@ static void home_service(void)
             {
                 if (g_arm2.usteps != ARM2_STRAIGHT_JOG_DIR * (int32)home_straight_steps(2u))
                 { stage_stop("HOME arm2 straight: commanded count mismatch", 0u); return; }
+                if(!enc_sample() || !dual_ready() || abs_i32(cmd_lsb()-g_enc.pos)>PTP_FINAL_ERROR_LSB || (a->hasEnc && abs_i32(e->cmdLsbX100/100-e->pos)>PTP_FINAL_ERROR_LSB)) {
+                    stage_stop("HOME arm2 straight: encoder mismatch",0u); return;
+                }
+                g_enc.softCenter=g_enc.pos; e->softCenter=e->pos; cmd_reset_to_measured(); cmd_reset_axis(e);
                 g_homed2 = 1u;
                 g_ptp.origin[0]=g_arm1.usteps; g_ptp.origin[1]=g_arm2.usteps;
-                g_ptp.encoderOrigin=g_enc.pos; g_ptp.referenceSource=1u;
+                g_ptp.encoderOrigin=g_enc.pos; g_enc.origin=g_enc.pos; g_enc2.origin=g_enc2.pos; g_ptp.referenceSource=1u;
                 g_ptp.reference=1u;
                 g_home.phase = HOME_IDLE;
                 g_arm1HomeActive = 0u;
                 g_arm2HomeActive = 0u;
                 g_homeNeedKeyRelease = 1u;
-                JLOGF("HOME arm2 STRAIGHT commanded: %ld usteps from NPN origin (open loop, NOT measured)\r\n",
+                JLOGF("HOME arm2 STRAIGHT commanded: %ld usteps from NPN origin (enabled feedback checked; arm2 may use commanded steps)\r\n",
                       (long)g_arm2.usteps);
-                JLOG("HOME OK: both straight moves completed; arm2 open loop, verify physical alignment\r\n");
+                JLOG("HOME OK: both straight moves completed; enabled motor encoders checked; verify physical alignment\r\n");
                 stage_status();
                 return;
             }
             if (enc_sample() == 0u) { stage_stop("HOME straight: encoder invalid", 0u); return; }
             commanded = jog_enc_sign(&g_arm1, (int8)-ARM1_HOME_JOG_DIR) *
                         usteps_to_lsb(abs_i32(g_arm1.usteps));
-            if ((g_directionKnown == 0u) ||
-                (abs_i32(g_enc.pos - commanded) >= SLIP_FAIL_LSB))
+            if ((e->directionKnown == 0u) ||
+                (abs_i32(e->pos - commanded) >= SLIP_FAIL_LSB))
             { stage_stop("HOME straight: measured position differs from commanded", 0u); return; }
-            g_arm1SoftCenter = g_enc.pos;
-            cmd_reset_to_measured();
+            g_arm1SoftCenter = e->pos;
+            cmd_reset_axis(e);
             JLOG("HOME arm1 STRAIGHT OK: switch origin retained, not reset to zero\r\n");
             home_start_axis(2u);
             return;
@@ -2130,26 +2319,62 @@ static void home_service(void)
 
 static void motion_config_status(void)
 {
-    JLOGF("PTP_STATE lock=%u ref=%u active=%u epoch=%lu seq=%lu min1=%d max1=%d min2=%d max2=%d\r\n",
+    JLOGF("PTP_STATE lock=%u ref=%u active=%u epoch=%lu seq=%lu min1=%d max1=%d min2=%d max2=%d emin=%d emax=%d\r\n",
           (unsigned)!PTP_COMMISSIONED,(unsigned)g_ptp.reference,(unsigned)g_ptp.active,
           (unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,
-          (int)g_jointMinCd[0],(int)g_jointMaxCd[0],(int)g_jointMinCd[1],(int)g_jointMaxCd[1]);
+          (int)g_jointMinCd[0],(int)g_jointMaxCd[0],(int)g_jointMinCd[1],(int)g_jointMaxCd[1],
+          (int)g_jointMinCd[JOINT_ELBOW],(int)g_jointMaxCd[JOINT_ELBOW]);
     JLOGF("MOTION_RATES epoch=%lu r1=%u r2=%u a1=%u a2=%u\r\n",(unsigned long)g_ptp.epoch,
           (unsigned)g_motionRate[0],(unsigned)g_motionRate[1],(unsigned)g_motionAccel[0],(unsigned)g_motionAccel[1]);
 }
 
+/* One coherent, low-rate sample, no extra encoder transactions. Positive = CCW.
+ * e1 is motor encoder LSB relative to the reference; e2 measures the motor-2 elbow; q2=q1+elbow. */
+static void telem_line(void)
+{
+    JLOGF("TELEM t=%lu epoch=%lu seq=%lu ref=%u source=%u p1=%ld p2=%ld e1=%ld err=%ld "
+        ENC2_LOG_FORMAT
+        "inputs=%u drops=%lu\r\n",
+        (unsigned long)g_jogMs,(unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,
+        (unsigned)(g_ptp.reference && dual_ready()),
+        (unsigned)g_ptp.referenceSource,(long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
+        (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),
+        (long)(cmd_lsb()-g_enc.pos),
+        ENC2_LOG_ARGS
+        (unsigned)((HARD_LIMIT_ACTIVE()?1u:0u)|(ARM1_HOME_ACTIVE()?2u:0u)|(ARM2_NPN_ACTIVE()?4u:0u)|(FAULT_ACTIVE()?8u:0u)),
+        (unsigned long)g_ptpRxDropped);
+}
+
+/* The streamed TELEM line, between status blocks.  Its cost is measured (telem_max_us in TELEM_DIAG) because the
+ * formatting runs in the same loop that times the step pulses. */
+static void telem_service(void)
+{
+    uint32 started, cost;
+    if (g_telemHz == 0u || g_motionEnabled == 0u || (g_jogMs - g_telemLastMs) < (1000u / g_telemHz)) { return; }
+    g_telemLastMs = g_jogMs;
+    if (txq_free() < TELEM_MIN_FREE_BYTES) { g_telemSkipped++; return; }
+    started = SU_NOW();
+    telem_line();
+    cost = SU_ELAPSED(started);
+    if (cost > g_telemMaxCy) { g_telemMaxCy = cost; }
+    g_telemSent++;
+}
+
 static void stage_status(void)
 {
-    JLOGF("STATE fw=stage2-v7 enabled=%u home=%u homed1=%u homed2=%u fault=%u enc=%u dir=%u\r\n",
+    if(!g_motionEnabled && g_lastStop[0]) { JLOG(g_lastStop); } /* priority before ordinary status; retried each stopped status block */
+    JLOGF("STATE fw=stage2-v10 enabled=%u home=%u homed1=%u homed2=%u fault=%u enc=%u dir=%u enc2=%u dir2=%u arm2fb=%u\r\n",
           (unsigned)g_motionEnabled, (unsigned)g_home.phase,
           (unsigned)g_homed1, (unsigned)g_homed2, (unsigned)g_jogFaulted,
-          (unsigned)(g_arm1.hasEnc && (g_enc.badStreak == 0u)), (unsigned)g_directionKnown);
+          (unsigned)(g_arm1.hasEnc && (g_enc.badStreak == 0u)), (unsigned)g_directionKnown, (unsigned)(g_arm2.hasEnc && !g_enc2.badStreak), (unsigned)g_enc2.directionKnown, (unsigned)ARM2_ENCODER_FEEDBACK);
     JLOGF("CONTROL seq=%lu\r\n",(unsigned long)g_controlSequence);
     motion_config_status();
     JLOGF("PTP_CHECK final_lsb=%d follow_lsb=%d\r\n",PTP_FINAL_ERROR_LSB,SLIP_FAIL_LSB);
     traj_status();
-    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 proto=%u\r\n",
-          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)PROTO_VERSION);
+    /* traj_repeat: a held plan that already ran accepts another RUN.  fault_snapshot: every stop prints a FAULT_SNAPSHOT
+     * line first.  telem_hz: the streamed TELEM rate in force (0 = status block only); its presence means type 11 exists. */
+    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=1 traj_repeat=1 fault_snapshot=1 telem_hz=%u proto=%u\r\n",
+          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)g_telemHz, (unsigned)PROTO_VERSION);
     /* Frame loss by cause: rx_error only sees UART-level faults, so a frame that
      * simply arrives short must be counted here or it stays invisible. */
     JLOGF("PTP_RX short_ok=%lu drop_crc=%lu drop_short=%lu drop_timeout=%lu rejected=%lu epoch_rejected=%lu last_rejected_byte=0x%02X\r\n",
@@ -2162,16 +2387,9 @@ static void stage_status(void)
     JLOGF("ENC_DIAG irq_max_us=%lu retries=%lu rejected=%lu gap_max_ms=%lu follow_peak_lsb=%lu\r\n",
           (unsigned long)(g_encIrqMaxCy/SU_CY_PER_US),(unsigned long)g_encRetries,
           (unsigned long)g_encRejected,(unsigned long)g_encMaxGapMs,(unsigned long)g_followPeakLsb);
-    /* One coherent, low-rate sample, no extra encoder transactions. Positive = CCW.
-     * e1 is motor encoder LSB relative to the reference; arm2 is commanded only. */
-    JLOGF("TELEM t=%lu epoch=%lu seq=%lu ref=%u source=%u p1=%ld p2=%ld e1=%ld err=%ld inputs=%u drops=%lu\r\n",
-        (unsigned long)g_jogMs,(unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,
-        (unsigned)(g_ptp.reference && g_directionKnown && g_arm1.hasEnc && !g_enc.badStreak),
-        (unsigned)g_ptp.referenceSource,(long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
-        (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),
-        (long)(cmd_lsb()-g_enc.pos),
-        (unsigned)((HARD_LIMIT_ACTIVE()?1u:0u)|(ARM1_HOME_ACTIVE()?2u:0u)|(ARM2_NPN_ACTIVE()?4u:0u)|(FAULT_ACTIVE()?8u:0u)),
-        (unsigned long)g_ptpRxDropped);
+    JLOGF("TELEM_DIAG hz=%u sent=%lu skipped=%lu max_us=%lu\r\n",
+          (unsigned)g_telemHz,(unsigned long)g_telemSent,(unsigned long)g_telemSkipped,(unsigned long)(g_telemMaxCy/SU_CY_PER_US));
+    telem_line();
 }
 
 static void stage_enable(void)
@@ -2181,23 +2399,23 @@ static void stage_enable(void)
     if (!host_input_idle() || !motion_inputs_clear())
     { JLOG("ENABLE refused: fresh idle heartbeat and clear nFAULT/P0[4] required\r\n"); return; }
     if (enc_set_origin() == 0u)
-    { g_arm1.hasEnc = 0u; JLOG("ENABLE refused: encoder invalid; inspect E diagnostics\r\n"); return; }
+    { g_arm1.hasEnc = g_arm2.hasEnc = 0u; JLOG("ENABLE refused: encoder invalid; inspect E diagnostics\r\n"); return; }
     stepper2_enable();
     stepper1_enable();
     if (FAULT_ACTIVE() || HARD_LIMIT_ACTIVE())
     { stage_stop("ENABLE hardware fault/limit", 1u); return; }
-    g_arm1.hasEnc = 1u;
+    g_arm1.hasEnc = 1u; g_arm2.hasEnc = ARM2_ENCODER_FEEDBACK;
     g_arm1.usteps = 0;
     g_arm2.usteps = 0;
-    g_arm1SoftCenter = 0;
-    g_directionKnown = 0u;
+    g_arm1SoftCenter = g_enc2.softCenter = 0;
+    g_directionKnown = g_enc2.directionKnown = 0u;
     g_homed1 = 0u;
     g_homed2 = 0u;
     g_jogFaulted = 0u;
     g_limitStop = 0u;
     g_motionEnabled = 1u;
     g_keyMaxGapMs = 0u;
-    cmd_reset_to_measured();
+    cmd_reset_to_measured(); cmd_reset_axis(&g_enc2);
     JLOG("ENABLE OK: no automatic movement; low-speed jog or R for home; Space stops\r\n");
     stage_status();
 }
@@ -2278,12 +2496,13 @@ static uint8 jog_slot_free(uint32 us)
 
 static void jog_print_position(const jog_axis_t *a)
 {
+    enc_t *e=axis_encoder(a);
     if (a->hasEnc != 0u)
     {
-        int32 d = lsb_to_out_deg100(g_enc.pos);
+        int32 d = encoder_deg100(a,e->pos);
         JLOGF("%s: encoder %s%ld.%02ld relative-deg (%ld lsb, %ld commanded usteps)%s\r\n",
               a->name, DEG_SGN(d), DEG_INT(d), DEG_FRC(d),
-              (long)g_enc.pos, (long)a->usteps,
+              (long)e->pos, (long)a->usteps,
               (a->invert != 0u) ? " [inverted]" : "");
     }
     else
@@ -2297,14 +2516,15 @@ static void jog_print_position(const jog_axis_t *a)
 /* Called when the rotor has had MOVE_SETTLE_MS after the last step. */
 static void jog_axis_settled(jog_axis_t *a)
 {
+    enc_t *e=axis_encoder(a);
     if (a->hasEnc != 0u)
     {
-        (void)enc_sample();
-        cmd_reset_to_measured();
-        a->holdTarget = g_enc.pos;
-        a->holding    = g_directionKnown;
+        if(!enc_sample()) { stage_stop("jog settle: encoder invalid",0u); return; }
+        cmd_reset_axis(e);
+        a->holdTarget = e->pos;
+        a->holding    = e->directionKnown;
         {
-            int32 d = lsb_to_out_deg100(g_enc.pos);
+            int32 d = encoder_deg100(a,e->pos);
             JLOGF("%s stop: pos %s%ld.%02ld out-deg, peak slip %ld lsb (%ld%% of pull-out)\r\n",
                   a->name, DEG_SGN(d), DEG_INT(d), DEG_FRC(d),
                   (long)a->peakSlip, (long)((a->peakSlip * 100) / PULLOUT_LSB));
@@ -2319,6 +2539,7 @@ static void jog_axis_settled(jog_axis_t *a)
 /* Velocity ramp, once per JOG_TICK_US. */
 static void jog_axis_tick(jog_axis_t *a)
 {
+    enc_t *e=axis_encoder(a);
     int8 want = a->want;
 
     if (a->latched != 0u)
@@ -2329,19 +2550,19 @@ static void jog_axis_tick(jog_axis_t *a)
 
     /* Calibrated jog shares the PTP bounds and per-step guard. Before a straight
      * reference exists, retain the old encoder-relative jog guard. */
-    if (g_directionKnown && (a==&g_arm1 ? g_homed1 : g_homed2) && want!=0)
+    if (e->directionKnown && (a==&g_arm1 ? g_homed1 : g_homed2) && want!=0)
     {
         if(!joint_step_allowed(a,want)) {
             if(!a->limitHit) { JLOGF("%s: configured joint limit, %s refused\r\n",a->name,jog_dir_name(want)); }
             a->limitHit=1u; want=0;
         } else { a->limitHit=0u; }
     }
-    else if ((a->hasEnc != 0u) && (g_directionKnown != 0u) && (want != 0))
+    else if ((a->hasEnc != 0u) && (e->directionKnown != 0u) && (want != 0))
     {
-        int8  e     = jog_enc_sign(a, want);
-        int32 limit = out_deg10_to_lsb(SOFT_LIMIT_OUT_DEG10);
-        if (((e > 0) && (g_enc.pos >= g_arm1SoftCenter + limit)) ||
-            ((e < 0) && (g_enc.pos <= g_arm1SoftCenter - limit)))
+        int8  sign  = jog_enc_sign(a, want);
+        int32 limit = (int32)((int64)SOFT_LIMIT_OUT_DEG10*ENCODER_CPR*(a==&g_arm2 ? ARM2_GEAR_RATIO_X100 : GEAR_RATIO*100)/360000);
+        if (((sign > 0) && (e->pos >= e->softCenter + limit)) ||
+            ((sign < 0) && (e->pos <= e->softCenter - limit)))
         {
             if (a->limitHit == 0u)
             {
@@ -2372,8 +2593,8 @@ static void jog_axis_tick(jog_axis_t *a)
             a->statusMs = 0u;
             if (a->hasEnc != 0u)
             {
-                (void)enc_sample();
-                cmd_reset_to_measured();
+                if(!enc_sample()) { stage_stop("jog start: encoder invalid",0u); return; }
+                cmd_reset_axis(e);
             }
             /* First step is due immediately. */
             a->periodCy  = BCLK__BUS_CLK__HZ / a->rate;
@@ -2415,7 +2636,7 @@ static void jog_axis_tick(jog_axis_t *a)
             a->statusMs = 0u;
             if (a->hasEnc != 0u)
             {
-                int32 d = lsb_to_out_deg100(g_enc.pos);
+                int32 d = encoder_deg100(a,e->pos);
                 JLOGF("%s %s %lu ustep/s pos %s%ld.%02ld out-deg slip %ld lsb\r\n",
                       a->name, jog_dir_name(a->moving), (unsigned long)a->rate,
                       DEG_SGN(d), DEG_INT(d), DEG_FRC(d), (long)a->peakSlip);
@@ -2440,7 +2661,7 @@ static void jog_axis_tick(jog_axis_t *a)
         if (a->holdCooldownMs != 0u) { a->holdCooldownMs--; }
         else
         {
-            int32 err = a->holdTarget - g_enc.pos;
+            int32 err = a->holdTarget - e->pos;
             if (abs_i32(err) >= SLIP_FAIL_LSB)
             {
                 stage_stop("hold position lost", 0u);
@@ -2465,16 +2686,17 @@ static void jog_axis_service(jog_axis_t *a)
     }
 }
 
-/* arm1 slip monitor, after every encoder sample while moving. */
+/* Both axes share the slip monitor, after every encoder sample while moving. */
 static void jog_slip_check(jog_axis_t *a)
 {
+    enc_t *e=axis_encoder(a);
     int32 slip;
     uint32 periodUs;
 
-    if ((a->hasEnc == 0u) || (g_directionKnown == 0u) || (a->moving == 0)) { return; }
+    if ((a->hasEnc == 0u) || (e->directionKnown == 0u) || (a->moving == 0)) { return; }
 
     periodUs = a->periodCy / SU_CY_PER_US;
-    slip = abs_i32(slip_lsb(jog_enc_sign(a, a->moving), periodUs));
+    slip = abs_i32(slip_axis(e,jog_enc_sign(a, a->moving), periodUs));
     if (slip > a->peakSlip) { a->peakSlip = slip; }
 
     if (slip >= SLIP_FAIL_LSB)
@@ -2612,6 +2834,20 @@ static void jog_handle_byte(uint8 b)
                   (g_arm1.hasEnc != 0u) ? " [angle feedback]" : " [motion blocked; C rechecks]");
             break;
         }
+        case 'f':
+        {
+            /* Daisy chain check: board 1 and board 2 frames from one 38-clock read. */
+            uint32 f1, f2;
+            as5045_read_chain(&f1, &f2);
+            JLOGF("CHAIN board1 raw=0x%05lX angle=%u OCF=%u COF=%u LIN=%u par=%s | board2 raw=0x%05lX angle=%u OCF=%u COF=%u LIN=%u par=%s\r\n",
+                  (unsigned long)f1, (unsigned)((f1 >> 6) & ENCODER_MASK),
+                  (unsigned)((f1 >> 5) & 1u), (unsigned)((f1 >> 4) & 1u), (unsigned)((f1 >> 3) & 1u),
+                  (frame_parity_ok(f1) != 0u) ? "ok" : "BAD",
+                  (unsigned long)f2, (unsigned)((f2 >> 6) & ENCODER_MASK),
+                  (unsigned)((f2 >> 5) & 1u), (unsigned)((f2 >> 4) & 1u), (unsigned)((f2 >> 3) & 1u),
+                  (frame_parity_ok(f2) != 0u) ? "ok" : "BAD");
+            break;
+        }
         case '!':
             if (g_motionEnabled != 0u) { JLOG("rx capture refused while enabled\r\n"); break; }
             JLOG("rxcap unavailable: hardware UART; use LINK counters\r\n");
@@ -2643,6 +2879,7 @@ static void jog_tick(void)
     jog_update_time();
     if ((g_jogMs - lastStatus) >= JOG_STATUS_MS)
     { lastStatus = g_jogMs; stage_status(); }
+    telem_service();
     if (g_motionEnabled == 0u) { return; }
     if (jog_safety_blocked() != 0u) { return; }
     if (g_home.phase != HOME_IDLE || g_ptp.active) { return; }
@@ -2664,9 +2901,9 @@ static void jog_rx_service(void)
             g_ptpRxDropped++;
             if(b==-3 && (g_traj.state==1u || g_traj.state==2u) && !g_ptp.active &&
                g_home.phase==HOME_IDLE && g_motionEnabled && g_ptp.reference &&
-               g_homed1 && g_homed2 && g_directionKnown && !g_jogFaulted && !g_limitStop &&
+               g_homed1 && g_homed2 && dual_ready() && !g_jogFaulted && !g_limitStop &&
                host_input_idle() && axes_idle() && !g_arm1.holding && !g_arm2.holding &&
-               g_arm1.hasEnc && !g_enc.badStreak && abs_i32(cmd_lsb()-g_enc.pos)<SLIP_FAIL_LSB &&
+               dual_ready() && abs_i32(cmd_lsb()-g_enc.pos)<SLIP_FAIL_LSB && (!ARM2_ENCODER_FEEDBACK || abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)<SLIP_FAIL_LSB) &&
                motion_inputs_clear() && home_inputs_clear() &&
                ptp_counts_in_range(0u,g_arm1.usteps) && ptp_counts_in_range(1u,g_arm2.usteps)) {
                 g_uploadRxQuarantine=1u; g_ptpRx.active=2u; g_ptpRx.count=0u;
@@ -2702,15 +2939,21 @@ static void service_encoder(void)
 {
     if (enc_sample() == 0u)
     {
-        if (g_enc.badStreak >= ENC_BAD_LIMIT)
+        if (g_enc.badStreak >= ENC_BAD_LIMIT || g_enc2.badStreak >= ENC_BAD_LIMIT)
         {
-            g_arm1.hasEnc = 0u;
-            stage_stop("encoder lost; automatic open-loop fallback disabled", 0u);
+            uint8 newlyLost=(g_enc.badStreak>=ENC_BAD_LIMIT && g_arm1.hasEnc) ||
+                            (g_enc2.badStreak>=ENC_BAD_LIMIT && g_arm2.hasEnc);
+            if(g_enc.badStreak>=ENC_BAD_LIMIT) { g_arm1.hasEnc=0u; }
+            if(g_enc2.badStreak>=ENC_BAD_LIMIT) { g_arm2.hasEnc=0u; }
+            if(newlyLost) {
+                stage_stop("encoder lost; automatic open-loop fallback disabled", 0u);
+            }
         }
     }
-    else if ((g_motionEnabled != 0u) && (g_home.phase == HOME_IDLE))
+    if ((g_motionEnabled != 0u) && (g_home.phase == HOME_IDLE))
     {
-        jog_slip_check(&g_arm1);
+        if(!g_enc.badStreak) { jog_slip_check(&g_arm1); }
+        if(g_motionEnabled && !g_enc2.badStreak) { jog_slip_check(&g_arm2); }
     }
 }
 
@@ -2720,13 +2963,13 @@ static void app_init(uint8 encOk)
                   ARM1_LEFT_DIR_LEVEL,
                   JOG1_RATE_MAX_USTEP_S, JOG1_RATE_START_USTEP_S,
                   JOG1_ACCEL_USTEP_S2, JOG1_DECEL_USTEP_S2);
-    jog_axis_init(&g_arm2, "arm2", PIN_STEP1, PIN_DIR1, 0u, 0u,
+    jog_axis_init(&g_arm2, "arm2", PIN_STEP1, PIN_DIR1, 0u, encOk && ARM2_ENCODER_FEEDBACK,
                   ARM2_LEFT_DIR_LEVEL,
                   JOG2_RATE_MAX_USTEP_S, JOG2_RATE_START_USTEP_S,
                   JOG2_ACCEL_USTEP_S2, JOG2_DECEL_USTEP_S2);
 
     /* No startup enable, direction probe, return-to-origin, or holding steps. */
-    JLOG("\r\nSTAGE2 v7 framed control: both drivers disabled, reference unset; use home or explicit manual straight reference\r\n");
+    JLOG("\r\nSTAGE2 v10 latched stop framed control: both drivers disabled, reference unset; use home or explicit manual straight reference\r\n");
     JLOG("INPUT MAP: HOME1=J4-2/P0[3], GLOBAL=J4-1/P0[4], HOME2=NPN/P1[0]\r\n");
     JLOG("C = explicit enable/recheck; R = home; Space/Esc = latched stop\r\n");
     jog_print_inputs();
@@ -2773,7 +3016,7 @@ static void app_poll(void)
 
     /* Encoder: about once per ms, in a gap between steps.  If no gap
      * appears for 5 ms take the sample anyway (one late step). */
-    if ((g_arm1.hasEnc != 0u) && (SU_ELAPSED(g_loopEnc) >= JOG_ENC_SAMPLE_CY))
+    if (((g_arm1.hasEnc != 0u) || (g_arm2.hasEnc != 0u)) && (SU_ELAPSED(g_loopEnc) >= JOG_ENC_SAMPLE_CY))
     {
         if ((jog_slot_free(JOG_ENC_READ_US) != 0u) ||
             (SU_ELAPSED(g_loopEnc) >= (5u * JOG_ENC_SAMPLE_CY)))
@@ -2801,7 +3044,8 @@ static void jog_run(uint8 encOk)
 /* ================================= main ================================= */
 static uint8 app_boot(void)
 {
-    as5045_t sample;
+    as5045_t sample, second;
+    uint32 raw1, raw2;
     uint8 code = ST_DO_LOW;
     uint8 lastCode = 0xFFu;
     uint16 validStreak = 0u;
@@ -2815,8 +3059,10 @@ static uint8 app_boot(void)
     DBG("\r\nSELFTEST START: static inputs and AS5045, both drivers disabled\r\n");
     for (count = 0u; count < ENCODER_SELFTEST_MS / 50u; count++)
     {
-        as5045_read(&sample);
+        as5045_read_chain(&raw1,&raw2);
+        as5045_decode(&sample,raw1); as5045_decode(&second,raw2);
         code = classify(&sample);
+        if(ARM2_ENCODER_FEEDBACK && !encoder_state_valid(classify(&second))) { code=classify(&second); }
         if (encoder_state_valid(code)) { validStreak++; validCount++; }
         else { validStreak = 0u; }
         if (code != lastCode)
@@ -2834,7 +3080,7 @@ static uint8 app_boot(void)
          (unsigned)(CyPins_ReadPin(PIN_FAULT) != 0u), (unsigned)(CyPins_ReadPin(PIN_LIMIT2) != 0u),
          (unsigned)(CyPins_ReadPin(PIN_LIMIT1) != 0u), (unsigned)(CyPins_ReadPin(PIN_ARM2_NPN) != 0u));
     DBG("SELFTEST is electrical status only: motor power/motion and switch wiring need bench verification\r\n");
-    cmd_reset_to_measured();
+    cmd_reset_to_measured(); cmd_reset_axis(&g_enc2);
     return encOk;
 }
 

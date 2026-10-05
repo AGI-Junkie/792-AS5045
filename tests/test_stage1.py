@@ -22,6 +22,10 @@ def replace_once(text, old, new):
 
 pins = sorted(set(re.findall(r'CYREG_PRT\d+_PC\d+', source)))
 pin_defs = '\n'.join(f'#define {pin} {i}' for i, pin in enumerate(pins))
+# Check node arrival at the actual transition, before the next node can pulse.
+# A 1 ms fixture iteration may cross the boundary and already emit the next step.
+source = replace_once(source, 'if(++g_traj.index==g_traj.count)',
+                      'sim_check_traj_boundary(); if(++g_traj.index==g_traj.count)')
 
 mock = r'''
 #include <stdint.h>
@@ -71,7 +75,9 @@ static int simRxActive; static uint32 simRxBase, simRxOffset;
 static uint8 simPtpWire[36], simPtpWireN;
 static uint8 simPtpReceived[256];static unsigned simPtpReceivedN;
 static int simAngleOverride=-1;
-static int simEncoderBias;
+static int simEncoderBias, simEncoderBias2, simBadEncoder2, simPolarity2=1, simStall2;
+static unsigned simBoundaryChecks;
+static void sim_check_traj_boundary(void);
 static unsigned simPulse1, simPulse2;
 static unsigned simDriverSwitches;
 static char simLog[1048576]; static unsigned simLogN;
@@ -141,9 +147,15 @@ static uint32 mock_frame(void) {
     return frame|parity;
 }
 /* AS5045 at pin level: CSn falling latches a frame, every CLK rising edge while CSn is low presents the next bit, MSB first. */
-static uint32 simSsiFrame; static int simSsiBits;
+static uint32 simSsiFrame, simSsiFrame2; static int simSsiBits;
+static int simSsiSecondFrame=-1, simSsiDummy;
 static int mock_read(int pin) {
-    if(pin==CYREG_PRT1_PC3) return (simSsiBits>=1 && simSsiBits<=18 && ((simSsiFrame>>(18-simSsiBits))&1u))?16:0;
+    if(pin==CYREG_PRT1_PC3) {
+        if(simSsiBits>=20 && simSsiBits<=37)
+            return ((((simSsiSecondFrame>=0)?(uint32)simSsiSecondFrame:simSsiFrame2)>>(37-simSsiBits))&1u)?16:0;
+        if(simSsiSecondFrame>=0 && (simSsiBits==19 || simSsiBits==38))return simSsiDummy?16:0;
+        return (simSsiBits>=1 && simSsiBits<=18 && ((simSsiFrame>>(18-simSsiBits))&1u))?16:0;
+    }
     if(pin==CYREG_PRT12_PC5) return simFault?0:16;
     if(pin==CYREG_PRT0_PC4) return simLimit?16:0;
     if(pin==CYREG_PRT0_PC3) return (simHome1Mode<0?0:(simHome1Mode>0?1:simStep1>=simHome1At))?16:0;
@@ -152,7 +164,13 @@ static int mock_read(int pin) {
 }
 static void mock_set(int pin,int value) {
     if(pin==CYREG_PRT12_PC1 && value!=simPins[pin]) {
-        if(!value){simSsiFrame=mock_frame();simSsiBits=0;simRegCost=6;} else simRegCost=24;
+        if(!value){
+            uint32 bits, parity=0;
+            simSsiFrame=mock_frame();simSsiBits=0;simRegCost=6;
+            simSsiFrame2=(((uint32)(1000+(int64)simStep2*simPolarity2*256/100+simEncoderBias2)&4095u)<<6)|0x26u;
+            for(bits=simSsiFrame2;bits;bits>>=1)parity^=bits&1;
+            simSsiFrame2=simBadEncoder2?0:simSsiFrame2|parity;
+        } else simRegCost=24;
     }
     if(pin==CYREG_PRT12_PC0 && value && !simPins[pin] && !simPins[CYREG_PRT12_PC1])simSsiBits++;
     if(value!=simPins[pin] && (pin==CYREG_PRT1_PC7 || pin==CYREG_PRT12_PC2 || pin==CYREG_PRT1_PC2 ||
@@ -164,7 +182,7 @@ static void mock_set(int pin,int value) {
             simPulse1++; if(tracks && !simStall && !(simStiction && simPulse1<=24)) simStep1+=simPins[CYREG_PRT12_PC4]?1:-1;
         }
         if(pin==CYREG_PRT2_PC1 && !simPins[CYREG_PRT2_PC7] && simPins[CYREG_PRT2_PC2] && simPins[CYREG_PRT2_PC3]) {
-            simPulse2++; simStep2+=simPins[CYREG_PRT2_PC0]?1:-1;
+            simPulse2++; if(!simStall2)simStep2+=simPins[CYREG_PRT2_PC0]?1:-1;
         }
     }
     simPins[pin]=value;
@@ -204,6 +222,12 @@ static void setup(void) {
     sim_keys(0);
     stage_enable();
     assert(g_motionEnabled && !simPulse1 && !simPulse2 && !g_homed1 && !g_homed2);
+}
+static void sim_check_traj_boundary(void) {
+    const traj_node_t *node=&g_traj.nodes[g_traj.index];
+    assert(g_arm1.usteps==g_ptp.origin[0]-ptp_offset(0,node->q1));
+    assert(g_arm2.usteps==g_ptp.origin[1]-ptp_offset(1,node->q2-node->q1));
+    simBoundaryChecks++;
 }
 static void cycle(int heartbeat) {
     if(g_traj.state==3u && g_ptp.active==1u) {
@@ -290,6 +314,118 @@ static void short_send(uint8 keys, int corrupt) {
 static void limits_send(uint32 seq,uint32 epoch,uint16 axis,int16 min,int16 max) {
     packetType=9;ptp_send(seq,epoch,min,max,axis,5);packetType=1;txq_flush_blocking();
 }
+static void telem_test(const char *t) {
+    uint32 seq,epoch,sent,skipped,dropped,started,elapsed; unsigned i,lines; const char *at;
+    static const uint16 badHz[]={1,4,21,100,65535};
+    /* The streamed TELEM line (control type 11) and its protections. setup() leaves the stage enabled. */
+    seq=g_controlSequence+1u;epoch=g_ptp.epoch;
+    if(!strcmp(t,"telem_rate_invalid")) {
+        packetType=11;
+        for(i=0;i<sizeof(badHz)/sizeof(badHz[0]);i++)ptp_send(seq,epoch,0,0,badHz[i],5);
+        ptp_send(seq,epoch,1,0,10,5);ptp_send(seq,epoch,0,1,10,5);   /* the angle fields must be zero */
+        ptp_send(0,epoch,0,0,10,5);ptp_send(seq,epoch-1u,0,0,10,5);  /* sequence 0, stale epoch */
+        ptp_send(seq,epoch,0,0,10,1);                                 /* corrupted CRC */
+        packetType=1;
+        assert(g_telemHz==0 && g_controlSequence<seq && g_telemSent==0);
+        return;
+    }
+    if(!strcmp(t,"telem_rate")) {
+        packetType=11;ptp_send(seq,epoch,0,0,10,5);packetType=1;txq_flush_blocking();
+        assert(g_telemHz==10 && g_controlSequence==seq && strstr(simLog,"TELEM_RATE epoch=") && strstr(simLog,"hz=10"));
+        simLogN=0;simLog[0]=0;packetType=11;ptp_send(seq,epoch,0,0,10,5);packetType=1;txq_flush_blocking();
+        assert(g_controlSequence==seq && strstr(simLog,"TELEM_RATE epoch=") && strstr(simLog,"hz=10")); /* an exact retry only repeats the receipt */
+        packetType=11;ptp_send(seq,epoch,0,0,20,5);packetType=1;
+        assert(g_telemHz==10);                                         /* the same sequence with another rate is stale */
+        packetType=11;ptp_send(g_controlSequence+1u,epoch,0,0,0,5);packetType=1;
+        assert(g_telemHz==0);                                          /* 0 switches the stream off */
+        simLogN=0;simLog[0]=0;stage_status();txq_flush_blocking();
+        assert(strstr(simLog," telem_hz=0 proto=") && strstr(simLog," traj_repeat=1") && strstr(simLog," fault_snapshot=1") && strstr(simLog,"TELEM_DIAG hz=0 sent=0"));
+        return;
+    }
+    if(!strcmp(t,"telem_stream")) {
+        /* Off: only the 500 ms status block carries TELEM, as before. */
+        simLogN=0;simLog[0]=0;
+        for(i=0;i<1000;i++)cycle(1);
+        assert(g_motionEnabled && g_telemSent==0);
+        for(lines=0,at=simLog;(at=strstr(at,"TELEM t="))!=NULL;at++)lines++;
+        assert(lines>=1 && lines<=3);
+        /* 20 Hz while enabled: one standalone line per 50 ms of device time, on top of the status blocks, with nothing dropped.
+         * (cycle() also pays for the heartbeat frames, so count against the device clock, not the loop count.) */
+        packetType=11;ptp_send(g_controlSequence+1u,epoch,0,0,20,5);packetType=1;
+        sent=g_telemSent;dropped=g_txqDropped;started=g_jogMs;simLogN=0;simLog[0]=0;
+        for(i=0;i<1000;i++)cycle(1);
+        elapsed=g_jogMs-started;
+        assert(g_motionEnabled && elapsed>=1000u && elapsed<=1400u && g_txqDropped==dropped && g_telemSkipped==0);
+        assert(g_telemSent-sent+1u>=elapsed/50u && g_telemSent-sent<=elapsed/50u+1u);
+        for(lines=0,at=simLog;(at=strstr(at,"TELEM t="))!=NULL;at++)lines++;
+        assert(lines>=g_telemSent-sent && lines<=g_telemSent-sent+3);
+        /* The slowest setting, 5 Hz. */
+        packetType=11;ptp_send(g_controlSequence+1u,epoch,0,0,5,5);packetType=1;
+        sent=g_telemSent;started=g_jogMs;
+        for(i=0;i<1000;i++)cycle(1);
+        elapsed=g_jogMs-started;
+        assert(g_telemSent-sent+1u>=elapsed/200u && g_telemSent-sent<=elapsed/200u+1u);
+        /* Disabled: no stream. */
+        jog_handle_byte(JOG_CMD_STOP);short_send(0,0);txq_flush_blocking();
+        sent=g_telemSent;g_telemLastMs=g_jogMs-1000u;telem_service();
+        assert(!g_motionEnabled && g_telemSent==sent);
+        return;
+    }
+    if(!strcmp(t,"telem_skip")) {
+        /* A nearly full transmit queue skips the stream line (counted) instead of dropping anything. */
+        char filler[101];memset(filler,'x',100);filler[100]=0;
+        g_telemHz=20;g_telemLastMs=g_jogMs-100u;
+        while(txq_free()>=TELEM_MIN_FREE_BYTES)txq_puts(filler);
+        sent=g_telemSent;skipped=g_telemSkipped;dropped=g_txqDropped;
+        telem_service();
+        assert(g_telemSkipped==skipped+1 && g_telemSent==sent && g_txqDropped==dropped);
+        txq_flush_blocking();
+        g_telemLastMs=g_jogMs-100u;telem_service();
+        assert(g_telemSent==sent+1);
+        return;
+    }
+    assert(!"unknown telem test");
+}
+static void fault_snapshot_test(void) {
+    /* One structured line per stop, printed BEFORE the stop resets anything. */
+    int32 beforeP1;
+    simLogN=0;simLog[0]=0;
+    g_ptp.origin[0]=100;g_ptp.origin[1]=200;g_arm1.usteps=40;g_arm2.usteps=50;
+    fault_snapshot("fixture protection",0u);txq_flush_blocking();
+    assert(strstr(simLog,"FAULT_SNAPSHOT t=") && strstr(simLog," phase=idle ") && strstr(simLog," p1=60 p2=150 ") &&
+           strstr(simLog,"reason=\"fixture protection\"") && strstr(simLog," drv=ok ") && strstr(simLog," hb_age_ms=") && strstr(simLog," inputs=0 "));
+    beforeP1=g_ptp.origin[0]-g_arm1.usteps;
+    simLogN=0;simLog[0]=0;
+    stage_stop("fixture protection",0u);txq_flush_blocking();
+    assert(beforeP1==60 && strstr(simLog,"FAULT_SNAPSHOT") && strstr(simLog,"STOP: fixture protection"));
+    assert(strstr(simLog,"FAULT_SNAPSHOT")<strstr(simLog,"STOP context")); /* before any reset */
+    assert(strstr(simLog," phase=idle ")); /* the phase is the one the machine was in, not "disabled" after the stop */
+    /* The phase names. */
+    g_motionEnabled=1u;
+    { static const struct { const char *name; } phases[]={{"home"},{"ptp"},{"traj_run"},{"traj_upload"},{"jog"},{"idle"},{"disabled"}}; unsigned k;
+      for(k=0;k<sizeof(phases)/sizeof(phases[0]);k++) {
+        g_home.phase=HOME_IDLE;g_ptp.active=0u;g_traj.state=0u;g_arm1.moving=0;g_motionEnabled=1u;
+        if(k==0)g_home.phase=HOME_FAST;
+        if(k==1)g_ptp.active=1u;
+        if(k==2){g_ptp.active=1u;g_traj.state=3u;}
+        if(k==3)g_traj.state=1u;
+        if(k==4)g_arm1.moving=1;
+        if(k==6)g_motionEnabled=0u;
+        simLogN=0;simLog[0]=0;fault_snapshot("x",0u);txq_flush_blocking();
+        { char want[40]; sprintf(want," phase=%s ",phases[k].name); assert(strstr(simLog,want)); }
+      } }
+    g_home.phase=HOME_IDLE;g_ptp.active=0u;g_traj.state=0u;g_arm1.moving=0;
+    /* A driver fault is never explained: the pin cannot tell over-current from over-temperature. */
+    simLogN=0;simLog[0]=0;fault_snapshot("DRV8825 nFAULT; drivers OFF",1u);txq_flush_blocking();
+    assert(strstr(simLog," drv=nfault_undetermined "));
+    assert(!strstr(simLog,"thermal") && !strstr(simLog,"over-temp") && !strstr(simLog,"overheat"));
+    simLogN=0;simLog[0]=0;simFault=1;fault_snapshot("fixture",0u);txq_flush_blocking();simFault=0;
+    assert(strstr(simLog," drv=nfault_undetermined ") && strstr(simLog," inputs=8 "));
+    /* An over-long reason is cut off by the debug buffer, never overflowed. */
+    simLogN=0;simLog[0]=0;
+    fault_snapshot("HOME direction: no credible rotor motion; check VMOT/motor/encoder; UART receive error/overflow; buffered commands discarded",0u);txq_flush_blocking();
+    assert(strstr(simLog,"FAULT_SNAPSHOT") && strstr(simLog,"reason=\"HOME direction"));
+}
 static void rates_live_test(void);
 static void rates_test(const char *t) {
     uint32 seq,epoch; unsigned i; uint32 before;
@@ -342,7 +478,7 @@ static void rates_test(const char *t) {
         home_enter(HOME_RELEASE);assert(g_home.ramp.cMin==step_period_us(300)); /* a lower global speed lowers release, backoff and the slow touch too */
         home_enter(HOME_SLOW);assert(g_home.ramp.cMin==step_period_us(300));
     } else if(!strcmp(t,"rates_traj") && PTP_COMMISSIONED) {
-        packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);
+        /* Simulated calibration: board2 polarity was previously learned. */ g_enc2.directionKnown=1u;g_enc2.incDir=simPolarity2>0?1u:0u;packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);
         packetType=2;ptp_send(2,g_ptp.epoch,0,0,4,0);
         assert(g_traj.count==1);
         /* 200 pulses/s passes legacy 600/800 caps but exceeds configured 150. */
@@ -353,7 +489,7 @@ static void rates_test(const char *t) {
         ptp_send(3,g_ptp.epoch,0,4,250,0);assert(g_traj.count==2);
         packetType=1;
     } else if(!strcmp(t,"rates_ptp") && PTP_COMMISSIONED) {
-        packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;
+        /* Simulated calibration: board2 polarity was previously learned. */ g_enc2.directionKnown=1u;g_enc2.incDir=simPolarity2>0?1u:0u;packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;
         ptp_send(2,g_ptp.epoch,100,200,600,0); /* absolute q2: elbow = 100 cd, so both motors move and the axis-2 rate applies */
         assert(g_ptp.active && g_ptp.ramp.cMin==step_period_us(150) && g_ptp.ramp.c0>=55000);
     }
@@ -371,7 +507,9 @@ static void limits_test(const char *t) {
     if(!strcmp(t,"limits_invalid")) {
         const int16 bounds[][2]={{-18001,13500},{-13500,18001},{100,200},{-200,-100},{1,1},{100,-100}};
         for(i=0;i<sizeof(bounds)/sizeof(bounds[0]);i++)limits_send(seq,epoch,0,bounds[i][0],bounds[i][1]);
-        limits_send(seq,epoch,2,-13500,13500);limits_send(0,epoch,0,-13500,13500);
+        limits_send(seq,epoch,3,-13500,13500);limits_send(0,epoch,0,-13500,13500);
+        { const int16 elbow[][2]={{-18001,12000},{-9000,18001},{100,12000},{-9000,-100},{1,1},{100,-100}}; /* axis 2 = elbow: same rules as the boxes */
+          for(i=0;i<sizeof(elbow)/sizeof(elbow[0]);i++)limits_send(seq,epoch,2,elbow[i][0],elbow[i][1]); }
         limits_send(seq,epoch-1u,0,-13500,13500);
         packetType=9;ptp_send(seq,epoch,-13500,13500,0,1);packetType=1;
         assert(g_controlSequence<seq && g_ptp.epoch==epoch && !simPulse1 && !simPulse2);
@@ -404,16 +542,58 @@ static void limits_test(const char *t) {
     }
     limits_send(g_controlSequence+1u,epoch,1,-15000,15000);
     assert(strstr(simLog,"min1=-13500 max1=13500 min2=-15000 max2=15000"));
+    if(!strncmp(t,"limits_elbow",12)) {
+        /* Boot default first: straight is inside, +/-155 deg is the provisional bound. */
+        assert(g_jointMinCd[JOINT_ELBOW]==-15500 && g_jointMaxCd[JOINT_ELBOW]==15500 && strstr(simLog,"emin=-15500 emax=15500"));
+        simLogN=0;simLog[0]=0;limits_send(g_controlSequence+1u,epoch,JOINT_ELBOW,-9000,12000);
+        assert(g_jointMinCd[JOINT_ELBOW]==-9000 && g_jointMaxCd[JOINT_ELBOW]==12000);
+        assert(strstr(simLog,"PTP_LIMITS epoch=") && strstr(simLog,"axis=2 min=-9000 max=12000") && strstr(simLog,"emin=-9000 emax=12000"));
+        assert(g_jointMinCd[0]==-13500 && g_jointMaxCd[1]==15000); /* the boxes did not move */
+    }
     jog_handle_byte(JOG_CMD_STOP);short_send(0,0);stage_enable();txq_flush_blocking();
     assert(g_motionEnabled && !simPulse1 && !simPulse2);
-    assert(ptp_counts_in_range(0u,g_ptp.origin[0]-ptp_offset(0u,13500)) && ptp_counts_in_range(1u,g_ptp.origin[1]-ptp_offset(1u,15000)));
+    assert(ptp_counts_in_range(0u,g_ptp.origin[0]-ptp_offset(0u,13500)) && (!strncmp(t,"limits_elbow",12) || ptp_counts_in_range(1u,g_ptp.origin[1]-ptp_offset(1u,15000)))); /* the elbow cases narrow the elbow below q2's +150 */
     if(!strcmp(t,"limits_configure") || !strcmp(t,"limits_retry"))return;
-    packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;
+    /* Simulated calibration: board2 polarity was previously learned. */ g_enc2.directionKnown=1u;g_enc2.incDir=simPolarity2>0?1u:0u;packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;
     assert(g_ptp.reference && g_homed1 && g_homed2);
     if(!strcmp(t,"limits_ptp")) {
         ptp_send(2,g_ptp.epoch,13501,0,600,0);assert(!g_ptp.active);
         packetType=2;ptp_send(2,g_ptp.epoch,13501,0,2,0);packetType=1;assert(!g_traj.state);
         ptp_send(2,g_ptp.epoch,13500,0,600,0);assert(g_ptp.active && g_ptp.target[0]==g_ptp.origin[0]-ptp_offset(0u,13500));
+        return;
+    }
+    if(!strcmp(t,"limits_elbow")) {
+        /* q1 and q2 are inside their boxes in every refusal below: only the elbow range (-90..+120 deg) can say no. */
+        ptp_send(2,g_ptp.epoch,0,12001,600,0);assert(!g_ptp.active);
+        ptp_send(2,g_ptp.epoch,-3000,9001,600,0);assert(!g_ptp.active);   /* elbow +120.01 */
+        ptp_send(2,g_ptp.epoch,3000,-6001,600,0);assert(!g_ptp.active);   /* elbow -90.01 */
+        packetType=2;ptp_send(2,g_ptp.epoch,0,12001,2,0);packetType=1;assert(!g_traj.state);
+        ptp_send(2,g_ptp.epoch,0,12000,600,0);
+        assert(g_ptp.active && g_ptp.target[1]==g_ptp.origin[1]-ptp_offset(1u,12000)); /* exactly on the bound is allowed */
+        return;
+    }
+    if(!strcmp(t,"limits_elbow_traj")) {
+        packetType=2;ptp_send(2,g_ptp.epoch,0,0,3,0);assert(g_traj.count==1);
+        simLogN=0;simLog[0]=0;
+        packetType=3;ptp_send(3,g_ptp.epoch,0,12001,250,0);txq_flush_blocking();
+        assert(g_traj.count==1 && strstr(simLog,"joint range/rate")); /* refused for the range, not for rate or order */
+        simLogN=0;simLog[0]=0;
+        ptp_send(3,g_ptp.epoch,0,-9001,250,0);txq_flush_blocking();
+        assert(g_traj.count==1 && strstr(simLog,"joint range/rate"));
+        packetType=1;
+        return;
+    }
+    if(!strcmp(t,"limits_elbow_jog")) {
+        jog_axis_t *a=&g_arm2;int32 count;
+        g_ptp.reference=0;simHome1Mode=simHome2Mode=-1;g_arm1.usteps=g_ptp.origin[0];
+        /* q2 would still allow +15000 here, so the elbow bound alone stops the outward step. */
+        a->usteps=g_ptp.origin[1]-ptp_offset(1u,12000);count=a->usteps;
+        jog_step(a,-1);assert(a->usteps==count);jog_step(a,1);assert(a->usteps==count+1);
+        a->usteps=g_ptp.origin[1]-ptp_offset(1u,-9000);count=a->usteps;
+        jog_step(a,1);assert(a->usteps==count);jog_step(a,-1);assert(a->usteps==count-1);
+        /* Outside the bound the axis may only come back; the position check agrees. */
+        a->usteps=g_ptp.origin[1]-ptp_offset(1u,12500);
+        assert(!ptp_counts_in_range(1u,a->usteps) && !ptp_counts_in_range(0u,g_arm1.usteps)); /* the elbow is shared by both checks */
         return;
     }
     assert(!strcmp(t,"limits_jog"));
@@ -488,7 +668,7 @@ static void ptp_test(const char *t) {
             assert_stopped();txq_flush_blocking();assert(strstr(simLog,"PTP encoder following error"));return;
         }
         assert(g_motionEnabled&&!g_ptp.active&&g_ptp.reference);
-        assert(g_jogMs-started<24000 && g_arm1.usteps==start1-ptp_offset(0,-1437) && g_arm2.usteps==start2-ptp_offset(1,2904-(-1437)));
+        assert(g_jogMs-started<30000 /* coarse 1 ms fixture plus dual SSI reads, not pulse scheduler throughput */ && g_arm1.usteps==start1-ptp_offset(0,-1437) && g_arm2.usteps==start2-ptp_offset(1,2904-(-1437)));
         jog_handle_byte(JOG_CMD_STOP);assert_stopped();
         assert(simDriverSwitches==switches+6u && simPins[PIN_EN1] && simPins[PIN_EN2]);
         puts("PTP 600: power stable through completion; operator STOP releases both drivers");return;
@@ -500,7 +680,11 @@ static void ptp_test(const char *t) {
         ptp_send(1,epoch,-100,100,200,0);
         for(i=0;i<1000 && g_ptp.active;i++)cycle(1);
         stage_status();txq_flush_blocking();
-        sprintf(expected,"p1=%ld p2=%ld e1=%ld err=%ld inputs=0 drops=0",
+        sprintf(expected,"p1=%ld p2=%ld e1=%ld err=%ld e2=%ld err2=%ld inputs=0 drops=0",
+            (long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
+            (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),(long)(cmd_lsb()-g_enc.pos),
+            (long)((g_enc2.pos-g_enc2.origin)*(g_enc2.incDir==ARM2_LEFT_DIR_LEVEL?1:-1)),(long)(g_enc2.cmdLsbX100/100-g_enc2.pos));
+        if(!ARM2_ENCODER_FEEDBACK) sprintf(expected,"p1=%ld p2=%ld e1=%ld err=%ld inputs=0 drops=0",
             (long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
             (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),(long)(cmd_lsb()-g_enc.pos));
         assert(strstr(simLog,expected));
@@ -605,7 +789,7 @@ static void rates_send(uint32 seq,uint32 epoch,uint16 axis,int16 rate,int16 acce
 }
 static void rates_live_test(void) {
     uint32 epoch,seq,sequence; unsigned i; int32 u1,u2; int16 min1;
-    short_send(0,0);packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;txq_flush_blocking();
+    short_send(0,0);/* Simulated calibration: board2 polarity was previously learned. */ g_enc2.directionKnown=1u;g_enc2.incDir=simPolarity2>0?1u:0u;packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;txq_flush_blocking();
     assert(g_motionEnabled && g_ptp.reference && g_homed1 && g_homed2);
     epoch=g_ptp.epoch;u1=g_arm1.usteps;u2=g_arm2.usteps;
     /* Idle and referenced: taken at once; the reference, the epoch and the position stay. */
@@ -708,7 +892,11 @@ static void host_rates_config(void) {
 static void traj_test(const char *t) {
     unsigned i,p1,p2; int32 origin1,origin2; uint32 seq=1;
     if(!strncmp(t,"traj_host_plan",14)||!strcmp(t,"traj_manual_plan")) host_rates_config();
-    if(!strcmp(t,"traj_manual_plan")) {traj_send(5,seq++,0,0,0);assert(!simPulse1&&!simPulse2);}
+    if(!strcmp(t,"traj_manual_plan")) {
+        /* Simulated prior polarity calibration; manual reference itself must not pulse. */
+        g_enc2.directionKnown=1u;g_enc2.incDir=1u;
+        traj_send(5,seq++,0,0,0);assert(!simPulse1&&!simPulse2);
+    }
     else jog_home_all();
     for(i=0;i<250000&&g_home.phase!=HOME_IDLE&&g_motionEnabled;i++)cycle(1);
     assert(g_homed1&&g_homed2&&g_ptp.reference);cycle(1);sim_keys(0);
@@ -732,14 +920,11 @@ static void traj_test(const char *t) {
         assert(p1==simPulse1&&p2==simPulse2&&g_traj.state==2);
         traj_send(4,++seq,0,0,0);assert(g_ptp.active);
         for(i=0;i<650000&&g_ptp.active&&g_motionEnabled;i++) {
-            uint16 index=g_traj.index;cycle(1);
-            if(g_traj.index!=index&&g_motionEnabled) {
-                assert(g_arm1.usteps==origin1-ptp_offset(0,nodes[index].q1));
-                assert(g_arm2.usteps==origin2-ptp_offset(1,nodes[index].q2-nodes[index].q1));
-            }
+            cycle(1); /* sim_check_traj_boundary checks both axes at each actual node transition. */
         }
         if(!g_motionEnabled)fprintf(stderr,"%s\n",simLog);
         assert(g_motionEnabled&&!g_ptp.active&&g_traj.state==4&&g_traj.index==count);
+        assert(simBoundaryChecks==count-1u);
         assert(g_arm1.usteps==origin1-ptp_offset(0,nodes[count-1].q1));
         assert(g_arm2.usteps==origin2-ptp_offset(1,nodes[count-1].q2-nodes[count-1].q1));
         if(!strcmp(t,"traj_host_plan_offset"))assert(abs_i32(cmd_lsb()-g_enc.pos)>=66&&abs_i32(cmd_lsb()-g_enc.pos)<=68&&g_ptp.reference);
@@ -841,6 +1026,8 @@ static void traj_test(const char *t) {
     assert(!g_ptp.active&&p1==simPulse1&&p2==simPulse2); /* never replay completed start */
 }
 static void manual_test(const char *t) {
+    /* This fixture represents a previously learned board2 polarity. */
+    g_enc2.directionKnown=1u;g_enc2.incDir=simPolarity2>0?1u:0u;
     uint32 epoch=g_ptp.epoch; unsigned i,p1=simPulse1,p2=simPulse2;
     int bad=strcmp(t,"manual_success")&&strcmp(t,"manual_duplicate")&&strcmp(t,"manual_stop")&&strcmp(t,"manual_old_epoch");
     /* Current counters can be outside the old reference envelope: no physical motion. */
@@ -853,7 +1040,7 @@ static void manual_test(const char *t) {
     if(!strcmp(t,"manual_fault"))simFault=1;
     if(!strcmp(t,"manual_encoder"))simBadEncoder=1;
     if(!strcmp(t,"manual_timeout"))g_keysSeen=0;
-    packetType=5;
+    /* Simulated calibration: board2 polarity was previously learned. */ g_enc2.directionKnown=1u;g_enc2.incDir=simPolarity2>0?1u:0u;packetType=5;
     ptp_send(1,!strcmp(t,"manual_stale")?epoch-1:epoch,!strcmp(t,"manual_payload")?1:0,0,0,!strcmp(t,"manual_crc")?1:(!strcmp(t,"manual_timeout")?5:0));
     packetType=1;
     assert(p1==simPulse1&&p2==simPulse2&&g_home.phase==HOME_IDLE);
@@ -861,7 +1048,7 @@ static void manual_test(const char *t) {
     assert(g_ptp.reference&&g_homed1&&g_homed2&&g_directionKnown&&g_encIncDir==1&&g_ptp.epoch!=epoch);
     assert(g_ptp.origin[0]==12345&&g_ptp.origin[1]==-23456&&g_arm1SoftCenter==g_enc.pos);
     if(!strcmp(t,"manual_duplicate")) {
-        uint32 newEpoch=g_ptp.epoch;packetType=5;ptp_send(1,epoch,0,0,0,0);packetType=1;
+        uint32 newEpoch=g_ptp.epoch;/* Simulated calibration: board2 polarity was previously learned. */ g_enc2.directionKnown=1u;g_enc2.incDir=simPolarity2>0?1u:0u;packetType=5;ptp_send(1,epoch,0,0,0,0);packetType=1;
         assert(g_ptp.epoch==newEpoch&&g_ptp.sequence==1&&p1==simPulse1&&p2==simPulse2);return;
     }
     if(!strcmp(t,"manual_old_epoch")) {
@@ -870,6 +1057,9 @@ static void manual_test(const char *t) {
     if(!strcmp(t,"manual_stop")) {
         jog_handle_byte(JOG_CMD_STOP);assert_stopped();assert(!g_ptp.reference);
         sim_keys(0);stage_enable();traj_send(5,2,0,0,0);
+        assert(g_ptp.reference==!ARM2_ENCODER_FEEDBACK && !g_enc2.directionKnown && p1==simPulse1 && p2==simPulse2);
+        /* A fresh enable invalidates polarity: model a new successful calibration. */
+        g_enc2.directionKnown=1u;g_enc2.incDir=1u;traj_send(5,2,0,0,0);
         assert(g_ptp.reference&&!g_ptp.active&&p1==simPulse1&&p2==simPulse2);return;
     }
     ptp_send(2,g_ptp.epoch,20,30,200,0);assert(g_ptp.active);
@@ -894,7 +1084,7 @@ static void fuzz_invariants(void) {
     FZ(!(g_home.phase!=HOME_IDLE && (g_arm1.want || g_arm2.want)));
     FZ(g_traj.state!=3u || g_ptp.active);
     FZ(!g_ptp.active || (g_ptp.reference && g_motionEnabled));
-    FZ(!g_ptp.reference || (g_homed1 && g_homed2 && g_directionKnown));
+    FZ(!g_ptp.reference || (g_homed1 && g_homed2 && g_enc.directionKnown && (!ARM2_ENCODER_FEEDBACK || g_enc2.directionKnown)));
     FZ(!g_ptp.reference || g_ptp.active || (ptp_counts_in_range(0u,g_arm1.usteps) && ptp_counts_in_range(1u,g_arm2.usteps)));
 }
 static struct { uint8 en, ref, ptp, tr; home_phase_t ph; } fz;
@@ -1023,13 +1213,167 @@ static void fuzz_test(uint32 seed) {
 int main(int argc,char **argv) {
     const char *t=argv[1]; unsigned i, p1, p2;
     assert(argc==2);
+    if(!strcmp(t,"stop_latch")) {
+        const char *fill="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n";
+        char saved[800];
+        setup(); txq_flush_blocking(); simLogN=0;simLog[0]=0;
+        g_traj.state=3u;g_traj.count=2u;g_traj.index=1u;g_traj.nodes[1].ms=248u;
+        g_ptp.active=1u;g_ptp.done=90u;g_ptp.total=100u;
+        g_traj.elapsedCy=268001u*SU_CY_PER_US;g_traj.clock=SU_NOW();
+        while(txq_free()>=strlen(fill)) JLOG(fill); /* first stop messages cannot fit */
+        traj_service(); assert(!g_motionEnabled && g_txqDropped);
+        assert(strstr(g_lastStop,"reason=\"trajectory timing overrun\"") && strstr(g_lastStop,"idx=1/2") &&
+               strstr(g_lastStop,"done=90 total=100"));
+        { unsigned long elapsed,planned,late;
+          assert(sscanf(strstr(g_lastStop,"elapsed_us="),"elapsed_us=%lu plan_us=%lu late_us=%lu",&elapsed,&planned,&late)==3);
+          assert(elapsed>268000u && planned==248000u && late==elapsed-planned && late>20000u); }
+        strcpy(saved,g_lastStop);txq_flush_blocking();simLogN=0;simLog[0]=0;
+        stage_status();txq_flush_blocking();assert(strstr(simLog,saved)==simLog);
+        jog_handle_byte(JOG_CMD_STOP);txq_flush_blocking();assert(!strcmp(saved,g_lastStop));
+        simLogN=0;simLog[0]=0;stage_status();txq_flush_blocking();assert(strstr(simLog,saved));
+        sim_keys(0);stage_enable();txq_flush_blocking();simLogN=0;simLog[0]=0;
+        stage_status();txq_flush_blocking();assert(!strstr(simLog,"LAST_STOP")); /* no extra motion-time output */
+        stage_stop("new test stop",0u);assert(g_lastStopId==2u && strstr(g_lastStop,"new test stop"));
+        puts(t);return 0;
+    }
+    if(!strcmp(t,"optional_arm2")) {
+        assert(!ARM2_ENCODER_FEEDBACK); simBadEncoder2=1;
+        assert(app_boot()); setup(); assert(g_arm1.hasEnc && !g_arm2.hasEnc);
+        assert(!g_enc2.directionKnown); packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;
+        assert(g_ptp.reference && !simPulse1 && !simPulse2);
+        stage_status();txq_flush_blocking();assert(strstr(simLog,"arm2fb=0") && !strstr(simLog," e2="));
+        { uint32 epoch=g_ptp.epoch; ptp_send(2,epoch,0,100,200,0);
+          for(i=0;i<20000 && g_ptp.active;i++)cycle(1);
+          assert(g_motionEnabled && !g_ptp.active && simPulse2); }
+        jog_home_all(); run_until(HOME_STRAIGHT_SETTLE,2);
+        for(i=0;i<2000 && g_home.phase!=HOME_IDLE;i++)cycle(1);
+        assert(g_motionEnabled && g_home.phase==HOME_IDLE && g_ptp.reference && !g_arm2.hasEnc && !g_enc2.directionKnown);
+        g_enc.directionKnown=1u; simBadEncoder=1;
+        for(i=0;i<ENC_BAD_LIMIT;i++)service_encoder(); assert(!g_motionEnabled);
+        puts(t);return 0;
+    }
+    if(!strcmp(t,"chain_frames")) {
+        const int angles[]={0,1234,2048,4095};
+        const uint32 frames[]={0,1,0x20000u,0x3ffffu,0x1f8a6u};
+        unsigned j;uint32 first,second,expected;
+        hw_init();
+        for(i=0;i<4;i++)for(j=0;j<5;j++)for(simSsiDummy=0;simSsiDummy<2;simSsiDummy++) {
+            simAngleOverride=angles[i];simSsiSecondFrame=(int)frames[j];expected=mock_frame();
+            as5045_read_chain(&first,&second);
+            assert(first==expected && second==frames[j]);
+            assert(simSsiBits==38 && simPins[PIN_CSN] && simInts);
+            assert(as5045_read_raw()==expected && simSsiBits==18);
+        }
+        puts(t);return 0;
+    }
+
+    if(!strncmp(t,"dual_",5) && strcmp(t,"dual_snapshot_length")) {
+        if(!strcmp(t,"dual_home_reverse"))simPolarity2=-1;
+        setup();
+        if(!strcmp(t,"dual_home_reverse") || !strcmp(t,"dual_home_stall")) {
+            if(!strcmp(t,"dual_home_stall"))simStall2=1;
+            jog_home_all();for(i=0;i<250000 && g_motionEnabled && g_home.phase!=HOME_IDLE;i++)cycle(1);
+            if(simStall2) { assert(!g_motionEnabled && !g_ptp.reference && strstr(simLog,"no credible rotor motion")); }
+            else { assert(dual_ready() && g_homed2 && g_enc2.incDir==0 && g_ptp.reference && g_enc2.origin==g_enc2.pos); }
+        } else if(!strcmp(t,"dual_wrap")) {
+            int32 first=g_enc.pos;
+            for(i=0;i<14;i++) {
+                simEncoderBias2+=250;g_enc2.cmdUsteps+=98;g_enc2.cmdLsbX100+=25000;
+                simClock+=24000u;assert(enc_sample());
+            }
+            assert(g_enc2.pos==3500 && g_enc.pos==first && g_enc2.lastAngle==404);
+            for(i=0;i<20;i++) {simEncoderBias2-=250;g_enc2.cmdUsteps-=98;g_enc2.cmdLsbX100-=25000;simClock+=24000u;assert(enc_sample());}
+            assert(g_enc2.pos==-1500 && g_enc.pos==first && g_enc2.lastAngle==3596);
+        } else if(!strcmp(t,"dual_loss")) {
+            simBadEncoder2=1;
+            for(i=0;i<ENC_BAD_LIMIT;i++){simClock+=24000u;service_encoder();}
+            assert(!g_motionEnabled && !g_arm2.hasEnc && g_arm1.hasEnc && !g_enc.badStreak && !g_ptp.reference);
+            {
+                uint32 epoch=g_ptp.epoch, faults=g_jogFaultCount;
+                for(i=0;i<20;i++){simClock+=24000u;service_encoder();}
+                assert(g_ptp.epoch==epoch && g_jogFaultCount==faults && !g_enc.badStreak);
+            }
+        } else if(!strcmp(t,"dual_gap")) {
+            g_enc2.lastMs=wall_ms()-101u;
+            service_encoder();assert(g_enc2.trackingLost && !g_enc.trackingLost && !g_motionEnabled);
+        } else if(!strcmp(t,"dual_parity")) {
+            simSsiSecondFrame=(int)(simSsiFrame2^1u);
+            for(i=0;i<ENC_BAD_LIMIT;i++){simClock+=24000u;service_encoder();}
+            assert(!g_motionEnabled && g_enc2.badStreak>=ENC_BAD_LIMIT && !g_enc.badStreak);
+        } else if(!strcmp(t,"dual_hold")) {
+            g_enc2.incDir=1u;g_enc2.directionKnown=1u;
+            jog_axis_settled(&g_arm2);assert(g_arm2.holding && g_arm2.holdTarget==0);
+            simEncoderBias2=20;simClock+=24000u;assert(enc_sample());
+            p1=simPulse1;p2=simPulse2;
+            for(i=0;i<150;i++)cycle(1);
+            assert(g_motionEnabled && abs_i32(g_enc2.pos)<=CL_DEADBAND_LSB && simPulse2>p2 && simPulse1==p1);
+        } else if(!strcmp(t,"dual_derate") || !strcmp(t,"dual_follow_stop")) {
+            g_enc2.incDir=1u;g_enc2.directionKnown=1u;g_arm2.moving=1;
+            g_arm2.rate=600;g_arm2.rateCap=600;g_arm2.periodCy=24000000u/600;
+            simStall2=1;
+            for(i=0;i<(!strcmp(t,"dual_derate")?20u:150u);i++)jog_step(&g_arm2,1);
+            simClock+=24000u;service_encoder();
+            if(!strcmp(t,"dual_derate")) {assert(g_motionEnabled && g_arm2.derates==1 && g_arm2.rateCap==300 && !g_arm1.derates);}
+            else {assert(!g_motionEnabled && !g_ptp.reference);}
+        } else if(!strcmp(t,"dual_peer_bad") || !strcmp(t,"dual_peer_bad_reverse")) {
+            jog_axis_t *healthy=!strcmp(t,"dual_peer_bad") ? &g_arm1 : &g_arm2;
+            enc_t *e=axis_encoder(healthy);
+            e->incDir=e->directionKnown=1u;e->cmdLsbX100=SLIP_FAIL_LSB*100;
+            healthy->moving=1;healthy->rate=600;healthy->periodCy=24000000u/600;
+            if(healthy==&g_arm1)simBadEncoder2=1;else simBadEncoder=1;
+            service_encoder();txq_flush_blocking();
+            assert(!g_motionEnabled && !e->badStreak && strstr(simLog,"jog encoder following error"));
+            assert((healthy==&g_arm1 ? g_enc2.badStreak : g_enc.badStreak)==1u);
+        } else if(!strcmp(t,"dual_final")) {
+            g_enc.directionKnown=g_enc2.directionKnown=1u;g_enc.incDir=g_enc2.incDir=1u;
+            g_homed1=g_homed2=g_ptp.reference=1u;g_ptp.active=2u;
+            g_ptp.settleMs=g_jogMs-HOME_SETTLE_MS;
+            simEncoderBias2=240;assert(enc_sample());ptp_service();txq_flush_blocking();
+            assert(!g_motionEnabled && strstr(simLog,"PTP final position mismatch"));
+        } else if(!strcmp(t,"dual_limit")) {
+            g_enc.directionKnown=g_enc2.directionKnown=1u;g_enc.incDir=g_enc2.incDir=1u;
+            g_homed1=g_homed2=1u;
+            g_jointMinCd[0]=-3000;g_jointMaxCd[0]=3000;
+            g_jointMinCd[1]=-6000;g_jointMaxCd[1]=6000;
+            g_jointMinCd[2]=-15500;g_jointMaxCd[2]=15500;
+            g_enc2.pos=-(int32)((int64)g_jointMaxCd[1]*ENCODER_CPR*ARM2_GEAR_RATIO_X100/3600000)-10;
+            assert(!joint_step_allowed(&g_arm2,-1) && joint_step_allowed(&g_arm2,1));
+        } else if(!strcmp(t,"dual_manual_unknown")) {
+            packetType = 5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;txq_flush_blocking();
+            assert(!simPulse1 && !simPulse2);
+            if(ARM2_ENCODER_FEEDBACK) assert(!g_ptp.reference && strstr(simLog,"home first to learn arm2"));
+            else assert(g_ptp.reference && strstr(simLog,"MANUAL REF OK"));
+        } else if(!strcmp(t,"dual_ptp_follow")) {
+            g_enc.directionKnown=g_enc2.directionKnown=1u;g_enc.incDir=g_enc2.incDir=1u;
+            g_homed1=g_homed2=g_ptp.reference=1u;g_ptp.active=1u;
+            g_enc2.cmdLsbX100=SLIP_FAIL_LSB*100;ptp_service();txq_flush_blocking();
+            if(ARM2_ENCODER_FEEDBACK) assert(!g_motionEnabled && strstr(simLog,"PTP encoder following error") && !simPulse1 && !simPulse2);
+            else assert(g_motionEnabled && !strstr(simLog,"PTP encoder following error"));
+        } else if(!strcmp(t,"dual_enable_bad")) {
+            stage_stop("test",0u);simBadEncoder2=1;sim_keys(0);stage_enable();
+            assert(!g_motionEnabled && !g_arm1.hasEnc && !g_arm2.hasEnc);
+        } else {assert(0);}
+        puts(t);return 0;
+    }
     if(!strcmp(t,"boot_tx_backlog")) {
         hw_init();assert(enc_set_origin());
         simRxActive=1;simRxBase=simClock;simUartTxBusyUntil=simClock+120u*24000u;
         sim_run(1);
         assert(!g_motionEnabled && !simPulse1 && !simPulse2);
         assert(g_arm1.hasEnc && !g_enc.trackingLost && g_encMaxGapMs<10u);
-        assert(simWdtFeeds>1000u && strstr(simLog,"STAGE2 v7 framed control"));
+        assert(simWdtFeeds>1000u && strstr(simLog,"STAGE2 v10 latched stop framed control"));
+        puts(t);return 0;
+    }
+    if(!strcmp(t,"dual_snapshot_length")) {
+        const char *reason="HOME direction: no credible rotor motion; check VMOT/motor/encoder";
+        setup();simLogN=0;simLog[0]=0;
+        g_jogMs=g_ptp.epoch=g_ptp.sequence=UINT32_MAX;g_lastKeyMs=0;g_keyMaxGapMs=UINT32_MAX;
+        g_traj.state=1u;g_traj.index=g_traj.count=2048u;
+        g_ptp.origin[0]=g_ptp.origin[1]=1073741823;g_arm1.usteps=g_arm2.usteps=-1073741823;
+        g_enc.pos=g_enc2.pos=-21474836;g_ptp.encoderOrigin=g_enc2.origin=21474836;
+        fault_snapshot(reason,1u);txq_flush_blocking();
+        assert(strlen(simLog)>320 && strstr(simLog,reason) && strstr(simLog,"encoder\"\r\n"));
+        assert(strstr(simLog," e2=") && strstr(simLog," err2="));
         puts(t);return 0;
     }
     if(!strcmp(t,"boot") || !strcmp(t,"boot_bad") || !strcmp(t,"boot_limit")) {
@@ -1042,24 +1386,28 @@ int main(int argc,char **argv) {
     }
     if(!strcmp(t,"reverse_polarity")||!strcmp(t,"ptp_reverse")) simPolarity=-1;
     /* Operator aligned the links before power/enable; sensors remain at their real offsets. */
-    if(!strcmp(t,"traj_manual_plan") || !strncmp(t,"fuzz_",5)) {simStep1=400-22577;simStep2=120-36990;}
+    if(!strcmp(t,"traj_manual_plan") || !strncmp(t,"fuzz_",5)) {simStep1=400-22400;simStep2=120-36650;}
     /* Logged circle endpoint: q1=-14.37 deg, q2=+29.04 deg from straight. */
-    if(!strcmp(t,"home_from_drawing")) {simStep1=400-22577+2555;simStep2=120-36990-6590;}
+    if(!strcmp(t,"home_from_drawing")) {simStep1=400-22400+2555;simStep2=120-36650-6590;}
     if(!strcmp(t,"home_active_at_start")) simStep1=450;
     if(!strcmp(t,"home_from_arm2_range") || !strcmp(t,"home_long_stop"))
-        simStep2=120-36990-13616; /* +60 deg: farthest commissioned arm2 pose */
+        simStep2=120-36650-13616; /* +60 deg: farthest commissioned arm2 pose */
     setup();
+    if(!strcmp(t,"traj_manual_plan") || !strncmp(t,"fuzz_",5)) {g_enc2.directionKnown=1u;g_enc2.incDir=1u;}
     if(!strncmp(t,"fuzz_",5)){fuzz_test((uint32)atoi(t+5));puts(t);return 0;}
     if(!strcmp(t,"link_capabilities")) {
         /* The LINK line is the only carrier of the host's compatibility contract (docs/PROTOCOL.md section 6). */
         char proto[24]; simLogN=0; simLog[0]=0;
         stage_status(); txq_flush_blocking();
         sprintf(proto," proto=%u\r\n",(unsigned)PROTO_VERSION); /* with its end of line: the debug buffer must not cut the LINK line short */
-        assert(strstr(simLog,"STATE fw=stage2-v7 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
+        assert(strstr(simLog,"STATE fw=stage2-v10 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
         assert(strstr(simLog," short_hb=1") && strstr(simLog," joint_limits=1") && strstr(simLog," motion_rates=1") && strstr(simLog," rates_live=1") && strstr(simLog," q2_absolute=1"));
+        assert(strstr(simLog," traj_repeat=1") && strstr(simLog," fault_snapshot=1") && strstr(simLog," telem_hz=0 proto="));
         puts(t);return 0;
     }
     if(!strncmp(t,"limits_",7)){limits_test(t);puts(t);return 0;}
+    if(!strncmp(t,"telem_",6)){telem_test(t);puts(t);return 0;}
+    if(!strcmp(t,"fault_snapshot")){fault_snapshot_test();puts(t);return 0;}
     if(!strncmp(t,"rates_",6)){rates_test(t);puts(t);return 0;}
     if(!strncmp(t,"operator_stop_",14)) {
         uint32 epoch=g_ptp.epoch;
@@ -1155,7 +1503,10 @@ int main(int argc,char **argv) {
                 assert(JOG_STATUS_MS>JOG_DEADMAN_MS && wall_ms()-requested<JOG_DEADMAN_MS);
                 snprintf(expected,sizeof(expected),"PTP_STATE lock=%u ref=0 active=0 epoch=%lu ",
                          (unsigned)!PTP_COMMISSIONED,(unsigned long)(epoch+1));
-                assert(strstr(simLog,expected)); /* no jog_tick() or periodic status after HOME */
+                if(!ARM2_ENCODER_FEEDBACK) sprintf(expected,"p1=%ld p2=%ld e1=%ld err=%ld inputs=0 drops=0",
+            (long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
+            (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),(long)(cmd_lsb()-g_enc.pos));
+        assert(strstr(simLog,expected)); /* no jog_tick() or periodic status after HOME */
             } else if(!strcmp(t,"control_replay_deadman")) {
                 packetType=6;seq=g_controlSequence+1;ptp_send(seq,g_ptp.epoch,0,0,0,0);
                 for(i=0;i<260;i++) {
@@ -1362,7 +1713,7 @@ int main(int argc,char **argv) {
             assert(g_home.steps==0u); /* contact stopped search and reset phase accounting */
             for(i=0;i<250000 && g_home.phase!=HOME_IDLE && g_motionEnabled;i++)cycle(1);
             assert(g_motionEnabled && g_homed1 && g_homed2 && strstr(simLog,"HOME OK:"));
-            assert(simStep1==simHome1At-22577 && simStep2==simHome2At-36990);
+            assert(simStep1==simHome1At-22400 && simStep2==simHome2At-36650);
             puts(t);return 0;
         }
         assert_stopped();puts(t);return 0;
@@ -1495,28 +1846,30 @@ int main(int argc,char **argv) {
     } else {
         if(!g_homed2)fprintf(stderr,"%s\n",simLog);
         assert(g_motionEnabled && g_homed1 && g_homed2 && g_directionKnown);
-        assert(home_straight_steps(1)==22577u);
-        assert(home_straight_steps(2)==36990u);
-        assert(g_arm2.usteps==-36990 && simStep2==120-36990 && g_arm1.usteps==-22577);
+        assert(home_straight_steps(1)==22400u);
+        assert(home_straight_steps(2)==36650u);
+        assert(g_arm2.usteps==-36650 && simStep2==120-36650 && g_arm1.usteps==-22400);
         assert(!ARM2_NPN_ACTIVE());
-        assert(abs_i32(abs_i32(lsb_to_out_deg100(g_enc.pos))-12700)<10);
+        assert(abs_i32(abs_i32(lsb_to_out_deg100(g_enc.pos))-12600)<10);
         assert(strstr(simLog,"HOME OK:"));
         p1=simPulse1;p2=simPulse2;for(i=0;i<200;i++)cycle(1);
         assert(simPulse1==p1 && simPulse2==p2);
         jog_home_all();for(i=0;i<250000&&g_home.phase!=HOME_IDLE&&g_motionEnabled;i++)cycle(1);
         assert(g_homed1 && g_homed2);
-        assert(g_arm2.usteps==-36990 && simStep2==120-36990 && g_arm1.usteps==-22577);
+        assert(g_arm2.usteps==-36650 && simStep2==120-36650 && g_arm1.usteps==-22400);
     }
     puts(t);return 0;
 }
 '''
 
-cases = ['boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
+cases = ['dual_'+n for n in ['home_reverse','home_stall','wrap','loss','gap','parity','hold','derate','follow_stop','peer_bad','peer_bad_reverse','final','limit','enable_bad']]
+cases += ['dual_snapshot_length','chain_frames','boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
          'missing_sensor','stuck_sensor','missing_npn','stalled_motor','reject_moving',
          'fault','limit','encoder_loss','jog_cancels','sensor_bounce']
 cases += ['startup_stiction','home_low_speed_tracking','home_following_stall','jog_slip_follow','jog_slip_stall','link_capabilities']
 cases += ['boot_tx_backlog','rejected_byte_status','operator_stop_reenable','operator_stop_after_protection','operator_stop_after_fault']
 cases += ['limits_'+n for n in ['configure','retry','invalid','busy','enabled']]
+cases += ['telem_rate','telem_rate_invalid','telem_stream','telem_skip','fault_snapshot']
 cases += ['rates_config','rates_jog','rates_home']
 cases += ['home_from_drawing','home_from_arm2_range','home_long_stop']
 cases += ['home_search_stop','home_search_heartbeat','home_search_limit','home_search_fault','home_release_time_limit']
@@ -1543,7 +1896,7 @@ ptp_cases += [f'ptp_uart_logged_{offset}' for offset in [0,499,1750]]
 ptp_cases += ['ptp_uart_paced','traj_uart_upload_paced','traj_uart_run_paced']
 ptp_cases += ['ptp_zero','ptp_axis1','ptp_axis2']
 ptp_cases += ['ptp_power_stable','ptp_fast_stall']
-ptp_cases += ['limits_ptp','limits_jog']
+ptp_cases += ['limits_ptp','limits_jog','limits_elbow','limits_elbow_traj','limits_elbow_jog']
 ptp_cases += ['rates_ptp','rates_traj','rates_live']
 ptp_cases += ['ptp_final_'+name for name in ['positive','negative','boundary','over_limit','following','counts']]
 ptp_cases += ['ptp_logged_retry']
@@ -1553,6 +1906,7 @@ ptp_cases += ['traj_'+name for name in ['success','dwell','duplicate','capacity'
     'upload_stop','upload_jog','upload_timeout','crc','ptp_busy','stop','fault','limit','home1','npn','encoder','timeout','overrun','uart_upload','uart_run']]
 ptp_cases += ['manual_'+name for name in ['success','duplicate','stop','old_epoch','disabled','moving','busy','upload','sensor','fault','encoder','timeout','stale','payload','crc']]
 ptp_cases += ['fuzz_%d' % n for n in range(1, 7)]   # the gate's share; long campaigns: --emit-c=DIR and run fuzz_<seed> in parallel
+ptp_cases += ['dual_manual_unknown','dual_ptp_follow','stop_latch']
 if host_plan is not None: ptp_cases += ['traj_host_plan','traj_manual_plan','traj_host_plan_offset','traj_host_plan_rx_retry']
 if len(sys.argv)>1:
     cases=[c for c in cases if c in sys.argv[1:]]
@@ -1585,7 +1939,7 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
         (emit_c/'check.c').write_text(pin_defs+'\n'+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
         print('wrote', emit_c/'check.c'); sys.exit(0)
     (tmp/'check.c').write_text(pin_defs+'\n'+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
-    (tmp/'build.cmd').write_text(f'@echo off\ncall "{vcvars}" >nul\ncl /nologo /TC /std:c11 /W3 /DPTP_COMMISSIONED=0 /I"{tmp}" "{tmp / "check.c"}" /Fe:"{tmp / "check.exe"}" /Fo:"{tmp / "check.obj"}"\n',encoding='utf-8')
+    (tmp/'build.cmd').write_text(f'@echo off\ncall "{vcvars}" >nul\ncl /nologo /TC /std:c11 /W3 /DPTP_COMMISSIONED=0 /DARM2_ENCODER_FEEDBACK=1 /I"{tmp}" "{tmp / "check.c"}" /Fe:"{tmp / "check.exe"}" /Fo:"{tmp / "check.obj"}"\n',encoding='utf-8')
     result=subprocess.run(['cmd','/c',str(tmp/'build.cmd')],cwd=tmp,capture_output=True,text=True,errors='replace')
     if result.returncode: raise RuntimeError(result.stdout+result.stderr)
     for case in cases:
@@ -1593,7 +1947,7 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
         assert result.returncode==0, f'{case}: {result.stdout}\n{result.stderr}'
         print('PASS',case)
     # Protocol regression profile uses artificial ranges only in the mock executable.
-    defines='/DPTP_COMMISSIONED=1 /DPTP_MIN1_CD=-6000 /DPTP_MAX1_CD=6000 /DPTP_MIN2_CD=-9000 /DPTP_MAX2_CD=9000'
+    defines='/DARM2_ENCODER_FEEDBACK=1 /DPTP_COMMISSIONED=1 /DPTP_MIN1_CD=-6000 /DPTP_MAX1_CD=6000 /DPTP_MIN2_CD=-9000 /DPTP_MAX2_CD=9000'
     (tmp/'build.cmd').write_text(f'@echo off\ncall "{vcvars}" >nul\ncl /nologo /TC /std:c11 /W3 {defines} /I"{tmp}" "{tmp / "check.c"}" /Fe:"{tmp / "check.exe"}" /Fo:"{tmp / "check.obj"}"\n',encoding='utf-8')
     result=subprocess.run(['cmd','/c',str(tmp/'build.cmd')],cwd=tmp,capture_output=True,text=True,errors='replace')
     if result.returncode: raise RuntimeError(result.stdout+result.stderr)
@@ -1602,12 +1956,13 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
         assert result.returncode==0, f'{case}: {result.stdout}\n{result.stderr}'
         fuzz_total('simulated-unlock',result.stdout)
         print('PASS simulated-unlock',case)
+    # Exercise the deliberately optional, absent arm2 encoder in the delivery profile.
     # Build the exact delivery defaults as a third profile, with no macro overrides.
     build = replace_once((tmp/'build.cmd').read_text(encoding='utf-8'), defines, '')
     (tmp/'build.cmd').write_text(build, encoding='utf-8')
     result=subprocess.run(['cmd','/c',str(tmp/'build.cmd')],cwd=tmp,capture_output=True,text=True,errors='replace')
     if result.returncode: raise RuntimeError(result.stdout+result.stderr)
-    for case in ptp_cases:
+    for case in ptp_cases + (["optional_arm2"] if len(sys.argv)==1 or host_plan is not None else []):
         result=subprocess.run([str(tmp/'check.exe'),case],cwd=tmp,capture_output=True,text=True,errors='replace',timeout=(120 if case.startswith('fuzz_') else 20))
         assert result.returncode==0, f'delivery {case}: {result.stdout}\n{result.stderr}'
         fuzz_total('delivery-default',result.stdout)
@@ -1617,4 +1972,4 @@ for profile, sums in fuzz_sums.items():
     for reason, count in sorted(fuzz_stops.get(profile, {}).items(), key=lambda kv: -kv[1]): print(f'  stop x{count}: {reason}')
     # a fuzz run that never reached a mode proves nothing about it
     if len(sys.argv)==1: assert all(v > 0 for v in sums.values()) and len(sums)==6, f'fuzz did not reach every mode: {sums}'
-print(f'{len(cases)+2*len(ptp_cases)} actual-C simulation cases passed; hardware validation still required.')
+print(f'{len(cases)+2*len(ptp_cases)+(1 if len(sys.argv)==1 or host_plan is not None else 0)} actual-C simulation cases passed; hardware validation still required.')
