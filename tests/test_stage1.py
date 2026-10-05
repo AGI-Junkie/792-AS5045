@@ -33,6 +33,7 @@ mock = r'''
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdarg.h>
 typedef uint8_t uint8; typedef uint16_t uint16; typedef uint32_t uint32;
 typedef int8_t int8; typedef int16_t int16; typedef int32_t int32; typedef int64_t int64;
 #define __attribute__(x)
@@ -83,6 +84,13 @@ static unsigned simDriverSwitches;
 static char simLog[1048576]; static unsigned simLogN;
 /* SysTick read cost: the coarse 1 us keeps busy-wait loops fast, but inside an SSI frame (CSn low) the firmware
  * busy-waits on it for ~115 us, so a read costs 0.25 us there and the frame lasts as long as the real one. */
+/* Inject target-library formatting cost; this is a scheduling stress model, not a measured printf profile. */
+static unsigned simFormatCostUs;
+static int mock_snprintf(char *dst,size_t size,const char *fmt,...) {
+    int n; va_list ap; va_start(ap,fmt);n=vsnprintf(dst,size,fmt,ap);va_end(ap);
+    simClock+=(uint64_t)simFormatCostUs*24u;sim_tick_sync();return n;
+}
+#define snprintf mock_snprintf
 static unsigned simRegCost=24;
 static uint32 mock_reg(uint32 reg) {
     simClock+=simRegCost;sim_tick_sync();
@@ -246,6 +254,7 @@ static void cycle(int heartbeat) {
     if(g_arm1.hasEnc)service_encoder();
     jog_tick();
     service_motion();
+    stage_status_service();
     txq_flush_blocking();
 }
 /* The real foreground loop for 2 s of simulated time. init=1 also runs the firmware's own axis set-up and banner;
@@ -679,7 +688,7 @@ static void ptp_test(const char *t) {
         assert(g_ptp.referenceSource==1u && g_ptp.encoderOrigin==g_enc.pos);
         ptp_send(1,epoch,-100,100,200,0);
         for(i=0;i<1000 && g_ptp.active;i++)cycle(1);
-        stage_status();txq_flush_blocking();
+        stage_status();for(i=0;i<100u && g_statusNext;i++)cycle(1);txq_flush_blocking();
         sprintf(expected,"p1=%ld p2=%ld e1=%ld err=%ld e2=%ld err2=%ld inputs=0 drops=0",
             (long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
             (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),(long)(cmd_lsb()-g_enc.pos),
@@ -1213,6 +1222,53 @@ static void fuzz_test(uint32 seed) {
 int main(int argc,char **argv) {
     const char *t=argv[1]; unsigned i, p1, p2;
     assert(argc==2);
+    if(!strcmp(t,"traj_status_cost")) {
+        uint64_t start; unsigned requested=0;
+        setup();g_enc2.directionKnown=1u;g_enc2.incDir=1u;
+        packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;txq_flush_blocking();
+        g_traj.state=3u;g_traj.count=2u;g_traj.index=1u;
+        g_traj.nodes[1].q1=-139;g_traj.nodes[1].q2=207;g_traj.nodes[1].ms=248;
+        g_ptp.active=1u;g_traj.elapsedCy=0;g_traj.clock=SU_NOW();g_ptp.lastStep=SU_NOW();traj_segment();
+        assert(g_ptp.total==785u); CyILO_Start1K();CyWdtStart(CYWDT_128_TICKS,CYWDT_LPMODE_NOCHANGE);start=simClock;
+        simFormatCostUs=2500u; /* 12 format calls in one burst cost about the observed 30 ms loop gap. */
+        while(g_motionEnabled && g_traj.index<g_traj.count && simClock-start<400000u*24u) {
+            if(!requested && simClock-start>=240000u*24u){requested=1;stage_status();}
+            if(g_jogMs-g_lastKeyMs>=35u)short_send(0,0);
+            app_poll();simClock+=24u;
+        }
+        if(!g_motionEnabled)fprintf(stderr,"status stress stop: %s\n",g_lastStop);
+        assert(requested && g_motionEnabled && g_traj.index==g_traj.count);
+        assert(simBoundaryChecks==1u && g_ptp.done==785u);
+        { unsigned long lag; const char *p; simLogN=0;simLog[0]=0;g_statusNext=9u;stage_status_line();txq_flush_blocking();
+          p=strstr(simLog,"traj_lag_max_us="); assert(p && sscanf(p,"traj_lag_max_us=%lu",&lag)==1 && lag==g_trajLagMaxCy/SU_CY_PER_US); }
+        printf("%s: 248 ms / 785 steps completed with injected formatting cost\n",t);return 0;
+    }
+    if(!strcmp(t,"hot_arith")) {
+        /* The 32-bit fast paths must equal the original 64-bit arithmetic, inside and outside their bounds. */
+        const uint32 totals[]={1u,2u,3u,785u,2000u,65535u,65536u,70000u};
+        const uint32 durations[]={24000u*50u,24000u*248u,24000u*249u+7u,24000u*500u};
+        unsigned a, ti, di; int32 v;
+        setup();
+        for(a=0;a<2;a++) {
+            int32 rev=a==0 ? MOTOR_FULLSTEPS_REV*USTEP_DIV*GEAR_RATIO : ARM2_MOTOR_FULLSTEPS_REV*USTEP_DIV*ARM2_GEAR_RATIO_X100/100;
+            g_ptp.origin[a]=0;
+            for(v=-150000;v<=150000;v+=(v>-70000 && v<70000)?1:97) {
+                int64 scaled=(int64)v*36000; int32 want=(int32)(scaled>=0 ? (scaled+rev/2)/rev : -((-scaled+rev/2)/rev));
+                assert(ptp_angle_from_counts((uint8)a,-v)==want);
+            }
+            for(v=-40000;v<=40000;v++) {
+                int64 n=(int64)v*rev; int32 want=(int32)(n>=0 ? (n+18000)/36000 : -((-n+18000)/36000));
+                assert(ptp_offset((uint8)a,v)==want);
+            }
+        }
+        for(ti=0;ti<sizeof(totals)/sizeof(totals[0]);ti++) for(di=0;di<sizeof(durations)/sizeof(durations[0]);di++) {
+            uint32 k;
+            for(k=1;k<=totals[ti];k+=(k<3000u || totals[ti]-k<3000u)?1u:61u)
+                assert(traj_due_cy(k,durations[di],totals[ti])==(uint32)((int64)k*durations[di]/totals[ti]));
+            assert(traj_due_cy(totals[ti],durations[di],totals[ti])==durations[di]); /* the last step is due exactly at the end */
+        }
+        puts(t);return 0;
+    }
     if(!strcmp(t,"stop_latch")) {
         const char *fill="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n";
         char saved[800];
@@ -1248,6 +1304,10 @@ int main(int argc,char **argv) {
         jog_home_all(); run_until(HOME_STRAIGHT_SETTLE,2);
         for(i=0;i<2000 && g_home.phase!=HOME_IDLE;i++)cycle(1);
         assert(g_motionEnabled && g_home.phase==HOME_IDLE && g_ptp.reference && !g_arm2.hasEnc && !g_enc2.directionKnown);
+        { /* arm2 feedback off: the closed loop reads board 1 only (18 clocks) and never touches the arm2 encoder state */
+          int32 pos2=g_enc2.pos; uint8 bad2=g_enc2.badStreak, primed2=g_enc2.primed;
+          simSsiBits=0; simClock+=24000u; assert(enc_sample() && simSsiBits==18);
+          assert(g_enc2.pos==pos2 && g_enc2.badStreak==bad2 && g_enc2.primed==primed2); }
         g_enc.directionKnown=1u; simBadEncoder=1;
         for(i=0;i<ENC_BAD_LIMIT;i++)service_encoder(); assert(!g_motionEnabled);
         puts(t);return 0;
@@ -1400,7 +1460,7 @@ int main(int argc,char **argv) {
         char proto[24]; simLogN=0; simLog[0]=0;
         stage_status(); txq_flush_blocking();
         sprintf(proto," proto=%u\r\n",(unsigned)PROTO_VERSION); /* with its end of line: the debug buffer must not cut the LINK line short */
-        assert(strstr(simLog,"STATE fw=stage2-v10 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
+        assert(strstr(simLog,"STATE fw=stage2-v11 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
         assert(strstr(simLog," short_hb=1") && strstr(simLog," joint_limits=1") && strstr(simLog," motion_rates=1") && strstr(simLog," rates_live=1") && strstr(simLog," q2_absolute=1"));
         assert(strstr(simLog," traj_repeat=1") && strstr(simLog," fault_snapshot=1") && strstr(simLog," telem_hz=0 proto="));
         puts(t);return 0;
@@ -1497,7 +1557,10 @@ int main(int argc,char **argv) {
                 while(g_jogMs<JOG_STATUS_MS)cycle(1);
                 txq_flush_blocking();simLogN=0;simLog[0]=0;
                 requested=wall_ms();sim_keys(0);packetType=8;
+                g_statusNext=8u;g_statusEpoch=g_ptp.epoch; /* previous running block has already published its old epoch */
                 seq=g_controlSequence+1;epoch=g_ptp.epoch;ptp_send(seq,epoch,0,0,0,0);
+                /* Drain the requested sliced block without waiting for the next periodic status. */
+                for(i=0;i<80u && g_statusNext;i++){simClock+=24000u;jog_update_time();stage_status_service();txq_flush_blocking();}
                 txq_flush_blocking();
                 assert(g_motionEnabled && g_home.phase!=HOME_IDLE && g_ptp.epoch==epoch+1);
                 assert(JOG_STATUS_MS>JOG_DEADMAN_MS && wall_ms()-requested<JOG_DEADMAN_MS);
@@ -1906,7 +1969,7 @@ ptp_cases += ['traj_'+name for name in ['success','dwell','duplicate','capacity'
     'upload_stop','upload_jog','upload_timeout','crc','ptp_busy','stop','fault','limit','home1','npn','encoder','timeout','overrun','uart_upload','uart_run']]
 ptp_cases += ['manual_'+name for name in ['success','duplicate','stop','old_epoch','disabled','moving','busy','upload','sensor','fault','encoder','timeout','stale','payload','crc']]
 ptp_cases += ['fuzz_%d' % n for n in range(1, 7)]   # the gate's share; long campaigns: --emit-c=DIR and run fuzz_<seed> in parallel
-ptp_cases += ['dual_manual_unknown','dual_ptp_follow','stop_latch']
+ptp_cases += ['dual_manual_unknown','dual_ptp_follow','stop_latch','traj_status_cost','hot_arith']
 if host_plan is not None: ptp_cases += ['traj_host_plan','traj_manual_plan','traj_host_plan_offset','traj_host_plan_rx_retry']
 if len(sys.argv)>1:
     cases=[c for c in cases if c in sys.argv[1:]]

@@ -1,3 +1,22 @@
+# v11-hotpath — 削减前台循环每圈/每步成本（针对 idx=40 轨迹超时）
+
+- 现象：19:13（v10）、19:42（v11）同一图形（shape=8，feed=136.6）都在 idx=40/158 触发 `trajectory timing overrun`，v11 的状态分片没有改变结果。该计划每段所需协调步频从 idx 36 的 2254 步/s 爬到 idx 41–42 的 3258 步/s；本机完成过的计划峰值最高 2486 步/s，峰值 2832 与 3258 的都中止。
+- 原因（读代码和汇编得出，未在板上测）：总线时钟只有 24 MHz，热路径里有多处 libgcc 64 位软件除法——`wall_ms()` 每圈 2 次、`ptp_service` 范围检查 4 次、轨迹到期时间 1–3 次、每个脉冲的 `joint_step_allowed` 约 4 次。另外默认配置仍读 38 拍双链（约 360 µs），比 3000+ 步/s 的步间隔还长，找不到空档，只能每 5 ms 强制读一次并顶掉一个步。
+- 改动（`stage2-v11-hotpath`；协议、`STATE fw=stage2-v11` 前缀、20 ms 门槛、`TRAJ_RATE_MAX`、脉冲宽度都不变）：
+  - `wall_ms`、`ptp_offset`、`ptp_angle_from_counts`、轨迹到期时间 `traj_due_cy`、`joint_step_allowed` 里的编码器角度换算、`enc_update` 的指令步数换算改用 32 位运算；超出 32 位范围时回落到原来的 64 位算法，结果逐值相同。
+  - arm2 反馈关闭（默认）时，`enc_sample` 只读 board 1 的 18 拍（约 170 µs），不再更新 `g_enc2`；`JOG_ENC_READ_US` 由 360 降为 200，读取可以塞进步与步之间。附带好处：`ENC_DIAG follow_peak_lsb / gap_max_ms / rejected` 不再被 arm2 未测量的“跟随误差”污染（v9/v10 review 第 2 项）。`ARM2_ENCODER_FEEDBACK=1` 时行为不变（仍 38 拍）。
+  - `TIMING` 行末尾新增 `traj_lag_max_us`：使能以来轨迹步进相对其到期时刻的最大滞后，ENABLE 清零。中止时它接近 20000；实测通过时它就是余量。
+- 验证：actual-C 闸门 389 例通过（基线 387 例；新增 `hot_arith`，把 `ptp_angle_from_counts` / `ptp_offset` / `traj_due_cy` 与 64 位原式在快路径边界内外逐值比较；`optional_arm2` 增加“默认配置只发 18 个 SSI 时钟、不碰 arm2 编码器状态”；`traj_status_cost` 检查 `traj_lag_max_us`）。`wall_ms` 新旧公式 250 万组随机输入对拍无差异。PSoC Creator 命令行构建通过（代码 35776 B、SRAM 19809 B；v11 为 35536 / 19793）。ARM 汇编里 `wall_ms`、`traj_service`、`jog_slot_free`、`joint_step_allowed` 已没有 64 位除法调用，保留的只在超范围回落分支里。
+- 估算（Cortex-M3 模拟器上用 libgcc 5.4.1 实测指令数，再按周期模型折算；不是板上测量）：一次 64 位除法约 140–170 周期（6–7 µs），新算法约 35–45 周期（1.5–2 µs）；热路径上除法相关开销，空转一圈约 56 µs → 11 µs，每个步进圈额外约 41 µs → 10 µs。
+- **未验证**：没有烧录。夹具只给寄存器读取计时，量不出 CPU 开销，也就量不出能否撑住 3258 步/s；需要实机复测，见 [STOP_DIAG.md](docs/STOP_DIAG.md) 的“v11-hotpath 复测”。
+
+# v11 — 将状态日志拆成前台调度片段
+
+- 19:13:33 实机快照确认在 idx=40/158 触发轨迹超时：248 ms 计划，268.068 ms 实际计时，755/785 次协同步进完成。
+- 修复运动时整块状态格式化占用前台循环的调度问题：每次只生成一条状态行，间隔至少 5 ms，步进已到期时让路；停止仍立即输出锁存证据。
+- TIMING 增加 status_max_us，保留 20 ms 超时、心跳、限位、编码器保护和 arm2 反馈默认关闭。
+- 实际 C 回归注入每条格式化 2.5 ms：原实现在 248 ms / 785 次步进的段上超时，分片实现完成。注入耗时为压力模型，真实硬件是否完全修复需烧录复测。
+
 # v10 — 锁存图形中断证据
 
 - 停机快照增加当前轨迹段的计划/实际耗时、超时量和协调步数。停止后优先重复 LAST_STOP，即使首次 TX 丢弃也可恢复；后续总停止不覆盖原故障。
