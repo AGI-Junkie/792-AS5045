@@ -1,5 +1,5 @@
 /* ========================================================================
- * AS5045 + DRV8825: two-joint arm firmware (stage2-v8)
+ * AS5045 + DRV8825: two-joint arm firmware (stage2-v11, see FW_BUILD_ID)
  * Target: CY8CKIT-059 (PSoC 5LP) @ 24 MHz BUS_CLK, GPIO + UDB host UART.
  *
  * MECHANICS: arm1 = 42 mm 1.8 deg stepper on DRV2 / stepper2 behind a 40:1
@@ -48,7 +48,9 @@
 
 /* Physical directions confirmed on the bench: left DIR=0 for both axes.
  * Encoder polarity is learned only during manually requested homing.
- * This stage requires both motor encoders; there is no automatic fallback. */
+ * arm1 always needs its motor encoder.  arm2's is optional: with ARM2_ENCODER_FEEDBACK=0 (the delivery default)
+ * arm2 runs on commanded steps without feedback; with 1 both encoders are required.  Either way a lost encoder
+ * that is required stops the machine; there is no automatic open-loop fallback. */
 #define ARM2_LEFT_DIR_LEVEL         (0u)
 #define ARM1_LEFT_DIR_LEVEL         (0u)
 
@@ -69,14 +71,14 @@
 #define PTP_EPOCH_ANNOUNCE_MS       (250u)  /* re-announce a changed reference epoch this often */
 
 /* Identifies this exact firmware build in every LINK line and in the boot banner.
- * The STATE line keeps the plain "stage2-v7" token because the host matches it to
- * select the framed transport.  Bump this on every firmware change so a field log
+ * The STATE line keeps the plain "stage2-v11" token because the host matches it to
+ * select the framed transport (StatePattern in App.cs).  Bump this on every firmware change so a field log
  * can answer "was this fix actually flashed?". */
 #ifndef ARM2_ENCODER_FEEDBACK
 #define ARM2_ENCODER_FEEDBACK       (0u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-hotpath"
+#define FW_BUILD_ID                 "stage2-v11-hotpath2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -403,13 +405,6 @@ static int32 out_deg10_to_lsb(int32 deg10)
     return (int32)(((int64)deg10 * ENCODER_CPR * GEAR_RATIO) / 3600);
 }
 
-/* Motor-side encoder LSB -> output-shaft degrees, hundredths. */
-static int32 lsb_to_out_deg100(int32 lsb) __attribute__((unused));
-static int32 lsb_to_out_deg100(int32 lsb)
-{
-    return (int32)(((int64)lsb * 36000) / ((int64)ENCODER_CPR * GEAR_RATIO));
-}
-
 /* snprintf has no float support here; print signed fixed point by parts. */
 #define DEG_SGN(v)   (((v) < 0) ? "-" : "")
 #define DEG_INT(v)   ((long)(abs_i32(v) / 100))
@@ -697,10 +692,21 @@ static uint8 enc_set_origin(void)
     uint32 raw[2];
     as5045_t sample;
     for(i=0u;i<12u;i++) {
-        as5045_read_chain(&raw[0],&raw[1]);
+        uint8 attempt, good=0u;
+        /* ENABLE already blocks for these 12 ms, so one bad frame gets the same retries enc_sample() allows (1 ms apart)
+         * instead of refusing the whole enable. */
+        for(attempt=0u;attempt<ENCODER_READ_RETRIES && !good;attempt++) {
+            if(attempt) { g_encRetries++; CyDelay(1u); }
+            as5045_read_clocks(&raw[0],&raw[1],ARM2_ENCODER_FEEDBACK ? 38u : 18u);
+            good=1u;
+            for(axis=0u;axis<(ARM2_ENCODER_FEEDBACK ? 2u : 1u);axis++) {
+                as5045_decode(&sample,raw[axis]);
+                if(!encoder_state_valid(classify(&sample))) { good=0u; }
+            }
+        }
+        if(!good) { return 0u; }
         for(axis=0u;axis<(ARM2_ENCODER_FEEDBACK ? 2u : 1u);axis++) {
             as5045_decode(&sample,raw[axis]);
-            if(!encoder_state_valid(classify(&sample))) { return 0u; }
             if(!i) { reference[axis]=sample.angle; }
             sum[axis]+=angle_delta(sample.angle,reference[axis]);
         }
@@ -2174,8 +2180,8 @@ static uint8 home_set_zero(jog_axis_t *a)
         /* Preserve the latest reading relative to the averaged origin. */
         e->pos = angle_delta(e->lastAngle, mean);
         cmd_reset_axis(e);
-        JLOGF("HOME arm1 averaged origin: samples=%u raw=%u lsb (motor single-turn)\r\n",
-              (unsigned)g_home.zeroSamples, (unsigned)mean);
+        JLOGF("HOME %s averaged origin: samples=%u raw=%u lsb (motor single-turn)\r\n",
+              a->name, (unsigned)g_home.zeroSamples, (unsigned)mean);
     }
     a->usteps = 0;
     a->holding = 0u;
@@ -2449,8 +2455,8 @@ static void stage_status_line(void)
     case 6u:
     traj_status(); break;
     case 7u:
-    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=1 traj_repeat=1 fault_snapshot=1 telem_hz=%u proto=%u\r\n",
-          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)g_telemHz, (unsigned)PROTO_VERSION); break;
+    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=%u traj_repeat=1 fault_snapshot=1 telem_hz=%u proto=%u\r\n",
+          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)ARM2_ENCODER_FEEDBACK, (unsigned)g_telemHz, (unsigned)PROTO_VERSION); break;
     case 8u:
     JLOGF("PTP_RX short_ok=%lu drop_crc=%lu drop_short=%lu drop_timeout=%lu rejected=%lu epoch_rejected=%lu last_rejected_byte=0x%02X\r\n",
           (unsigned long)g_shortRxOk, (unsigned long)g_ptpRxCrc, (unsigned long)g_ptpRxShort, (unsigned long)g_ptpRxTimeout,
@@ -2651,7 +2657,9 @@ static void jog_axis_tick(jog_axis_t *a)
 
     /* Calibrated jog shares the PTP bounds and per-step guard. Before a straight
      * reference exists, retain the old encoder-relative jog guard. */
-    if (e->directionKnown && (a==&g_arm1 ? g_homed1 : g_homed2) && want!=0)
+    /* Without arm2 feedback g_enc2 never learns a direction; arm2's calibrated zero then hangs on the same
+     * arm1 polarity that joint_step_allowed() itself checks. */
+    if (((a==&g_arm2 && !ARM2_ENCODER_FEEDBACK) ? g_directionKnown : e->directionKnown) && (a==&g_arm1 ? g_homed1 : g_homed2) && want!=0)
     {
         if(!joint_step_allowed(a,want)) {
             if(!a->limitHit) { JLOGF("%s: configured joint limit, %s refused\r\n",a->name,jog_dir_name(want)); }
@@ -3004,7 +3012,7 @@ static void jog_rx_service(void)
                g_home.phase==HOME_IDLE && g_motionEnabled && g_ptp.reference &&
                g_homed1 && g_homed2 && dual_ready() && !g_jogFaulted && !g_limitStop &&
                host_input_idle() && axes_idle() && !g_arm1.holding && !g_arm2.holding &&
-               dual_ready() && abs_i32(cmd_lsb()-g_enc.pos)<SLIP_FAIL_LSB && (!ARM2_ENCODER_FEEDBACK || abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)<SLIP_FAIL_LSB) &&
+               abs_i32(cmd_lsb()-g_enc.pos)<SLIP_FAIL_LSB && (!ARM2_ENCODER_FEEDBACK || abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)<SLIP_FAIL_LSB) &&
                motion_inputs_clear() && home_inputs_clear() &&
                ptp_counts_in_range(0u,g_arm1.usteps) && ptp_counts_in_range(1u,g_arm2.usteps)) {
                 g_uploadRxQuarantine=1u; g_ptpRx.active=2u; g_ptpRx.count=0u;

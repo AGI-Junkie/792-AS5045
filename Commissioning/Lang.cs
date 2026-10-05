@@ -709,7 +709,7 @@ internal static class Lang
         ["exp.finishedPrefix.aborted"] = ("实验中止", "Experiment aborted"),
         ["exp.complete"] = ("完成", "complete"),
         ["exp.aborted"] = ("中止", "aborted"),
-        ["exp.rmse"] = ("RMSE {0:F4}°\n", "RMSE {0:F4}°\n"),
+        ["exp.rmse"] = ("RMSE {0:F4}°", "RMSE {0:F4}°"),
         ["exp.noMotion"] = ("无有效运动样本\n", "No valid motion samples\n"),
         ["exp.savedNote"] = ("已保存可用反馈和摘要；笔尖误差未实测。",
             "Available feedback and summary saved; tip error not measured."),

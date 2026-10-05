@@ -37,7 +37,7 @@
 
 ## v11-hotpath 复测
 
-固件 `stage2-v11-hotpath`，上位机不变。烧录后确认 LINK 显示 `fw=stage2-v11-hotpath`。
+固件 `stage2-v11-hotpath2`（hotpath 加审查修补，见 CHANGELOG），上位机用同目录的 host。烧录后确认 LINK 显示 `fw=stage2-v11-hotpath2`。
 
 1. 原图、原速度（feed=136.6，峰值 3258 步/s）执行三遍；每次开始前按界面完成使能、回零/人工伸直确认、移到起点、上传、执行。
 2. 运行结束（成功或中止）后保持连接至少 2 秒，在日志里找 `TIMING ... traj_lag_max_us=`：它是使能以来步进相对计划到期时刻的最大滞后（微秒）。几百 µs 以内算有余量；中止时它接近 20000。

@@ -1,4 +1,18 @@
-# v11-hotpath — 削减前台循环每圈/每步成本（针对 idx=40 轨迹超时）
+# 变更记录
+
+最新在前。每条写“改了什么、验证到哪一步”；“未烧录”指固件镜像没有下载到板子上。
+
+## 2026-10-05 — v11-hotpath2 — 审查遗留问题修补（固件 + 上位机）
+
+- 固件 `stage2-v11-hotpath2`（`STATE fw=stage2-v11` 前缀、proto=4 不变）。v9/v10 审查里发现的问题逐条核对，仍在的修掉：
+  - arm2 反馈关闭（默认）时，arm2 点动到关节/肘边界不再静默空转：`jog_axis_tick` 对 arm2 改用 arm1 的方向识别（`joint_step_allowed` 本来就看它），会报 “configured joint limit” 且不起步。此前 `g_enc2.directionKnown` 在默认配置下永远不置位，限位分支进不去。
+  - `enc_set_origin`（ENABLE 时 12 次平均）恢复每个样本最多 `ENCODER_READ_RETRIES` 次重试（间隔 1 ms，同 v8 之前）；v8 起一次坏帧就拒绝使能。默认配置下也只读 18 拍。
+  - `LINK dual_encoder=` 跟随 `ARM2_ENCODER_FEEDBACK`（默认 0）；上位机“轨迹完成”日志在 arm2 无反馈时不再写“两路编码器”；实验摘要里 arm2 RMSE 不再拼出断行（仅 arm2 反馈开启时出现）；`pre_fault.csv` 的 `slip2_motor_lsb` 挪到最后一列，与 `feedback.csv` 一致、其余列顺序回到 v8 之前（v8–v11 已保存的 `pre_fault.csv` 仍是旧列序）。
+  - 清理：固件里只有测试用的 `lsb_to_out_deg100` 移进测试夹具；`home_set_zero` 日志写实际轴名；`jog_rx_service` 条件里重复的 `dual_ready()`；文件头注释与版本说明按默认配置重写；README / STATE_MODEL / PROTOCOL 里按双编码器写的步骤和说明改成默认配置的实际行为（`ARM2_ENCODER_FEEDBACK=1` 另注）。
+- 补记 v8 起未写进变更记录的行为变化：运行中 `enc_sample` 的重试之间不再 `CyDelay(1)`（主循环不阻塞，坏帧时不再有 1–2 ms 的步进停顿）；点动起步 / 停稳遇到单次坏帧会 `stage_stop`（原先忽略这次读取，更保守）。
+- 验证：actual-C 闸门 520 例通过（此前 389；新增 `jog_arm2_limit`、`origin_retry`，把对应修复去掉后这两个用例都会失败；基础用例同时在 `ARM2_ENCODER_FEEDBACK=0` 下再跑一遍，排除只描述双编码器行为的 `dual_*`；`control_home_epoch_ack` 里粘错位置、让 `=0` 下不再检查 `PTP_STATE` 的断言已删）。上位机 `--self-test`、`--language-self-test` 通过。**未烧录**。
+
+## 2026-10-05 — v11-hotpath — 削减前台循环每圈/每步成本（针对 idx=40 轨迹超时）
 
 - 现象：19:13（v10）、19:42（v11）同一图形（shape=8，feed=136.6）都在 idx=40/158 触发 `trajectory timing overrun`，v11 的状态分片没有改变结果。该计划每段所需协调步频从 idx 36 的 2254 步/s 爬到 idx 41–42 的 3258 步/s；本机完成过的计划峰值最高 2486 步/s，峰值 2832 与 3258 的都中止。
 - 原因（读代码和汇编得出，未在板上测）：总线时钟只有 24 MHz，热路径里有多处 libgcc 64 位软件除法——`wall_ms()` 每圈 2 次、`ptp_service` 范围检查 4 次、轨迹到期时间 1–3 次、每个脉冲的 `joint_step_allowed` 约 4 次。另外默认配置仍读 38 拍双链（约 360 µs），比 3000+ 步/s 的步间隔还长，找不到空档，只能每 5 ms 强制读一次并顶掉一个步。
@@ -10,26 +24,24 @@
 - 估算（Cortex-M3 模拟器上用 libgcc 5.4.1 实测指令数，再按周期模型折算；不是板上测量）：一次 64 位除法约 140–170 周期（6–7 µs），新算法约 35–45 周期（1.5–2 µs）；热路径上除法相关开销，空转一圈约 56 µs → 11 µs，每个步进圈额外约 41 µs → 10 µs。
 - **未验证**：没有烧录。夹具只给寄存器读取计时，量不出 CPU 开销，也就量不出能否撑住 3258 步/s；需要实机复测，见 [STOP_DIAG.md](docs/STOP_DIAG.md) 的“v11-hotpath 复测”。
 
-# v11 — 将状态日志拆成前台调度片段
+## 2026-10-05 — v11 — 将状态日志拆成前台调度片段
 
 - 19:13:33 实机快照确认在 idx=40/158 触发轨迹超时：248 ms 计划，268.068 ms 实际计时，755/785 次协同步进完成。
 - 修复运动时整块状态格式化占用前台循环的调度问题：每次只生成一条状态行，间隔至少 5 ms，步进已到期时让路；停止仍立即输出锁存证据。
 - TIMING 增加 status_max_us，保留 20 ms 超时、心跳、限位、编码器保护和 arm2 反馈默认关闭。
 - 实际 C 回归注入每条格式化 2.5 ms：原实现在 248 ms / 785 次步进的段上超时，分片实现完成。注入耗时为压力模型，真实硬件是否完全修复需烧录复测。
 
-# v10 — 锁存图形中断证据
+## 2026-10-05 — v10 — 锁存图形中断证据
 
 - 停机快照增加当前轨迹段的计划/实际耗时、超时量和协调步数。停止后优先重复 LAST_STOP，即使首次 TX 丢弃也可恢复；后续总停止不覆盖原故障。
 - 上位机去重保存恢复的快照，日志分析工具识别锁存记录。协议仍为 proto=4，arm2 反馈仍默认关闭；20 ms 门槛和停机行为保持原样。
 - 复现步骤与字段说明见 docs/STOP_DIAG.md；构建不烧录、不连接或驱动硬件。
 
-# v9 — arm2 编码器暂时可选
+## 2026-10-05 — v9 — arm2 编码器暂时可选
 
 - 默认关闭 arm2 编码器反馈要求，保留 arm1 反馈与既有保护；无 arm2 反馈时使用指令计数。
 - 人工伸直确认不再被 arm2 方向未识别拦住。
 - proto=4 用 arm2fb 报告模式，缺测字段不生成虚假零值；固定编码器后可重新启用双轴反馈构建。
-
-# 变更记录
 
 ## 2026-10-05 — arm2 feedback parity
 
@@ -37,9 +49,6 @@
 - Both encoders qualify enable/home/PTP/trajectory and final acceptance. Telemetry and fault snapshots now include `e2/err2`; host shows/records/replays measured q2 = measured q1 + measured elbow, with q2 error/RMSE/peak. Older archives retain their original measurement gaps.
 - SSI masks interrupts per bit, permitting UART RX between bits. Current 126°/161.5° calibration parameters retained and regression expectations aligned. Arm2 manual reference requires polarity learned during homing after enable.
 - Software validation and matching artifacts are produced by `build-release.ps1`; no flashing or physical motion. Continuous trajectory correction, physical calibration, real timing and precision acceptance remain: see [arm2 feedback](docs/ARM2_FEEDBACK.md).
-
-
-最新在前。每条写“改了什么、验证到哪一步”；“未烧录”指固件镜像没有下载到板子上。
 
 ## 2026-10-02（修复）：流式遥测的序号领先 `PTP_STATE` 时，上位机误报“设备反馈无效”并在上传刚开始时自己发 STOP（上位机；固件不变）
 

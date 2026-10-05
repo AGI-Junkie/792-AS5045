@@ -1,4 +1,4 @@
-# 上位机 ↔ 固件 通信协议（stage2-v11-hotpath，proto=4）
+# 上位机 ↔ 固件 通信协议（stage2-v11-hotpath2，proto=4）
 
 本页只写当前源码里**已经存在**的行为，均已对照 `DRV8825.cydsn/main.c` 与 `Commissioning/` 核对；有出入以源码为准。设计过程和现场日志分析见 `docs/history/WORKBENCH_HARDENING.md`。状态机见 [STATE_MODEL.md](STATE_MODEL.md)。
 
@@ -64,7 +64,7 @@
 | 行 | 内容 |
 |---|---|
 | `STATE fw=stage2-v11 enabled home homed1 homed2 fault enc dir enc2 dir2 arm2fb` | `fw=stage2-v11` 用于选择“帧控制”；`enc/dir` 与 `enc2/dir2` 分别报告两路有效性与方向已识别；`home`：0 待机、1 释放、2 额外退开、3 快碰、4 慢碰、5 零点稳定、6 伸直、7 伸直稳定。`homed1=1` 可能只表示 arm1 已置零，整个流程要看两轴且 `home=0` |
-| `LINK uart=hw baud=115200 rx_overflow rx_error tx_dropped fw=<构建号> short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=1 traj_repeat=1 fault_snapshot=1 telem_hz=<n> proto=<n>` | 能力声明。上位机要求 `proto=` 等于自己的协议版本才解锁运动（见第 6 节）；`rates_live=1` 表示已使能且静止时也接受 type 10。计数器自上电起累计，判断“本次是否新增”要看日志内的增量。整行约 230 个字符，固件调试缓冲区 `g_dbg` 为 512 字节（双轴快照可能超过 320）；缓冲区太短会把行尾的 `proto=` 连同换行截掉，`link_capabilities` 测试检查行尾 |
+| `LINK uart=hw baud=115200 rx_overflow rx_error tx_dropped fw=<构建号> short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=<0|1> traj_repeat=1 fault_snapshot=1 telem_hz=<n> proto=<n>` | 能力声明。上位机要求 `proto=` 等于自己的协议版本才解锁运动（见第 6 节）；`rates_live=1` 表示已使能且静止时也接受 type 10；`dual_encoder` 等于 `ARM2_ENCODER_FEEDBACK`：1 表示本构建要求并读取 arm2 编码器，交付默认为 0。计数器自上电起累计，判断“本次是否新增”要看日志内的增量。整行约 230 个字符，固件调试缓冲区 `g_dbg` 为 512 字节（双轴快照可能超过 320）；缓冲区太短会把行尾的 `proto=` 连同换行截掉，`link_capabilities` 测试检查行尾 |
 | `PTP_STATE lock ref active epoch seq min1 max1 min2 max2 emin emax` | 执行锁、参考、运动阶段、代次、序号、固件里的关节范围；`emin/emax` 是肘范围（0.01°，开机默认 ∓15500）。**缺这两项的行上位机一律不接受**（旧固件不能证明肘范围） |
 | `TRAJ_STATE state count total index seq epoch` | 轨迹缓存状态（0 空、1 上传、2 就绪、3 运行、4 完成） |
 | `TIMING loop_max_ms tick_lag_max_ms clock wdt key_age_ms key_max_gap_ms status_max_us traj_lag_max_us` | `key_max_gap_ms`：使能以来运动许可有效期间最长的一次心跳间隔，ENABLE 清零；`traj_lag_max_us`：使能以来轨迹步进相对其到期时刻的最大滞后（微秒），ENABLE 清零；它逼近一整段时长加 20 ms 就会触发“trajectory timing overrun” |
@@ -82,7 +82,7 @@
 
 ## 6. 版本与兼容
 
-- 固件标识 `FW_BUILD_ID`（现为 `stage2-v11-hotpath`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。行为不变的结构性重构（例如 2026-09-30 的循环拆分）没有改它，靠 `firmware.hex` 的 SHA-256 区分。
+- 固件标识 `FW_BUILD_ID`（现为 `stage2-v11-hotpath2`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。行为不变的结构性重构（例如 2026-09-30 的循环拆分）没有改它，靠 `firmware.hex` 的 SHA-256 区分。
 - **proto=2（肘范围）**：type 9 新增轴 2（肘），`PTP_STATE` 末尾新增 `emin=<cd> emax=<cd>`，并把肘范围纳入 PTP/轨迹/点动的校验。固件开机默认 ∓155°（`PTP_ELBOW_DEFAULT_CD`，与 `DeviceContract.ElbowDefaultCd` 同值、由发布闸门核对）：这是暂定值，不是实测机械行程。上位机连接后把界面里的肘范围同步给固件，和 q1/q2 范围一样，确认一致才允许运动；proto=1 的固件会被拒绝运动并提示更新。
 - **能力位（不改 proto）**：`traj_repeat=1` 已运行过的已缓存图形接受再次 RUN，没有它的固件第二次 RUN 会被拒绝并停止，上位机据此在运行一次后要求重新上传；`fault_snapshot=1` 每次停止先打印 `FAULT_SNAPSHOT`；`telem_hz=<n>` 出现表示支持 type 11，值是当前速率。上位机对没声明的固件不发 type 11、不指望快照。
 - **proto=3（双编码器历史版本）**：STATE 新增 enc2/dir2；TELEM 与 FAULT_SNAPSHOT 新增 e2/err2；同次 SSI 读取更新两路，任一路失效都会保护停机。人工参考要求 arm2 方向已由本次使能后的回零识别。

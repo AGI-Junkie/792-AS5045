@@ -585,7 +585,7 @@ public sealed partial class ControlWindow : Window
             lastTrajectoryAt = DateTime.UtcNow; trajectoryIndex = (int)values[3]; trajectoryTotal = (int)total - 1;
             if (mode == 4) {
                 // The device keeps the nodes after a run (state 4): hold the plan so 执行图形 can repeat it.
-                executing = false; experimentCompleting = "complete"; uploaded = supportsTrajRepeat ? runPlan : null; uploadedRan = uploaded is not null; trajectoryRanOnce = true; Append("HOST trajectory complete; firmware checks passed for both motor encoders");
+                executing = false; experimentCompleting = "complete"; uploaded = supportsTrajRepeat ? runPlan : null; uploadedRan = uploaded is not null; trajectoryRanOnce = true; Append(arm2FeedbackEnabled ? "HOST trajectory complete; firmware checks passed for both motor encoders" : "HOST trajectory complete; firmware checks passed for the arm1 motor encoder (arm2 has no feedback)");
                 // A firmware that does not declare traj_repeat=1 refuses a second RUN of the plan it holds (and stops): upload again instead.
                 if (!supportsTrajRepeat) Append("HOST this firmware cannot repeat a held plan (its LINK line has no traj_repeat=1); upload the plan again to draw it again");
             }

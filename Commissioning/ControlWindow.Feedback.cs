@@ -82,7 +82,7 @@ public sealed partial class ControlWindow
         if (recorder is null) return;
         recorder.Finish(outcome); RecordExperimentOutcome(outcome, recorder);
         Lang.Text(experimentResult, () => Lang.T("exp.finished", outcome=="complete"?Lang.T("exp.complete"):Lang.T("exp.aborted"), recorder.Samples) +
-            (recorder.MotionSamples>0?Lang.T("exp.rmse", recorder.Rmse) + (recorder.MotionSamples2>0 ? Lang.T("exp.rmse2", recorder.Rmse2) : ""):Lang.T("exp.noMotion")) +
+            (recorder.MotionSamples>0?Lang.T("exp.rmse", recorder.Rmse) + (recorder.MotionSamples2>0 ? Lang.T("exp.rmse2", recorder.Rmse2) : "") + "\n":Lang.T("exp.noMotion")) +
             Lang.T("exp.savedNote"));
         diagnostics.IsExpanded = true;
         Append("HOST experiment " + outcome + ": " + recorder.DirectoryPath);
