@@ -85,7 +85,7 @@ public sealed partial class ControlWindow
             if (leaseGap > SlowLeaseLogMs) sessionSlowLeases++;
             if (leaseGap > SlowLeaseLogMs && Stopwatch.GetElapsedTime(lastLeaseLogAt, now).TotalMilliseconds >= SlowLeaseLogPeriodMs) {
                 lastLeaseLogAt = now;
-                Append($"HOST UI lease gap max={worstLeaseGap:F0} ms");
+                Append($"HOST UI lease gap max={worstLeaseGap:F0} ms", LogLevel.Warning);
                 worstLeaseGap = 0;
             }
         }
@@ -95,7 +95,7 @@ public sealed partial class ControlWindow
         lock (wireSync) { Volatile.Write(ref leaseEpoch, framedControl && !stopPending ? reportedEpoch : 0u); }
         Volatile.Write(ref leasePublishedAt, now);
         double gap = Interlocked.Exchange(ref pendingHeartbeatGap, 0);
-        if (gap > 0) Append($"HOST control heartbeat gap={gap:F0} ms");
+        if (gap > 0) Append($"HOST control heartbeat gap={gap:F0} ms", LogLevel.Warning);
     }
 
     // Asks the writer for a heartbeat now: used when a key is released, when the

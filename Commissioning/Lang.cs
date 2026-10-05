@@ -187,6 +187,13 @@ internal static class Lang
 
         // tabs / sections
         ["tab.feedback"] = ("实时反馈与实验", "Live Feedback & Experiments"),
+        ["log.level"] = ("最低日志级别", "Minimum log level"),
+        ["log.level.tip"] = ("只筛选界面；原始文件完整保存。切换级别可查看最近 1000 行。", "Filters the display only; raw files remain complete. Switching levels shows the latest 1000 lines."),
+        ["log.Trace"] = ("Trace · 遥测", "Trace · Telemetry"),
+        ["log.Debug"] = ("Debug · 诊断", "Debug · Diagnostics"),
+        ["log.Info"] = ("Info · 事件", "Info · Events"),
+        ["log.Warning"] = ("Warning · 警告", "Warning · Warnings"),
+        ["log.Error"] = ("Error · 停机/错误", "Error · Stops/errors"),
         ["tab.log"] = ("原始日志", "Raw Log"),
         ["tab.log.tip"] = ("日志可选中文字，用 Ctrl+C 复制。", "Select text in the log and copy with Ctrl+C."),
         ["diag.header"] = ("实时反馈与实验 / 原始日志", "Live Feedback & Experiments / Raw Log"),
@@ -709,7 +716,7 @@ internal static class Lang
         ["exp.finishedPrefix.aborted"] = ("实验中止", "Experiment aborted"),
         ["exp.complete"] = ("完成", "complete"),
         ["exp.aborted"] = ("中止", "aborted"),
-        ["exp.rmse"] = ("RMSE {0:F4}°\n", "RMSE {0:F4}°\n"),
+        ["exp.rmse"] = ("RMSE {0:F4}°", "RMSE {0:F4}°"),
         ["exp.noMotion"] = ("无有效运动样本\n", "No valid motion samples\n"),
         ["exp.savedNote"] = ("已保存可用反馈和摘要；笔尖误差未实测。",
             "Available feedback and summary saved; tip error not measured."),

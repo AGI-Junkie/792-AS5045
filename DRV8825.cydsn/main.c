@@ -1,5 +1,5 @@
 /* ========================================================================
- * AS5045 + DRV8825: two-joint arm firmware (stage2-v8)
+ * AS5045 + DRV8825: two-joint arm firmware (stage2-v11, see FW_BUILD_ID)
  * Target: CY8CKIT-059 (PSoC 5LP) @ 24 MHz BUS_CLK, GPIO + UDB host UART.
  *
  * MECHANICS: arm1 = 42 mm 1.8 deg stepper on DRV2 / stepper2 behind a 40:1
@@ -48,7 +48,9 @@
 
 /* Physical directions confirmed on the bench: left DIR=0 for both axes.
  * Encoder polarity is learned only during manually requested homing.
- * This stage requires both motor encoders; there is no automatic fallback. */
+ * arm1 always needs its motor encoder.  arm2's is optional: with ARM2_ENCODER_FEEDBACK=0 (the delivery default)
+ * arm2 runs on commanded steps without feedback; with 1 both encoders are required.  Either way a lost encoder
+ * that is required stops the machine; there is no automatic open-loop fallback. */
 #define ARM2_LEFT_DIR_LEVEL         (0u)
 #define ARM1_LEFT_DIR_LEVEL         (0u)
 
@@ -69,14 +71,14 @@
 #define PTP_EPOCH_ANNOUNCE_MS       (250u)  /* re-announce a changed reference epoch this often */
 
 /* Identifies this exact firmware build in every LINK line and in the boot banner.
- * The STATE line keeps the plain "stage2-v7" token because the host matches it to
- * select the framed transport.  Bump this on every firmware change so a field log
+ * The STATE line keeps the plain "stage2-v11" token because the host matches it to
+ * select the framed transport (StatePattern in App.cs).  Bump this on every firmware change so a field log
  * can answer "was this fix actually flashed?". */
 #ifndef ARM2_ENCODER_FEEDBACK
 #define ARM2_ENCODER_FEEDBACK       (0u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v10-stop-latch"
+#define FW_BUILD_ID                 "stage2-v11-hotpath2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -309,6 +311,11 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
  * timing. The ISR only counts wraps; foreground stalls do not slow deadlines. */
 static volatile uint32 g_clockWraps;
 CY_ISR(clock_wrap_isr) { g_clockWraps++; }
+/* floor((wraps * 2^24 + elapsed cycles) / 24000) in 32-bit arithmetic: the 64-bit divide it replaces was a libgcc
+ * call (several us at 24 MHz) made twice on every pass of the main loop.  2^24 = 699 * 24000 + 1216 and
+ * 1216 / 24000 = 19 / 375, so with wraps = 375 * k + r the quotient is 699 * wraps + 19 * k + (1216 * r + x) / 24000.
+ * Every term is exact modulo 2^32, which is also how the 64-bit result was truncated. */
+_Static_assert(BCLK__BUS_CLK__HZ == 24000000u, "wall_ms is written for the 24 MHz bus clock");
 static uint32 wall_ms(void)
 {
     uint32 wraps, current;
@@ -321,8 +328,7 @@ static uint32 wall_ms(void)
         current = SU_NOW();
     }
     CyExitCriticalSection(ints);
-    return (uint32)((((uint64_t)wraps << 24) + (0x00FFFFFFu-current)) /
-                    (BCLK__BUS_CLK__HZ / 1000u));
+    return wraps * 699u + (wraps / 375u) * 19u + ((wraps % 375u) * 1216u + (0x00FFFFFFu - current)) / 24000u;
 }
 
 static void su_timer_start(void)
@@ -399,13 +405,6 @@ static int32 out_deg10_to_lsb(int32 deg10)
     return (int32)(((int64)deg10 * ENCODER_CPR * GEAR_RATIO) / 3600);
 }
 
-/* Motor-side encoder LSB -> output-shaft degrees, hundredths. */
-static int32 lsb_to_out_deg100(int32 lsb) __attribute__((unused));
-static int32 lsb_to_out_deg100(int32 lsb)
-{
-    return (int32)(((int64)lsb * 36000) / ((int64)ENCODER_CPR * GEAR_RATIO));
-}
-
 /* snprintf has no float support here; print signed fixed point by parts. */
 #define DEG_SGN(v)   (((v) < 0) ? "-" : "")
 #define DEG_INT(v)   ((long)(abs_i32(v) / 100))
@@ -462,10 +461,12 @@ static uint32 as5045_read_raw(void)
     return (value & FRAME_MASK);
 }
 
-/* Daisy chain diagnostic: 2 x 19 clocks (18 data + 1 dummy per device).
- * Board 1 (wired to the MCU) comes first, board 2 second. Not used by the
- * closed loop; that still reads 18 bits from board 1 only. */
-static void as5045_read_chain(uint32 *first, uint32 *second)
+/* Daisy chain: 2 x 19 clocks (18 data + 1 dummy per device).  Board 1 (wired to
+ * the MCU) comes first, board 2 second.  With `clocks` = 18 only board 1 is read
+ * and *second is 0: that is all the closed loop needs while arm2 has no encoder
+ * feedback, and it is less than half the time (about 170 us instead of 360 us),
+ * short enough to fit between two trajectory steps at 3000+ steps/s. */
+static void as5045_read_clocks(uint32 *first, uint32 *second, uint8 clocks)
 {
     uint32 a = 0u, b = 0u;
     uint8 i, ints;
@@ -473,7 +474,7 @@ static void as5045_read_chain(uint32 *first, uint32 *second)
 
     CyPins_ClearPin(PIN_CSN);
     delay_us(2u);
-    for (i = 0u; i < 38u; i++)
+    for (i = 0u; i < clocks; i++)
     {
         uint32 bit;
         ints=CyEnterCriticalSection(); started=SU_NOW();
@@ -493,6 +494,7 @@ static void as5045_read_chain(uint32 *first, uint32 *second)
     *first = a & FRAME_MASK;
     *second = b & FRAME_MASK;
 }
+static void as5045_read_chain(uint32 *first, uint32 *second) { as5045_read_clocks(first, second, 38u); }
 
 static uint8 frame_parity_ok(uint32 frame)
 {
@@ -610,7 +612,7 @@ static uint8 enc_update(enc_t *e, const as5045_t *sample, uint8 valid)
 {
     uint32 now, gap;
     int32 delta;
-    int64 commanded, position;
+    int64 commanded, commandedLsb, position;
 
     if(e->trackingLost) { e->badStreak=ENC_BAD_LIMIT; return 0u; }
 
@@ -633,12 +635,15 @@ static uint8 enc_update(enc_t *e, const as5045_t *sample, uint8 valid)
         delta=(int32)angle_delta(sample->angle, e->lastAngle);
         commanded=(int64)e->cmdUsteps-e->lastCmd;
         if(commanded<0) { commanded=-commanded; }
+        /* commanded steps as encoder LSB; 32-bit hardware divide unless the product could overflow */
+        commandedLsb=(commanded<=INT32_MAX/LSB_PER_USTEP_X100) ? (int64)((int32)commanded*LSB_PER_USTEP_X100/100)
+                                                               : commanded*LSB_PER_USTEP_X100/100;
         position=(int64)e->pos+delta;
         /* At the configured maximum 6000 usteps/s, 100 ms plus the margin
          * stays below half a motor turn. A lost turn cannot be reconstructed. */
         if(gap>ENC_MAX_GAP_MS ||
            abs_i32(delta)>(int32)((MOVE_RATE_MAX_USTEP_S*(uint32)LSB_PER_USTEP_X100*(gap+1u))/100000u)+ENC_JUMP_MARGIN_LSB ||
-           abs_i32(delta)>commanded*LSB_PER_USTEP_X100/100+ENC_JUMP_MARGIN_LSB ||
+           abs_i32(delta)>commandedLsb+ENC_JUMP_MARGIN_LSB ||
            position>INT32_MAX/100 || position<INT32_MIN/100) {
             e->trackingLost=1u; e->badStreak=ENC_BAD_LIMIT; g_encRejected++;
             return 0u;
@@ -648,14 +653,16 @@ static uint8 enc_update(enc_t *e, const as5045_t *sample, uint8 valid)
     }
     e->lastMs=wall_ms(); e->lastCmd=e->cmdUsteps;
     {
-        int64 following=(int64)e->cmdLsbX100/100-e->pos;
+        int64 following=(int64)(e->cmdLsbX100/100)-e->pos; /* int32 divide: same quotient, no 64-bit libcall */
         if(following<0) { following=-following; }
         if((uint64_t)following>g_followPeakLsb) { g_followPeakLsb=(uint32)following; }
     }
     return 1u;
 }
 
-/* One shared 38-clock transaction; a bad axis never advances its position. */
+/* One shared transaction; a bad axis never advances its position.  With arm2 feedback off (the default) it is the
+ * 18-clock read of board 1 alone and g_enc2 is left untouched: nothing uses it, and updating it from a floating
+ * second frame only polluted ENC_DIAG (follow_peak_lsb, gap, rejected) with arm2's unmeasured "following error". */
 static uint8 enc_sample(void)
 {
     as5045_t a, b;
@@ -663,13 +670,16 @@ static uint8 enc_sample(void)
     uint8 i, v1=0u, v2=0u, ok1, ok2;
     for(i=0u;i<ENCODER_READ_RETRIES;i++) {
         if(i) { g_encRetries++; }
-        as5045_read_chain(&raw1,&raw2);
-        as5045_decode(&a,raw1); as5045_decode(&b,raw2);
-        v1=encoder_state_valid(classify(&a)); v2=encoder_state_valid(classify(&b));
+        as5045_read_clocks(&raw1,&raw2,ARM2_ENCODER_FEEDBACK ? 38u : 18u);
+        as5045_decode(&a,raw1);
+        v1=encoder_state_valid(classify(&a));
+        if(ARM2_ENCODER_FEEDBACK) { as5045_decode(&b,raw2); v2=encoder_state_valid(classify(&b)); }
         if(v1 && (!ARM2_ENCODER_FEEDBACK || v2)) { break; }
     }
-    ok1=enc_update(&g_enc,&a,v1); ok2=enc_update(&g_enc2,&b,v2);
-    return ok1 && (!ARM2_ENCODER_FEEDBACK || ok2);
+    ok1=enc_update(&g_enc,&a,v1);
+    if(!ARM2_ENCODER_FEEDBACK) { return ok1; }
+    ok2=enc_update(&g_enc2,&b,v2);
+    return ok1 && ok2;
 }
 
 /* Average 12 samples relative to the first angle so the average also works
@@ -682,10 +692,21 @@ static uint8 enc_set_origin(void)
     uint32 raw[2];
     as5045_t sample;
     for(i=0u;i<12u;i++) {
-        as5045_read_chain(&raw[0],&raw[1]);
+        uint8 attempt, good=0u;
+        /* ENABLE already blocks for these 12 ms, so one bad frame gets the same retries enc_sample() allows (1 ms apart)
+         * instead of refusing the whole enable. */
+        for(attempt=0u;attempt<ENCODER_READ_RETRIES && !good;attempt++) {
+            if(attempt) { g_encRetries++; CyDelay(1u); }
+            as5045_read_clocks(&raw[0],&raw[1],ARM2_ENCODER_FEEDBACK ? 38u : 18u);
+            good=1u;
+            for(axis=0u;axis<(ARM2_ENCODER_FEEDBACK ? 2u : 1u);axis++) {
+                as5045_decode(&sample,raw[axis]);
+                if(!encoder_state_valid(classify(&sample))) { good=0u; }
+            }
+        }
+        if(!good) { return 0u; }
         for(axis=0u;axis<(ARM2_ENCODER_FEEDBACK ? 2u : 1u);axis++) {
             as5045_decode(&sample,raw[axis]);
-            if(!encoder_state_valid(classify(&sample))) { return 0u; }
             if(!i) { reference[axis]=sample.angle; }
             sum[axis]+=angle_delta(sample.angle,reference[axis]);
         }
@@ -1112,7 +1133,7 @@ static void uart_discard_rx(void)      { }
 /* ----------------------------- jog axes --------------------------------- */
 #define JOG_TICK_CY                 (JOG_TICK_US * SU_CY_PER_US)
 #define JOG_ENC_SAMPLE_CY           (JOG_ENC_SAMPLE_US * SU_CY_PER_US)
-#define JOG_ENC_READ_US             (360u)   /* dual AS5045 frame + GPIO overhead margin */
+#define JOG_ENC_READ_US             (ARM2_ENCODER_FEEDBACK ? 360u : 200u) /* 38-clock dual / 18-clock single AS5045 frame + GPIO overhead margin */
 #define JOG_TX_BYTE_US              (10u)    /* enqueue only; UART shifts independently */
 
 typedef struct
@@ -1234,6 +1255,7 @@ static uint8 g_uploadRxQuarantine;
  * enabled, so the worst interval is measured over exactly that window and is
  * reset by ENABLE: it reports "how close did this run come to 250 ms". */
 static uint32 g_keyMaxGapMs;
+static uint32 g_trajLagMaxCy; /* worst lateness of a trajectory step behind its due time since ENABLE; the 20 ms overrun stop is this reaching a whole segment */
 
 /* Whole-path preload: no movement until every numbered node is accepted. */
 #define TRAJ_CAPACITY 2048u
@@ -1275,6 +1297,8 @@ static struct {
 
 static void jog_print_inputs(void);
 static void stage_status(void);
+static void stage_status_service(void);
+static uint8 jog_slot_free(uint32 us);
 
 static uint8 host_lease_fresh(void)
 {
@@ -1589,10 +1613,24 @@ static uint16 ptp_crc(const uint8 *p, uint8 n)
 }
 static uint16 ptp_u16(const uint8 *p) { return (uint16)((uint16)p[0] | ((uint16)p[1] << 8)); }
 static uint32 ptp_u32(const uint8 *p) { return (uint32)p[0] | ((uint32)p[1]<<8) | ((uint32)p[2]<<16) | ((uint32)p[3]<<24); }
+/* The two angle<->count conversions below sit under every pulse and every pass of the trajectory loop.  Inside these
+ * bounds the products fit 32 bits, so they use the hardware divider instead of a libgcc 64-bit divide (several us at
+ * 24 MHz); outside them the original 64-bit arithmetic runs, so the results never differ. */
+#define PTP_CD_FAST    (21474)  /* |cd| * 100000 + 18000 < 2^31 */
+#define PTP_STEPS_FAST (58000)  /* |steps| * 36000 + 50000 < 2^31 */
+_Static_assert(MOTOR_FULLSTEPS_REV * USTEP_DIV * GEAR_RATIO <= 100000 &&
+               ARM2_MOTOR_FULLSTEPS_REV * USTEP_DIV * ARM2_GEAR_RATIO_X100 / 100 <= 100000,
+               "ptp_offset/ptp_angle_from_counts 32-bit fast path assumes at most 100000 counts per revolution");
 static int32 ptp_offset(uint8 axis, int32 cd)
 {
-    int64 n = (int64)cd * ((axis == 0u) ? (int32)(MOTOR_FULLSTEPS_REV * USTEP_DIV * GEAR_RATIO) :
-        (int32)(ARM2_MOTOR_FULLSTEPS_REV * USTEP_DIV * ARM2_GEAR_RATIO_X100 / 100));
+    int32 perRev = (axis == 0u) ? (int32)(MOTOR_FULLSTEPS_REV * USTEP_DIV * GEAR_RATIO) :
+        (int32)(ARM2_MOTOR_FULLSTEPS_REV * USTEP_DIV * ARM2_GEAR_RATIO_X100 / 100);
+    int64 n;
+    if (cd >= -PTP_CD_FAST && cd <= PTP_CD_FAST) {
+        int32 m = cd * perRev;
+        return (m >= 0) ? (m + 18000) / 36000 : -((-m + 18000) / 36000);
+    }
+    n = (int64)cd * perRev;
     return (int32)((n >= 0) ? (n + 18000) / 36000 : -((-n + 18000) / 36000));
 }
 static int32 ptp_axis_angle_cd(uint8 axis, int32 q1, int32 q2)
@@ -1604,7 +1642,12 @@ static int32 ptp_angle_from_counts(uint8 axis, int32 count)
     int32 steps=g_ptp.origin[axis]-count;
     int32 revolution=axis==0u ? MOTOR_FULLSTEPS_REV*USTEP_DIV*GEAR_RATIO :
         ARM2_MOTOR_FULLSTEPS_REV*USTEP_DIV*ARM2_GEAR_RATIO_X100/100;
-    int64 scaled=(int64)steps*36000;
+    int64 scaled;
+    if(steps>=-PTP_STEPS_FAST && steps<=PTP_STEPS_FAST) {
+        int32 s32=steps*36000;
+        return s32>=0 ? (s32+revolution/2)/revolution : -((-s32+revolution/2)/revolution);
+    }
+    scaled=(int64)steps*36000;
     return (int32)(scaled>=0 ? (scaled+revolution/2)/revolution : -((-scaled+revolution/2)/revolution));
 }
 static uint8 ptp_counts_in_range(uint8 axis, int32 count)
@@ -1616,6 +1659,7 @@ static uint8 ptp_counts_in_range(uint8 axis, int32 count)
     return value>=g_jointMinCd[axis] && value<=g_jointMaxCd[axis] &&
            elbow>=g_jointMinCd[JOINT_ELBOW] && elbow<=g_jointMaxCd[JOINT_ELBOW];
 }
+_Static_assert(ENCODER_CPR * GEAR_RATIO * 225 == 36000 * 1024, "joint_step_allowed: 225/1024 must equal 36000/(ENCODER_CPR*GEAR_RATIO)");
 static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
 {
     uint8 axis = (a == &g_arm1) ? 0u : 1u;
@@ -1636,7 +1680,8 @@ static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
     if(axis==0u && ((s<0 && g_arm1.usteps<=g_ptp.origin[0]-ptp_offset(0u,g_jointMaxCd[1]-elbow)) ||
                     (s>0 && g_arm1.usteps>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[1]-elbow)))) return 0u;
     if(dual_ready()) {
-        int32 m1=(int32)(((int64)g_enc.pos-g_enc.softCenter)*(g_enc.incDir==ARM1_LEFT_DIR_LEVEL?1:-1)*36000/(ENCODER_CPR*GEAR_RATIO));
+        /* 36000 / (ENCODER_CPR * GEAR_RATIO) = 225 / 1024: same truncated quotient, but a shift instead of a 64-bit divide. */
+        int32 m1=(int32)(((int64)g_enc.pos-g_enc.softCenter)*(g_enc.incDir==ARM1_LEFT_DIR_LEVEL?1:-1)*225/1024);
         int32 me=ARM2_ENCODER_FEEDBACK ? (int32)(((int64)g_enc2.pos-g_enc2.softCenter)*(g_enc2.incDir==ARM2_LEFT_DIR_LEVEL?1:-1)*3600000/(ENCODER_CPR*ARM2_GEAR_RATIO_X100)) : elbow;
         int32 m2=m1+me;
         if((s<0 && (m2>=g_jointMaxCd[1] || (axis ? me>=g_jointMaxCd[2] : m1>=g_jointMaxCd[0]))) ||
@@ -1988,6 +2033,18 @@ static uint8 coordinated_step(const char *failure)
     g_ptp.done++;
     return 1u;
 }
+/* When step k of a segment is due: floor(k * duration / total) cycles.  With q = duration / total and
+ * r = duration % total that is k*q + k*r/total, which stays in 32 bits while total < 65536 (a node is at most 500 ms
+ * at 4000 steps/s), so the hot loop needs no 64-bit divide.  The last answer is kept because one pass of the main
+ * loop asks for the same step from the trajectory service, the encoder slot check and the TX slot check. */
+static uint32 traj_due_cy(uint32 k, uint32 duration, uint32 total)
+{
+    static uint32 memoK, memoDuration, memoTotal, memoDue; /* k >= 1, so the zero start never matches */
+    if(k==memoK && duration==memoDuration && total==memoTotal) { return memoDue; }
+    memoDue=(total<65536u) ? k*(duration/total)+k*(duration%total)/total : (uint32)((int64)k*duration/total);
+    memoK=k; memoDuration=duration; memoTotal=total;
+    return memoDue;
+}
 static void traj_service(void)
 {
     uint32 now=SU_NOW();
@@ -1995,8 +2052,9 @@ static void traj_service(void)
     g_traj.elapsedCy+=(g_traj.clock-now)&0x00FFFFFFu; g_traj.clock=now;
     if(g_traj.elapsedCy>duration+20000u*SU_CY_PER_US) { stage_stop("trajectory timing overrun",0u); return; }
     if(g_ptp.done<g_ptp.total) {
-        uint32 due=(uint32)((int64)(g_ptp.done+1u)*duration/g_ptp.total);
+        uint32 due=traj_due_cy(g_ptp.done+1u,duration,g_ptp.total);
         if(g_traj.elapsedCy<due || SU_ELAPSED(g_ptp.lastStep)<TRAJ_STEP_MIN_US*SU_CY_PER_US) { return; }
+        if(g_traj.elapsedCy-due>g_trajLagMaxCy) { g_trajLagMaxCy=g_traj.elapsedCy-due; }
         g_ptp.lastStep=SU_NOW();
         if(!coordinated_step("trajectory pulse blocked")) { return; }
     }
@@ -2122,8 +2180,8 @@ static uint8 home_set_zero(jog_axis_t *a)
         /* Preserve the latest reading relative to the averaged origin. */
         e->pos = angle_delta(e->lastAngle, mean);
         cmd_reset_axis(e);
-        JLOGF("HOME arm1 averaged origin: samples=%u raw=%u lsb (motor single-turn)\r\n",
-              (unsigned)g_home.zeroSamples, (unsigned)mean);
+        JLOGF("HOME %s averaged origin: samples=%u raw=%u lsb (motor single-turn)\r\n",
+              a->name, (unsigned)g_home.zeroSamples, (unsigned)mean);
     }
     a->usteps = 0;
     a->holding = 0u;
@@ -2317,15 +2375,24 @@ static void home_service(void)
     }
 }
 
-static void motion_config_status(void)
+static void ptp_state_line(void)
 {
     JLOGF("PTP_STATE lock=%u ref=%u active=%u epoch=%lu seq=%lu min1=%d max1=%d min2=%d max2=%d emin=%d emax=%d\r\n",
           (unsigned)!PTP_COMMISSIONED,(unsigned)g_ptp.reference,(unsigned)g_ptp.active,
           (unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,
           (int)g_jointMinCd[0],(int)g_jointMaxCd[0],(int)g_jointMinCd[1],(int)g_jointMaxCd[1],
           (int)g_jointMinCd[JOINT_ELBOW],(int)g_jointMaxCd[JOINT_ELBOW]);
+}
+
+static void motion_rates_line(void)
+{
     JLOGF("MOTION_RATES epoch=%lu r1=%u r2=%u a1=%u a2=%u\r\n",(unsigned long)g_ptp.epoch,
           (unsigned)g_motionRate[0],(unsigned)g_motionRate[1],(unsigned)g_motionAccel[0],(unsigned)g_motionAccel[1]);
+}
+
+static void motion_config_status(void)
+{
+    ptp_state_line(); motion_rates_line();
 }
 
 /* One coherent, low-rate sample, no extra encoder transactions. Positive = CCW.
@@ -2360,36 +2427,75 @@ static void telem_service(void)
     g_telemSent++;
 }
 
-static void stage_status(void)
+/* Format only one status line per foreground slice during motion. A queued UART
+ * does not make the preceding snprintf burst nonblocking. Keep safety deadlines. */
+static uint8 g_statusNext;
+static uint32 g_statusAt, g_statusMaxCy, g_statusEpoch;
+static uint8 status_moving(void)
 {
-    if(!g_motionEnabled && g_lastStop[0]) { JLOG(g_lastStop); } /* priority before ordinary status; retried each stopped status block */
-    JLOGF("STATE fw=stage2-v10 enabled=%u home=%u homed1=%u homed2=%u fault=%u enc=%u dir=%u enc2=%u dir2=%u arm2fb=%u\r\n",
+    return g_motionEnabled && (g_ptp.active || g_home.phase!=HOME_IDLE || g_arm1.moving || g_arm2.moving);
+}
+static void stage_status_line(void)
+{
+    uint32 start=SU_NOW(), cost;
+    switch(g_statusNext++) {
+    case 1u:
+    JLOGF("STATE fw=stage2-v11 enabled=%u home=%u homed1=%u homed2=%u fault=%u enc=%u dir=%u enc2=%u dir2=%u arm2fb=%u\r\n",
           (unsigned)g_motionEnabled, (unsigned)g_home.phase,
           (unsigned)g_homed1, (unsigned)g_homed2, (unsigned)g_jogFaulted,
-          (unsigned)(g_arm1.hasEnc && (g_enc.badStreak == 0u)), (unsigned)g_directionKnown, (unsigned)(g_arm2.hasEnc && !g_enc2.badStreak), (unsigned)g_enc2.directionKnown, (unsigned)ARM2_ENCODER_FEEDBACK);
-    JLOGF("CONTROL seq=%lu\r\n",(unsigned long)g_controlSequence);
-    motion_config_status();
-    JLOGF("PTP_CHECK final_lsb=%d follow_lsb=%d\r\n",PTP_FINAL_ERROR_LSB,SLIP_FAIL_LSB);
-    traj_status();
-    /* traj_repeat: a held plan that already ran accepts another RUN.  fault_snapshot: every stop prints a FAULT_SNAPSHOT
-     * line first.  telem_hz: the streamed TELEM rate in force (0 = status block only); its presence means type 11 exists. */
-    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=1 traj_repeat=1 fault_snapshot=1 telem_hz=%u proto=%u\r\n",
-          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)g_telemHz, (unsigned)PROTO_VERSION);
-    /* Frame loss by cause: rx_error only sees UART-level faults, so a frame that
-     * simply arrives short must be counted here or it stays invisible. */
+          (unsigned)(g_arm1.hasEnc && (g_enc.badStreak == 0u)), (unsigned)g_directionKnown, (unsigned)(g_arm2.hasEnc && !g_enc2.badStreak), (unsigned)g_enc2.directionKnown, (unsigned)ARM2_ENCODER_FEEDBACK); break;
+    case 2u:
+    JLOGF("CONTROL seq=%lu\r\n",(unsigned long)g_controlSequence); break;
+    case 3u:
+    ptp_state_line(); break;
+    case 4u:
+    motion_rates_line(); break;
+    case 5u:
+    JLOGF("PTP_CHECK final_lsb=%d follow_lsb=%d\r\n",PTP_FINAL_ERROR_LSB,SLIP_FAIL_LSB); break;
+    case 6u:
+    traj_status(); break;
+    case 7u:
+    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=%u traj_repeat=1 fault_snapshot=1 telem_hz=%u proto=%u\r\n",
+          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)ARM2_ENCODER_FEEDBACK, (unsigned)g_telemHz, (unsigned)PROTO_VERSION); break;
+    case 8u:
     JLOGF("PTP_RX short_ok=%lu drop_crc=%lu drop_short=%lu drop_timeout=%lu rejected=%lu epoch_rejected=%lu last_rejected_byte=0x%02X\r\n",
           (unsigned long)g_shortRxOk, (unsigned long)g_ptpRxCrc, (unsigned long)g_ptpRxShort, (unsigned long)g_ptpRxTimeout,
           (unsigned long)g_rxRejected, (unsigned long)g_ptpEpochRejected,
-          (unsigned)g_rxLastBad[(g_rxLastBadIdx + 7u) % 8u]);
-    JLOGF("TIMING loop_max_ms=%lu tick_lag_max_ms=%lu clock=hardware wdt=256-384ms key_age_ms=%lu key_max_gap_ms=%lu\r\n",
+          (unsigned)g_rxLastBad[(g_rxLastBadIdx + 7u) % 8u]); break;
+    case 9u:
+    JLOGF("TIMING loop_max_ms=%lu tick_lag_max_ms=%lu clock=hardware wdt=256-384ms key_age_ms=%lu key_max_gap_ms=%lu status_max_us=%lu traj_lag_max_us=%lu\r\n",
           (unsigned long)g_loopMaxMs,(unsigned long)g_tickMaxLagMs,
-          (unsigned long)(g_keysSeen ? (g_jogMs - g_lastKeyMs) : 0u),(unsigned long)g_keyMaxGapMs);
+          (unsigned long)(g_keysSeen ? (g_jogMs - g_lastKeyMs) : 0u),(unsigned long)g_keyMaxGapMs,(unsigned long)(g_statusMaxCy/SU_CY_PER_US),
+          (unsigned long)(g_trajLagMaxCy/SU_CY_PER_US)); break;
+    case 10u:
     JLOGF("ENC_DIAG irq_max_us=%lu retries=%lu rejected=%lu gap_max_ms=%lu follow_peak_lsb=%lu\r\n",
           (unsigned long)(g_encIrqMaxCy/SU_CY_PER_US),(unsigned long)g_encRetries,
-          (unsigned long)g_encRejected,(unsigned long)g_encMaxGapMs,(unsigned long)g_followPeakLsb);
+          (unsigned long)g_encRejected,(unsigned long)g_encMaxGapMs,(unsigned long)g_followPeakLsb); break;
+    case 11u:
     JLOGF("TELEM_DIAG hz=%u sent=%lu skipped=%lu max_us=%lu\r\n",
-          (unsigned)g_telemHz,(unsigned long)g_telemSent,(unsigned long)g_telemSkipped,(unsigned long)(g_telemMaxCy/SU_CY_PER_US));
-    telem_line();
+          (unsigned)g_telemHz,(unsigned long)g_telemSent,(unsigned long)g_telemSkipped,(unsigned long)(g_telemMaxCy/SU_CY_PER_US)); break;
+    case 12u:
+    telem_line(); break;
+    }
+    if(g_statusNext>12u) g_statusNext=0u;
+    cost=SU_ELAPSED(start);if(cost>g_statusMaxCy)g_statusMaxCy=cost;
+}
+static void stage_status_service(void)
+{
+    if(!g_statusNext) return;
+    if(status_moving() && (SU_ELAPSED(g_statusAt)<5000u*SU_CY_PER_US || !jog_slot_free(50u))) return;
+    g_statusAt=SU_NOW();stage_status_line();
+}
+static void stage_status(void)
+{
+    if(status_moving()) {
+        /* A new reference epoch must restart at STATE/PTP_STATE, even in a partial block. */
+        if(!g_statusNext || g_statusEpoch!=g_ptp.epoch)g_statusNext=1u;
+        g_statusEpoch=g_ptp.epoch;return;
+    }
+    /* Stops publish the retained cause first, and supersede any partial running block. */
+    if(!g_motionEnabled && g_lastStop[0]) JLOG(g_lastStop);
+    g_statusEpoch=g_ptp.epoch;g_statusNext=1u;while(g_statusNext)stage_status_line();
 }
 
 static void stage_enable(void)
@@ -2415,6 +2521,7 @@ static void stage_enable(void)
     g_limitStop = 0u;
     g_motionEnabled = 1u;
     g_keyMaxGapMs = 0u;
+    g_trajLagMaxCy = 0u;
     cmd_reset_to_measured(); cmd_reset_axis(&g_enc2);
     JLOG("ENABLE OK: no automatic movement; low-speed jog or R for home; Space stops\r\n");
     stage_status();
@@ -2467,7 +2574,7 @@ static uint8 jog_slot_free(uint32 us)
         if(g_traj.state==3u) {
             uint32 duration=(uint32)g_traj.nodes[g_traj.index].ms*1000u*SU_CY_PER_US;
             since=g_traj.elapsedCy+SU_ELAPSED(g_traj.clock);
-            period=(g_ptp.done<g_ptp.total) ? (uint32)((int64)(g_ptp.done+1u)*duration/g_ptp.total) : duration;
+            period=(g_ptp.done<g_ptp.total) ? traj_due_cy(g_ptp.done+1u,duration,g_ptp.total) : duration;
         }
         if (since>=period || period-since<need) { return 0u; }
     }
@@ -2550,7 +2657,9 @@ static void jog_axis_tick(jog_axis_t *a)
 
     /* Calibrated jog shares the PTP bounds and per-step guard. Before a straight
      * reference exists, retain the old encoder-relative jog guard. */
-    if (e->directionKnown && (a==&g_arm1 ? g_homed1 : g_homed2) && want!=0)
+    /* Without arm2 feedback g_enc2 never learns a direction; arm2's calibrated zero then hangs on the same
+     * arm1 polarity that joint_step_allowed() itself checks. */
+    if (((a==&g_arm2 && !ARM2_ENCODER_FEEDBACK) ? g_directionKnown : e->directionKnown) && (a==&g_arm1 ? g_homed1 : g_homed2) && want!=0)
     {
         if(!joint_step_allowed(a,want)) {
             if(!a->limitHit) { JLOGF("%s: configured joint limit, %s refused\r\n",a->name,jog_dir_name(want)); }
@@ -2903,7 +3012,7 @@ static void jog_rx_service(void)
                g_home.phase==HOME_IDLE && g_motionEnabled && g_ptp.reference &&
                g_homed1 && g_homed2 && dual_ready() && !g_jogFaulted && !g_limitStop &&
                host_input_idle() && axes_idle() && !g_arm1.holding && !g_arm2.holding &&
-               dual_ready() && abs_i32(cmd_lsb()-g_enc.pos)<SLIP_FAIL_LSB && (!ARM2_ENCODER_FEEDBACK || abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)<SLIP_FAIL_LSB) &&
+               abs_i32(cmd_lsb()-g_enc.pos)<SLIP_FAIL_LSB && (!ARM2_ENCODER_FEEDBACK || abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)<SLIP_FAIL_LSB) &&
                motion_inputs_clear() && home_inputs_clear() &&
                ptp_counts_in_range(0u,g_arm1.usteps) && ptp_counts_in_range(1u,g_arm2.usteps)) {
                 g_uploadRxQuarantine=1u; g_ptpRx.active=2u; g_ptpRx.count=0u;
@@ -3025,6 +3134,8 @@ static void app_poll(void)
             service_encoder();
         }
     }
+
+    stage_status_service();
 
     if ((txq_pending() != 0u) && (jog_slot_free(JOG_TX_BYTE_US) != 0u))
     {

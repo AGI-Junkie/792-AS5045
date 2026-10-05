@@ -17,14 +17,15 @@ public sealed class App : Application
     [STAThread]
     public static int Main(string[] args)
     {
-        if (args.Contains("--self-test") || args.Contains("--language-self-test") || args.Contains("--upload-language-test"))
+        if (args.Contains("--self-test") || args.Contains("--language-self-test") || args.Contains("--upload-language-test") || args.Contains("--log-level-self-test"))
         {
             try
             {
                 Lang.PersistChanges = false;
                 int snapshot = Array.IndexOf(args, "--snapshot");
                 string? path = snapshot >= 0 && snapshot + 1 < args.Length ? args[snapshot + 1] : null;
-                if (args.Contains("--upload-language-test")) ControlWindow.UploadLanguageTest();
+                if (args.Contains("--log-level-self-test")) ControlWindow.LoggingSelfTest();
+                else if (args.Contains("--upload-language-test")) ControlWindow.UploadLanguageTest();
                 else if (args.Contains("--language-self-test")) { Lang.SelfTest(); ControlWindow.LanguageSelfTest(path); }
                 else ControlWindow.SelfTest(path);
                 return 0;
@@ -125,7 +126,7 @@ public sealed partial class ControlWindow : Window
     private static readonly Regex TrajectoryPattern = new(@"^TRAJ_STATE state=([0-4]) count=(\d+) total=(\d+) index=(\d+) seq=(\d+) epoch=(\d+)$", RegexOptions.CultureInvariant);
     private string? lastLinkLine;
     private Func<string> regularStateText = () => Lang.T("state.disconnected");
-    private static readonly Regex StatePattern = new(@"^STATE fw=(?:stage1-v3|stage2-v(?:[1-9]|10)) enabled=([01]) home=([0-7]) homed1=([01]) homed2=([01]) fault=([01]) enc=([01]) dir=([01])(?: enc2=([01]) dir2=([01]))?(?: arm2fb=([01]))?$", RegexOptions.CultureInvariant);
+    private static readonly Regex StatePattern = new(@"^STATE fw=(?:stage1-v3|stage2-v(?:[1-9]|10|11)) enabled=([01]) home=([0-7]) homed1=([01]) homed2=([01]) fault=([01]) enc=([01]) dir=([01])(?: enc2=([01]) dir2=([01]))?(?: arm2fb=([01]))?$", RegexOptions.CultureInvariant);
 
     public ControlWindow(bool restoreParameters = false)
     {
@@ -287,7 +288,7 @@ public sealed partial class ControlWindow : Window
         double gap = lastHeartbeatSent == 0 ? 0 : Stopwatch.GetElapsedTime(lastHeartbeatSent, now).TotalMilliseconds;
         Send((byte)(0x41 | ((CanJog ? (keyboardMask | mouseMask) : 0) << 1)));
         lastHeartbeatSent = now;
-        if (gap > 150) Append($"HOST heartbeat send gap={gap:F0} ms");
+        if (gap > 150) Append($"HOST heartbeat send gap={gap:F0} ms", LogLevel.Warning);
     }
     private void OnHeartbeatTick(object? sender, EventArgs e)
     {
@@ -312,7 +313,7 @@ public sealed partial class ControlWindow : Window
         }
         pending.Clear();
         if (text.Length <= 4096) pending.Append(text);
-        else Append("HOST discarded oversized/unterminated serial line");
+        else Append("HOST discarded oversized/unterminated serial line", LogLevel.Warning);
     }
     // Each trajectory node waits for its ACK, so a 40 ms poll adds ~20 ms per node. Read as soon as bytes
     // arrive (still on the UI thread); the Tick keeps polling as the fallback if the driver never raises this.
@@ -333,7 +334,7 @@ public sealed partial class ControlWindow : Window
             CheckTelemetryTimeout(DateTime.UtcNow);
             if ((uploading is not null || executing) && ((DateTime.UtcNow - lastPtpAt).TotalSeconds > 2 ||
                 (executing && (DateTime.UtcNow - lastTrajectoryAt).TotalSeconds > 2))) {
-                Append("HOST trajectory status timeout; stopping"); Stop();
+                Append("HOST trajectory status timeout; stopping", LogLevel.Error); Stop();
             }
             if (framedControl) { /* The 8 ms control timer owns all framed writes. */ }
             else if (LimitsReady && hardwareUart && pointWire.Count > 0 && serial is { IsOpen: true })
@@ -356,7 +357,7 @@ public sealed partial class ControlWindow : Window
         {
             compatible = true; lastStateAt = DateTime.UtcNow;
             stage2 = line.StartsWith("STATE fw=stage2-");
-            framedControl = line.StartsWith("STATE fw=stage2-v7 ") || line.StartsWith("STATE fw=stage2-v8 ") || line.StartsWith("STATE fw=stage2-v9 ") || line.StartsWith("STATE fw=stage2-v10 ");
+            framedControl = line.StartsWith("STATE fw=stage2-v7 ") || line.StartsWith("STATE fw=stage2-v8 ") || line.StartsWith("STATE fw=stage2-v9 ") || line.StartsWith("STATE fw=stage2-v10 ") || line.StartsWith("STATE fw=stage2-v11 ");
             heartbeatTimer.Interval = TimeSpan.FromMilliseconds(framedControl ? 8 : 40);
             bool fastLink = framedControl || line.StartsWith("STATE fw=stage2-v6 ");
             if (hardwareUart != fastLink)
@@ -560,7 +561,7 @@ public sealed partial class ControlWindow : Window
         bool valid = m.Success;
         for (int i = 0; valid && i < 6; i++) valid = uint.TryParse(m.Groups[i + 1].Value, out values[i]);
         if (!valid || values[1] > DeviceContract.TrajCapacity || values[2] > DeviceContract.TrajCapacity || values[3] > values[1]) {
-            if (uploading is not null || executing) { Append("HOST malformed trajectory status"); Stop(); }
+            if (uploading is not null || executing) { Append("HOST malformed trajectory status", LogLevel.Error); Stop(); }
             return;
         }
         uint mode = values[0], count = values[1], total = values[2], seq = values[4], epoch = values[5];
@@ -569,7 +570,7 @@ public sealed partial class ControlWindow : Window
             bool run = uploadNext == plan.Nodes.Length;
             uint expected = (uint)(run ? plan.Nodes.Length : uploadNext + 1);
             if (count != expected || total != plan.Nodes.Length || (run ? mode is not (3 or 4) : mode != (count == total ? 2 : 1))) {
-                Append("HOST trajectory acknowledgement mismatch"); Stop(); return;
+                Append("HOST trajectory acknowledgement mismatch", LogLevel.Error); Stop(); return;
             }
             pendingPoint = 0; lock (wireSync) { pointWire.Clear(); }
             if (run) { uploading = null; executing = true; }
@@ -585,7 +586,7 @@ public sealed partial class ControlWindow : Window
             lastTrajectoryAt = DateTime.UtcNow; trajectoryIndex = (int)values[3]; trajectoryTotal = (int)total - 1;
             if (mode == 4) {
                 // The device keeps the nodes after a run (state 4): hold the plan so 执行图形 can repeat it.
-                executing = false; experimentCompleting = "complete"; uploaded = supportsTrajRepeat ? runPlan : null; uploadedRan = uploaded is not null; trajectoryRanOnce = true; Append("HOST trajectory complete; firmware checks passed for both motor encoders");
+                executing = false; experimentCompleting = "complete"; uploaded = supportsTrajRepeat ? runPlan : null; uploadedRan = uploaded is not null; trajectoryRanOnce = true; Append(arm2FeedbackEnabled ? "HOST trajectory complete; firmware checks passed for both motor encoders" : "HOST trajectory complete; firmware checks passed for the arm1 motor encoder (arm2 has no feedback)");
                 // A firmware that does not declare traj_repeat=1 refuses a second RUN of the plan it holds (and stops): upload again instead.
                 if (!supportsTrajRepeat) Append("HOST this firmware cannot repeat a held plan (its LINK line has no traj_repeat=1); upload the plan again to draw it again");
             }
@@ -635,7 +636,7 @@ public sealed partial class ControlWindow : Window
         if (age >= 3) {
             uint sequence = pendingPoint; int attempts = pointAttempts;
             Lang.Text(lastStop, () => Lang.T("fault.pointTimeout", sequence, attempts));
-            Append($"HOST PTP acknowledgement timeout seq={pendingPoint} attempts={pointAttempts}; stopping"); Stop(); return;
+            Append($"HOST PTP acknowledgement timeout seq={pendingPoint} attempts={pointAttempts}; stopping", LogLevel.Error); Stop(); return;
         }
         // Same seq/epoch/payload: firmware only acknowledges duplicates, never restarts motion.
         bool wireEmpty;
@@ -644,7 +645,7 @@ public sealed partial class ControlWindow : Window
         if (!enabled || !hardwareReady || homing || stopPending || (now - lastPtpAt).TotalSeconds >= 2) { Stop(); return; }
         pointAttempts++;
         lock (wireSync) { foreach (byte b in pointPacket) pointWire.Enqueue(b); }
-        Append($"HOST PTP retry seq={pendingPoint} attempt={pointAttempts}/3; identical packet");
+        Append($"HOST PTP retry seq={pendingPoint} attempt={pointAttempts}/3; identical packet", LogLevel.Warning);
     }
     private void Stop()
     {
@@ -742,7 +743,7 @@ public sealed partial class ControlWindow : Window
         try { action(); }
         catch (Exception ex) {
             Trace.TraceError(ex.ToString());
-            try { Append("HOST exception: " + ex); } catch { /* Preserve fail-stop even if logging failed. */ }
+            try { Append("HOST exception: " + ex, LogLevel.Error); } catch { /* Preserve fail-stop even if logging failed. */ }
             Disconnect(() => Lang.T("fault.opFail") + ex.GetType().Name + "：" + ex.Message + Lang.T("fault.opFailSuffix"));
         }
     }
@@ -781,14 +782,20 @@ public sealed partial class ControlWindow : Window
         try { recording?.Dispose(); } catch { }
         recording = null;
     }
-    private void Append(string line)
+    private void Append(string line, LogLevel? level = null)
     {
         string entry = $"[{DateTime.Now:HH:mm:ss.fff}] {line}{Environment.NewLine}";
         recording?.Write(entry);
+        LogLevel severity = level ?? LogLevels.Classify(line);
+        string displayed = $"[{DateTime.Now:HH:mm:ss.fff}] [{severity}] {line}{Environment.NewLine}";
+        recentLog.Enqueue((severity, displayed));
+        // ponytail: retain 1000 lines for instant filtering; use the raw file for older history.
+        while (recentLog.Count > 1000) recentLog.Dequeue();
+        if (severity < minimumLogLevel) return;
         bool reading = log.IsKeyboardFocusWithin || log.SelectionLength > 0;
         // Reading Text after every append materializes the whole log on the large-object heap.
         if (logCharacters > 100000 && !reading) log.Text = log.Text[^50000..];
-        log.AppendText(entry);
+        log.AppendText(displayed);
         // TextBox.ScrollToEnd forces layout per line; the native viewer queues the scroll.
         if (!reading && log.Template?.FindName("PART_ContentHost", log) is ScrollViewer scroll) scroll.ScrollToEnd();
     }
@@ -800,6 +807,7 @@ public sealed partial class ControlWindow : Window
         MotionProfileSelfTest();
         JointLimitsSyncSelfTest();
         LiveRatesSyncSelfTest();
+        LoggingSelfTest();
         DiagnosticsSelfTest();
         WorkflowSelfTest();
         StopRecoverySelfTest();

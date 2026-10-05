@@ -23,6 +23,7 @@ public sealed partial class ControlWindow
         var seed = new StringBuilder();
         while (seed.Length < 92000)
             seed.AppendLine("[19:30:19.432] TELEM t=49000 epoch=2 seq=1 ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
+        window.logLevelBox.SelectedIndex = (int)LogLevel.Trace; // Exercise full-output trimming even though the UI defaults to Info.
         window.log.Text = seed.ToString();
         window.diagnostics.IsExpanded = true;
         var tabs = (TabControl)window.diagnostics.Content;

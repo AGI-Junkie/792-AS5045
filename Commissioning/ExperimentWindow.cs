@@ -377,13 +377,7 @@ internal sealed partial class ExperimentWindow : Window
         for (int k = 0; k < a.T.Length; k++) { double d = Math.Abs(a.T[k] - cursor); if (d < best) { best = d; i = k; } }
         var host = a.HostUtc[i].AddSeconds(cursor - a.T[i]).ToLocalTime();
         double tod = host.TimeOfDay.TotalSeconds;
-        static bool Quiet(string line)
-        {
-            string body = line.Length > 15 ? line[15..] : line;
-            return !(body.StartsWith("TELEM ") || body.StartsWith("TELEM_DIAG") || body.StartsWith("TIMING ") || body.StartsWith("ENC_DIAG") || body.StartsWith("PTP_RX") || body.StartsWith("PTP_STATE") ||
-                     body.StartsWith("MOTION_RATES") || body.StartsWith("PTP_CHECK") || body.StartsWith("CONTROL ") || body.StartsWith("STATE ") || body.StartsWith("LINK ") || body.StartsWith("TRAJ_STATE"));
-        }
-        var lines = log.Around(tod, 1.0, 60, quietLog.IsChecked == true ? Quiet : null).ToList();
+        var lines = log.Around(tod, 1.0, 60, quietLog.IsChecked == true ? line => LogLevels.Classify(line) >= LogLevel.Info : null).ToList();
         logBox.Text = lines.Count == 0 ? Lang.T("exp.log.empty") : string.Join("\n", lines);
     }
 

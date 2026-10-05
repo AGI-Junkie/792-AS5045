@@ -96,7 +96,7 @@ public sealed partial class ControlWindow
             if (pendingControlType != 0 || (now - telemRequestedAt).TotalSeconds < 1) return;
             if (telemAttempts >= TelemRetryLimit)
             {
-                if (telemAttempts == TelemRetryLimit) { telemAttempts++; Append("HOST telemetry rate: the device did not confirm " + desiredTelemHz + " Hz; leaving it at " + reportedTelemHz + " Hz"); }
+                if (telemAttempts == TelemRetryLimit) { telemAttempts++; Append("HOST telemetry rate: the device did not confirm " + desiredTelemHz + " Hz; leaving it at " + reportedTelemHz + " Hz", LogLevel.Warning); }
                 return;
             }
             telemAttempts++; telemRequestedHz = desiredTelemHz; telemRequestedAt = now; pendingControlType = 11;
@@ -138,11 +138,11 @@ public sealed partial class ControlWindow
     private void HandleFaultSnapshot(string line)
     {
         var snapshot = FaultSnapshot.Parse(line);
-        if (snapshot is null) { Append("HOST could not read a FAULT_SNAPSHOT line; kept in the log only"); return; }
+        if (snapshot is null) { Append("HOST could not read a FAULT_SNAPSHOT line; kept in the log only", LogLevel.Warning); return; }
         lastFault = snapshot;
         Lang.Text(faultDetail, () => DescribeFault(snapshot));
         try { string? where = SaveFaultBundle(snapshot, line); if (where is not null) Append("HOST fault snapshot saved: " + where); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Append("HOST fault snapshot not saved: " + ex.Message); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Append("HOST fault snapshot not saved: " + ex.Message, LogLevel.Error); }
     }
 
     private static string DescribeFault(FaultSnapshot f)
@@ -166,9 +166,9 @@ public sealed partial class ControlWindow
             note = f.DriverFault ? "nFAULT can be over-current, over-temperature or under-voltage; the pin does not say which. Cause not determined." : "see snapshot.reason",
             pre_fault_seconds = PreFaultSeconds, pre_fault_samples = recentTelemetry.Count
         }, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
-        var csv = new StringBuilder("host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_encoder_deg,q2_error_deg,slip2_motor_lsb,slip_motor_lsb,inputs_active_mask\n");
+        var csv = new StringBuilder("host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_encoder_deg,q2_error_deg,slip_motor_lsb,inputs_active_mask,slip2_motor_lsb\n");
         foreach (var (at, s) in recentTelemetry)
-            csv.AppendLine(FormattableString.Invariant($"{at:O},{s.Milliseconds},{s.Epoch},{s.Sequence},{s.Command.Q1:F6},{s.Measured1:F6},{s.Error1:F6},{s.Command.Q2:F6},{s.Measured2:F6},{s.Error2:F6},{s.Slip2},{s.Slip},{s.Inputs}"));
+            csv.AppendLine(FormattableString.Invariant($"{at:O},{s.Milliseconds},{s.Epoch},{s.Sequence},{s.Command.Q1:F6},{s.Measured1:F6},{s.Error1:F6},{s.Command.Q2:F6},{s.Measured2:F6},{s.Error2:F6},{s.Slip},{s.Inputs},{s.Slip2}"));
         File.WriteAllText(Path.Combine(directory, "pre_fault.csv"), csv.ToString(), new UTF8Encoding(true));
         return directory;
     }
