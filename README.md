@@ -193,3 +193,11 @@ python tools\check-log.py --self-test
 ## 版本管理
 
 仓库 `origin` 是私有仓库 [AGI-Junkie/792-AS5045](https://github.com/AGI-Junkie/792-AS5045)，旧地址保存在 `legacy`。标签 `gate-green/*` 表示通过离线闸门的源码，`hw-tested/*` 表示对应的镜像上过实机。换电脑：`git clone`，更新前先提交本地修改再 `git pull --ff-only`。
+
+### 日志级别
+
+上位机日志页可选择最低级别，默认 Info：Trace 为逐帧遥测，Debug 为状态/协议诊断，Info 为操作事件，Warning 为拒绝指令/重试/通信间隔警告，Error 为停机证据、故障与超时。故障状态优先于普通状态分级；未知固件文本默认 Info。主机错误调用显式指定级别。
+
+筛选只影响界面，协议解析、实验 CSV 和原始连接日志仍完整保留；切换级别重绘最近 1000 行，更早记录查看 `%LOCALAPPDATA%\TwoLinkCommissioning\Logs`。实验回放的“隐藏状态块”复用同一分级规则，显示 Info 及以上。固件 UART 承载协议，因此不通过日志级别关闭它。
+
+验证：`TwoLinkCommissioning.exe --log-level-self-test`，以及 `--language-self-test`。

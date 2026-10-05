@@ -96,7 +96,7 @@ public sealed partial class ControlWindow
             if (pendingControlType != 0 || (now - telemRequestedAt).TotalSeconds < 1) return;
             if (telemAttempts >= TelemRetryLimit)
             {
-                if (telemAttempts == TelemRetryLimit) { telemAttempts++; Append("HOST telemetry rate: the device did not confirm " + desiredTelemHz + " Hz; leaving it at " + reportedTelemHz + " Hz"); }
+                if (telemAttempts == TelemRetryLimit) { telemAttempts++; Append("HOST telemetry rate: the device did not confirm " + desiredTelemHz + " Hz; leaving it at " + reportedTelemHz + " Hz", LogLevel.Warning); }
                 return;
             }
             telemAttempts++; telemRequestedHz = desiredTelemHz; telemRequestedAt = now; pendingControlType = 11;
@@ -138,11 +138,11 @@ public sealed partial class ControlWindow
     private void HandleFaultSnapshot(string line)
     {
         var snapshot = FaultSnapshot.Parse(line);
-        if (snapshot is null) { Append("HOST could not read a FAULT_SNAPSHOT line; kept in the log only"); return; }
+        if (snapshot is null) { Append("HOST could not read a FAULT_SNAPSHOT line; kept in the log only", LogLevel.Warning); return; }
         lastFault = snapshot;
         Lang.Text(faultDetail, () => DescribeFault(snapshot));
         try { string? where = SaveFaultBundle(snapshot, line); if (where is not null) Append("HOST fault snapshot saved: " + where); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Append("HOST fault snapshot not saved: " + ex.Message); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Append("HOST fault snapshot not saved: " + ex.Message, LogLevel.Error); }
     }
 
     private static string DescribeFault(FaultSnapshot f)

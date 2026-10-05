@@ -63,6 +63,7 @@ public sealed partial class ControlWindow
         if (telemRateLabel is { } tl) tl.Text = Lang.T("lbl.telemRate");
         Lang.RefreshText(faultDetail);
         if (feedbackTab is { } ft) ft.Header = Lang.T("tab.feedback");
+        RefreshLogLanguage();
         if (logTab is { } lt) { lt.Header = Lang.T("tab.log"); lt.ToolTip = Lang.T("tab.log.tip"); }
         if (jointNameBlocks.Length == JointNames.Length) {
             string[] names = JointNames;
@@ -206,7 +207,15 @@ public sealed partial class ControlWindow
         errorPlot.SizeChanged += (_,_) => DrawErrorPlot();
         feedbackTab = new TabItem { Header = Lang.T("tab.feedback"), Content = feedback };
         tabs.Items.Add(feedbackTab);
-        var logPanel = new DockPanel(); logPath.FontSize = 11; DockPanel.SetDock(logPath,Dock.Bottom); logPanel.Children.Add(logPath); logPanel.Children.Add(log);
+        foreach (LogLevel level in Enum.GetValues<LogLevel>()) logLevelBox.Items.Add(new ComboBoxItem { Tag = level });
+        logLevelBox.SelectedIndex = (int)minimumLogLevel;
+        logLevelBox.SelectionChanged += (_, _) => {
+            if (logLevelBox.SelectedItem is ComboBoxItem { Tag: LogLevel level }) { minimumLogLevel = level; RefreshLog(); }
+        };
+        RefreshLogLanguage();
+        var logHead = new StackPanel { Orientation = Orientation.Horizontal };
+        logHead.Children.Add(logLevelLabel); logHead.Children.Add(logLevelBox);
+        var logPanel = new DockPanel(); DockPanel.SetDock(logHead, Dock.Top); logPanel.Children.Add(logHead); logPath.FontSize = 11; DockPanel.SetDock(logPath,Dock.Bottom); logPanel.Children.Add(logPath); logPanel.Children.Add(log);
         logTab = new TabItem { Header = Lang.T("tab.log"), ToolTip = Lang.T("tab.log.tip"), Content = logPanel };
         tabs.Items.Add(logTab);
         SizeChanged += (_,_) => {

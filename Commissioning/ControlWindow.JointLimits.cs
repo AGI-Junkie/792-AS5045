@@ -125,10 +125,10 @@ public sealed partial class ControlWindow
                 if (limitAttempts >= 3) {
                     if (limitSyncError.Length > 0) return;
                     limitSyncError = "limits.syncTimeout";
-                    Append("HOST " + Lang.T(limitSyncError)); return;
+                    Append("HOST " + Lang.T(limitSyncError), LogLevel.Error); return;
                 }
                 limitAttempts++; limitRequestedAt = now; pendingControlType = limitType;
-                Append($"HOST joint limits retry axis={limitAxis} seq={limitSequence} attempt={limitAttempts}/3");
+                Append($"HOST joint limits retry axis={limitAxis} seq={limitSequence} attempt={limitAttempts}/3", LogLevel.Warning);
                 return;
             }
             if (desired is not { } wanted || reportedLimits is null || limitsAwaitingState) return;

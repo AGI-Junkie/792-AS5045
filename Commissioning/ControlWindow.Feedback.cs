@@ -17,13 +17,13 @@ public sealed partial class ControlWindow
         if(pendingControl is null || (now-controlRequestedAt).TotalSeconds<3) return;
         string control = pendingControl;
         Lang.Text(lastStop, () => Lang.T("fault.controlTimeout", control=="使能"?Lang.T("ctl.enable"):Lang.T("ctl.home")));
-        Append("HOST control acknowledgement timeout: "+pendingControl); Stop();
+        Append("HOST control acknowledgement timeout: "+pendingControl, LogLevel.Error); Stop();
     }
     private void CheckTelemetryTimeout(DateTime now)
     {
         if (!supportsTelemetry || (now-lastTelemetryAt).TotalSeconds < 2) return;
         telemetry = null; ShowFeedback(null, () => Lang.T("fault.telemetryStale"));
-        if (pendingControl is null && (PointBusy || executing)) { Append("HOST telemetry timeout; stopping"); Stop(); }
+        if (pendingControl is null && (PointBusy || executing)) { Append("HOST telemetry timeout; stopping", LogLevel.Error); Stop(); }
     }
     private bool AtStart(JointPose pose) => supportsTelemetry && ptp is { Active: 0, Referenced: true } &&
         telemetry is { Referenced: true, Inputs: 0 } && telemetry.Epoch == ptp.Epoch && telemetry.Sequence == ptp.Sequence &&
