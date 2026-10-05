@@ -1,4 +1,4 @@
-# 上位机 ↔ 固件 通信协议（stage2-v7-absolute-q2-elbow，proto=2）
+# 上位机 ↔ 固件 通信协议（stage2-v9-optional-arm2-feedback，proto=4）
 
 本页只写当前源码里**已经存在**的行为，均已对照 `DRV8825.cydsn/main.c` 与 `Commissioning/` 核对；有出入以源码为准。设计过程和现场日志分析见 `docs/history/WORKBENCH_HARDENING.md`。状态机见 [STATE_MODEL.md](STATE_MODEL.md)。
 
@@ -63,14 +63,14 @@
 
 | 行 | 内容 |
 |---|---|
-| `STATE fw=stage2-v7 enabled home homed1 homed2 fault enc dir` | 固定的 `fw=stage2-v7` 用于选择“帧控制”；`home`：0 待机、1 释放、2 额外退开、3 快碰、4 慢碰、5 零点稳定、6 伸直、7 伸直稳定。`homed1=1` 可能只表示 arm1 已置零，整个流程要看两轴且 `home=0` |
-| `LINK uart=hw baud=115200 rx_overflow rx_error tx_dropped fw=<构建号> short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 traj_repeat=1 fault_snapshot=1 telem_hz=<n> proto=<n>` | 能力声明。上位机要求 `proto=` 等于自己的协议版本才解锁运动（见第 6 节）；`rates_live=1` 表示已使能且静止时也接受 type 10。计数器自上电起累计，判断“本次是否新增”要看日志内的增量。整行约 230 个字符，固件调试缓冲区 `g_dbg` 为 320 字节；缓冲区太短会把行尾的 `proto=` 连同换行截掉，`link_capabilities` 测试检查行尾 |
+| `STATE fw=stage2-v9 enabled home homed1 homed2 fault enc dir enc2 dir2 arm2fb` | 固定的 `fw=stage2-v8` 用于选择“帧控制”；`enc/dir` 与 `enc2/dir2` 分别报告两路有效性与方向已识别；`home`：0 待机、1 释放、2 额外退开、3 快碰、4 慢碰、5 零点稳定、6 伸直、7 伸直稳定。`homed1=1` 可能只表示 arm1 已置零，整个流程要看两轴且 `home=0` |
+| `LINK uart=hw baud=115200 rx_overflow rx_error tx_dropped fw=<构建号> short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=1 traj_repeat=1 fault_snapshot=1 telem_hz=<n> proto=<n>` | 能力声明。上位机要求 `proto=` 等于自己的协议版本才解锁运动（见第 6 节）；`rates_live=1` 表示已使能且静止时也接受 type 10。计数器自上电起累计，判断“本次是否新增”要看日志内的增量。整行约 230 个字符，固件调试缓冲区 `g_dbg` 为 512 字节（双轴快照可能超过 320）；缓冲区太短会把行尾的 `proto=` 连同换行截掉，`link_capabilities` 测试检查行尾 |
 | `PTP_STATE lock ref active epoch seq min1 max1 min2 max2 emin emax` | 执行锁、参考、运动阶段、代次、序号、固件里的关节范围；`emin/emax` 是肘范围（0.01°，开机默认 ∓15500）。**缺这两项的行上位机一律不接受**（旧固件不能证明肘范围） |
 | `TRAJ_STATE state count total index seq epoch` | 轨迹缓存状态（0 空、1 上传、2 就绪、3 运行、4 完成） |
 | `TIMING loop_max_ms tick_lag_max_ms clock wdt key_age_ms key_max_gap_ms` | `key_max_gap_ms`：使能以来运动许可有效期间最长的一次心跳间隔，ENABLE 清零 |
 | `ENC_DIAG irq_max_us retries rejected gap_max_ms follow_peak_lsb` | 编码器读取的关中断最长时间等 |
 | `PTP_RX short_ok drop_crc drop_short drop_timeout rejected epoch_rejected last_rejected_byte` | 协议层丢帧/拒绝计数；`rx_error` 只统计 UART 级故障 |
-| `TELEM t epoch seq ref source p1 p2 e1 err inputs drops` | 位置遥测：`p1/p2` 指令微步，`e1` 编码器，`err` 跟随误差。默认只随 500 ms 状态块出现（约 2 Hz）；type 11 设为 5…20 Hz 后，**已使能期间**另外按该速率单独发送，格式不变。`seq` 是设备最后接受的序号，**收下一条指令（上传的每个节点、RUN）就立刻前进**，而 `PTP_STATE` 仍是每 500 ms 一条：所以流式 `TELEM` 的 `seq` 可以领先主机最近一条 `PTP_STATE`。主机把“`seq` 大于 `PTP_STATE` 的、但不超过自己已发出的最大序号”当作正常（照常使用，只是还不算“已稳定”，`AtStart` 等要等 `PTP_STATE` 追上）；`seq` 落后、超过自己发出过的、或 `epoch` 不同才按“设备反馈无效”处理并停止 |
+| `TELEM t epoch seq ref source p1 p2 e1 err e2 err2 inputs drops` | 位置遥测：`p1/p2` 指令微步，`e1/e2` 两路相对参考的电机轴累计 LSB（逆时针正）；`e2` 是肘而不是绝对 q2，q2=q1+e2×360/(4096×51.06)。`err/err2` 两路原始编码器方向的跟随误差。`ref=1` 要求两路都有效且方向已识别。默认只随 500 ms 状态块出现（约 2 Hz）；type 11 设为 5…20 Hz 后，**已使能期间**另外按该速率单独发送，格式不变。`seq` 是设备最后接受的序号，**收下一条指令（上传的每个节点、RUN）就立刻前进**，而 `PTP_STATE` 仍是每 500 ms 一条：所以流式 `TELEM` 的 `seq` 可以领先主机最近一条 `PTP_STATE`。主机把“`seq` 大于 `PTP_STATE` 的、但不超过自己已发出的最大序号”当作正常（照常使用，只是还不算“已稳定”，`AtStart` 等要等 `PTP_STATE` 追上）；`seq` 落后、超过自己发出过的、或 `epoch` 不同才按“设备反馈无效”处理并停止 |
 | `TELEM_RATE epoch seq hz` | type 11 的回执；`LINK` 里的 `telem_hz=` 是当前值 |
 | `TELEM_DIAG hz sent skipped max_us` | 流式遥测的代价：已发送行数、因发送队列过半而跳过的行数、一次格式化最长耗时（微秒）。**跳过而不是丢弃**：流式行从不占用发送队列的后一半，ACK 和停止信息保有余量 |
 | `FAULT_SNAPSHOT t epoch seq phase home traj idx ref p1 p2 e1 err inputs hb_age_ms hb_max_gap_ms drv reason="…"` | 每次停止的第一行（在任何状态被清除之前）：停机时的阶段（`home/ptp/traj_run/traj_upload/jog/idle/disabled`）、位置（同 `TELEM`）、输入掩码、心跳年龄。`drv=nfault_undetermined` 表示驱动器 nFAULT 有效，**原因待诊断**：该引脚可由过流、过热或欠压触发，不能据此认定过热；否则 `drv=ok` |
@@ -82,8 +82,12 @@
 
 ## 6. 版本与兼容
 
-- 固件标识 `FW_BUILD_ID`（现为 `stage2-v7-absolute-q2-elbow-r4000-telem`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。行为不变的结构性重构（例如 2026-09-30 的循环拆分）没有改它，靠 `firmware.hex` 的 SHA-256 区分。
+- 固件标识 `FW_BUILD_ID`（现为 `stage2-v9-optional-arm2-feedback`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。行为不变的结构性重构（例如 2026-09-30 的循环拆分）没有改它，靠 `firmware.hex` 的 SHA-256 区分。
 - **proto=2（肘范围）**：type 9 新增轴 2（肘），`PTP_STATE` 末尾新增 `emin=<cd> emax=<cd>`，并把肘范围纳入 PTP/轨迹/点动的校验。固件开机默认 ∓155°（`PTP_ELBOW_DEFAULT_CD`，与 `DeviceContract.ElbowDefaultCd` 同值、由发布闸门核对）：这是暂定值，不是实测机械行程。上位机连接后把界面里的肘范围同步给固件，和 q1/q2 范围一样，确认一致才允许运动；proto=1 的固件会被拒绝运动并提示更新。
 - **能力位（不改 proto）**：`traj_repeat=1` 已运行过的已缓存图形接受再次 RUN，没有它的固件第二次 RUN 会被拒绝并停止，上位机据此在运行一次后要求重新上传；`fault_snapshot=1` 每次停止先打印 `FAULT_SNAPSHOT`；`telem_hz=<n>` 出现表示支持 type 11，值是当前速率。上位机对没声明的固件不发 type 11、不指望快照。
-- **协议版本号**：`LINK` 行末尾的 `proto=<n>`（固件 `PROTO_VERSION`，上位机 `DeviceContract.ProtocolVersion`）。上位机只在两者相等时解锁运动，与 `fw=` 构建号无关，所以构建号可以随时改。**帧格式、字段含义、序号/代次规则或坐标约定一变，两边一起加一**；发布闸门会核对两边的数字。当前为 `proto=2`（即本页描述的协议，含 absolute-q2 坐标和肘范围）。固件仍同时输出旧的 `q2_absolute=1`，只为让上一版上位机继续可用。
+- **proto=3（双编码器历史版本）**：STATE 新增 enc2/dir2；TELEM 与 FAULT_SNAPSHOT 新增 e2/err2；同次 SSI 读取更新两路，任一路失效都会保护停机。人工参考要求 arm2 方向已由本次使能后的回零识别。
+
+- **proto=4（arm2 反馈可选）**：STATE 增加 `arm2fb=0/1`。当前交付默认 0，arm2 不要求编码器连接或方向识别，人工伸直可直接确认；TELEM/FAULT_SNAPSHOT 省略 e2/err2，上位机显示缺测。宏 `ARM2_ENCODER_FEEDBACK=1` 构建才启用双编码器强制检查和失效停机。
+
+- **协议版本号**：`LINK` 行末尾的 `proto=<n>`（固件 `PROTO_VERSION`，上位机 `DeviceContract.ProtocolVersion`）。上位机只在两者相等时解锁运动，与 `fw=` 构建号无关，所以构建号可以随时改。**帧格式、字段含义、序号/代次规则或坐标约定一变，两边一起加一**；发布闸门会核对两边的数字。当前为 `proto=4`（即本页描述的协议，含 absolute-q2 坐标和肘范围）。`q2_absolute=1` 保留坐标说明；proto=2 上位机不能控制本版固件。
 - 上位机对旧固件的处理：`LINK` 里没有 `short_hb` 就用 36 字节完整心跳；没有声明 `joint_limits`、`motion_rates` 或 `q2_absolute` 的能力，相应功能保持锁定并提示更新固件（不会静默忽略）。没有 `rates_live=1` 时，已使能下改速度不下发，仍要先总停止、禁用后自动同步、再使能。`rates_live` 是新增的能力位，不改帧格式，所以 `proto` 没有变。

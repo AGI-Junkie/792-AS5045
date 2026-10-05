@@ -178,7 +178,7 @@ public sealed partial class ControlWindow
             void Device(JointPose at, bool referenced = true, uint seq = 1) {
                 w.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
                 w.TestLine($"PTP_STATE lock=0 ref={(referenced ? 1 : 0)} active=0 epoch=4 seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
-                w.TestLine($"TELEM t=10 epoch=4 seq={seq} ref={(referenced ? 1 : 0)} source=2 p1={ExecutionTrajectory.Counts(0, at)} p2={ExecutionTrajectory.Counts(1, at)} e1=0 err=0 inputs=0 drops=0");
+                w.TestLine($"TELEM t=10 epoch=4 seq={seq} ref={(referenced ? 1 : 0)} source=2 p1={ExecutionTrajectory.Counts(0, at)} p2={ExecutionTrajectory.Counts(1, at)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
                 w.UpdateControls();
             }
             Device(elsewhere);

@@ -353,7 +353,7 @@ public sealed partial class ControlWindow
                 window.lastTelemetryAt = DateTime.UtcNow.AddSeconds(-3);
                 window.CheckTelemetryTimeout(DateTime.UtcNow);
                 Check(window.pendingControlType == 7, "old telemetry timestamp cancelled the enable request");
-                window.TestLine("TELEM t=10 epoch=10 seq=1 ref=0 source=0 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+                window.TestLine("TELEM t=10 epoch=10 seq=1 ref=0 source=0 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
                 Check(window.pendingControlType == 7, "unreferenced telemetry cancelled the enable request");
                 window.PublishHeartbeatLease(); window.WireWriterStep(Write);
                 Check(window.WireWriterStep(Write), "enable failed after full range confirmation");

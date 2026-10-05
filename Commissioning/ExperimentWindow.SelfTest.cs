@@ -43,7 +43,7 @@ internal sealed partial class ExperimentWindow
             {
                 var at = baseLocal.AddSeconds(s);
                 log.Add($"[{at:HH:mm:ss.fff}] HOST marker {s}");
-                log.Add($"[{at.AddMilliseconds(500):HH:mm:ss.fff}] TELEM t=1 epoch=5 seq=1 ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+                log.Add($"[{at.AddMilliseconds(500):HH:mm:ss.fff}] TELEM t=1 epoch=5 seq=1 ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
             }
             string logFile = Path.Combine(logs, $"stage1-{baseLocal.AddMinutes(-1):yyyyMMdd-HHmmss}-000.log");
             File.WriteAllLines(logFile, log); File.SetLastWriteTime(logFile, DateTime.Now);
@@ -62,7 +62,7 @@ internal sealed partial class ExperimentWindow
             // One recording: the curves, the events, the written summary.
             w.SelectForSelfTest(rectRow);
             var (q, err, speed, accel) = (w.Plots[0], w.Plots[1], w.Plots[2], w.Plots[3]);
-            Check(w.ShownRuns == 1 && q.Series.Count == 3 && err.Series.Count == 1 && speed.Series.Count == 2 && accel.Series.Count == 2, "series per chart");
+            Check(w.ShownRuns == 1 && q.Series.Count == 5 && err.Series.Count == 2 && speed.Series.Count == 2 && accel.Series.Count == 2, "series per chart");
             Check(err.Marks.Count(m => m.Label is "起步" or "停机" or "拐角 1" or "拐角 2" or "拐角 3") == 5 && err.Marks.Any(m => m.Label.StartsWith("故障 ")), "the plan's events and the stop snapshot are marked on the error chart");
             Check(Math.Abs(err.Marks.First(m => m.Label.StartsWith("故障")).X - 12.0) < 0.02, "the stop snapshot is placed at its device time on the aligned axis");
             Check(speed.Lines.Count == 4 && speed.Lines.Any(l => l.Label.StartsWith("电机1 上限")) && accel.Lines.Count == 4, "the caps are drawn as reference lines");
@@ -99,7 +99,7 @@ internal sealed partial class ExperimentWindow
 
             // Two recordings laid over each other.
             w.SelectForSelfTest(0, 1);
-            Check(w.ShownRuns == 2 && q.Series.Count == 6 && err.Series.Count == 2 && speed.Series.Count == 4 && q.Series[0].Name.StartsWith("A ") && q.Series[3].Name.StartsWith("B "), "comparison doubles the series and tags them A and B");
+            Check(w.ShownRuns == 2 && q.Series.Count == 10 && err.Series.Count == 4 && speed.Series.Count == 4 && q.Series[0].Name.StartsWith("A ") && q.Series[5].Name.StartsWith("B "), "comparison doubles the series and tags them A and B");
             Check(w.SummaryText_.Contains("B 相对 A") && w.Plane.Paths.Count == 6 && err.Notes.Count == 2, "comparison summary and notes");
             Check(w.Range.Max >= 10 && w.Plane.Arms.Count == 4, "both arms at the cursor");
             // Language switch rewrites everything without losing the selection.

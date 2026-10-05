@@ -44,6 +44,8 @@ def analyse(text):
         if last[2] > first[2]:
             warns.append("tx_dropped 增加 %d（状态/回执可能被丢）" % (last[2] - first[2]))
 
+    if "arm2fb=0" in text: info.append("arm2 反馈未启用：按指令计数，无 arm2 实测误差")
+
     enable = text.find("ENABLE OK")
     if enable < 0:
         info.append("本次日志没有使能，不评估心跳余量")
@@ -85,6 +87,9 @@ def analyse(text):
     for err, limit in re.findall(r"PTP done seq=\d+;.*?error_lsb=(-?\d+) final_limit_lsb=(\d+)", text):
         if abs(int(err)) > int(limit):
             fails.append("终点误差 %s LSB 超过限 %s" % (err, limit))
+    for err1, err2, limit in re.findall(r"PTP done seq=\d+;.*?error1_lsb=(-?\d+)(?: error2_lsb=(-?\d+))? final_limit_lsb=(\d+)", text):
+        for axis, err in enumerate((err1, err2), 1):
+            if err and abs(int(err)) > int(limit): fails.append("arm%d 终点误差 %s LSB 超过限 %s" % (axis, err, limit))
     done = len(set(re.findall(r"TRAJ_STATE state=4 [^\n]*?seq=(\d+)", text)))
     info.append("完整执行轨迹 %d 条" % done)
     return fails, warns, info

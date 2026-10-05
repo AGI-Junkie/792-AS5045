@@ -28,11 +28,11 @@ public sealed partial class ControlWindow
                     w.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
                     w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch={epoch} seq={seq} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
                     if (!w.protocolMatches) w.TestLine($"LINK fw=stage2-v7-absolute-q2 q2_absolute=1 proto={DeviceContract.ProtocolVersion} motion_rates=1");
-                    w.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, at)} p2={ExecutionTrajectory.Counts(1, at)} e1=0 err=0 inputs=0 drops=0");
+                    w.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, at)} p2={ExecutionTrajectory.Counts(1, at)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
                     w.UpdateControls();
                 }
                 // The 10 Hz stream: the device's sequence moves on the moment it accepts a command, before the next PTP_STATE says so.
-                void Stream(uint at, JointPose pose) => w.TestLine($"TELEM t=20 epoch={epoch} seq={at} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, pose)} p2={ExecutionTrajectory.Counts(1, pose)} e1=0 err=0 inputs=0 drops=0");
+                void Stream(uint at, JointPose pose) => w.TestLine($"TELEM t=20 epoch={epoch} seq={at} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, pose)} p2={ExecutionTrajectory.Counts(1, pose)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
                 void Click(Button button) => button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
                 void MoveThere(JointPose target) {
                     Click(panel.MoveButton);

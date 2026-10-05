@@ -1,4 +1,18 @@
+# v9 — arm2 编码器暂时可选
+
+- 默认关闭 arm2 编码器反馈要求，保留 arm1 反馈与既有保护；无 arm2 反馈时使用指令计数。
+- 人工伸直确认不再被 arm2 方向未识别拦住。
+- proto=4 用 arm2fb 报告模式，缺测字段不生成虚假零值；固定编码器后可重新启用双轴反馈构建。
+
 # 变更记录
+
+## 2026-10-05 — arm2 feedback parity
+
+- `stage2-v8-dual-encoder-feedback` / `proto=3`: 38-clock SSI chain integrated into normal sampling; each motor has independent wrap tracking, polarity learning, following protection, jog hold and measured joint guards. No open-loop fallback. Existing physical stop behavior retained.
+- Both encoders qualify enable/home/PTP/trajectory and final acceptance. Telemetry and fault snapshots now include `e2/err2`; host shows/records/replays measured q2 = measured q1 + measured elbow, with q2 error/RMSE/peak. Older archives retain their original measurement gaps.
+- SSI masks interrupts per bit, permitting UART RX between bits. Current 126°/161.5° calibration parameters retained and regression expectations aligned. Arm2 manual reference requires polarity learned during homing after enable.
+- Software validation and matching artifacts are produced by `build-release.ps1`; no flashing or physical motion. Continuous trajectory correction, physical calibration, real timing and precision acceptance remain: see [arm2 feedback](docs/ARM2_FEEDBACK.md).
+
 
 最新在前。每条写“改了什么、验证到哪一步”；“未烧录”指固件镜像没有下载到板子上。
 

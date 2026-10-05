@@ -244,6 +244,11 @@ internal sealed partial class ExperimentWindow : Window
             var a = shown[i]; var c = Colours[i]; string tag = compare ? (i == 0 ? "A " : "B ") : "";
             qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.cmd"), a.T, a.Q1Command, c[0]) { Unit = "°" });
             qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.enc"), a.T, a.Q1Encoder, c[1]) { Dashed = true, Thickness = 1.3, Unit = "°" });
+            if(a.Q2Measured.Length==a.T.Length && a.T.Length>0) {
+                qPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.cmd"),a.T,a.Q2Command,c[3]) { Unit="°" });
+                qPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.enc"),a.T,a.Q2Measured,c[1]) { Unit="°",Dashed=true });
+                errPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.err"),a.T,a.Q2Error,c[3]) { Unit="°",Decimals=4 });
+            }
             if (a.HasPlan) qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.plan"), a.PlanT, a.PlanQ1, c[2]) { Dashed = true, Thickness = 1.1, Unit = "°" });
             errPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.err"), a.T, a.Q1Error, c[0]) { Unit = "°", Decimals = 4, Dots = a.T.Length < 120 });
             if (a.T.Length > 0) { errPlot.Lines.Add(new PlotLine(a.Rmse, tag + "RMSE " + a.Rmse.ToString("0.0000", CultureInfo.InvariantCulture), c[0])); errPlot.Lines.Add(new PlotLine(-a.Rmse, "", c[0])); }
@@ -338,7 +343,7 @@ internal sealed partial class ExperimentWindow : Window
             double q1 = a.At(a.Q1Command, cursor), q2 = a.At(a.Q2Command, cursor), enc = a.At(a.Q1Encoder, cursor);
             var (elbow, tip) = a.Model.Forward(new JointPose(q1, q2));
             xy.Arms.Add(new XYView.Arm((i == 0 ? "A" : "B") + " cmd", [new Point(0, 0), elbow, tip], Colours[i][0], false));
-            var (hElbow, hTip) = a.Model.Forward(new JointPose(enc, enc + (q2 - q1)));
+            var (hElbow, hTip) = a.Model.Forward(new JointPose(enc, a.Q2Measured.Length==a.T.Length ? a.At(a.Q2Measured,cursor) : enc + (q2 - q1)));
             xy.Arms.Add(new XYView.Arm((i == 0 ? "A" : "B") + " hybrid", [new Point(0, 0), hElbow, hTip], Colours[i][1], true));
         }
         xy.InvalidateVisual();

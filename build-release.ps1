@@ -15,7 +15,7 @@ if ($running) { throw 'Close the host from this output directory before rebuildi
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Push-Location -LiteralPath $repo
 try {
-    $sources = @('DRV8825.cydsn\main.c','DRV8825.cydsn\DRV8825.cyprj','DRV8825.cydsn\DRV8825.cydwr','DRV8825.cydsn\TopDesign\TopDesign.cysch','Commissioning\Commissioning.csproj','tests\test_stage1.py','build-release.ps1','verify-creator-pins.ps1','RELEASE_VERSION','README.md','CHANGELOG.md','docs\PROTOCOL.md','docs\STATE_MODEL.md','docs\UART_DIAGNOSIS.md','docs\history\RUN_REVIEW_20260929.md','tools\check-log.py')
+    $sources = @('DRV8825.cydsn\main.c','DRV8825.cydsn\DRV8825.cyprj','DRV8825.cydsn\DRV8825.cydwr','DRV8825.cydsn\TopDesign\TopDesign.cysch','Commissioning\Commissioning.csproj','tests\test_stage1.py','build-release.ps1','verify-creator-pins.ps1','RELEASE_VERSION','README.md','CHANGELOG.md','docs\PROTOCOL.md','docs\ARM2_FEEDBACK.md','docs\STATE_MODEL.md','docs\UART_DIAGNOSIS.md','docs\history\RUN_REVIEW_20260929.md','tools\check-log.py')
     $sources += Get-ChildItem -LiteralPath Commissioning -Filter '*.cs' | ForEach-Object { 'Commissioning\' + $_.Name }
     $sourceHashes = @{}
     foreach ($source in $sources) { $sourceHashes[$source] = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash }
@@ -113,7 +113,7 @@ try {
         ('Rectangle: ' + (Get-Content (Join-Path $dest 'rectangle-tests.log') -Tail 1)),
         'No serial connection, programming, or real motor movement performed by this build.',
         'Screenshots contain explicitly marked simulated data, not hardware evidence.',
-        'Arm2 and pen XY are not measured; real-machine acceptance and calibration remain with operator.'
+        "Arm2 encoder feedback enabled: $(Def 'ARM2_ENCODER_FEEDBACK') (0 = arm2 commanded steps without feedback; arm1 encoder still required). Pen XY is not measured. Tracking servo, real-machine acceptance and calibration remain."
     )
     $report = @($report | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
     foreach ($source in $sources) {

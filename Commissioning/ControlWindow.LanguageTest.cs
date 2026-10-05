@@ -49,7 +49,7 @@ public sealed partial class ControlWindow
             w.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=4 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             w.TestLine($"LINK fw=stage2-v7-absolute-q2 proto={DeviceContract.ProtocolVersion} motion_rates=1 joint_limits=1");
             var plan = p.Plan!; var start = plan.Nodes[0].Pose;
-            w.TestLine($"TELEM t=10 epoch=4 seq=1 ref=1 source=2 p1={ExecutionTrajectory.Counts(0,start)} p2={ExecutionTrajectory.Counts(1,start)} e1=0 err=0 inputs=0 drops=0");
+            w.TestLine($"TELEM t=10 epoch=4 seq=1 ref=1 source=2 p1={ExecutionTrajectory.Counts(0,start)} p2={ExecutionTrajectory.Counts(1,start)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
             w.TestLine("INPUTS: J4-1/P0[4]=1 J4-2/P0[3]=1 NPN/P1[0]=1 nFAULT=1");
             Toggle(true);
             Check(w.state.Text.Contains("Enabled") && w.liveValues.Text.Contains("Manual straight zero") && w.inputs.Text.StartsWith("Input levels"), "existing feedback stale");
@@ -62,7 +62,7 @@ public sealed partial class ControlWindow
             for (int i = 0; i < plan.Nodes.Length; i++)
                 w.TestLine($"TRAJ_STATE state={(i+1 == plan.Nodes.Length ? 2 : 1)} count={i+1} total={plan.Nodes.Length} index=0 seq={w.pendingPoint} epoch={epoch}");
             w.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=4 seq={w.pointSequence} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
-            w.TestLine($"TELEM t=11 epoch=4 seq={w.pointSequence} ref=1 source=2 p1={ExecutionTrajectory.Counts(0,start)} p2={ExecutionTrajectory.Counts(1,start)} e1=0 err=0 inputs=0 drops=0");
+            w.TestLine($"TELEM t=11 epoch=4 seq={w.pointSequence} ref=1 source=2 p1={ExecutionTrajectory.Counts(0,start)} p2={ExecutionTrajectory.Counts(1,start)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
             Check(w.uploaded == plan && p.RunButton.IsEnabled && !w.executing, "held plan missing");
             p.CheckLanguagePreservesPreview(() => Toggle(true));
             Check(p.RunButton.IsEnabled && w.state.Text.StartsWith("Shape uploaded"), "switch lost held plan");

@@ -30,7 +30,7 @@ public sealed partial class ControlWindow
         window.heartbeatTimer.Tick -= window.OnHeartbeatTick;
         var seed = new StringBuilder();
         while (seed.Length < 92000)
-            seed.AppendLine("[19:30:19.432] TELEM t=49000 epoch=2 seq=1 ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+            seed.AppendLine("[19:30:19.432] TELEM t=49000 epoch=2 seq=1 ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
         window.log.Text = seed.ToString();
         var tabs = (TabControl)window.diagnostics.Content;
         var clock = new Stopwatch();

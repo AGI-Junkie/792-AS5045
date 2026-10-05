@@ -31,7 +31,8 @@ public static partial class ExperimentArchiveTests
             var pose = followPlan ? new JointPose(Interp(q1, tau), Interp(q2, tau)) : new JointPose(rng.NextDouble() * 40 - 20, rng.NextDouble() * 40 - 20);
             double err = errorAmplitude * Math.Sin(2 * Math.PI * tau / 3);
             int encoder = (int)Math.Round((pose.Q1 + err) / 360.0 * DeviceContract.EncoderCounts * DeviceContract.Arm1GearRatio);
-            var sample = new TelemetrySample((uint)ms, 5, 1, true, 2, ExecutionTrajectory.Counts(0, pose), ExecutionTrajectory.Counts(1, pose), encoder, 0, 0, 0);
+            int encoder2 = (int)Math.Round((pose.Q2-pose.Q1) / 360.0 * DeviceContract.EncoderCounts * (DeviceContract.Arm2GearRatioX100/100.0));
+            var sample = new TelemetrySample((uint)ms, 5, 1, true, 2, ExecutionTrajectory.Counts(0, pose), ExecutionTrajectory.Counts(1, pose), encoder, 0, 0, 0, encoder2, 0);
             recorder.Record(sample, tau < -0.3 ? "upload" : tau < 0.06 ? "ready" : "drawing", 0);
         }
         recorder.Finish("complete");

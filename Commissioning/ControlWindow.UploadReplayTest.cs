@@ -22,7 +22,7 @@ public sealed partial class ControlWindow
         if (plan.Nodes.Length < 362) throw new InvalidOperationException("Upload replay must exercise at least 362 nodes.");
         var seed = new StringBuilder();
         while (seed.Length < 92000)
-            seed.AppendLine("[19:30:19.432] TELEM t=49000 epoch=2 seq=1 ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+            seed.AppendLine("[19:30:19.432] TELEM t=49000 epoch=2 seq=1 ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
         window.log.Text = seed.ToString();
         window.diagnostics.IsExpanded = true;
         var tabs = (TabControl)window.diagnostics.Content;
@@ -59,7 +59,7 @@ public sealed partial class ControlWindow
             lock (peerSync) { statusSequence = sequence; }
             window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
             window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=2 seq={statusSequence} min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
-            window.TestLine($"TELEM t={49000 + batches * 500} epoch=2 seq={statusSequence} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, plan.Nodes[0].Pose)} p2={ExecutionTrajectory.Counts(1, plan.Nodes[0].Pose)} e1=0 err=0 inputs=0 drops=0");
+            window.TestLine($"TELEM t={49000 + batches * 500} epoch=2 seq={statusSequence} ref=1 source=2 p1={ExecutionTrajectory.Counts(0, plan.Nodes[0].Pose)} p2={ExecutionTrajectory.Counts(1, plan.Nodes[0].Pose)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
             // Advertise the compact heartbeat so the replay exercises the configuration
             // that actually ships, not a legacy one.
             window.TestLine($"LINK uart=hw baud=115200 rx_overflow=0 rx_error=0 tx_dropped=0 fw=stage2-v7-absolute-q2 short_hb=1 motion_rates=1 joint_limits=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion}");

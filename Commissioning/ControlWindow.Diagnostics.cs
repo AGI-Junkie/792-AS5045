@@ -13,14 +13,15 @@ namespace TwoLinkCommissioning;
 // under-voltage and the pin does not say which, so Driver stays "nfault_undetermined" and the UI says so.
 public sealed record FaultSnapshot(uint Milliseconds, uint Epoch, uint Sequence, string Phase, int Home, int TrajState,
     int TrajIndex, int TrajCount, bool Referenced, int Steps1, int Steps2, int Encoder1, int Slip, int Inputs,
-    uint HeartbeatAgeMs, uint HeartbeatMaxGapMs, string Driver, string Reason)
+    uint HeartbeatAgeMs, uint HeartbeatMaxGapMs, string Driver, string Reason, int? Encoder2 = null, int? Slip2 = null)
 {
     private static readonly Regex Pair = new(@"(\w+)=(""[^""]*""?|\S+)", RegexOptions.CultureInvariant);
     public bool DriverFault => Driver != "ok";
-    private TelemetrySample AsSample => new(Milliseconds, Epoch, Sequence, Referenced, Referenced ? 2 : 0, Steps1, Steps2, Encoder1, Slip, Inputs, 0);
+    private TelemetrySample AsSample => new(Milliseconds, Epoch, Sequence, Referenced, Referenced ? 2 : 0, Steps1, Steps2, Encoder1, Slip, Inputs, 0, Encoder2, Slip2);
     // Joint angles as the host computes them from commanded steps (arm2 has no encoder), and arm1's encoder error.
     public JointPose Command => AsSample.Command;
     public double EncoderErrorDegrees => AsSample.Error1;
+    public double? EncoderError2Degrees => AsSample.Error2;
     public static FaultSnapshot? Parse(string line)
     {
         if (!line.StartsWith("FAULT_SNAPSHOT ", StringComparison.Ordinal)) return null;
@@ -34,7 +35,12 @@ public sealed record FaultSnapshot(uint Milliseconds, uint Epoch, uint Sequence,
             !int.TryParse(values["p1"], out int p1) || !int.TryParse(values["p2"], out int p2) || !int.TryParse(values["e1"], out int e1) || !int.TryParse(values["err"], out int err) ||
             !int.TryParse(values["inputs"], out int inputs) || !uint.TryParse(values["hb_age_ms"], out uint age) || !uint.TryParse(values["hb_max_gap_ms"], out uint gap) ||
             values["ref"] is not ("0" or "1") || inputs is < 0 or > 15) return null;
-        return new(t, epoch, seq, values["phase"], home, traj, at, count, values["ref"] == "1", p1, p2, e1, err, inputs, age, gap, values["drv"], values["reason"]);
+        int? e2 = null, err2 = null;
+        if(values.ContainsKey("e2") || values.ContainsKey("err2")) {
+            if(!values.TryGetValue("e2",out var raw2) || !values.TryGetValue("err2",out var slip2) || !int.TryParse(raw2,out int r2) || !int.TryParse(slip2,out int s2)) return null;
+            e2=r2; err2=s2;
+        }
+        return new(t, epoch, seq, values["phase"], home, traj, at, count, values["ref"] == "1", p1, p2, e1, err, inputs, age, gap, values["drv"], values["reason"], e2, err2);
     }
 }
 
@@ -134,7 +140,7 @@ public sealed partial class ControlWindow
         var command = f.Command;
         string phase = Lang.T("snap.phase." + (f.Phase is "home" or "ptp" or "traj_run" or "traj_upload" or "jog" or "idle" or "disabled" ? f.Phase : "other"));
         return Lang.T("snap.summary", phase, f.Referenced ? $"{command.Q1:F2}°/{command.Q2:F2}°" : Lang.T("snap.noRef"),
-                   f.Referenced ? $"{f.EncoderErrorDegrees:+0.000;-0.000;0.000}°" : "—", f.Inputs, f.HeartbeatAgeMs, f.HeartbeatMaxGapMs) + "\n" +
+                   f.Referenced ? $"{f.EncoderErrorDegrees:+0.000;-0.000;0.000}° / " + (f.EncoderError2Degrees is double e2 ? $"{e2:+0.000;-0.000;0.000}°" : "—") : "—", f.Inputs, f.HeartbeatAgeMs, f.HeartbeatMaxGapMs) + "\n" +
                (f.DriverFault ? Lang.T("snap.drvUndetermined") : Lang.T("snap.drvOk"));
     }
 
@@ -150,9 +156,9 @@ public sealed partial class ControlWindow
             note = f.DriverFault ? "nFAULT can be over-current, over-temperature or under-voltage; the pin does not say which. Cause not determined." : "see snapshot.reason",
             pre_fault_seconds = PreFaultSeconds, pre_fault_samples = recentTelemetry.Count
         }, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
-        var csv = new StringBuilder("host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,slip_motor_lsb,inputs_active_mask\n");
+        var csv = new StringBuilder("host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_encoder_deg,q2_error_deg,slip2_motor_lsb,slip_motor_lsb,inputs_active_mask\n");
         foreach (var (at, s) in recentTelemetry)
-            csv.AppendLine(FormattableString.Invariant($"{at:O},{s.Milliseconds},{s.Epoch},{s.Sequence},{s.Command.Q1:F6},{s.Measured1:F6},{s.Error1:F6},{s.Command.Q2:F6},{s.Slip},{s.Inputs}"));
+            csv.AppendLine(FormattableString.Invariant($"{at:O},{s.Milliseconds},{s.Epoch},{s.Sequence},{s.Command.Q1:F6},{s.Measured1:F6},{s.Error1:F6},{s.Command.Q2:F6},{s.Measured2:F6},{s.Error2:F6},{s.Slip2},{s.Slip},{s.Inputs}"));
         File.WriteAllText(Path.Combine(directory, "pre_fault.csv"), csv.ToString(), new UTF8Encoding(true));
         return directory;
     }
@@ -211,8 +217,8 @@ public sealed partial class ControlWindow
             Check(w.lastTelemDiag == "telemetry hz=10 sent=120 skipped=3 max_us=410", "TELEM_DIAG was not read");
 
             // The snapshot: parsed, shown, and saved with the telemetry before it. A driver fault is never explained.
-            w.RememberTelemetry(TelemetrySample.Parse("TELEM t=1000 epoch=3 seq=0 ref=1 source=2 p1=100 p2=-50 e1=200 err=1 inputs=0 drops=0")!);
-            string line = "FAULT_SNAPSHOT t=1500 epoch=3 seq=4 phase=traj_run home=0 traj=3 idx=120/383 ref=1 p1=2000 p2=-3000 e1=3500 err=-7 inputs=8 hb_age_ms=23 hb_max_gap_ms=41 drv=nfault_undetermined reason=\"DRV8825 nFAULT; drivers OFF, arm is NOT held\"";
+            w.RememberTelemetry(TelemetrySample.Parse("TELEM t=1000 epoch=3 seq=0 ref=1 source=2 p1=100 p2=-50 e1=200 err=1 e2=0 err2=0 inputs=0 drops=0")!);
+            string line = "FAULT_SNAPSHOT t=1500 epoch=3 seq=4 phase=traj_run home=0 traj=3 idx=120/383 ref=1 p1=2000 p2=-3000 e1=3500 err=-7 e2=0 err2=0 inputs=8 hb_age_ms=23 hb_max_gap_ms=41 drv=nfault_undetermined reason=\"DRV8825 nFAULT; drivers OFF, arm is NOT held\"";
             var parsed = FaultSnapshot.Parse(line);
             Check(parsed is { Phase: "traj_run", TrajIndex: 120, TrajCount: 383, Referenced: true, Steps1: 2000, Inputs: 8, HeartbeatAgeMs: 23, DriverFault: true } && parsed.Reason.StartsWith("DRV8825 nFAULT"), "the snapshot was not read");
             foreach (string bad in new[] { "FAULT_SNAPSHOT t=1 epoch=3", line.Replace(" ref=1", " ref=2"), line.Replace(" idx=120/383", " idx=120"), line.Replace("inputs=8", "inputs=99"), "STOP: x" })
@@ -227,7 +233,7 @@ public sealed partial class ControlWindow
             w.HandleLine(line.Replace("drv=nfault_undetermined", "drv=ok").Replace("phase=traj_run", "phase=idle").Replace("hb_age_ms=23", "hb_age_ms=300"));
             Check(w.faultDetail.Text.Contains("心跳") && !w.faultDetail.Text.Contains("原因待诊断"), "a non-driver stop must not talk about the driver");
             // The ring keeps only what is recent.
-            for (int i = 0; i < 1300; i++) w.RememberTelemetry(TelemetrySample.Parse("TELEM t=1 epoch=3 seq=0 ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0")!);
+            for (int i = 0; i < 1300; i++) w.RememberTelemetry(TelemetrySample.Parse("TELEM t=1 epoch=3 seq=0 ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0")!);
             Check(w.recentTelemetry.Count <= 1200, "the telemetry ring is unbounded");
             w.Disconnect("diagnostics self-test");
             Check(!w.supportsTrajRepeat && !w.supportsTelemRate && w.reportedTelemHz == -1 && w.lastFault is null && w.recentTelemetry.Count == 0, "disconnect kept the device's capabilities or snapshot");

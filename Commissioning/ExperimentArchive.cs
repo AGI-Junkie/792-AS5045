@@ -54,7 +54,7 @@ public sealed class ExperimentRun
 }
 
 public sealed record FeedbackRow(DateTime HostUtc, uint DeviceMs, uint Epoch, uint Sequence, string Phase, int Segment, double Q1Command, double Q1Encoder,
-    double Q1Error, double Q2Command, double XCommand, double YCommand, double XHybrid, double YHybrid, int Slip, int Inputs, uint Drops);
+    double Q1Error, double Q2Command, double XCommand, double YCommand, double XHybrid, double YHybrid, int Slip, int Inputs, uint Drops, double? Q2Measured = null);
 public sealed record PlanNode(int Index, int TimeMs, double Q1, double Q2);
 public sealed record RunData(PlanNode[] Plan, FeedbackRow[] Feedback, int SkippedRows);
 
@@ -173,7 +173,7 @@ public static class ExperimentArchive
                     {
                         rows.Add(new FeedbackRow(DateTime.Parse(f[at["host_utc"]], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind).ToUniversalTime(), uint.Parse(f[at["device_ms"]]), uint.Parse(f[at["epoch"]]), uint.Parse(f[at["seq"]]),
                             f[at["phase"]], int.Parse(f[at["segment"]]), D("q1_command_deg"), D("q1_encoder_deg"), D("q1_error_deg"), D("q2_command_deg"), D("x_command_model_mm"), D("y_command_model_mm"),
-                            D("x_hybrid_estimate_mm"), D("y_hybrid_estimate_mm"), int.Parse(f[at["slip_motor_lsb"]]), int.Parse(f[at["inputs_active_mask"]]), uint.Parse(f[at["rx_drops"]])));
+                            D("x_hybrid_estimate_mm"), D("y_hybrid_estimate_mm"), int.Parse(f[at["slip_motor_lsb"]]), int.Parse(f[at["inputs_active_mask"]]), uint.Parse(f[at["rx_drops"]]), at.ContainsKey("q2_measured_deg") && double.TryParse(f[at["q2_measured_deg"]], NumberStyles.Float, CultureInfo.InvariantCulture, out var measured2) ? measured2 : null));
                     }
                     catch (Exception ex) when (ex is FormatException or IndexOutOfRangeException or OverflowException or KeyNotFoundException) { if (line.Length > 0) skipped++; }
                 }
@@ -191,7 +191,7 @@ public sealed record AxisUse(string Name, double Peak, double Cap, string Unit)
 }
 
 // Everything the curves and the replay need, derived once from a recording. Time zero is the start of the plan (drawings)
-// or the first moving sample (a single point). Nothing here is a measurement of the pen: arm2 has no encoder.
+// or the first moving sample (a single point). Nothing here is a measurement of the pen; motor encoders do not see gearbox backlash. Old runs may have no arm2 measurement.
 public sealed class RunAnalysis
 {
     public required ExperimentRun Run { get; init; }
@@ -204,6 +204,8 @@ public sealed class RunAnalysis
     public double[] Q1Encoder { get; init; } = [];
     public double[] Q1Error { get; init; } = [];
     public double[] Q2Command { get; init; } = [];
+    public double[] Q2Measured { get; init; } = [];
+    public double[] Q2Error { get; init; } = [];
     public double[] XCommand { get; init; } = [];
     public double[] YCommand { get; init; } = [];
     public double[] XHybrid { get; init; } = [];
@@ -327,7 +329,9 @@ public sealed class RunAnalysis
         return new RunAnalysis {
             Run = run, Data = data, Model = model, T = T, HostUtc = motion.Select(r => r.HostUtc).ToArray(),
             Q1Command = motion.Select(r => r.Q1Command).ToArray(), Q1Encoder = motion.Select(r => r.Q1Encoder).ToArray(), Q1Error = motion.Select(r => r.Q1Error).ToArray(),
-            Q2Command = motion.Select(r => r.Q2Command).ToArray(), XCommand = motion.Select(r => r.XCommand).ToArray(), YCommand = motion.Select(r => r.YCommand).ToArray(),
+            Q2Command = motion.Select(r => r.Q2Command).ToArray(),
+            Q2Measured = motion.All(r=>r.Q2Measured.HasValue) ? motion.Select(r=>r.Q2Measured!.Value).ToArray() : [],
+            Q2Error = motion.All(r=>r.Q2Measured.HasValue) ? motion.Select(r=>r.Q2Measured!.Value-r.Q2Command).ToArray() : [], XCommand = motion.Select(r => r.XCommand).ToArray(), YCommand = motion.Select(r => r.YCommand).ToArray(),
             XHybrid = motion.Select(r => r.XHybrid).ToArray(), YHybrid = motion.Select(r => r.YHybrid).ToArray(), Segment = motion.Select(r => r.Segment).ToArray(),
             PlanT = planT, PlanQ1 = planQ1, PlanQ2 = planQ2, PlanX = xy.Select(p => p.X).ToArray(), PlanY = xy.Select(p => p.Y).ToArray(),
             PlanVT = vt.ToArray(), PlanV1 = v1.ToArray(), PlanV2 = v2.ToArray(), PlanAT = at.ToArray(), PlanA1 = a1.ToArray(), PlanA2 = a2.ToArray(),

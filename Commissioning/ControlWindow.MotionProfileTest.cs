@@ -55,7 +55,7 @@ public sealed partial class ControlWindow
             // Legacy transport fixtures predate TELEM; supply their stationary
             // simulated origin for the new feed-limited point calculation.
             if(!supportsTelemetry) {
-                telemetry=TelemetrySample.Parse($"TELEM t=100 epoch={state.Epoch} seq={state.Sequence} ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+                telemetry=TelemetrySample.Parse($"TELEM t=100 epoch={state.Epoch} seq={state.Sequence} ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
                 lastTelemetryAt=DateTime.UtcNow;
             }
         }

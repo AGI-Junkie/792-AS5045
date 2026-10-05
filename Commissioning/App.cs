@@ -95,6 +95,8 @@ public sealed partial class ControlWindow : Window
     private PtpState? ptp;
     private DateTime lastPtpAt, pointRequestedAt;
     private bool stage2, homed, feedbackReady, hardwareReady, supportsManualReference, manualReferencePending;
+    private bool manualPolarityReady;
+    private bool arm2FeedbackEnabled = true;
     private uint pointSequence, pendingPoint;
     private readonly Queue<byte> pointWire = new();
     private byte[] pointPacket = [];
@@ -123,7 +125,7 @@ public sealed partial class ControlWindow : Window
     private static readonly Regex TrajectoryPattern = new(@"^TRAJ_STATE state=([0-4]) count=(\d+) total=(\d+) index=(\d+) seq=(\d+) epoch=(\d+)$", RegexOptions.CultureInvariant);
     private string? lastLinkLine;
     private Func<string> regularStateText = () => Lang.T("state.disconnected");
-    private static readonly Regex StatePattern = new(@"^STATE fw=(?:stage1-v3|stage2-v[1234567]) enabled=([01]) home=([0-7]) homed1=([01]) homed2=([01]) fault=([01]) enc=([01]) dir=([01])$", RegexOptions.CultureInvariant);
+    private static readonly Regex StatePattern = new(@"^STATE fw=(?:stage1-v3|stage2-v[1-9]) enabled=([01]) home=([0-7]) homed1=([01]) homed2=([01]) fault=([01]) enc=([01]) dir=([01])(?: enc2=([01]) dir2=([01]))?(?: arm2fb=([01]))?$", RegexOptions.CultureInvariant);
 
     public ControlWindow(bool restoreParameters = false)
     {
@@ -210,7 +212,7 @@ public sealed partial class ControlWindow : Window
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Referenced: true, Epoch: > 0 } &&
         (DateTime.UtcNow - lastPtpAt).TotalSeconds < 2 && (!supportsTelemetry ||
         telemetry is { Referenced: true, Inputs: 0 } && telemetry.Epoch == ptp.Epoch && (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2);
-    private bool CanManualReference => LimitsReady && supportsManualReference && compatible && enabled && hardwareReady && !homing && !stopPending && !PointBusy && uploaded is null &&
+    private bool CanManualReference => LimitsReady && supportsManualReference && manualPolarityReady && compatible && enabled && hardwareReady && !homing && !stopPending && !PointBusy && uploaded is null &&
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Epoch: > 0 } &&
         (DateTime.UtcNow - lastPtpAt).TotalSeconds < 2;
     private bool CanJog => LimitsReady && compatible && enabled && !homing && !stopPending && !PointBusy && IsActive && (DateTime.UtcNow - lastStateAt).TotalSeconds < 2;
@@ -354,7 +356,7 @@ public sealed partial class ControlWindow : Window
         {
             compatible = true; lastStateAt = DateTime.UtcNow;
             stage2 = line.StartsWith("STATE fw=stage2-");
-            framedControl = line.StartsWith("STATE fw=stage2-v7 ");
+            framedControl = line.StartsWith("STATE fw=stage2-v7 ") || line.StartsWith("STATE fw=stage2-v8 ") || line.StartsWith("STATE fw=stage2-v9 ");
             heartbeatTimer.Interval = TimeSpan.FromMilliseconds(framedControl ? 8 : 40);
             bool fastLink = framedControl || line.StartsWith("STATE fw=stage2-v6 ");
             if (hardwareUart != fastLink)
@@ -368,8 +370,12 @@ public sealed partial class ControlWindow : Window
             supportsTrajectory = supportsManualReference || line.StartsWith("STATE fw=stage2-v2 ");
             if (!stage2) { ptp = null; reportedLimits = null; reportedProfile = null; }
             homed = match.Groups[3].Value == "1" && match.Groups[4].Value == "1";
-            hardwareReady = match.Groups[5].Value == "0" && match.Groups[6].Value == "1";
-            feedbackReady = hardwareReady && match.Groups[7].Value == "1";
+            arm2FeedbackEnabled = !match.Groups[10].Success || match.Groups[10].Value == "1";
+            hardwareReady = match.Groups[5].Value == "0" && match.Groups[6].Value == "1" &&
+                (!arm2FeedbackEnabled || !match.Groups[8].Success || match.Groups[8].Value == "1");
+            feedbackReady = hardwareReady && match.Groups[7].Value == "1" &&
+                (!arm2FeedbackEnabled || !match.Groups[8].Success || match.Groups[9].Value == "1");
+            manualPolarityReady = !arm2FeedbackEnabled || !match.Groups[8].Success || match.Groups[9].Value == "1";
             enabled = match.Groups[1].Value == "1"; homing = match.Groups[2].Value != "0";
             if ((pendingControl == "使能" && enabled) || (pendingControl == "回零" && homing)) pendingControl = null;
             if (pendingPoint != 0 && (!enabled || !hardwareReady || homing)) Stop();
@@ -578,7 +584,7 @@ public sealed partial class ControlWindow : Window
             lastTrajectoryAt = DateTime.UtcNow; trajectoryIndex = (int)values[3]; trajectoryTotal = (int)total - 1;
             if (mode == 4) {
                 // The device keeps the nodes after a run (state 4): hold the plan so 执行图形 can repeat it.
-                executing = false; experimentCompleting = "complete"; uploaded = supportsTrajRepeat ? runPlan : null; uploadedRan = uploaded is not null; trajectoryRanOnce = true; Append("HOST trajectory complete; firmware arm1 check passed, arm2 commanded only");
+                executing = false; experimentCompleting = "complete"; uploaded = supportsTrajRepeat ? runPlan : null; uploadedRan = uploaded is not null; trajectoryRanOnce = true; Append("HOST trajectory complete; firmware checks passed for both motor encoders");
                 // A firmware that does not declare traj_repeat=1 refuses a second RUN of the plan it holds (and stops): upload again instead.
                 if (!supportsTrajRepeat) Append("HOST this firmware cannot repeat a held plan (its LINK line has no traj_repeat=1); upload the plan again to draw it again");
             }
@@ -768,7 +774,7 @@ public sealed partial class ControlWindow : Window
         serial = null;
         compatible = enabled = homing = stopPending = false;
         pending.Clear(); Lang.Text(state, reason); regularStateText = reason; Lang.Text(inputs, () => Lang.T("fault.inputsInvalid"));
-        ShowFeedback(null, () => Lang.T("fault.unplugReason")); errorHistory.Clear(); DrawErrorPlot();
+        ShowFeedback(null, () => Lang.T("fault.unplugReason")); errorHistory.Clear(); errorHistory2.Clear(); DrawErrorPlot();
         connect.Content = Lang.T("btn.connect"); ports.IsEnabled = true; UpdateControls();
         try { Append("HOST " + reason()); } catch { }
         try { recording?.Dispose(); } catch { }
@@ -841,7 +847,7 @@ public sealed partial class ControlWindow : Window
         void Arm(int epoch, uint seq = 0) {
             var r = window.xyPreview.RequestedProfile!.Value;
             window.TestLine($"MOTION_RATES epoch={epoch} r1={r.R1} r2={r.R2} a1={r.A1} a2={r.A2}");
-            window.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=1 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+            window.TestLine($"TELEM t=10 epoch={epoch} seq={seq} ref=1 source=1 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
         }
         Check(!window.enable.IsEnabled && !window.home.IsEnabled);
         window.TestLine("STATE fw=stage2-v6 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
@@ -905,7 +911,7 @@ public sealed partial class ControlWindow : Window
         Check(!window.CanPoint); // the device has not confirmed the requested rates yet
         { var r = window.xyPreview.RequestedProfile!.Value; window.TestLine($"MOTION_RATES epoch=7 r1={r.R1} r2={r.R2} a1={r.A1} a2={r.A2}"); }
         Check(!window.CanPoint); // no telemetry for this reference yet
-        window.TestLine("TELEM t=10 epoch=7 seq=0 ref=1 source=1 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
+        window.TestLine("TELEM t=10 epoch=7 seq=0 ref=1 source=1 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
         Check(window.CanPoint);
         window.RequestPoint(new JointPose(1.25, -2.5));
         Check(window.pendingPoint==1 && window.pointWire.Count==36 && !window.CanPoint && !window.home.IsEnabled);
@@ -976,7 +982,7 @@ public sealed partial class ControlWindow : Window
         window.xyPreview.RestoreLimitsForSelfTest("-60", "60", "-90", "90");
         window.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
         window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=8 seq=1 min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
-        void StartSample(uint epoch, uint seq) => window.TestLine($"TELEM t=1000 epoch={epoch} seq={seq} ref=1 source=2 p1={ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose)} p2={ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose)} e1=0 err=0 inputs=0 drops=0");
+        void StartSample(uint epoch, uint seq) => window.TestLine($"TELEM t=1000 epoch={epoch} seq={seq} ref=1 source=2 p1={ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose)} p2={ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
         window.RequestTrajectory(execution); Check(window.uploading is null); // missing position feedback
         StartSample(8,1);
         window.RequestTrajectory(execution);
@@ -1035,7 +1041,7 @@ public sealed partial class ControlWindow : Window
             window.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=30 seq=10000 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
             int p1=ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose), p2=ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose);
             window.errorHistory.Clear();
-            for(int i=0;i<40;i++) window.TestLine($"TELEM t={i*500} epoch=30 seq=10000 ref=1 source=2 p1={p1} p2={p2} e1={(int)Math.Round(p1*2.56)+i%9-4} err=0 inputs=0 drops=0");
+            for(int i=0;i<40;i++) window.TestLine($"TELEM t={i*500} epoch=30 seq=10000 ref=1 source=2 p1={p1} p2={p2} e1={(int)Math.Round(p1*2.56)+i%9-4} err=0 e2=0 err2=0 inputs=0 drops=0");
             Lang.Text(window.lastStop, () => ""); window.connectionBadge.Text="离线界面检查 · 模拟数据";
             string dir=Path.GetDirectoryName(snapshotPath)!;
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench.png"),1380,930);
@@ -1081,7 +1087,7 @@ public sealed partial class ControlWindow : Window
             // The solid arm tracks the device even when it differs from the plan; the plan stays as a dashed ghost.
             window.xyPreview.FitView(false);
             var away = new JointPose(10, 25);
-            window.TestLine($"TELEM t=30000 epoch=30 seq=10000 ref=1 source=2 p1={ExecutionTrajectory.Counts(0,away)} p2={ExecutionTrajectory.Counts(1,away)} e1=0 err=0 inputs=0 drops=0");
+            window.TestLine($"TELEM t=30000 epoch=30 seq=10000 ref=1 source=2 p1={ExecutionTrajectory.Counts(0,away)} p2={ExecutionTrajectory.Counts(1,away)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
             window.SaveWorkbenchSnapshot(Path.Combine(dir,"workbench-device-moved.png"),1380,930);
         }
         window.Close();
