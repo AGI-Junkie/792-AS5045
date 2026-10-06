@@ -54,12 +54,12 @@ public sealed partial class ControlWindow
         if (paint) lastFeedbackPaintAt = lastTelemetryAt;
         if (sample.Referenced) {
             if (paint) ShowFeedback(sample, () => Lang.T("status.ref") + sample.ReferenceName + (arm2FeedbackEnabled ? "" : Lang.T("live.arm2Optional")));
-            if(sample.Error2 is double error2) errorHistory2.Enqueue(error2); while(errorHistory2.Count > 600) errorHistory2.Dequeue();
+            if(sample.ElbowError is double error2) errorHistory2.Enqueue(error2); while(errorHistory2.Count > 600) errorHistory2.Dequeue();
             errorHistory.Enqueue(sample.Error1); while(errorHistory.Count > 600) errorHistory.Dequeue(); if (paint) DrawErrorPlot();
             if (experiment is { } recorder) {
                 recorder.Record(sample,uploading is not null ? "upload" : uploaded is not null ? "ready" : experimentPhase=="trajectory" ? "drawing" : "point",trajectoryIndex);
                 Lang.Text(experimentResult, () => recorder.MotionSamples==0 ? Lang.T("exp.savedWaiting", recorder.Samples) :
-                    recorder.MotionSamples2 > 0 ? Lang.T("exp.live", recorder.Samples, recorder.Rmse, recorder.Peak, recorder.Rmse2, recorder.Peak2) : Lang.T("exp.liveArm1", recorder.Samples, recorder.Rmse, recorder.Peak));
+                    recorder.MotionSamples2 > 0 ? Lang.T("exp.live", recorder.Samples, recorder.Rmse, recorder.Peak, recorder.RmseElbow, recorder.PeakElbow) : Lang.T("exp.liveArm1", recorder.Samples, recorder.Rmse, recorder.Peak));
                 if(experimentPhase=="point" && pendingPoint==0 && ptp.Active==0 && sample.Sequence==experimentSequence) experimentCompleting="complete";
                 if (experimentCompleting is { } outcome) FinishExperiment(outcome);
             }
@@ -86,7 +86,7 @@ public sealed partial class ControlWindow
         if (recorder is null) return;
         recorder.Finish(outcome); RecordExperimentOutcome(outcome, recorder); xyPreview.RefreshRecentRuns();
         Lang.Text(experimentResult, () => Lang.T("exp.finished", outcome=="complete"?Lang.T("exp.complete"):Lang.T("exp.aborted"), recorder.Samples) +
-            (recorder.MotionSamples>0?Lang.T("exp.rmse", recorder.Rmse) + (recorder.MotionSamples2>0 ? Lang.T("exp.rmse2", recorder.Rmse2) : "") + "\n":Lang.T("exp.noMotion")) +
+            (recorder.MotionSamples>0?Lang.T("exp.rmse", recorder.Rmse) + (recorder.MotionSamples2>0 ? Lang.T("exp.rmse2", recorder.RmseElbow) : "") + "\n":Lang.T("exp.noMotion")) +
             Lang.T("exp.savedNote"));
         diagnostics.IsExpanded = true;
         Append("HOST experiment " + outcome + ": " + recorder.DirectoryPath);

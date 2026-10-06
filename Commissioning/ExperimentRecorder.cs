@@ -21,6 +21,8 @@ public sealed record TelemetrySample(uint Milliseconds, uint Epoch, uint Sequenc
     public double? Measured2 => MeasuredElbow + Measured1;
     public double? Error2 => Measured2 - Command.Q2;
     public double Error1 => Measured1 - Command.Q1;
+    // arm2's own following error: elbow encoder minus commanded elbow (q2-q1); unlike Error2 it excludes arm1's error.
+    public double? ElbowError => MeasuredElbow - (Command.Q2 - Command.Q1);
     public string ReferenceName => Source == 2 ? Lang.T("ref.manual") : Source == 1 ? Lang.T("ref.home") : Lang.T("ref.none");
     public static TelemetrySample? Parse(string line)
     {
@@ -51,6 +53,9 @@ public sealed class ExperimentRecorder : IDisposable
     public int MotionSamples2 { get; private set; }
     public double Rmse2 => MotionSamples2 > 0 ? Math.Sqrt(squares2 / MotionSamples2) : 0;
     public double Peak2 { get; private set; }
+    private double squaresElbow;
+    public double RmseElbow => MotionSamples2 > 0 ? Math.Sqrt(squaresElbow / MotionSamples2) : 0;
+    public double PeakElbow { get; private set; }
     private double squares;
     private readonly PlanarArm model;
     private readonly StreamWriter csv;
@@ -79,7 +84,7 @@ public sealed class ExperimentRecorder : IDisposable
         }
         File.WriteAllText(Path.Combine(DirectoryPath, "plan.csv"), plan.ToString(), new UTF8Encoding(true));
         csv = new StreamWriter(Path.Combine(DirectoryPath, "feedback.csv"), false, new UTF8Encoding(true)) { AutoFlush = true };
-        csv.WriteLine("host_utc,device_ms,epoch,seq,phase,segment,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_measured_deg,x_command_model_mm,y_command_model_mm,x_hybrid_estimate_mm,y_hybrid_estimate_mm,slip_motor_lsb,inputs_active_mask,rx_drops,q2_error_deg,elbow_encoder_deg,slip2_motor_lsb");
+        csv.WriteLine("host_utc,device_ms,epoch,seq,phase,segment,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_measured_deg,x_command_model_mm,y_command_model_mm,x_hybrid_estimate_mm,y_hybrid_estimate_mm,slip_motor_lsb,inputs_active_mask,rx_drops,q2_error_deg,elbow_encoder_deg,slip2_motor_lsb,elbow_error_deg");
     }
     public void Record(TelemetrySample s, string phase, int segment)
     {
@@ -87,9 +92,9 @@ public sealed class ExperimentRecorder : IDisposable
         var command = model.Forward(s.Command).Tip;
         double? q2Measured = s.Measured2, error2 = s.Error2;
         var hybrid = model.Forward(new(s.Measured1, q2Measured ?? s.Measured1 + s.Command.Q2 - s.Command.Q1)).Tip;
-        csv.WriteLine(FormattableString.Invariant($"{DateTime.UtcNow:O},{s.Milliseconds},{s.Epoch},{s.Sequence},{phase},{segment},{s.Command.Q1:F6},{s.Measured1:F6},{s.Error1:F6},{s.Command.Q2:F6},{q2Measured:F6},{command.X:F6},{command.Y:F6},{hybrid.X:F6},{hybrid.Y:F6},{s.Slip},{s.Inputs},{s.Drops},{error2:F6},{s.MeasuredElbow:F6},{s.Slip2}"));
+        csv.WriteLine(FormattableString.Invariant($"{DateTime.UtcNow:O},{s.Milliseconds},{s.Epoch},{s.Sequence},{phase},{segment},{s.Command.Q1:F6},{s.Measured1:F6},{s.Error1:F6},{s.Command.Q2:F6},{q2Measured:F6},{command.X:F6},{command.Y:F6},{hybrid.X:F6},{hybrid.Y:F6},{s.Slip},{s.Inputs},{s.Drops},{error2:F6},{s.MeasuredElbow:F6},{s.Slip2},{s.ElbowError:F6}"));
         Samples++;
-        if(phase is "point" or "drawing") { MotionSamples++; squares += s.Error1 * s.Error1; Peak = Math.Max(Peak, Math.Abs(s.Error1)); if(error2 is double e2) { MotionSamples2++; squares2 += e2 * e2; Peak2 = Math.Max(Peak2, Math.Abs(e2)); } }
+        if(phase is "point" or "drawing") { MotionSamples++; squares += s.Error1 * s.Error1; Peak = Math.Max(Peak, Math.Abs(s.Error1)); if(error2 is double e2) { MotionSamples2++; squares2 += e2 * e2; Peak2 = Math.Max(Peak2, Math.Abs(e2)); if(s.ElbowError is double ee) { squaresElbow += ee * ee; PeakElbow = Math.Max(PeakElbow, Math.Abs(ee)); } } }
     }
     public void Finish(string outcome)
     {
@@ -100,6 +105,7 @@ public sealed class ExperimentRecorder : IDisposable
             motion_samples = MotionSamples,
             q1_rmse_deg = MotionSamples > 0 ? (double?)Rmse : null, q1_peak_abs_error_deg = MotionSamples > 0 ? (double?)Peak : null,
             q2_rmse_deg = MotionSamples2 > 0 ? (double?)Rmse2 : null, q2_peak_abs_error_deg = MotionSamples2 > 0 ? (double?)Peak2 : null,
+            arm2_follow_rmse_deg = MotionSamples2 > 0 ? (double?)RmseElbow : null, arm2_follow_peak_abs_error_deg = MotionSamples2 > 0 ? (double?)PeakElbow : null,
             measured_xy_error_available = false
         }, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
     }
@@ -107,7 +113,7 @@ public sealed class ExperimentRecorder : IDisposable
     public static void SelfTest()
     {
         var s = TelemetrySample.Parse("TELEM t=500 epoch=9 seq=3 ref=1 source=2 p1=1600 p2=-1600 e1=4096 err=-2 e2=-4096 err2=0 inputs=0 drops=3")!;
-        if (s is null || s.Command.Q1 != 9 || Math.Abs(s.Command.Q2-(9-1600*360.0/DeviceContract.Arm2StepsPerRev))>1e-8 || s.Measured1 != 9 || s.Error1 != 0 || s.ReferenceName != "人工伸直零位" || s.Measured2 is not double measured2 || Math.Abs(measured2-s.Command.Q2)>1e-8) throw new Exception("Telemetry units/sign invalid");
+        if (s is null || s.Command.Q1 != 9 || Math.Abs(s.Command.Q2-(9-1600*360.0/DeviceContract.Arm2StepsPerRev))>1e-8 || s.Measured1 != 9 || s.Error1 != 0 || s.ReferenceName != "人工伸直零位" || s.Measured2 is not double measured2 || Math.Abs(measured2-s.Command.Q2)>1e-8 || Math.Abs(s.ElbowError!.Value)>1e-8 || Math.Abs((s with { Encoder1=s.Encoder1+16 }).ElbowError!.Value)>1e-8) throw new Exception("Telemetry units/sign invalid");
         if (TelemetrySample.Parse("TELEM t=0 epoch=0 seq=0 ref=1 source=0 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=16 drops=0") is not null) throw new Exception("Malformed telemetry accepted");
         string root = Path.Combine(Path.GetTempPath(), "arm-recorder-" + Guid.NewGuid().ToString("N"));
         try {
@@ -116,7 +122,7 @@ public sealed class ExperimentRecorder : IDisposable
             r.Record(s with { Encoder1=s.Encoder1+320 },"upload",0);
             r.Record(s with { Epoch = 10 }, "point", 0); r.Record(s with { Referenced = false }, "point", 0);
             r.Finish("complete"); r.Finish("aborted");
-            if (r.Samples != 3 || r.MotionSamples!=2 || Math.Abs(r.Rmse2-r.Rmse)>1e-9 || Math.Abs(r.Rmse-16*360.0/(4096*40)/Math.Sqrt(2))>1e-9 ||
+            if (r.Samples != 3 || r.MotionSamples!=2 || Math.Abs(r.Rmse2-r.Rmse)>1e-9 || r.RmseElbow!=0 || Math.Abs(r.Rmse-16*360.0/(4096*40)/Math.Sqrt(2))>1e-9 ||
                 File.ReadAllLines(Path.Combine(r.DirectoryPath,"feedback.csv")).Length != 4 ||
                 !File.ReadAllText(Path.Combine(r.DirectoryPath,"summary.json")).Contains("complete")) throw new Exception("Experiment persistence failed");
             using var optional = new ExperimentRecorder(root,"optional",3,9,new PlanarArm(180,176.38),"test","manual",[],arm2Feedback:false);
