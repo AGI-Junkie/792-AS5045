@@ -36,8 +36,10 @@ Release/
 # Workspace user files (per-user, don't commit)
 DRV8825.cywrk.Xiaoj
 
-# Claude
-.claude/
+# Claude (personal files stay ignored; the shared settings and hooks are tracked)
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
 
 # Recovered temp files
 recovered/
