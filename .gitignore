@@ -51,6 +51,7 @@ Desktop.ini
 Commissioning/bin/
 Commissioning/obj/
 deliverables/
+/out/
 __pycache__/
 
 # Local Creator experiments, backups and obsolete preview output
@@ -67,3 +68,4 @@ __pycache__/
 
 # Local KiCad circuit project
 /circuit/
+dist/

@@ -2045,8 +2045,8 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
         fuzz_total('simulated-unlock',result.stdout)
         print('PASS simulated-unlock',case)
     # Exercise the deliberately optional, absent arm2 encoder in the delivery profile.
-    # Build the exact delivery defaults as a third profile, with no macro overrides.
-    build = replace_once((tmp/'build.cmd').read_text(encoding='utf-8'), defines, '')
+    # Third profile: arm2 feedback off (the macro default is now 1), no other overrides.
+    build = replace_once((tmp/'build.cmd').read_text(encoding='utf-8'), defines, '/DARM2_ENCODER_FEEDBACK=0')
     (tmp/'build.cmd').write_text(build, encoding='utf-8')
     result=subprocess.run(['cmd','/c',str(tmp/'build.cmd')],cwd=tmp,capture_output=True,text=True,errors='replace')
     if result.returncode: raise RuntimeError(result.stdout+result.stderr)
@@ -2059,7 +2059,7 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     # pass without it); everything else, including the arm2_* and control_* cases, must hold in both configurations.
     default_cases = [c for c in cases if not c.startswith('dual_')]
     build = (tmp/'build.cmd').read_text(encoding='utf-8').replace('/W3 ', '/W3 /DPTP_COMMISSIONED=0 ', 1)
-    assert '/DPTP_COMMISSIONED=0' in build and 'ARM2_ENCODER_FEEDBACK' not in build
+    assert '/DPTP_COMMISSIONED=0' in build and '/DARM2_ENCODER_FEEDBACK=0' in build
     (tmp/'build.cmd').write_text(build, encoding='utf-8')
     result=subprocess.run(['cmd','/c',str(tmp/'build.cmd')],cwd=tmp,capture_output=True,text=True,errors='replace')
     if result.returncode: raise RuntimeError(result.stdout+result.stderr)

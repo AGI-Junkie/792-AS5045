@@ -14,6 +14,9 @@ public sealed partial class ControlWindow
     private MotionProfile? reportedProfile;
     private byte limitType=9;
     private JointLimits? reportedLimits;
+    private DateTime limitsReportSince;      // a disabled STATE cleared the reports above; the display holds until they return
+    private const double LimitsReportHoldMs = 300;
+    private bool enableAfterReport;          // 使能 was clicked during that hold
     private string limitSyncError = "";
     private int limitsMotionAllowed;
     // One immutable request remains pending through input edits until ACK + STATE.
@@ -247,10 +250,41 @@ public sealed partial class ControlWindow
             w.TestLine("PTP_EPOCH 1");
             Check(!w.LimitsReady && w.limitsMotionAllowed == 0, "epoch rollback retained custom range authorization");
             Range(wide, 1); Check(w.LimitsReady, "range report did not restore matching authorization");
-            State(); Check(!w.LimitsReady && !w.enable.IsEnabled, "same-epoch disabled/reboot state trusted cached custom ranges");
-            Range(defaults, 1); Check(!w.LimitsReady && w.limitAxis == 0, "boot defaults were not synchronized again");
+            State(); Check(!w.LimitsReady && w.limitsMotionAllowed == 0, "same-epoch disabled/reboot state trusted cached custom ranges");
+            w.RequestEnable(); Check(w.pendingControl is null, "an enable clicked before the reboot report was sent");
+            Range(defaults, 1); Check(!w.LimitsReady && w.limitAxis == 0 && !w.enable.IsEnabled && w.pendingControl is null, "boot defaults were not synchronized again, or a held click enabled anyway");
             w.Disconnect("range sync self-test");
             Check(w.reportedLimits is null && w.limitAxis < 0 && !w.supportsJointLimits && !w.LimitsReady, "disconnect retained range authorization");
+        }
+        finally { w.Close(); }
+    }
+
+    // A disabled device repeats STATE, PTP_STATE, MOTION_RATES every 500 ms; the STATE clears the reports until the
+    // other two arrive. Between those lines the display must not flash, and a click on 使能 there must wait for them.
+    private static void StatusBlockHoldSelfTest()
+    {
+        var w = new ControlWindow { selfTesting = true };
+        static void Check(bool yes, string reason) { if (!yes) throw new InvalidOperationException("Status block hold: " + reason); }
+        var d = XYPreviewPanel.DefaultTrialRange;
+        string range = $"PTP_STATE lock=0 ref=0 active=0 epoch=1 seq=0 min1={(int)Math.Round(d.Min1*100)} max1={(int)Math.Round(d.Max1*100)} min2={(int)Math.Round(d.Min2*100)} max2={(int)Math.Round(d.Max2*100)} emin={(int)Math.Round(d.ElbowMin*100)} emax={(int)Math.Round(d.ElbowMax*100)}";
+        const string state = "STATE fw=stage2-v7 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=1";
+        try {
+            w.TestLine($"LINK uart=hw baud=115200 fw=stage2-v7-test short_hb=1 joint_limits=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion}");
+            w.TestLine(state); w.TestLine(range);
+            Check(w.LimitsReady && w.enable.IsEnabled, "a disabled device reporting the requested settings must be ready");
+            string Shown() => $"{w.enable.IsEnabled}|{w.rangeStatus.Text}|{w.pointBlockReason}";
+            string steady = Shown();
+            for (int block = 0; block < 3; block++) {
+                w.TestLine(state); w.UpdateControls();
+                Check(Shown() == steady && w.limitsMotionAllowed == 0, "the display flashed between STATE and the range report, or the gate opened early");
+                w.TestLine(range); w.UpdateControls();
+                Check(Shown() == steady && w.LimitsReady, "the display changed after a complete unchanged block");
+            }
+            w.TestLine(state); w.RequestEnable();
+            Check(w.pendingControl is null, "enable was sent before the block re-confirmed the settings");
+            w.TestLine(range);
+            Check(w.pendingControl == "使能", "an enable clicked inside a status block was lost");
+            w.Disconnect("status block self-test");
         }
         finally { w.Close(); }
     }

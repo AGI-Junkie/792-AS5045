@@ -25,8 +25,12 @@ public sealed partial class ControlWindow
         telemetry = null; ShowFeedback(null, () => Lang.T("fault.telemetryStale"));
         if (pendingControl is null && (PointBusy || executing)) { Append("HOST telemetry timeout; stopping", LogLevel.Error); Stop(); }
     }
-    private bool AtStart(JointPose pose) => supportsTelemetry && ptp is { Active: 0, Referenced: true } &&
-        telemetry is { Referenced: true, Inputs: 0 } && telemetry.Epoch == ptp.Epoch && telemetry.Sequence == ptp.Sequence &&
+    // "At the start" needs a position and an Active flag from after the last command that can move the arm (a point move or
+    // RUN). The trajectory packets in between leave the arm where it was, so neither has to carry the newest sequence: TELEM
+    // (10 Hz) and PTP_STATE (2 Hz) overtake each other at every node of an upload, and requiring equal sequences made the
+    // start check, the canvas arm and the workflow strip flip at every status block.
+    private bool AtStart(JointPose pose) => supportsTelemetry && ptp is { Active: 0, Referenced: true } && ptp.Sequence >= lastMoveSequence &&
+        telemetry is { Referenced: true, Inputs: 0 } && telemetry.Epoch == ptp.Epoch && telemetry.Sequence >= lastMoveSequence &&
         (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2 &&
         telemetry.Steps1 == ExecutionTrajectory.Counts(0,pose) && telemetry.Steps2 == ExecutionTrajectory.Counts(1,pose);
     private void HandleTelemetry(string line)
@@ -80,7 +84,7 @@ public sealed partial class ControlWindow
     {
         var recorder = experiment; experiment = null; experimentCompleting = null;
         if (recorder is null) return;
-        recorder.Finish(outcome); RecordExperimentOutcome(outcome, recorder);
+        recorder.Finish(outcome); RecordExperimentOutcome(outcome, recorder); xyPreview.RefreshRecentRuns();
         Lang.Text(experimentResult, () => Lang.T("exp.finished", outcome=="complete"?Lang.T("exp.complete"):Lang.T("exp.aborted"), recorder.Samples) +
             (recorder.MotionSamples>0?Lang.T("exp.rmse", recorder.Rmse) + (recorder.MotionSamples2>0 ? Lang.T("exp.rmse2", recorder.Rmse2) : "") + "\n":Lang.T("exp.noMotion")) +
             Lang.T("exp.savedNote"));

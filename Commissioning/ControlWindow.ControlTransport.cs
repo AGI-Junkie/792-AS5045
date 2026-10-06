@@ -61,6 +61,7 @@ public sealed partial class ControlWindow
                 waitingStopEpoch = false;
                 reportedLimits = null; reportedProfile = null;
                 Volatile.Write(ref limitsMotionAllowed, 0);
+                lastMoveSequence = 0;   // a move belongs to its reference epoch (see AtStart)
             }
             reportedEpoch = epoch;
         }

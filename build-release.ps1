@@ -6,11 +6,13 @@ $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath($PSScriptRoot)
 $release = (Get-Content -LiteralPath (Join-Path $repo 'RELEASE_VERSION') -Raw).Trim()
 if ($release -notmatch '^stage2-workbench-v[0-9]+-[a-z0-9-]+$') { throw 'Invalid RELEASE_VERSION.' }
-if (-not $OutputDirectory) { $OutputDirectory = Join-Path 'deliverables' $release }
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path 'out' $release }
 $dest = [IO.Path]::GetFullPath((Join-Path $repo $OutputDirectory))
 if (-not $dest.StartsWith($repo + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Output directory must be inside this project.' }
 if (-not (Test-Path -LiteralPath $Creator)) { throw "PSoC Creator command not found: $Creator" }
-$running = Get-Process -Name TwoLinkCommissioning -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($dest,[StringComparison]::OrdinalIgnoreCase) }
+# Every passing build is also copied to out\latest, the one fixed place to run the host from.
+$latest = Join-Path $repo 'out\latest'
+$running = Get-Process -Name TwoLinkCommissioning -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ($_.Path.StartsWith($dest,[StringComparison]::OrdinalIgnoreCase) -or $_.Path.StartsWith($latest + '',[StringComparison]::OrdinalIgnoreCase)) }
 if ($running) { throw 'Close the host from this output directory before rebuilding it.' }
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Push-Location -LiteralPath $repo
@@ -127,4 +129,9 @@ try {
         '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash,$_.FullName.Substring($dest.Length+1)
     } | Set-Content -Encoding ascii (Join-Path $dest 'SHA256SUMS.txt')
     Write-Host "Build and offline checks passed: $dest"
+    if ($dest -ne $latest) {
+        if (Test-Path -LiteralPath $latest) { Remove-Item -LiteralPath $latest -Recurse -Force }
+        Copy-Item -LiteralPath $dest -Destination $latest -Recurse
+        Write-Host "Copied to $latest (run host\TwoLinkCommissioning.exe from there)"
+    }
 } finally { Pop-Location }

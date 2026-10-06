@@ -44,7 +44,8 @@ public sealed partial class ControlWindow
         bool point = panel.ShapeIndex == 0;
         var (checkOk, checkText) = panel.PlanCheck();
         var startPose = panel.WorkflowStartPose;
-        bool atStart = startPose is { } pose && AtStart(pose);
+        // Once an upload or a run has begun this step is behind us: a running shape leaves the start, and RUN waits for its PTP_STATE.
+        bool atStart = uploading is not null || executing || startPose is { } pose && AtStart(pose);
         bool connected = serial is not null && compatible && protocolMatches;
         bool canAct = CanPoint;
         // (done, skipped, detail, blocked): the detail is what the person should know about THIS step right now.
@@ -69,8 +70,11 @@ public sealed partial class ControlWindow
             !canAct ? (false, false, pointBlockReason, true) :
             (false, false, Lang.T(point ? "flow.start.todoPoint" : "flow.start.todo"), false);
         int nodes = uploaded?.Nodes.Length ?? uploading?.Nodes.Length ?? panel.Plan?.Nodes.Length ?? 0;
+        // Upload and run count only for the plan on screen: after drawing one shape, the next starts again at "move to start" (the reference stays).
+        bool OnScreen(ExecutionTrajectory? sent) => sent is not null && panel.Plan is { } shown && sent.Nodes.SequenceEqual(shown.Nodes);
+        bool runSent = uploading is { } sending && uploadNext >= sending.Nodes.Length;   // 执行图形 pressed, RUN not acknowledged yet
         steps[5] = point ? (false, true, Lang.T("flow.pointSkips"), false) :
-            uploaded is not null || executing ? (true, false, Lang.T("flow.upload.done", nodes), false) :
+            OnScreen(uploaded) || executing || runSent ? (true, false, Lang.T("flow.upload.done", nodes), false) :
             uploading is not null ? (false, false, Lang.T("flow.uploading", Math.Min(uploadNext, nodes), nodes), true) :
             !checkOk ? (false, false, Lang.T("flow.needCheck"), true) :
             !supportsTrajectory ? (false, false, Lang.T("flow.noTraj"), true) :
@@ -78,8 +82,8 @@ public sealed partial class ControlWindow
             !canAct ? (false, false, pointBlockReason, true) :
             (false, false, Lang.T("flow.upload.todo"), false);
         steps[6] = point ? (false, true, Lang.T("flow.pointSkips"), false) :
-            executing ? (false, false, Lang.T("flow.running", trajectoryIndex, trajectoryTotal), true) :
-            trajectoryRanOnce ? (true, false, Lang.T(uploaded is not null ? "flow.run.doneAgain" : "flow.run.doneUpload"), false) :
+            executing || runSent ? (false, false, Lang.T("flow.running", executing ? trajectoryIndex : 0, executing ? trajectoryTotal : nodes - 1), true) :
+            trajectoryRanOnce && OnScreen(runPlan) ? (true, false, Lang.T(uploaded is not null ? "flow.run.doneAgain" : "flow.run.doneUpload"), false) :
             uploaded is null ? (false, false, Lang.T("flow.needUpload"), true) :
             !atStart ? (false, false, Lang.T("flow.needStart"), true) :
             !canAct ? (false, false, pointBlockReason, true) :
@@ -210,6 +214,13 @@ public sealed partial class ControlWindow
             Check(w.workflow[6].State == StepState.Done && w.trajectoryRanOnce, "after the run the step is done: " + States());
             w.lastExperimentOutcome = "complete"; w.lastExperimentRmse = 0.0123; w.lastExperimentPeak = 0.031; w.lastExperimentMotionSamples = 40; w.UpdateControls();
             Check(States() == "DDDDDDDD" && w.workflow[7].Detail.Contains("0.012") && w.flowHint.Text.Contains("全部"), "everything done: " + States() + " " + w.workflow[7].Detail + " / " + Hint());
+            // Another shape after the run: the reference holds, so the strip goes back to moving to the new start and that move goes out, no homing.
+            w.xyPreview.SelectShapeForSelfTest(1); w.xyPreview.LoadExampleForSelfTest(); w.UpdateControls();
+            var next = w.xyPreview.WorkflowStartPose!.Value;
+            Check(next != start && w.workflow[2].State == StepState.Done && w.workflow[4].State == StepState.Current && !w.workflow[4].Blocked &&
+                w.workflow[5].State != StepState.Done && w.workflow[6].State != StepState.Done, "a new shape after a run must go back to moving to its start: " + States());
+            w.RequestPoint(next);
+            Check(w.pendingPoint != 0 && w.homed && !w.homing, "the move to the next shape's start must go out on the same reference");
             // A stop undoes the sequence from the reference on.
             w.TestLine("STOP: DEADMAN host heartbeat timeout; position invalid, release keys then C to enable");
             w.TestLine("STATE fw=stage2-v7 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=1");

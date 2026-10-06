@@ -99,6 +99,7 @@ public sealed partial class ControlWindow : Window
     private bool manualPolarityReady;
     private bool arm2FeedbackEnabled = true;
     private uint pointSequence, pendingPoint;
+    private uint lastMoveSequence;   // the last point move or RUN in this reference epoch; 0 while disabled (see AtStart)
     private readonly Queue<byte> pointWire = new();
     private byte[] pointPacket = [];
     private int pointAttempts;
@@ -113,7 +114,7 @@ public sealed partial class ControlWindow : Window
     private ExperimentRecorder? experiment;
     private string? experimentCompleting;
     private string experimentPhase = "idle";
-    private static string ExperimentRoot => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "Experiments");
+    internal static string ExperimentRoot => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "Experiments");
     private ExecutionTrajectory? uploading;
     private ExecutionTrajectory? uploaded;   // complete plan the device holds, waiting for 执行图形
     private ExecutionTrajectory? runPlan;    // plan of the RUN in flight; becomes `uploaded` again when it completes
@@ -136,7 +137,7 @@ public sealed partial class ControlWindow : Window
         BuildLayout();
         Lang.Changed += OnLanguageChanged;
         Closed += (_, _) => Lang.Changed -= OnLanguageChanged;
-        if (restoreParameters) xyPreview.RestoreSavedParameters();
+        if (restoreParameters) { xyPreview.RestoreSavedParameters(); xyPreview.RefreshRecentRuns(); }
         timer.Tick += (_, _) => Tick();
         heartbeatTimer.Tick += OnHeartbeatTick;
         xyPreview.PointMoveRequested += RequestPoint;
@@ -377,14 +378,17 @@ public sealed partial class ControlWindow : Window
             feedbackReady = hardwareReady && match.Groups[7].Value == "1" &&
                 (!arm2FeedbackEnabled || !match.Groups[8].Success || match.Groups[9].Value == "1");
             manualPolarityReady = !arm2FeedbackEnabled || !match.Groups[8].Success || match.Groups[9].Value == "1";
+            bool wasEnabled = enabled;
             enabled = match.Groups[1].Value == "1"; homing = match.Groups[2].Value != "0";
             if ((pendingControl == "使能" && enabled) || (pendingControl == "回零" && homing)) pendingControl = null;
             if (pendingPoint != 0 && (!enabled || !hardwareReady || homing)) Stop();
             if ((uploading is not null || executing) && (!supportsTrajectory || !enabled || !homed || !feedbackReady || homing)) Stop();
             if (!enabled) {
-                stopPending = false;
+                stopPending = false; lastMoveSequence = 0;   // nothing moves while disabled; a reboot restarts the sequences
                 // A reboot may reuse epoch 1 while restoring default ranges. Every
                 // disabled STATE requires the following full range report again.
+                // The report follows in the same status block, so a device that stays disabled holds the display meanwhile (see UpdateControls).
+                if (!wasEnabled && reportedLimits is not null && limitsReportSince == default) limitsReportSince = DateTime.UtcNow;
                 reportedLimits = null; reportedProfile = null;
             }
             regularStateText = () =>
@@ -483,7 +487,9 @@ public sealed partial class ControlWindow : Window
     }
     private void RequestEnable()
     {
-        if (!enable.IsEnabled || !LimitsReady) return;
+        if (!enable.IsEnabled) return;
+        // Clicked while the display holds through a status block: act once the block has confirmed (or not) the ranges.
+        if (!LimitsReady) { enableAfterReport = limitsReportSince != default; return; }
         SafeAction(() => { keyboardMask = mouseMask = 0; pendingControl = "使能"; controlRequestedAt = DateTime.UtcNow;
             if (framedControl) { lock (wireSync) { pendingControlType = 7; lastControlHeartbeat = 0; } }
             else { Send(0x41); Send(0x63); }
@@ -552,7 +558,7 @@ public sealed partial class ControlWindow : Window
         pendingPoint = ++pointSequence; pointRequestedAt = DateTime.UtcNow;
         QueuePointPacket(PtpProtocol.EncodePacket(run ? (byte)4 : uploadNext == 0 ? (byte)2 : (byte)3,
             pendingPoint, trajectoryEpoch, node.Pose, uploadNext == 0 ? (ushort)plan.Nodes.Length : node.Milliseconds));
-        if (run) trajectoryRunSequence = pendingPoint;
+        if (run) trajectoryRunSequence = lastMoveSequence = pendingPoint;
         ShowDeviceState(); UpdateControls();
     }
     private void HandleTrajectoryState(string line)
@@ -603,7 +609,7 @@ public sealed partial class ControlWindow : Window
             if (xyPreview.RequestedProfile is not { } profile || telemetry is null) return;
             double rate=Math.Min(DeviceContract.PlanRateMax,Math.Min(profile.R1,profile.R2));
             StartExperiment("point",pointSequence+1,[new(pose,0)]);
-            pendingPoint = ++pointSequence; pointRequestedAt = DateTime.UtcNow;
+            pendingPoint = lastMoveSequence = ++pointSequence; pointRequestedAt = DateTime.UtcNow;
             QueuePointPacket(PtpProtocol.Encode(pendingPoint, ptp.Epoch, pose,(ushort)Math.Floor(rate)));
             xyPreview.PausePlayback();
             Append($"HOST PTP request seq={pendingPoint} q1={pose.Q1:F2} q2={pose.Q2:F2} rate={Math.Floor(rate)} usteps/s; global joint limits; joint-space move, not a straight XY path");
@@ -662,7 +668,7 @@ public sealed partial class ControlWindow : Window
         manualReferencePending = false;
         uploading = uploaded = runPlan = null; executing = false;
         keyboardMask = mouseMask = 0;
-        pendingControl = null; telemetry = null;
+        pendingControl = null; telemetry = null; limitsReportSince = default; enableAfterReport = false;
         if (serial is not null) {
             stopPending = true;
             Lang.Text(state, () => Lang.T("state.stopReq"));
@@ -681,6 +687,14 @@ public sealed partial class ControlWindow : Window
         // The device forgets a loaded plan when its reference epoch changes or it is disabled.
         if (synchronize && uploaded is not null && (!enabled || homing || ptp is not { Referenced: true } || ptp.Epoch != trajectoryEpoch)) uploaded = null;
         if (synchronize && trajectoryRanOnce && (!enabled || homing || ptp is not { Referenced: true } || ptp.Epoch != trajectoryEpoch)) trajectoryRanOnce = false;
+        // A disabled STATE clears the reported ranges/speeds until PTP_STATE and MOTION_RATES of the same block arrive
+        // (tens of ms later). The gates above already use the cleared values; only the display waits, or every 500 ms
+        // block would flash the enable button and status between "ready" and "waiting for the device".
+        if (limitsReportSince != default) {
+            bool reported = reportedLimits is not null && (reportedProfile is not null || !supportsMotionRates);
+            if (!reported && (DateTime.UtcNow - limitsReportSince).TotalMilliseconds < LimitsReportHoldMs) return;
+            limitsReportSince = default;
+        }
         if (synchronize) xyPreview.SetEditingAllowed(!PointBusy && !homing);
         enable.IsEnabled = LimitsReady && compatible && !enabled && !stopPending && !PointBusy;
         manualReference.IsEnabled = CanManualReference;
@@ -708,7 +722,7 @@ public sealed partial class ControlWindow : Window
         xyPreview.SetParameterConfirmation(RangeConfirmed, SpeedConfirmed);
         xyPreview.SetPointMoveState(CanPoint, reportedLimits, reason, supportsTrajectory, LimitsReady, uploaded, uploadedRan);
         var devicePose = supportsTelemetry && telemetry is { Referenced: true } && ptp is { Referenced: true } &&
-            telemetry.Epoch == ptp.Epoch && telemetry.Sequence == ptp.Sequence && (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2 ? telemetry : null;
+            telemetry.Epoch == ptp.Epoch && (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2 ? telemetry : null;   // a live position; AtStart is stricter
         // The canvas draws the device arm whenever there is a pose; otherwise it says why it shows the offline plan.
         xyPreview.SetStartFeedback(devicePose, devicePose is not null || !compatible ? null :
             homing ? Lang.T("why.homing") : ptp is not { Referenced: true } ? Lang.T("why.noRef") : Lang.T("why.waitFeed"));
@@ -737,6 +751,7 @@ public sealed partial class ControlWindow : Window
         xyPreview.SetDeviceStatus(statusMessage,statusFault,statusBusy,percent,
             stopPending || pendingControl is not null || homing || ptp is { Active: > 0 } && !executing);
         UpdateWorkflow();
+        if (enableAfterReport) { enableAfterReport = false; RequestEnable(); }
     }
     private void SafeAction(Action action)
     {
@@ -763,9 +778,9 @@ public sealed partial class ControlWindow : Window
         framedControl = false; heartbeatTimer.Interval = TimeSpan.FromMilliseconds(40);
         InvalidateManualReferenceFeedback();
         heartbeatTimer.Stop(); timer.Stop(); keyboardMask = mouseMask = 0;
-        pendingControl = null; telemetry = null; supportsTelemetry = supportsPacketRetry = false;
+        pendingControl = null; telemetry = null; supportsTelemetry = supportsPacketRetry = false; limitsReportSince = default; enableAfterReport = false;
         lock (wireSync) { pointWire.Clear(); }
-        pendingPoint = 0; ptp = null; stage2 = homed = feedbackReady = false;
+        pendingPoint = lastMoveSequence = 0; ptp = null; stage2 = homed = feedbackReady = false;
         uploading = uploaded = null; executing = supportsTrajectory = false;
         manualReferencePending = supportsManualReference = hardwareReady = false;
         try { Send(0x79); } catch { /* Firmware heartbeat timeout remains the fallback. */ }
@@ -807,6 +822,8 @@ public sealed partial class ControlWindow : Window
         MotionProfileSelfTest();
         JointLimitsSyncSelfTest();
         LiveRatesSyncSelfTest();
+        StatusBlockHoldSelfTest();
+        FlickerSelfTest();
         LoggingSelfTest();
         DiagnosticsSelfTest();
         WorkflowSelfTest();

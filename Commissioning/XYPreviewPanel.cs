@@ -235,7 +235,7 @@ public sealed partial class XYPreviewPanel : UserControl
         if (previewButton is { } preview) preview.Content = Lang.T("btn.preview");
         if (saveButton is { } save) save.Content = Lang.T("btn.save");
         export.Content = Lang.T("btn.export");
-        RefreshPresetLanguage();
+        RefreshRecentLanguage();
         play.Content = playbackTimer.IsEnabled ? Lang.T("btn.playPause") : Lang.T("btn.play");
         rewind.Content = Lang.T("btn.rewind");
         upload.Content = Lang.T("btn.upload");
@@ -290,7 +290,7 @@ public sealed partial class XYPreviewPanel : UserControl
         StackPanel Group(string title, UIElement? trailing = null, bool expanded = true) {
             var body = new StackPanel(); controls.Children.Add(WorkbenchTheme.Section(title, body, trailing, expanded)); return body;
         }
-        var presets = Group("section.presets"); presets.Children.Add(BuildPresetControls());
+        var recent = Group("section.recent"); recent.Children.Add(BuildRecentRuns());
         var geometry = Group("section.geometry"); geometry.Children.Add(BuildLamps(ShapeGroup, false));
         geometry.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.shape"), shape));
         geometry.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.branch"), branch));
@@ -606,7 +606,7 @@ public sealed partial class XYPreviewPanel : UserControl
             move += Lang.T("move.fwBounds", label, target.Q1, target.Q2, bounds.Min1, bounds.Max1, bounds.Min2, bounds.Max2, JointLimits.Elbow(target), bounds.ElbowMin, bounds.ElbowMax);
         } else if (pointTarget is null) move += Lang.T("move.planFail") + result.Text;
         if (execution is not null) move += held ? (uploadedRan ? Lang.T("move.ran") : Lang.T("move.uploaded")) : atStart ? Lang.T("move.atStart") : Lang.T("move.needStart");
-        if (uploadedPlan is not null && !held) move += Lang.T("move.otherPlan");
+        if (uploadedPlan is not null && !held) move += uploadedRan ? Lang.T("move.nextPlan") : Lang.T("move.otherPlan");
         if (execution is null && shape.SelectedIndex > 0) move += "\n" + (executionInfo.Text.Length > 0 ? executionInfo.Text : Lang.T("move.needCheck"));
         SetText(moveState, move);
         UpdateActionStatus();
@@ -638,8 +638,10 @@ public sealed partial class XYPreviewPanel : UserControl
         else if(shape.SelectedIndex>0 && firmwareLimits is not null && execution is null) { text=Lang.T("act.trajFail"); severity=2; }
         else if(!pointMoveAllowed) { text=Lang.T("act.waiting")+(deviceStatusMessage??deviceMoveReason); severity=1; }
         else if(run.IsEnabled) { text=uploadedRan?Lang.T("act.runAgain"):Lang.T("act.runNow"); severity=0; }
-        else if(uploadedPlan is not null) { text=Lang.T("act.planOnDevice"); severity=1; }
+        // An undrawn plan blocks every other move; a drawn one does not, the next shape just goes to its own start.
+        else if(uploadedPlan is not null && !uploadedRan) { text=Lang.T("act.planOnDevice"); severity=1; }
         else if(upload.IsEnabled) { text=Lang.T("act.uploadReady"); severity=0; }
+        else if(uploadedPlan is not null && shape.SelectedIndex>0) { text=Lang.T("act.nextShape"); severity=1; }
         else if(shape.SelectedIndex==0 && movePoint.IsEnabled) { text=Lang.T("act.pointReady"); severity=0; }
         else if(!trajectorySupported) { text=Lang.T("act.noTraj"); severity=1; }
         else { text=Lang.T("act.needPen"); severity=1; }
@@ -918,7 +920,7 @@ public sealed partial class XYPreviewPanel : UserControl
         UnifiedLimitsSelfTest();
         ElbowLimitSelfTest();
         ShapeFieldsSelfTest();
-        PresetSelfTest();
+        RecentRunsSelfTest();
         ShapeDefaultsSelfTest();
         var panel = new XYPreviewPanel();
         panel.ViewportSelfTest();
@@ -1003,6 +1005,13 @@ public sealed partial class XYPreviewPanel : UserControl
         panel.SetPointMoveState(true, new JointLimits(-30, 30, -60, 60), "模拟设备已就绪", true, true, other);
         if (panel.run.IsEnabled || !panel.actionSummary.Text.StartsWith("等待中"))
             throw new InvalidOperationException("A different plan on the device must not be started by 执行图形");
+        panel.SetPointMoveState(true, new JointLimits(-30, 30, -60, 60), "模拟设备已就绪", true, true, other, true);
+        if (panel.run.IsEnabled || !panel.movePoint.IsEnabled || !panel.upload.IsEnabled || panel.actionSummary.Text.Contains("重新上传") || panel.moveState.Text.Contains("总停止"))
+            throw new InvalidOperationException("A drawn plan on the device must not hold up the next shape (no STOP ALL, no re-homing): " + panel.actionSummary.Text);
+        panel.SetStartFeedback(null);
+        if (!panel.movePoint.IsEnabled || !panel.actionSummary.Text.Contains("不用回零"))
+            throw new InvalidOperationException("Away from the next shape's start the status must say to move there, without re-homing: " + panel.actionSummary.Text);
+        panel.SetStartFeedback(fresh);
         panel.SetPointMoveState(true, new JointLimits(-30, 30, -60, 60), "模拟设备已就绪", true, true, null);
         panel.x.Text = "335";
         if (panel.movePoint.IsEnabled || panel.upload.IsEnabled || panel.timing is not null || panel.play.IsEnabled)

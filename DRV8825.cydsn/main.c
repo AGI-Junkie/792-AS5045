@@ -75,7 +75,7 @@
  * select the framed transport (StatePattern in App.cs).  Bump this on every firmware change so a field log
  * can answer "was this fix actually flashed?". */
 #ifndef ARM2_ENCODER_FEEDBACK
-#define ARM2_ENCODER_FEEDBACK       (0u) /* Enable only after the encoder/magnet is fixed and commissioned. */
+#define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
 #define FW_BUILD_ID                 "stage2-v11-hotpath2"

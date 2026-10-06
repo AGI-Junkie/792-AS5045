@@ -25,7 +25,7 @@ arm2 已对齐 arm1 的反馈功能与剩余闭环缺口见 [ARM2_FEEDBACK.md](d
 powershell -ExecutionPolicy Bypass -File .\build-release.ps1
 ```
 
-结果在 `deliverables\<RELEASE_VERSION>\`：`firmware.hex`、完整的 `host\`（不要只拷 exe，需要 .NET 10 Desktop Runtime）、`BUILD_REPORT.txt`、`SHA256SUMS.txt`。
+**最新可用的上位机固定在 `out\latest\host\TwoLinkCommissioning.exe`**（每次闸门全过后自动覆盖，版本见同目录 `BUILD_REPORT.txt` 第一行；闸门失败则保持上一版不动）。各版本另存于 `out\<RELEASE_VERSION>\`：`firmware.hex`、完整的 `host\`（不要只拷 exe，需要 .NET 10 Desktop Runtime）、`BUILD_REPORT.txt`、`SHA256SUMS.txt`。
 
 1. 烧录 `firmware.hex` 后上电：两轴保持禁用，约 5 秒静态自检，不自动探测方向、不自动回零。
 2. 运行 `host\TwoLinkCommissioning.exe`。只做图形或 XY 预览时无需连接。要控制就选择 KitProg COM 口；连接会先请求停止并释放保持力矩，不会自动使能。
@@ -188,7 +188,7 @@ python tools\check-log.py --self-test
 | `releases/` | 实机验证过的固件镜像（含哈希） |
 | `CHANGELOG.md` | 按日期的变更记录 |
 
-`deliverables/`、`Generated_Source/`、构建输出和本机配置不提交。克隆后需要 PSoC Creator 4.4、.NET 10 SDK 和 Visual Studio C++ 工具；Creator 安装路径不同时用 `-Creator '<cyprjmgr.exe 的绝对路径>'`。
+`out/`、`deliverables/`（旧版本输出）、`Generated_Source/`、构建输出和本机配置不提交。克隆后需要 PSoC Creator 4.4、.NET 10 SDK 和 Visual Studio C++ 工具；Creator 安装路径不同时用 `-Creator '<cyprjmgr.exe 的绝对路径>'`。
 
 ## 版本管理
 

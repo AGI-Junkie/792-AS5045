@@ -46,6 +46,7 @@ public sealed class ExperimentRun
     public double? Peak { get; init; }
     public int TelemetryHz { get; init; }                           // 0 = the old ~2 Hz status-block telemetry
     public RunSettings? Settings { get; init; }
+    public string SettingsText { get; init; } = "";                 // as recorded, so the fields can be restored exactly
     public double L1 { get; init; } = 180;
     public double L2 { get; init; } = 176.38;
     public bool HasFault { get; init; }
@@ -99,7 +100,7 @@ public static class ExperimentArchive
         return new ExperimentRun {
             Directory = directory, Kind = Text(root, "kind"), StartedUtc = startedUtc.ToUniversalTime(), Sequence = (uint)Number(root, "sequence", 0), Reference = Text(root, "reference"),
             Outcome = outcome, Samples = samples, MotionSamples = motion, Rmse = rmse, Peak = peak, TelemetryHz = (int)Number(root, "telemetry_hz", 0),
-            Settings = RunSettings.Parse(Text(root, "settings")), L1 = Number(root, "L1", 180), L2 = Number(root, "L2", 176.38),
+            Settings = RunSettings.Parse(Text(root, "settings")), SettingsText = Text(root, "settings"), L1 = Number(root, "L1", 180), L2 = Number(root, "L2", 176.38),
             HasFault = File.Exists(Path.Combine(directory, "fault.json")), CalibrationId = Text(root, "calibration_id") };
     }
 
