@@ -5,19 +5,27 @@
  * into step pulses, and the due-time arithmetic.  What stays in main.c: the supervision (heartbeat, limits, encoder
  * following, final-position check), the pulses themselves, and the wire protocol.
  *
+ * Time comes in as an argument (the SysTick count, 24 bits counting down), steps go out as an array: the executor
+ * never reads a clock or touches a pin, so a test can drive it with made-up times.
+ *
  * The host (main.c) must provide, before this header is included:
  *   TRAJ_CAPACITY, TRAJ_NODE_MIN_MS, TRAJ_NODE_MAX_MS, TRAJ_TOTAL_MAX_MS   (the host/firmware contract; the release
  *                                                                          gate reads them from main.c)
- *   abs_i32()
+ *   TRAJ_STEP_MIN_US                                                       (never pulse faster than the rate cap)
+ *   SU_CY_PER_US, abs_i32()
  * and, after it (a forward declaration here, the definition there):
  *   traj_joint_steps()                                                     (kinematics: joint angles -> steps)
  */
 #ifndef TRAJ_H
 #define TRAJ_H
 
-#if !defined(TRAJ_CAPACITY) || !defined(TRAJ_NODE_MIN_MS) || !defined(TRAJ_NODE_MAX_MS) || !defined(TRAJ_TOTAL_MAX_MS)
-#error "define the TRAJ_* contract macros before including traj.h"
+#if !defined(TRAJ_CAPACITY) || !defined(TRAJ_NODE_MIN_MS) || !defined(TRAJ_NODE_MAX_MS) || !defined(TRAJ_TOTAL_MAX_MS) || \
+    !defined(TRAJ_STEP_MIN_US) || !defined(SU_CY_PER_US)
+#error "define the TRAJ_* contract macros, TRAJ_STEP_MIN_US and SU_CY_PER_US before including traj.h"
 #endif
+
+/* A node running this much longer than planned stops the run (the foreground has stalled). */
+#define TRAJ_OVERRUN_US (20000u)
 
 /* Steps of axis 0 (arm1) or 1 (arm2) that the pose (q1,q2) lies from the reference, in 0.01 degree inputs. */
 static int32 traj_joint_steps(uint8 axis, int16 q1, int16 q2);
@@ -76,7 +84,10 @@ typedef struct { int16 q1, q2; uint16 ms; } traj_node_t;
 typedef struct {
     uint8 state;   /* traj_state_t; DONE keeps the nodes, so a fresh RUN repeats the plan */
     uint16 count, expected, index;
-    uint32 durationMs, elapsedCy, clock;
+    uint32 durationMs;
+    uint32 elapsedCy, clock;  /* time spent in node `index`, and the SysTick count it was last advanced at */
+    uint32 lastStep;          /* SysTick count of the last step pulse */
+    uint32 lagMaxCy;          /* worst lateness of a step behind its due time; the owner clears it (ENABLE) */
     int32 velocity[2];
     traj_node_t nodes[TRAJ_CAPACITY];
 } traj_t;
@@ -131,10 +142,65 @@ static uint8 traj_runnable(const traj_t *t)
     return (t->state == TRAJ_READY || t->state == TRAJ_DONE) && t->count == t->expected;
 }
 
-/* Start at node 1 (node 0 is where the machine already stands); `now` is the SysTick count at the start. */
-static void traj_start(traj_t *t, uint32 now)
+/* Aim `seg` at node `index`: both axes from `from` to the node's pose, with the reference at `origin`. */
+static void traj_segment(const traj_t *t, dda_t *seg, const int32 origin[2], const int32 from[2])
 {
-    t->state = TRAJ_RUNNING; t->index = 1u; t->elapsedCy = 0u; t->clock = now;
+    const traj_node_t *n = &t->nodes[t->index];
+    int32 to[2];
+    to[0] = origin[0] - traj_joint_steps(0u, n->q1, n->q2);
+    to[1] = origin[1] - traj_joint_steps(1u, n->q1, n->q2);
+    dda_start(seg, to, from);
+}
+
+/* Start at node 1 (node 0 is where the machine already stands, at `pos`); `now` is the SysTick count. */
+static void traj_start(traj_t *t, dda_t *seg, const int32 origin[2], const int32 pos[2], uint32 now)
+{
+    t->state = TRAJ_RUNNING; t->index = 1u; t->elapsedCy = 0u; t->clock = now; t->lastStep = now;
+    traj_segment(t, seg, origin, pos);
+}
+
+typedef enum { TRAJ_POLL_IDLE = 0, TRAJ_POLL_STEP, TRAJ_POLL_DONE, TRAJ_POLL_OVERRUN } traj_poll_t;
+
+/* Advance a running plan to `now`.  Call as often as the foreground allows; each call does at most one thing:
+ *   STEP     one DDA event is due: step[i] says which axes pulse and which way.  The caller pulses them.
+ *   DONE     the last node's time is up (the caller starts its settle check).
+ *   OVERRUN  the current node has run TRAJ_OVERRUN_US past its time: the caller stops the machine.
+ *   IDLE     nothing is due (a node boundary may have been crossed).
+ * A step is never issued sooner than TRAJ_STEP_MIN_US after the previous one, even when catching up.  The next
+ * segment starts from where the last one aimed, which is where the pulses put the axes. */
+static traj_poll_t traj_poll(traj_t *t, dda_t *seg, const int32 origin[2], uint32 now, int8 step[2])
+{
+    uint32 duration = (uint32)t->nodes[t->index].ms * 1000u * SU_CY_PER_US;
+    t->elapsedCy += (t->clock - now) & 0x00FFFFFFu; t->clock = now;
+    if (t->elapsedCy > duration + TRAJ_OVERRUN_US * SU_CY_PER_US) { return TRAJ_POLL_OVERRUN; }
+    if (seg->done < seg->total) {
+        uint32 due = traj_due_cy(seg->done + 1u, duration, seg->total);
+        if (t->elapsedCy < due || ((t->lastStep - now) & 0x00FFFFFFu) < TRAJ_STEP_MIN_US * SU_CY_PER_US) { return TRAJ_POLL_IDLE; }
+        if (t->elapsedCy - due > t->lagMaxCy) { t->lagMaxCy = t->elapsedCy - due; }
+        t->lastStep = now;
+        dda_step(seg, step);
+        return TRAJ_POLL_STEP;
+    }
+    if (t->elapsedCy >= duration) {
+        t->elapsedCy -= duration;
+        if(++t->index==t->count) { return TRAJ_POLL_DONE; }
+        traj_segment(t, seg, origin, seg->target);
+    }
+    return TRAJ_POLL_IDLE;
+}
+
+/* Cycles spent in the current node as of `now`. */
+static uint32 traj_elapsed_cy(const traj_t *t, uint32 now)
+{
+    return t->elapsedCy + ((t->clock - now) & 0x00FFFFFFu);
+}
+
+/* For slot checks: how far into the node we are, and where in the node the next step (or the node's end) is due. */
+static void traj_next_due(const traj_t *t, const dda_t *seg, uint32 now, uint32 *since, uint32 *due)
+{
+    uint32 duration = (uint32)t->nodes[t->index].ms * 1000u * SU_CY_PER_US;
+    *since = traj_elapsed_cy(t, now);
+    *due = (seg->done < seg->total) ? traj_due_cy(seg->done + 1u, duration, seg->total) : duration;
 }
 
 #endif /* TRAJ_H */

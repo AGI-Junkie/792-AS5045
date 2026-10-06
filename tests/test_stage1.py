@@ -27,8 +27,8 @@ pins = sorted(set(re.findall(r'CYREG_PRT\d+_PC\d+', source)))
 pin_defs = '\n'.join(f'#define {pin} {i}' for i, pin in enumerate(pins))
 # Check node arrival at the actual transition, before the next node can pulse.
 # A 1 ms fixture iteration may cross the boundary and already emit the next step.
-source = replace_once(source, 'if(++g_traj.index==g_traj.count)',
-                      'sim_check_traj_boundary(); if(++g_traj.index==g_traj.count)')
+source = replace_once(source, 'if(++t->index==t->count)',
+                      'sim_check_traj_boundary(); if(++t->index==t->count)')
 
 mock = r'''
 #include <stdint.h>
@@ -906,8 +906,9 @@ static void host_rates_config(void) {
     stage_enable();assert(g_motionEnabled);
 }
 /* Characterization of the trajectory executor: the exact pulse schedule of fixed plans.  The plans are out-and-back smoothsteps
- * built with integer arithmetic only, so they are identical on every compiler; the expected hashes were recorded from the
- * firmware before the executor was moved out of main.c, and the move must not change one pulse's timing. */
+ * built with integer arithmetic only, so they are identical on every compiler; the hashes were recorded from the firmware as of
+ * the time-in traj_poll (the move into traj.h left them unchanged; making time an argument removed SysTick reads, which moved
+ * every pulse by less than one foreground pass, with the same pulse counts and axis order).  Any other change is a change of behaviour. */
 #define SCHED_A1 7112u
 #define SCHED_A2 6808u
 #define SCHED_B1 3200u
@@ -915,13 +916,13 @@ static void host_rates_config(void) {
 #define SCHED_C1 2844u
 #define SCHED_C2 0u
 #if ARM2_ENCODER_FEEDBACK /* the second encoder frame lengthens the foreground pass, which moves where each pulse lands */
-#define SCHED_AH 0x61acfe4bu
-#define SCHED_BH 0x08f3da10u
-#define SCHED_CH 0x4a7c6f67u
+#define SCHED_AH 0x7065db97u
+#define SCHED_BH 0xebc07474u
+#define SCHED_CH 0xafd22703u
 #else
-#define SCHED_AH 0xa36f98c5u
-#define SCHED_BH 0x00b1033au
-#define SCHED_CH 0x539c35d3u
+#define SCHED_AH 0x0b38f375u
+#define SCHED_BH 0x7762a1cau
+#define SCHED_CH 0x124b175bu
 #endif
 typedef struct { unsigned n; int16 q1[128], q2[128]; uint16 ms[128]; } sched_plan_t;
 static void sched_build(sched_plan_t *p, const uint16 *ms, unsigned n, int a1, int ae, unsigned dwellMs) {
@@ -941,13 +942,13 @@ static void sched_run(const char *name, const sched_plan_t *p, uint32 *seq, unsi
     traj_send(2,(*seq)++,p->q1[0],p->q2[0],(uint16)p->n);
     for(i=1;i<p->n;i++){traj_send(3,(*seq)++,p->q1[i],p->q2[i],p->ms[i]);cycle(1);assert(g_traj.count==i+1);}
     assert(g_traj.state==2&&p1==simPulse1&&p2==simPulse2);
-    simTrace=2166136261u;simTraceBase=simClock;g_trajLagMaxCy=0u;p1=simPulse1;p2=simPulse2;
+    simTrace=2166136261u;simTraceBase=simClock;g_traj.lagMaxCy=0u;p1=simPulse1;p2=simPulse2;
     traj_send(4,(*seq)++,0,0,0);assert(g_traj.state==3);
     for(i=0;i<650000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
     if(!g_motionEnabled)fprintf(stderr,"%s\n",simLog);
     assert(g_motionEnabled&&!g_ptp.active&&g_traj.state==4&&g_traj.index==p->n);
     printf("TRAJ_SCHEDULE %s pulses1=%u pulses2=%u trace=0x%08lx lag_us=%lu\n",name,simPulse1-p1,simPulse2-p2,
-           (unsigned long)simTrace,(unsigned long)(g_trajLagMaxCy/SU_CY_PER_US));fflush(stdout);
+           (unsigned long)simTrace,(unsigned long)(g_traj.lagMaxCy/SU_CY_PER_US));fflush(stdout);
 #ifndef SCHED_RECORD /* compile with /DSCHED_RECORD to print new values instead of checking them */
     assert(simPulse1-p1==exp1&&simPulse2-p2==exp2&&simTrace==expTrace);
 #else
@@ -1302,7 +1303,7 @@ int main(int argc,char **argv) {
         packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;txq_flush_blocking();
         g_traj.state=3u;g_traj.count=2u;g_traj.index=1u;
         g_traj.nodes[1].q1=-139;g_traj.nodes[1].q2=207;g_traj.nodes[1].ms=248;
-        g_ptp.active=1u;g_traj.elapsedCy=0;g_traj.clock=SU_NOW();g_ptp.lastStep=SU_NOW();traj_segment();
+        g_ptp.active=1u;{int32 pos[2];pos[0]=g_arm1.usteps;pos[1]=g_arm2.usteps;g_traj.elapsedCy=0;g_traj.clock=g_traj.lastStep=SU_NOW();traj_segment(&g_traj,&g_ptp.seg,g_ptp.origin,pos);}
         assert(g_ptp.seg.total==785u); CyILO_Start1K();CyWdtStart(CYWDT_128_TICKS,CYWDT_LPMODE_NOCHANGE);start=simClock;
         simFormatCostUs=2500u; /* 12 format calls in one burst cost about the observed 30 ms loop gap. */
         while(g_motionEnabled && g_traj.index<g_traj.count && simClock-start<400000u*24u) {
@@ -1314,7 +1315,7 @@ int main(int argc,char **argv) {
         assert(requested && g_motionEnabled && g_traj.index==g_traj.count);
         assert(simBoundaryChecks==1u && g_ptp.seg.done==785u);
         { unsigned long lag; const char *p; simLogN=0;simLog[0]=0;g_statusNext=9u;stage_status_line();txq_flush_blocking();
-          p=strstr(simLog,"traj_lag_max_us="); assert(p && sscanf(p,"traj_lag_max_us=%lu",&lag)==1 && lag==g_trajLagMaxCy/SU_CY_PER_US); }
+          p=strstr(simLog,"traj_lag_max_us="); assert(p && sscanf(p,"traj_lag_max_us=%lu",&lag)==1 && lag==g_traj.lagMaxCy/SU_CY_PER_US); }
         printf("%s: 248 ms / 785 steps completed with injected formatting cost\n",t);return 0;
     }
     if(!strcmp(t,"jog_arm2_limit")) {
@@ -1367,6 +1368,18 @@ int main(int argc,char **argv) {
                 assert(traj_due_cy(k,durations[di],totals[ti])==(uint32)((int64)k*durations[di]/totals[ti]));
             assert(traj_due_cy(totals[ti],durations[di],totals[ti])==durations[di]); /* the last step is due exactly at the end */
         }
+        puts(t);return 0;
+    }
+    if(!strcmp(t,"pulse_blocked")) {
+        /* The one place a trajectory/PTP step meets the pins: a step the axis refuses must stop the machine, with the reason. */
+        int8 both[2]={1,1}, second[2]={0,1}; int32 u1,u2;
+        setup(); txq_flush_blocking(); simLogN=0;simLog[0]=0;
+        u1=g_arm1.usteps;u2=g_arm2.usteps;
+        assert(pulse_axes(both,"trajectory pulse blocked") && g_arm1.usteps==u1+1 && g_arm2.usteps==u2+1 && g_motionEnabled);
+        assert(pulse_axes((int8[2]){0,0},"trajectory pulse blocked") && g_arm1.usteps==u1+1 && g_arm2.usteps==u2+1); /* no step, no pulse */
+        g_motionEnabled=0u; /* jog_step() refuses every step while motion is disabled */
+        assert(!pulse_axes(second,"trajectory pulse blocked") && g_arm1.usteps==u1+1 && g_arm2.usteps==u2+1);
+        assert(strstr(g_lastStop,"reason=\"trajectory pulse blocked\""));
         puts(t);return 0;
     }
     if(!strcmp(t,"stop_latch")) {
@@ -2066,7 +2079,7 @@ ptp_cases += ['traj_'+name for name in ['success','dwell','duplicate','capacity'
     'upload_stop','upload_jog','upload_timeout','crc','ptp_busy','stop','fault','limit','home1','npn','encoder','timeout','overrun','uart_upload','uart_run']]
 ptp_cases += ['manual_'+name for name in ['success','duplicate','stop','old_epoch','disabled','moving','busy','upload','sensor','fault','encoder','timeout','stale','payload','crc']]
 ptp_cases += ['fuzz_%d' % n for n in range(1, 7)]   # the gate's share; long campaigns: --emit-c=DIR and run fuzz_<seed> in parallel
-ptp_cases += ['dual_manual_unknown','dual_ptp_follow','stop_latch','traj_status_cost','hot_arith','jog_arm2_limit','origin_retry','traj_schedule']
+ptp_cases += ['dual_manual_unknown','dual_ptp_follow','stop_latch','traj_status_cost','hot_arith','jog_arm2_limit','origin_retry','traj_schedule','pulse_blocked']
 if host_plan is not None: ptp_cases += ['traj_host_plan','traj_manual_plan','traj_host_plan_offset','traj_host_plan_rx_retry']
 if len(sys.argv)>1:
     cases=[c for c in cases if c in sys.argv[1:]]

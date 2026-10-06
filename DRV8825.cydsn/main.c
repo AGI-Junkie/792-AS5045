@@ -1263,7 +1263,6 @@ static uint8 g_uploadRxQuarantine;
  * enabled, so the worst interval is measured over exactly that window and is
  * reset by ENABLE: it reports "how close did this run come to 250 ms". */
 static uint32 g_keyMaxGapMs;
-static uint32 g_trajLagMaxCy; /* worst lateness of a trajectory step behind its due time since ENABLE; the 20 ms overrun stop is this reaching a whole segment */
 
 static traj_t g_traj;
 
@@ -1395,7 +1394,7 @@ static void fault_snapshot(const char *reason, uint8 driverFault)
 {
     uint32 elapsedUs=0u, plannedUs=0u;
     if(g_traj.state==TRAJ_RUNNING && g_traj.index<g_traj.count) {
-        elapsedUs=(g_traj.elapsedCy+SU_ELAPSED(g_traj.clock))/SU_CY_PER_US;
+        elapsedUs=traj_elapsed_cy(&g_traj,SU_NOW())/SU_CY_PER_US;
         plannedUs=(uint32)g_traj.nodes[g_traj.index].ms*1000u;
     }
     JLOGF("FAULT_SNAPSHOT t=%lu epoch=%lu seq=%lu phase=%s home=%u traj=%u idx=%u/%u ref=%u p1=%ld p2=%ld e1=%ld err=%ld "
@@ -1796,16 +1795,6 @@ static void control_accept(const uint8 *p)
     else { jog_home_all(); }
 }
 
-static void traj_segment(void)
-{
-    const traj_node_t *n=&g_traj.nodes[g_traj.index];
-    int32 to[2], from[2];
-    to[0]=g_ptp.origin[0]-traj_joint_steps(0u,n->q1,n->q2);
-    to[1]=g_ptp.origin[1]-traj_joint_steps(1u,n->q1,n->q2);
-    from[0]=g_arm1.usteps; from[1]=g_arm2.usteps;
-    dda_start(&g_ptp.seg,to,from);
-    g_ptp.periodUs=g_ptp.seg.total ? (uint32)n->ms*1000u/g_ptp.seg.total : 1000u;
-}
 static uint8 traj_accept(const uint8 *p)
 {
     uint16 value=ptp_u16(p+13);
@@ -1836,8 +1825,12 @@ static uint8 traj_accept(const uint8 *p)
            g_arm2.usteps!=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,g_traj.nodes[0].q1,g_traj.nodes[0].q2))) {
             JLOG("PTP refused: trajectory incomplete/start position\r\n"); return 0u;
         }
-        traj_start(&g_traj,SU_NOW());
-        g_ptp.sinceMs=g_jogMs; g_ptp.lastStep=SU_NOW(); g_ptp.active=1u; traj_segment();
+        {
+            int32 pos[2];
+            pos[0]=g_arm1.usteps; pos[1]=g_arm2.usteps;
+            traj_start(&g_traj,&g_ptp.seg,g_ptp.origin,pos,SU_NOW());
+        }
+        g_ptp.sinceMs=g_jogMs; g_ptp.active=1u;
     }
     return 1u;
 }
@@ -1999,11 +1992,10 @@ static uint8 ptp_receive(uint8 b)
 /* Piecewise joint-linear timed DDA, no rest/restart at ordinary nodes.
  * ponytail: bounded velocity changes between chords, not jerk-continuous motion;
  * validate low-speed tracking on hardware before increasing these caps. */
-static uint8 coordinated_step(const char *failure)
+static uint8 pulse_axes(const int8 step[2], const char *failure)
 {
-    uint8 i; int8 step[2];
+    uint8 i;
     jog_axis_t *axes[2]; axes[0]=&g_arm1; axes[1]=&g_arm2;
-    dda_step(&g_ptp.seg,step);
     for(i=0u;i<2u;i++) {
         if(step[i]) {
             int32 before=axes[i]->usteps;
@@ -2013,23 +2005,20 @@ static uint8 coordinated_step(const char *failure)
     }
     return 1u;
 }
+static uint8 coordinated_step(const char *failure)
+{
+    int8 step[2];
+    dda_step(&g_ptp.seg,step);
+    return pulse_axes(step,failure);
+}
 static void traj_service(void)
 {
-    uint32 now=SU_NOW();
-    uint32 duration=(uint32)g_traj.nodes[g_traj.index].ms*1000u*SU_CY_PER_US;
-    g_traj.elapsedCy+=(g_traj.clock-now)&0x00FFFFFFu; g_traj.clock=now;
-    if(g_traj.elapsedCy>duration+20000u*SU_CY_PER_US) { stage_stop("trajectory timing overrun",0u); return; }
-    if(g_ptp.seg.done<g_ptp.seg.total) {
-        uint32 due=traj_due_cy(g_ptp.seg.done+1u,duration,g_ptp.seg.total);
-        if(g_traj.elapsedCy<due || SU_ELAPSED(g_ptp.lastStep)<TRAJ_STEP_MIN_US*SU_CY_PER_US) { return; }
-        if(g_traj.elapsedCy-due>g_trajLagMaxCy) { g_trajLagMaxCy=g_traj.elapsedCy-due; }
-        g_ptp.lastStep=SU_NOW();
-        if(!coordinated_step("trajectory pulse blocked")) { return; }
-    }
-    if(g_ptp.seg.done==g_ptp.seg.total && g_traj.elapsedCy>=duration) {
-        g_traj.elapsedCy-=duration;
-        if(++g_traj.index==g_traj.count) { g_ptp.active=2u; g_ptp.settleMs=g_jogMs; }
-        else { traj_segment(); }
+    int8 step[2];
+    switch(traj_poll(&g_traj,&g_ptp.seg,g_ptp.origin,SU_NOW(),step)) {
+    case TRAJ_POLL_OVERRUN: stage_stop("trajectory timing overrun",0u); break;
+    case TRAJ_POLL_STEP: (void)pulse_axes(step,"trajectory pulse blocked"); break;
+    case TRAJ_POLL_DONE: g_ptp.active=2u; g_ptp.settleMs=g_jogMs; break;
+    default: break;
     }
 }
 static void ptp_service(void)
@@ -2434,7 +2423,7 @@ static void stage_status_line(void)
     JLOGF("TIMING loop_max_ms=%lu tick_lag_max_ms=%lu clock=hardware wdt=256-384ms key_age_ms=%lu key_max_gap_ms=%lu status_max_us=%lu traj_lag_max_us=%lu\r\n",
           (unsigned long)g_loopMaxMs,(unsigned long)g_tickMaxLagMs,
           (unsigned long)(g_keysSeen ? (g_jogMs - g_lastKeyMs) : 0u),(unsigned long)g_keyMaxGapMs,(unsigned long)(g_statusMaxCy/SU_CY_PER_US),
-          (unsigned long)(g_trajLagMaxCy/SU_CY_PER_US)); break;
+          (unsigned long)(g_traj.lagMaxCy/SU_CY_PER_US)); break;
     case 10u:
     JLOGF("ENC_DIAG irq_max_us=%lu retries=%lu rejected=%lu gap_max_ms=%lu follow_peak_lsb=%lu\r\n",
           (unsigned long)(g_encIrqMaxCy/SU_CY_PER_US),(unsigned long)g_encRetries,
@@ -2489,7 +2478,7 @@ static void stage_enable(void)
     g_limitStop = 0u;
     g_motionEnabled = 1u;
     g_keyMaxGapMs = 0u;
-    g_trajLagMaxCy = 0u;
+    g_traj.lagMaxCy = 0u;
     cmd_reset_to_measured(); cmd_reset_axis(&g_enc2);
     JLOG("ENABLE OK: no automatic movement; low-speed jog or R for home; Space stops\r\n");
     stage_status();
@@ -2538,12 +2527,9 @@ static uint8 jog_slot_free(uint32 us)
     uint8 i;
 
     if (g_ptp.active==1u) {
-        uint32 period=g_ptp.periodUs*SU_CY_PER_US, since=SU_ELAPSED(g_ptp.lastStep);
-        if(g_traj.state==TRAJ_RUNNING) {
-            uint32 duration=(uint32)g_traj.nodes[g_traj.index].ms*1000u*SU_CY_PER_US;
-            since=g_traj.elapsedCy+SU_ELAPSED(g_traj.clock);
-            period=(g_ptp.seg.done<g_ptp.seg.total) ? traj_due_cy(g_ptp.seg.done+1u,duration,g_ptp.seg.total) : duration;
-        }
+        uint32 period, since;
+        if(g_traj.state==TRAJ_RUNNING) { traj_next_due(&g_traj,&g_ptp.seg,SU_NOW(),&since,&period); }
+        else { period=g_ptp.periodUs*SU_CY_PER_US; since=SU_ELAPSED(g_ptp.lastStep); }
         if (since>=period || period-since<need) { return 0u; }
     }
 
