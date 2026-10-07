@@ -39,6 +39,18 @@
 #ifndef HW_STEP
 #define HW_STEP                     (0u) /* STEP pulses from Control_Regs "StepArm1Req"/"StepArm2Req" + UDB PWMs, no busy-wait */
 #endif
+#ifndef HW_EVT
+#define HW_EVT                      (0u) /* trajectory steps from the EvtTimer interrupt instead of the foreground poll */
+#endif
+#ifndef HW_TXDMA
+#define HW_TXDMA                    (0u) /* debug-UART transmit by DMA from the text queue into the UART's TX FIFO */
+#endif
+#ifndef HW_DEAD
+#define HW_DEAD                     (0u) /* hardware deadman: DeadTimer + AliveReq cut the STEP PWMs if the foreground stalls */
+#endif
+#if (HW_EVT != 0u || HW_DEAD != 0u) && (HW_STEP == 0u)
+#error "HW_EVT and HW_DEAD need HW_STEP: the interrupt must not busy-wait for pulses, the deadman acts on the STEP PWMs"
+#endif
 
 #include <cytypes.h>
 #include <cyfitter.h>
@@ -54,6 +66,21 @@
 #include "StepArm2Req.h"
 #include "StepArm1.h"
 #include "StepArm2.h"
+#endif
+#if (HW_EVT != 0u)
+#include "EvtTimer.h"
+#include "EvtRestart.h"
+#include "EvtIsr.h"
+#endif
+#if (HW_DEAD != 0u)
+#include "AliveReq.h"
+#include "DeadTimer.h"
+#endif
+#if (HW_TXDMA != 0u)
+#include "TxDma_dma.h"
+#ifndef TXDMA_ADDR
+#define TXDMA_ADDR(p)               LO16((uint32)(p))   /* low half of a bus address; the high half is the channel's */
+#endif
 #endif
 #include <stdint.h>
 #include <stdio.h>
@@ -965,6 +992,12 @@ static void ramp_advance(ramp_t *r, int32 done)
 }
 
 /* --------------------------- hardware setup ----------------------------- */
+#if (HW_EVT != 0u)
+static void evt_init(void);
+#endif
+#if (HW_TXDMA != 0u)
+static void txdma_init(void);
+#endif
 static void hw_init(void)
 {
     CyGlobalIntEnable;
@@ -1009,9 +1042,15 @@ static void hw_init(void)
     CY_SET_REG8(PIN_LIMIT2, CY_PINS_DM_RES_UP | CY_PINS_PC_DATAOUT);
     CY_SET_REG8(PIN_ARM2_NPN, CY_PINS_DM_RES_UP | CY_PINS_PC_DATAOUT);
 
+#if (HW_EVT != 0u)
+    evt_init();
+#endif
 #if (USE_DEBUG_UART != 0u)
     /* Creator owns the UART pin routing; never overwrite its PC registers. */
     HostUart_Start();
+#if (HW_TXDMA != 0u)
+    txdma_init();
+#endif
     CyGlobalIntEnable;
 #endif
     su_timer_start();
@@ -1102,8 +1141,24 @@ static void txq_puts(const char *s)
     }
 }
 
+#if (HW_TXDMA != 0u)
+/* HostUart's TX buffer is just its 4-byte FIFO (Creator: TX buffer size 4): the DMA channel "TxDma" (1-byte bursts, one
+ * request per burst, request = TX FIFO not full) copies g_txq[tail .. tail+len) into HostUart_TXDATA, so the CPU
+ * only queues text.  g_txqTail moves when a transfer has finished, never earlier, so the space the DMA still reads
+ * is not offered to txq_puts(). */
+static uint8 g_txDmaCh, g_txDmaTd;
+static uint16 g_txDmaLen;            /* bytes of the running transfer, 0 = idle */
+static void txdma_init(void)
+{
+    g_txDmaCh = TxDma_DmaInitialize(1u, 1u, HI16(CYDEV_SRAM_BASE), HI16(CYDEV_PERIPH_BASE));
+    g_txDmaTd = CyDmaTdAllocate();
+}
+#endif
 static uint8 txq_pending(void)
 {
+#if (HW_TXDMA != 0u)
+    if (g_txDmaLen != 0u) { return 1u; }
+#endif
     return (g_txqHead != g_txqTail) ? 1u : 0u;
 }
 
@@ -1112,6 +1167,29 @@ static uint16 txq_free(void)
     return (uint16)((g_txqTail + TXQ_SIZE - g_txqHead - 1u) % TXQ_SIZE);
 }
 
+#if (HW_TXDMA != 0u)
+/* Keeps the DMA fed: retires a finished transfer, starts the next contiguous run of the queue. */
+static void txq_send_one(void)
+{
+    if (g_txDmaLen != 0u)
+    {
+        uint8 td, state;
+        (void)CyDmaChStatus(g_txDmaCh, &td, &state);
+        if ((state & (CY_DMA_STATUS_CHAIN_ACTIVE | CY_DMA_STATUS_TD_ACTIVE)) != 0u) { return; }
+        g_txqTail = (uint16)((g_txqTail + g_txDmaLen) % TXQ_SIZE);
+        g_txDmaLen = 0u;
+    }
+    if (g_txqHead != g_txqTail)
+    {
+        uint16 len = (g_txqHead > g_txqTail) ? (uint16)(g_txqHead - g_txqTail) : (uint16)(TXQ_SIZE - g_txqTail);
+        (void)CyDmaTdSetConfiguration(g_txDmaTd, len, CY_DMA_DISABLE_TD, CY_DMA_TD_INC_SRC_ADR);
+        (void)CyDmaTdSetAddress(g_txDmaTd, TXDMA_ADDR(&g_txq[g_txqTail]), TXDMA_ADDR(HostUart_TXDATA_PTR));
+        (void)CyDmaChSetInitialTd(g_txDmaCh, g_txDmaTd);
+        (void)CyDmaChEnable(g_txDmaCh, 1u);
+        g_txDmaLen = len;
+    }
+}
+#else
 static void txq_send_one(void)
 {
     if (g_txqHead != g_txqTail && HostUart_GetTxBufferSize() < HostUart_TX_BUFFER_SIZE - 1u)
@@ -1120,12 +1198,16 @@ static void txq_send_one(void)
         g_txqTail = (uint16)((g_txqTail + 1u) % TXQ_SIZE);
     }
 }
+#endif
 
 static void txq_flush_blocking(void)
 {
     uint32 start = wall_ms();
     while (txq_pending() != 0u) {
         if (wall_ms()-start >= 100u) {
+#if (HW_TXDMA != 0u)
+            (void)CyDmaChDisable(g_txDmaCh); g_txDmaLen=0u;   /* abandon the transfer along with the queue */
+#endif
             g_txqTail=g_txqHead; g_txqDropped++; return;
         }
         txq_send_one();
@@ -1421,9 +1503,37 @@ static void jog_stop_now(jog_axis_t *a)
     a->holding = 0u;
 }
 
+/* Event timer (HW_EVT): evt_cancel() must run before anything rewrites the trajectory state, so the interrupt can no
+ * longer be in the middle of it. */
+#if (HW_EVT != 0u)
+static void evt_cancel(void);
+static void evt_start(void);
+#else
+#define evt_cancel() ((void)0)
+#endif
+
+/* Hardware deadman (HW_DEAD): the foreground writes AliveReq once per pass; DeadTimer is reset by it and, if 100 ms
+ * pass without a write, its terminal count latches a kill on both STEP PWMs, with or without any software running. */
+#if (HW_DEAD != 0u)
+static void alive_kick(void) { AliveReq_Write(1u); }
+static void deadman_arm(void)   /* (re)start the PWMs, which clears a latched kill, and the timer */
+{
+    StepArm1_Stop(); StepArm1_Start(); StepArm2_Stop(); StepArm2_Start();
+    DeadTimer_Start();
+    (void)DeadTimer_ReadStatusRegister();
+    alive_kick();
+}
+static uint8 deadman_tripped(void) { return ((DeadTimer_ReadStatusRegister() & DeadTimer_STATUS_TC) != 0u) ? 1u : 0u; }
+#else
+#define alive_kick()     ((void)0)
+#define deadman_arm()    ((void)0)
+#define deadman_tripped() (0u)
+#endif
+
 /* Forget the held trajectory (and any upload isolation) without touching the reference. */
 static void traj_discard(void)
 {
+    evt_cancel();
     if(g_uploadRxQuarantine) { uart_discard_rx(); }
     g_uploadRxQuarantine=0u;
     traj_reset(&g_traj);
@@ -1486,6 +1596,7 @@ static void fault_snapshot(const char *reason, uint8 driverFault)
  * The explicit operator STOP also disables both drivers at its command entry. */
 static void stage_stop(const char *reason, uint8 driverFault)
 {
+    evt_cancel();   /* the evidence below must describe a frozen plan */
     fault_snapshot(reason, driverFault);
 #if (USE_DEBUG_UART != 0u)
     if(g_motionEnabled || g_home.phase!=HOME_IDLE || !g_lastStop[0]) {
@@ -1960,7 +2071,11 @@ static void ptp_accept(void)
     if(p[0]!=1u) {
         if(!traj_accept(p)) { return; }
         if(p[0]==4u) { g_uploadRxQuarantine=0u; } /* only a validated RUN ends upload isolation */
-        g_ptp.sequence=seq; memcpy(g_ptp.accepted,p,15u); traj_status(); return;
+        g_ptp.sequence=seq; memcpy(g_ptp.accepted,p,15u); traj_status();
+#if (HW_EVT != 0u)
+        if(p[0]==4u) { evt_start(); }
+#endif
+        return;
     }
     if(g_traj.state!=TRAJ_DONE) { traj_reset(&g_traj); } /* a finished plan survives the move back to its start */
     {
@@ -2065,7 +2180,7 @@ static uint8 ptp_receive(uint8 b)
 /* Piecewise joint-linear timed DDA, no rest/restart at ordinary nodes.
  * ponytail: bounded velocity changes between chords, not jerk-continuous motion;
  * validate low-speed tracking on hardware before increasing these caps. */
-static uint8 pulse_axes(const int8 step[2], const char *failure)
+static uint8 pulse_axes_try(const int8 step[2])   /* false when a step was refused; stops nothing (interrupt safe) */
 {
     uint8 i;
     jog_axis_t *axes[2]; axes[0]=&g_arm1; axes[1]=&g_arm2;
@@ -2073,9 +2188,14 @@ static uint8 pulse_axes(const int8 step[2], const char *failure)
         if(step[i]) {
             int32 before=axes[i]->usteps;
             jog_step(axes[i],step[i]);
-            if(axes[i]->usteps!=before+step[i]) { stage_stop(failure,FAULT_ACTIVE()); return 0u; }
+            if(axes[i]->usteps!=before+step[i]) { return 0u; }
         }
     }
+    return 1u;
+}
+static uint8 pulse_axes(const int8 step[2], const char *failure)
+{
+    if(!pulse_axes_try(step)) { stage_stop(failure,FAULT_ACTIVE()); return 0u; }
     return 1u;
 }
 static uint8 coordinated_step(const char *failure)
@@ -2095,9 +2215,88 @@ static void traj_service(void)
     default: break;
     }
 }
+#if (HW_EVT != 0u)
+/* EvtTimer is a fixed-function one-shot restarted from EvtRestart (a PulseMode Control_Reg on its 1 MHz clock): each
+ * event writes the next delay into Period and pulses the restart, which reloads the counter from Period.  The restart
+ * costs EVT_RESTART_LAG_US between the write and the first count (two timer clocks plus the register sync); it is
+ * taken off every delay and is the one number to calibrate on the bench.  The interrupt does the plan's steps and
+ * nothing else: stops are only requested (g_evtStop) and logged by the foreground, which also keeps all supervision. */
+#define EVT_RESTART_LAG_US          (3u)
+#define EVT_MIN_US                  (EVT_RESTART_LAG_US + 2u)
+#define EVT_MAX_US                  (60000u)    /* the 16-bit timer at 1 MHz; longer waits are re-armed on the way */
+#define TRAJ_FOREGROUND_MAX_MS      (40u)       /* no foreground pass for this long: the plan is stopped */
+static volatile uint8 g_evtRunning;             /* the timer owns the trajectory's pulses */
+static const char * volatile g_evtStop;         /* why the interrupt ended a run (static text) */
+static uint32 g_fgPassAt;                       /* SU_NOW() at the start of the latest foreground pass */
+static uint32 g_evtMaxCy, g_evtBusyCy, g_evtEvents, g_evtRunMs;
+
+static void evt_arm_cy(uint32 cy)
+{
+    uint32 us = (cy + SU_CY_PER_US - 1u) / SU_CY_PER_US;
+    if (us < EVT_MIN_US) { us = EVT_MIN_US; }
+    if (us > EVT_MAX_US) { us = EVT_MAX_US; }
+    EvtTimer_WritePeriod((uint16)(us - EVT_RESTART_LAG_US - 1u));
+    EvtRestart_Write(1u);
+}
+static void evt_fail(const char *reason) { g_evtRunning = 0u; g_evtStop = reason; }
+CY_ISR(evt_isr)
+{
+    uint32 started = SU_NOW(), cost;
+    int8 step[2];
+    (void)EvtTimer_ReadStatusRegister();        /* clears the interrupt */
+    if (g_evtRunning == 0u) { return; }
+    if (SU_ELAPSED(g_fgPassAt) > TRAJ_FOREGROUND_MAX_MS * 1000u * SU_CY_PER_US) { evt_fail("trajectory foreground stalled"); return; }
+    switch (traj_poll(&g_traj, &g_ptp.seg, g_ptp.origin, started, step)) {
+    case TRAJ_POLL_OVERRUN:     evt_fail("trajectory timing overrun"); return;
+    case TRAJ_POLL_UNSUSTAINED: evt_fail("trajectory rate not sustained"); return;
+    case TRAJ_POLL_STEP:        if (pulse_axes_try(step) == 0u) { evt_fail("trajectory pulse blocked"); return; } break;
+    case TRAJ_POLL_DONE:        g_ptp.active = 2u; g_ptp.settleMs = g_jogMs; g_evtRunning = 0u; return;
+    default: break;
+    }
+    evt_arm_cy(traj_wait_cy(&g_traj, &g_ptp.seg, SU_NOW()));
+    cost = SU_ELAPSED(started);
+    if (cost > g_evtMaxCy) { g_evtMaxCy = cost; }
+    g_evtBusyCy += cost; g_evtEvents++;
+}
+static void evt_init(void)
+{
+    EvtIsr_StartEx(evt_isr);
+    EvtIsr_SetPriority(1u);
+    EvtIsr_Disable();
+    EvtTimer_Start();
+}
+static void evt_start(void)    /* a trajectory RUN was accepted: step it from the timer */
+{
+    uint8 ints = CyEnterCriticalSection();
+    g_evtStop = 0; g_fgPassAt = SU_NOW();
+    g_evtMaxCy = 0u; g_evtBusyCy = 0u; g_evtEvents = 0u; g_evtRunMs = g_jogMs;
+    (void)EvtTimer_ReadStatusRegister();
+    EvtIsr_ClearPending();
+    EvtIsr_Enable();
+    g_evtRunning = 1u;
+    evt_arm_cy(0u);
+    CyExitCriticalSection(ints);
+}
+static void evt_cancel(void)
+{
+    uint8 ints = CyEnterCriticalSection();
+    g_evtRunning = 0u;
+    EvtIsr_Disable();
+    EvtIsr_ClearPending();
+    (void)EvtTimer_ReadStatusRegister();
+    CyExitCriticalSection(ints);
+}
+#define FG_PASS_MARK()              (g_fgPassAt = SU_NOW())
+#else
+#define FG_PASS_MARK()              ((void)0)
+#endif
+
 static void ptp_service(void)
 {
     if (!g_ptp.active) { return; }
+#if (HW_EVT != 0u)
+    if (g_evtStop != 0) { const char *why = g_evtStop; g_evtStop = 0; stage_stop(why, FAULT_ACTIVE()); return; }
+#endif
     if (!g_motionEnabled || !g_ptp.reference || !g_keysSeen || g_jogMs-g_lastKeyMs>JOG_DEADMAN_MS) { stage_stop("PTP heartbeat/reference lost",0u); return; }
     if (FAULT_ACTIVE()) { stage_stop("PTP nFAULT",1u); return; }
     if (HARD_LIMIT_ACTIVE() || ARM1_HOME_ACTIVE() || ARM2_NPN_ACTIVE()) { stage_stop("PTP limit/home sensor",0u); return; }
@@ -2120,7 +2319,12 @@ static void ptp_service(void)
 #endif
         stage_status(); return;
     }
-    if(g_traj.state==TRAJ_RUNNING) { traj_service(); return; }
+    if(g_traj.state==TRAJ_RUNNING) {
+#if (HW_EVT != 0u)
+        if(g_evtRunning) { return; }   /* the event timer steps the plan */
+#endif
+        traj_service(); return;
+    }
     if (g_ptp.seg.done>=g_ptp.seg.total) { g_ptp.active=2u; g_ptp.settleMs=g_jogMs; return; }
     if (SU_ELAPSED(g_ptp.lastStep)<g_ptp.periodUs*SU_CY_PER_US) { return; }
     g_ptp.lastStep=SU_NOW(); /* no catch-up bursts after a late service */
@@ -2466,6 +2670,11 @@ static uint8 status_moving(void)
 {
     return g_motionEnabled && (g_ptp.active || g_home.phase!=HOME_IDLE || g_arm1.moving || g_arm2.moving);
 }
+#if (HW_SSI != 0u || HW_STEP != 0u || HW_EVT != 0u || HW_DEAD != 0u)
+#define STATUS_LINES                (13u)    /* one more line when any hardware offload is on */
+#else
+#define STATUS_LINES                (12u)
+#endif
 static void stage_status_line(void)
 {
     uint32 start=SU_NOW(), cost;
@@ -2507,8 +2716,22 @@ static void stage_status_line(void)
           (unsigned)g_telemHz,(unsigned long)g_telemSent,(unsigned long)g_telemSkipped,(unsigned long)(g_telemMaxCy/SU_CY_PER_US)); break;
     case 12u:
     telem_line(); break;
+#if (HW_SSI != 0u || HW_STEP != 0u || HW_EVT != 0u || HW_DEAD != 0u)
+    case 13u:
+    {
+#if (HW_EVT != 0u)
+        unsigned long isrMaxUs=g_evtMaxCy/SU_CY_PER_US, events=g_evtEvents;
+        unsigned long busyPermille=(g_jogMs>g_evtRunMs) ? (g_evtBusyCy/SU_CY_PER_US)/(g_jogMs-g_evtRunMs) : 0ul;   /* us per ms = permille */
+#else
+        unsigned long isrMaxUs=0ul, events=0ul, busyPermille=0ul;
+#endif
+        JLOGF("HWOFFLOAD bus_mhz=%u ssi=%u step=%u evt=%u dead=%u evt_isr_max_us=%lu evt_isr_busy_permille=%lu evt_events=%lu\r\n",
+              (unsigned)(BCLK__BUS_CLK__HZ/1000000u),(unsigned)HW_SSI,(unsigned)HW_STEP,(unsigned)HW_EVT,(unsigned)HW_DEAD,
+              isrMaxUs,busyPermille,events);
+    } break;
+#endif
     }
-    if(g_statusNext>12u) g_statusNext=0u;
+    if(g_statusNext>STATUS_LINES) g_statusNext=0u;
     cost=SU_ELAPSED(start);if(cost>g_statusMaxCy)g_statusMaxCy=cost;
 }
 static void stage_status_service(void)
@@ -2533,6 +2756,7 @@ static void stage_enable(void)
 {
     if (g_motionEnabled != 0u) { JLOG("ENABLE: already enabled\r\n"); return; }
     ptp_invalidate();
+    deadman_arm();   /* an operator enable is what clears a latched hardware kill */
     if (!host_input_idle() || !motion_inputs_clear())
     { JLOG("ENABLE refused: fresh idle heartbeat and clear nFAULT/P0[4] required\r\n"); return; }
     if (enc_set_origin() == 0u)
@@ -3066,6 +3290,7 @@ static uint32 g_loopAt;     /* wall_ms() at the start of the previous pass */
 
 static void service_motion(void)
 {
+    if (deadman_tripped() != 0u) { stage_stop("hardware deadman: foreground stalled", 0u); return; }
     if (jog_safety_blocked() != 0u) { return; }
     if (g_home.phase != HOME_IDLE) { home_service(); }
     else if (g_ptp.active) { ptp_service(); }
@@ -3159,11 +3384,15 @@ static void app_start(void)
     g_loopAt   = g_jogMs;
     CyILO_Start1K();
     CyWdtStart(CYWDT_128_TICKS, CYWDT_LPMODE_NOCHANGE);
+    deadman_arm();
 }
 
 static void app_poll(void)
 {
-    uint32 loopNow = wall_ms();
+    uint32 loopNow;
+    FG_PASS_MARK();
+    alive_kick();
+    loopNow = wall_ms();
     if (loopNow - g_loopAt > g_loopMaxMs) { g_loopMaxMs = loopNow - g_loopAt; }
     g_loopAt = loopNow;
     /* Check the elapsed deadline BEFORE consuming queued heartbeats or
@@ -3190,10 +3419,14 @@ static void app_poll(void)
 
     stage_status_service();
 
+#if (HW_TXDMA != 0u)
+    if (txq_pending() != 0u) { txq_send_one(); }       /* the DMA needs no gap between steps */
+#else
     if ((txq_pending() != 0u) && (jog_slot_free(JOG_TX_BYTE_US) != 0u))
     {
         txq_send_one();
     }
+#endif
     CyWdtClear(); /* Only a completed foreground iteration feeds the watchdog. */
 }
 

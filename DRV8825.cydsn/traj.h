@@ -216,4 +216,18 @@ static void traj_next_due(const traj_t *t, const dda_t *seg, uint32 now, uint32 
     *due = (seg->done < seg->total) ? traj_due_cy(seg->done + 1u, duration, seg->total) : duration;
 }
 
+/* Cycles until traj_poll() can do something again: the time to the next step or to the end of the node, and never less
+ * than what is left of the minimum step spacing.  An interrupt-driven caller arms its timer with this. */
+static uint32 traj_wait_cy(const traj_t *t, const dda_t *seg, uint32 now)
+{
+    uint32 since, due, wait = 0u;
+    traj_next_due(t, seg, now, &since, &due);
+    if (due > since) { wait = due - since; }
+    if (seg->done < seg->total) {
+        uint32 sinceStep = (t->lastStep - now) & 0x00FFFFFFu, minimum = TRAJ_STEP_MIN_US * SU_CY_PER_US;
+        if (sinceStep < minimum && minimum - sinceStep > wait) { wait = minimum - sinceStep; }
+    }
+    return wait;
+}
+
 #endif /* TRAJ_H */

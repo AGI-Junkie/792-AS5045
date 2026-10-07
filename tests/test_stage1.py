@@ -69,11 +69,13 @@ static void CyILO_Start1K(void){simIlo1K=1;}
 static void CyWdtStart(uint8 ticks,uint8 mode){assert(simIlo1K && ticks==2 && mode==0);simWdtStarted++;}
 static void CyWdtClear(void){assert(simWdtStarted);simWdtFeeds++;}
 static void CyIntSetSysVector(uint8 n,void (*isr)(void)){assert(n==15);simTickIsr=isr;}
+static void sim_evt_service(void);
 static void sim_tick_sync(void) {
     uint64_t wraps=(simClock-simClockBase)>>24;
     while(simClockWraps<wraps){simClockWraps++;simTickPending=1;
         if(simInts && simTickIsr){simTickPending=0;simTickIsr();}}
     if(simInts && simTickPending && simTickIsr){simTickPending=0;simTickIsr();}
+    sim_evt_service();
 }
 static uint8 mock_critical_enter(void){uint8 old=(uint8)simInts;sim_tick_sync();simInts=0;return old;}
 static void mock_critical_exit(uint8 old){simInts=old;sim_tick_sync();}
@@ -155,6 +157,36 @@ static void HostUart_PutChar(uint8 b){
     while(simClock<simUartTxBusyUntil){simClock+=SIM_MHZ;sim_tick_sync();}
     mock_log(b);
 }
+/* DMA channel "TxDma": text queue -> UART TX FIFO.  A transfer is logged the moment the channel is enabled and stays
+ * "active" for simDmaByteCy cycles per byte (0 = the UART keeps up instantly, like the PutChar model above). */
+#define HI16(x) ((uint16)(((uint32)(x))>>16))
+#define LO16(x) ((uint16)(x))
+#define CYDEV_SRAM_BASE 0x20000000u
+#define CYDEV_PERIPH_BASE 0x40000000u
+#define CY_DMA_DISABLE_TD 0xFEu
+#define CY_DMA_TD_INC_SRC_ADR 1u
+#define CY_DMA_STATUS_CHAIN_ACTIVE 1u
+#define CY_DMA_STATUS_TD_ACTIVE 2u
+typedef int cystatus;
+static uint8 simUartTxFifoReg;
+#define HostUart_TXDATA_PTR ((volatile uint8 *)&simUartTxFifoReg)
+static const void *simDmaPtrs[8]; static unsigned simDmaPtrN;
+static uint16 sim_dma_addr(const void *p){ if(simDmaPtrN>=8) simDmaPtrN=0; simDmaPtrs[simDmaPtrN]=p; return (uint16)simDmaPtrN++; }
+#define TXDMA_ADDR(p) sim_dma_addr((const void *)(p))
+static unsigned simDmaLen, simDmaTransfers, simDmaBytes, simDmaInit, simDmaByteCy; static const uint8 *simDmaSrc;
+static uint64_t simDmaDoneAt; static int simDmaActive, simDmaEnabled;
+static uint8 TxDma_DmaInitialize(uint8 b,uint8 r,uint16 hs,uint16 hd){(void)b;(void)r;(void)hs;(void)hd;simDmaInit=1;return 1;}
+static uint8 CyDmaTdAllocate(void){return 3;}
+static cystatus CyDmaTdSetConfiguration(uint8 td,uint16 n,uint8 next,uint8 cfg){(void)td;(void)next;assert(cfg==CY_DMA_TD_INC_SRC_ADR && n>=1u && n<=4095u);simDmaLen=n;return 0;}
+static cystatus CyDmaTdSetAddress(uint8 td,uint16 src,uint16 dst){(void)td;(void)dst;simDmaSrc=(const uint8 *)simDmaPtrs[src];return 0;}
+static cystatus CyDmaChSetInitialTd(uint8 ch,uint8 td){(void)ch;(void)td;return 0;}
+static cystatus CyDmaChEnable(uint8 ch,uint8 keep){unsigned i;(void)ch;(void)keep;assert(simDmaInit && !simDmaActive);
+    for(i=0;i<simDmaLen;i++) mock_log(simDmaSrc[i]);
+    simDmaActive=1;simDmaEnabled=1;simDmaDoneAt=simClock+(uint64_t)simDmaLen*simDmaByteCy;simDmaTransfers++;simDmaBytes+=simDmaLen;return 0;}
+static cystatus CyDmaChDisable(uint8 ch){(void)ch;simDmaActive=0;simDmaEnabled=0;return 0;}
+static cystatus CyDmaChStatus(uint8 ch,uint8 *td,uint8 *state){(void)ch;*td=0;simClock+=simRegCost;
+    if(simDmaActive && simClock>=simDmaDoneAt) simDmaActive=0;
+    *state=simDmaActive?CY_DMA_STATUS_TD_ACTIVE:0u;return 0;}
 static uint32 mock_frame(void) {
     uint32 angle, frame, bits, parity=0;
     if(simBadEncoder) return 0;
@@ -221,9 +253,47 @@ static uint16 Ssi_ReadRxData(void){
 }
 static void Ssi_ClearRxBuffer(void){simSsiRead=sim_ssi_complete();}
 static void Ssi_ClearTxBuffer(void){simSsiQueued=sim_ssi_complete();if(simSsiRead>simSsiQueued)simSsiRead=simSsiQueued;}
+/* EvtTimer (fixed-function one-shot) + EvtRestart (PulseMode reset) + EvtIsr: WritePeriod loads the Period register;
+ * a restart pulse reloads the counter from it, and the terminal count comes (Period + 1 + lag) us later.  The lag is
+ * the restart latency the firmware compensates (EVT_RESTART_LAG_US).  The interrupt is taken at the first moment
+ * simulated time moves after the terminal count, with interrupts enabled, and never inside itself. */
+#define SIM_EVT_LAG_US 3u
+static uint64_t simEvtDue, simEvtLateMaxCy; static int simEvtArmed, simEvtInIsr, simEvtIsrOn, simEvtPendingIrq;
+static void (*simEvtHandler)(void);
+static unsigned simEvtPeriod, simEvtStatusTc, simEvtStarted, simEvtRestarts, simEvtIsrCount;
+static void EvtTimer_Start(void){simEvtStarted=1;}
+static void EvtTimer_WritePeriod(uint16 p){ assert(p>=1u); simEvtPeriod=p; }
+static uint8 EvtTimer_ReadStatusRegister(void){ uint8 s=simEvtStatusTc?1u:0u; simEvtStatusTc=0u; return s; }
+static void EvtRestart_Write(uint8 v){
+    if(v&1u){ simEvtArmed=1; simEvtDue=simClock+(uint64_t)(simEvtPeriod+1u+SIM_EVT_LAG_US)*SIM_MHZ; simEvtRestarts++; }
+}
+static void EvtIsr_StartEx(void (*h)(void)){ simEvtHandler=h; }
+static void EvtIsr_SetPriority(uint8 prio){ (void)prio; }
+static void EvtIsr_Enable(void){ simEvtIsrOn=1; }
+static void EvtIsr_Disable(void){ simEvtIsrOn=0; }
+static void EvtIsr_ClearPending(void){ simEvtPendingIrq=0; }
+static void sim_evt_service(void) {
+    if(simEvtArmed && simClock>=simEvtDue) {
+        simEvtArmed=0; simEvtStatusTc=1u; simEvtPendingIrq=1;
+        if(simClock-simEvtDue>simEvtLateMaxCy) simEvtLateMaxCy=simClock-simEvtDue;
+    }
+    while(simEvtPendingIrq && simEvtIsrOn && simInts && !simEvtInIsr && simEvtHandler) {
+        simEvtPendingIrq=0; simEvtInIsr=1; simEvtIsrCount++; simEvtHandler(); simEvtInIsr=0;
+    }
+}
+/* AliveReq (PulseMode) resets DeadTimer; 100 ms without a write is a terminal count, which latches a kill on both STEP
+ * PWMs until they are restarted (StepArm*_Start). */
+#define DeadTimer_STATUS_TC 1u
+#define SIM_DEAD_MS 100u
+static uint64_t simDeadAt; static int simDeadStarted, simDeadTripped, simDeadKilled; static unsigned simAliveKicks;
+static void sim_dead_check(void){ if(simDeadStarted && !simDeadKilled && simClock>simDeadAt){ simDeadKilled=1; simDeadTripped=1; } }
+static void AliveReq_Write(uint8 v){ if(v&1u){ sim_dead_check(); if(!simDeadKilled) simDeadAt=simClock+(uint64_t)SIM_DEAD_MS*SIM_MHZ*1000u; simAliveKicks++; } }
+static void DeadTimer_Start(void){ simDeadStarted=1; simDeadAt=simClock+(uint64_t)SIM_DEAD_MS*SIM_MHZ*1000u; }
+static uint8 DeadTimer_ReadStatusRegister(void){ uint8 s; sim_dead_check(); s=simDeadTripped?DeadTimer_STATUS_TC:0u; simDeadTripped=0; return s; }
 /* One STEP pulse reaching a driver that is awake and enabled: the arm's motor moves one microstep along DIR.  The
  * bit-banged path calls these on the pin edge that ends the pulse, the PWM path when the pulse is requested. */
 static void sim_pulse_arm1(void) {
+    sim_dead_check(); if(simDeadKilled) return;
     if(!simPins[CYREG_PRT1_PC7] && simPins[CYREG_PRT12_PC2] && simPins[CYREG_PRT1_PC2]) {
         int tracks=!simRateLimited || simClock-simLastMotorPulse>=SIM_MHZ*1250u;
         simLastMotorPulse=simClock; /* fixture motor tracks at most the configured 800 ustep/s jog rate */
@@ -232,6 +302,7 @@ static void sim_pulse_arm1(void) {
     }
 }
 static void sim_pulse_arm2(void) {
+    sim_dead_check(); if(simDeadKilled) return;
     if(!simPins[CYREG_PRT2_PC7] && simPins[CYREG_PRT2_PC2] && simPins[CYREG_PRT2_PC3]) {
         simPulse2++; simTrace=(simTrace^(uint32)((simClock-simTraceBase)*24u/SIM_MHZ))*16777619u; simTrace=(simTrace^(simPins[CYREG_PRT2_PC0]?3u:4u))*16777619u;
         if(!simStall2)simStep2+=simPins[CYREG_PRT2_PC0]?1:-1;
@@ -240,8 +311,10 @@ static void sim_pulse_arm2(void) {
 /* Control_Regs "StepArm1Req" / "StepArm2Req" (PulseMode, one bit each) + one-shot PWMs "StepArm1" / "StepArm2": writing 1
  * requests one pulse.  A write of 0 requests nothing. */
 static unsigned simStepStarted, simStepWrites1, simStepWrites2;
-static void StepArm1_Start(void){simStepStarted|=1u;}
-static void StepArm2_Start(void){simStepStarted|=2u;}
+static void StepArm1_Start(void){simStepStarted|=1u; simDeadKilled=0;}
+static void StepArm2_Start(void){simStepStarted|=2u; simDeadKilled=0;}
+static void StepArm1_Stop(void){simStepStarted&=~1u;}
+static void StepArm2_Stop(void){simStepStarted&=~2u;}
 static void StepArm1Req_Write(uint8 v){ if(v&1u){simStepWrites1++; sim_pulse_arm1();} }
 static void StepArm2Req_Write(uint8 v){ if(v&1u){simStepWrites2++; sim_pulse_arm2();} }
 static void mock_set(int pin,int value) {
@@ -317,10 +390,11 @@ static void cycle(int heartbeat) {
          * but service at 100 us resolution for the newly uncapped host plans. */
         unsigned sub;
         for(sub=0;sub<10;sub++) {
-            simClock+=SIM_MHZ*100u;jog_update_time();
+            simClock+=SIM_MHZ*100u;FG_PASS_MARK();alive_kick();jog_update_time();
             if(!jog_safety_blocked() && g_ptp.active)ptp_service();
         }
     } else simClock+=(SIM_MHZ*1000u);
+    FG_PASS_MARK();alive_kick();
     jog_update_time();
     if(heartbeat && (g_jogMs-g_lastKeyMs>=40u)) sim_keys(0);
 #if HW_SSI
@@ -764,7 +838,8 @@ static void ptp_test(const char *t) {
         char expected[170];
         assert(g_ptp.referenceSource==1u && g_ptp.encoderOrigin==g_enc.pos);
         ptp_send(1,epoch,-100,100,200,0);
-        for(i=0;i<1000 && g_ptp.active;i++)cycle(1);
+        for(i=0;i<5000 && g_ptp.active;i++)cycle(1);   /* 212 steps at 200 steps/s: just over 1 s without the busy-waits */
+        assert(!g_ptp.active);
         stage_status();for(i=0;i<100u && g_statusNext;i++)cycle(1);txq_flush_blocking();
         sprintf(expected,"p1=%ld p2=%ld e1=%ld err=%ld e2=%ld err2=%ld inputs=0 drops=0",
             (long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
@@ -1169,6 +1244,38 @@ static void traj_test(const char *t) {
     }
     traj_send(4,++seq,0,0,0);
     assert(g_traj.state==3&&g_ptp.active==1);
+    if(!strncmp(t,"traj_evt_",9)) {
+#if HW_EVT
+        unsigned isr0=simEvtIsrCount; unsigned long pulses;
+        assert(g_evtRunning && simEvtArmed && simEvtIsrOn);
+        if(!strcmp(t,"traj_evt_runs")) {
+            /* the timer, not the foreground, steps the plan: one interrupt per coordinated step (90 of them carry the 72 + 90 pulses), every one re-armed */
+            for(i=0;i<2000&&g_motionEnabled&&g_ptp.active;i++)cycle(1);
+            assert(g_motionEnabled&&!g_ptp.active&&g_traj.state==4&&g_traj.index==g_traj.count);
+            assert(simPulse1-p1==72&&simPulse2-p2==90);
+            assert(simEvtIsrCount-isr0>=90u && simEvtRestarts>=simEvtIsrCount-isr0 && !g_evtRunning && !g_evtStop);
+            assert(g_evtEvents>=90u && g_evtMaxCy>0u);
+        } else if(!strcmp(t,"traj_evt_stall")) {
+            /* a foreground that stops passing is noticed by the interrupt itself and ends the run; the foreground logs it */
+            for(i=0;i<50;i++)cycle(1);
+            assert(g_motionEnabled&&g_ptp.active==1u&&g_evtRunning);
+            simClock+=(uint64_t)SIM_MHZ*60000u; (void)SU_NOW();
+            assert(!g_evtRunning && g_evtStop && strstr(g_evtStop,"foreground stalled"));
+            pulses=simPulse1+simPulse2; simClock+=(uint64_t)SIM_MHZ*5000u; (void)SU_NOW();
+            assert(pulses==simPulse1+simPulse2);   /* and not one more pulse */
+            cycle(1); assert(!g_motionEnabled && strstr(g_lastStop,"foreground stalled") && !g_evtStop);
+        } else if(!strcmp(t,"traj_evt_stop")) {
+            /* an operator stop takes the timer away before it touches the plan again */
+            for(i=0;i<50;i++)cycle(1);
+            assert(g_evtRunning); jog_handle_byte(JOG_CMD_STOP);
+            assert(!g_motionEnabled && !g_evtRunning && !simEvtIsrOn);
+            pulses=simPulse1+simPulse2; isr0=simEvtIsrCount;
+            simClock+=(uint64_t)SIM_MHZ*20000u; (void)SU_NOW();
+            assert(pulses==simPulse1+simPulse2 && isr0==simEvtIsrCount);
+        }
+#endif
+        return;
+    }
     if(!strcmp(t,"traj_rx_motion")){HostUart_errorStatus=HostUart_RX_STS_STOP_ERROR;jog_rx_service();assert_stopped();return;}
     if(!strcmp(t,"traj_duplicate")) {traj_send(4,seq,0,0,0);assert(g_traj.index==1);}
     if(!strcmp(t,"traj_overrun"))simClock+=SIM_MHZ*300000u;
@@ -1526,6 +1633,59 @@ int main(int argc,char **argv) {
           assert(g_enc2.pos==pos2 && g_enc2.badStreak==bad2 && g_enc2.primed==primed2); }
         g_enc.directionKnown=1u; simBadEncoder=1;
         for(i=0;i<ENC_BAD_LIMIT;i++)service_encoder(); assert(!g_motionEnabled);
+        puts(t);return 0;
+    }
+    if(!strncmp(t,"txdma_",6)) {
+#if HW_TXDMA
+        char big[300]; unsigned n, sent=0u, k; uint16 tail0;
+        hw_init(); assert(simDmaInit);
+        simLogN=0; simLog[0]=0;
+        if(!strcmp(t,"txdma_order")) {
+            /* more text than the ring holds, in pieces, across the wrap: it arrives complete and in order */
+            for(n=0;n<sizeof(big)-1;n++) big[n]=(char)('a'+(n%26)); big[sizeof(big)-1]=0;
+            for(k=0;k<20;k++) {
+                JLOG(big); sent+=(unsigned)strlen(big);
+                if(k%3==2) txq_flush_blocking();
+            }
+            txq_flush_blocking();
+            assert(!txq_pending() && !g_txqDropped && simLogN==sent && simDmaTransfers>=2u);
+            for(n=0;n<sent;n++) assert(simLog[n]==(char)('a'+((n%(sizeof(big)-1))%26)));
+        } else {
+            /* while a transfer is running the queue does not give its space back, and a finished one is retired */
+            simDmaByteCy=SIM_MHZ*87u;                      /* 115200 baud: 87 us a byte */
+            JLOG("0123456789"); tail0=g_txqTail; txq_send_one();
+            assert(g_txDmaLen==10u && txq_pending());
+            JLOG("abcdefghij");                             /* queued behind it */
+            txq_send_one(); assert(g_txDmaLen==10u && g_txqTail==tail0);
+            simClock+=(uint64_t)SIM_MHZ*300u; txq_send_one();   /* 300 us of the 870 us: still on the wire */
+            assert(g_txDmaLen==10u && g_txqTail==tail0);
+            simClock+=(uint64_t)SIM_MHZ*700u; txq_send_one();   /* 1000 us: retired, the next run starts */
+            assert(g_txDmaLen==10u && g_txqTail==(uint16)((tail0+10u)%TXQ_SIZE));
+            simClock+=(uint64_t)SIM_MHZ*2000u; txq_send_one();
+            assert(g_txDmaLen==0u && !txq_pending() && !strcmp(simLog,"0123456789abcdefghij"));
+            /* a stuck wire is given up after 100 ms like the interrupt-driven queue */
+            simDmaByteCy=SIM_MHZ*1000000u; JLOG("xyz"); txq_flush_blocking();
+            assert(g_txqDropped==1u && !txq_pending() && !simDmaEnabled);
+        }
+#endif
+        puts(t);return 0;
+    }
+    if(!strcmp(t,"dead_kill")) {
+#if HW_DEAD
+        int32 u1;
+        setup(); assert(simDeadStarted && !simDeadKilled);
+        /* fed by the foreground, the deadman never trips */
+        for(i=0;i<500;i++){ simClock+=SIM_MHZ*1000u; alive_kick(); assert(!deadman_tripped()); }
+        jog_step(&g_arm1,1); assert(simPulse1==1u);
+        /* 150 ms without a pass: the PWMs are killed in hardware, a requested pulse never leaves the chip, and the next
+         * pass notices and stops the stage */
+        simClock+=(uint64_t)SIM_MHZ*150000u; u1=g_arm1.usteps;
+        jog_step(&g_arm1,1); assert(g_arm1.usteps==u1+1 && simPulse1==1u);
+        service_motion(); assert(!g_motionEnabled && strstr(g_lastStop,"hardware deadman"));
+        /* only an operator enable clears the latch */
+        g_homeNeedKeyRelease=0u; sim_keys(0); stage_enable(); assert(g_motionEnabled && !simDeadKilled);
+        jog_step(&g_arm1,1); assert(simPulse1==2u);
+#endif
         puts(t);return 0;
     }
     if(!strncmp(t,"step_hw_",8)) {
@@ -2206,7 +2366,7 @@ int main(int argc,char **argv) {
 
 cases = ['dual_'+n for n in ['home_reverse','home_stall','wrap','loss','gap','parity','hold','derate','follow_stop','peer_bad','peer_bad_reverse','final','limit','enable_bad']]
 cases += ['ssi_nonblocking','ssi_snapshot','ssi_retry','ssi_timeout','ssi_takeover']
-cases += ['step_hw_request','step_hw_pins']
+cases += ['step_hw_request','step_hw_pins','dead_kill','txdma_order','txdma_busy']
 cases += ['dual_snapshot_length','chain_frames','boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
          'missing_sensor','stuck_sensor','missing_npn','stalled_motor','reject_moving',
          'fault','limit','encoder_loss','jog_cancels','sensor_bounce']
@@ -2250,6 +2410,7 @@ ptp_cases += ['traj_'+name for name in ['success','dwell','duplicate','capacity'
     'upload_stop','upload_jog','upload_timeout','crc','ptp_busy','stop','fault','limit','home1','npn','encoder','timeout','overrun','uart_upload','uart_run']]
 ptp_cases += ['manual_'+name for name in ['success','duplicate','stop','old_epoch','disabled','moving','busy','upload','sensor','fault','encoder','timeout','stale','payload','crc']]
 ptp_cases += ['fuzz_%d' % n for n in range(1, 7)]   # the gate's share; long campaigns: --emit-c=DIR and run fuzz_<seed> in parallel
+ptp_cases += ['traj_evt_runs','traj_evt_stall','traj_evt_stop']
 ptp_cases += ['dual_manual_unknown','dual_ptp_follow','stop_latch','traj_slip','traj_status_cost','hot_arith','jog_arm2_limit','origin_retry','traj_schedule','pulse_blocked']
 if host_plan is not None: ptp_cases += ['traj_host_plan','traj_manual_plan','traj_host_plan_offset','traj_host_plan_rx_retry']
 if len(sys.argv)>1:
@@ -2275,11 +2436,11 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     tmp = Path(temp)
     if host_plan is not None: (tmp/'host-plan.bin').write_bytes(host_plan.read_bytes())
     if host_control is not None: (tmp/'host-control.bin').write_bytes(host_control.read_bytes())
-    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h']:
+    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h']:
         (tmp/name).write_text('',encoding='ascii')
     if emit_c is not None:
         emit_c.mkdir(parents=True, exist_ok=True)
-        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h']: (emit_c/name).write_text('',encoding='ascii')
+        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h']: (emit_c/name).write_text('',encoding='ascii')
         (emit_c/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
         print('wrote', emit_c/'check.c'); sys.exit(0)
     (tmp/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
