@@ -108,9 +108,14 @@ internal sealed partial class ExperimentWindow : Window
     private bool settingSlider;
     private readonly Dictionary<string, LogIndex?> logs = [];
 
+    internal const int MaxCompared = 4;
+    private static string Letter(int index) => ((char)('A' + index)).ToString();
+
     private static readonly Brush[][] Colours = [
         [WorkbenchTheme.Blue, WorkbenchTheme.Teal, WorkbenchTheme.Brush("#7B8794"), WorkbenchTheme.Brush("#7C3AED"), WorkbenchTheme.Brush("#A78BFA")],
-        [WorkbenchTheme.Brush("#C66B05"), WorkbenchTheme.Brush("#B7791F"), WorkbenchTheme.Brush("#A8A29E"), WorkbenchTheme.Brush("#DB2777"), WorkbenchTheme.Brush("#F472B6")]];
+        [WorkbenchTheme.Brush("#C66B05"), WorkbenchTheme.Brush("#B7791F"), WorkbenchTheme.Brush("#A8A29E"), WorkbenchTheme.Brush("#DB2777"), WorkbenchTheme.Brush("#F472B6")],
+        [WorkbenchTheme.Brush("#16A34A"), WorkbenchTheme.Brush("#84CC16"), WorkbenchTheme.Brush("#9CA3AF"), WorkbenchTheme.Brush("#0E7490"), WorkbenchTheme.Brush("#67E8F9")],
+        [WorkbenchTheme.Brush("#0F172A"), WorkbenchTheme.Brush("#475569"), WorkbenchTheme.Brush("#CBD5E1"), WorkbenchTheme.Brush("#7F1D1D"), WorkbenchTheme.Brush("#FCA5A5")]];
 
     public ExperimentWindow(string experimentRoot)
     {
@@ -264,7 +269,7 @@ internal sealed partial class ExperimentWindow : Window
     private void ShowSelection()
     {
         PausePlayback();
-        var selected = grid.SelectedItems.OfType<Row>().Select(r => r.Run).Take(2).ToList();
+        var selected = grid.SelectedItems.OfType<Row>().Select(r => r.Run).Take(MaxCompared).ToList();
         shown.Clear();
         foreach (var run in selected)
         {
@@ -279,13 +284,13 @@ internal sealed partial class ExperimentWindow : Window
             xy.InvalidateVisual(); timeText.Text = ""; summary.Text = rows.Count == 0 ? Lang.T("exp.sum.none") : Lang.T("exp.hint");
             return;
         }
-        bool compare = shown.Count == 2;
+        bool compare = shown.Count >= 2;
         tMin = shown.Min(a => Math.Min(Math.Min(a.T.Length > 0 ? a.T[0] : 0, a.PreT.Length > 0 ? a.PreT[0] : 0), a.HasPlan ? 0 : double.MaxValue));
         tMax = shown.Max(a => Math.Max(Math.Max(a.T.Length > 0 ? a.T[^1] : 0, a.PreT.Length > 0 ? a.PreT[^1] : 0), a.Duration));
         if (tMax - tMin < 0.5) tMax = tMin + 0.5;
         for (int i = 0; i < shown.Count; i++)
         {
-            var a = shown[i]; var c = Colours[i]; string tag = compare ? (i == 0 ? "A " : "B ") : "";
+            var a = shown[i]; var c = Colours[i]; string tag = compare ? Letter(i) + " " : "";
             if (a.T.Length > 0)
             {
                 qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.cmd"), a.T, a.Q1Command, c[0]) { Unit = "°" });
@@ -296,6 +301,9 @@ internal sealed partial class ExperimentWindow : Window
                 qPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.enc"),a.T,a.Q2Measured,c[4]) { Unit="°",Dashed=true });
                 errPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.err"),a.T,a.Q2Error,c[3]) { Unit="°",Decimals=4 });
             }
+            // How far this run's error departs from the first run's, sample by sample (only meaningful for the same shape).
+            if (i > 0 && a.T.Length > 0 && shown[0].T.Length > 0)
+                errPlot.Series.Add(new PlotSeries($"{Letter(i)}−A " + Lang.T("exp.s.diff"), a.T, a.T.Select((t, k) => a.Q1Error[k] - shown[0].At(shown[0].Q1Error, t)).ToArray(), WorkbenchTheme.Ink) { Thickness = 1.0, Dashed = true, Unit = "°", Decimals = 4 });
             if (a.HasPlan) qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.plan"), a.PlanT, a.PlanQ1, c[2]) { Dashed = true, Thickness = 1.1, Unit = "°" });
             if (a.T.Length > 0) errPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.err"), a.T, a.Q1Error, c[0]) { Unit = "°", Decimals = 4, Dots = a.T.Length < 120 });
             if (a.T.Length > 0) { errPlot.Lines.Add(new PlotLine(a.Rmse, tag + "RMSE " + a.Rmse.ToString("0.0000", CultureInfo.InvariantCulture), c[0])); errPlot.Lines.Add(new PlotLine(-a.Rmse, "", c[0])); }
@@ -346,9 +354,9 @@ internal sealed partial class ExperimentWindow : Window
         qPlot.Title = Lang.T("exp.chart.q1"); errPlot.Title = Lang.T("exp.chart.err"); speedPlot.Title = Lang.T("exp.chart.speed"); accelPlot.Title = Lang.T("exp.chart.accel");
         errPlot.SymmetricY = true; speedPlot.SymmetricY = true; accelPlot.SymmetricY = true;
         qPlot.Source = Lang.T("exp.src.q1"); errPlot.Source = Lang.T("exp.src.err"); speedPlot.Source = Lang.T("exp.src.speed"); accelPlot.Source = Lang.T("exp.src.plan");
-        for (int i = 0; i < shown.Count; i++) errPlot.Notes.Add((compare ? (i == 0 ? "A " : "B ") : "") + Lang.T("exp.sum.err", shown[i].Rmse, shown[i].Peak, shown[i].T.Length, shown[i].Run.TelemetryHz > 0 ? shown[i].Run.TelemetryHz + " Hz" : "~2 Hz"));
-        for (int i = 0; i < shown.Count; i++) if (shown[i].Rmse2 is { } r2 && shown[i].Peak2 is { } p2) errPlot.Notes.Add((compare ? (i == 0 ? "A " : "B ") : "") + Lang.T("exp.sum.err2", r2, p2));
-        for (int i = 0; i < shown.Count; i++) speedPlot.Notes.Add((compare ? (i == 0 ? "A " : "B ") : "") + LimiterText(shown[i]));
+        for (int i = 0; i < shown.Count; i++) errPlot.Notes.Add((compare ? Letter(i) + " " : "") + Lang.T("exp.sum.err", shown[i].Rmse, shown[i].Peak, shown[i].T.Length, shown[i].Run.TelemetryHz > 0 ? shown[i].Run.TelemetryHz + " Hz" : "~2 Hz"));
+        for (int i = 0; i < shown.Count; i++) if (shown[i].Rmse2 is { } r2 && shown[i].Peak2 is { } p2) errPlot.Notes.Add((compare ? Letter(i) + " " : "") + Lang.T("exp.sum.err2", r2, p2));
+        for (int i = 0; i < shown.Count; i++) speedPlot.Notes.Add((compare ? Letter(i) + " " : "") + LimiterText(shown[i]));
         xy.Source = Lang.T("exp.src.xy"); xy.ReachRadius = shown[0].Model.OuterRadius;
         foreach (var plot in new[] { qPlot, errPlot, speedPlot, accelPlot }) plot.XRange = (tMin, tMax);
         settingSlider = true; timeSlider.Minimum = tMin; timeSlider.Maximum = tMax; settingSlider = false;
@@ -370,7 +378,7 @@ internal sealed partial class ExperimentWindow : Window
         for (int i = 0; i < shown.Count; i++)
         {
             var a = shown[i]; var run = a.Run; var s = run.Settings;
-            string tag = shown.Count == 2 ? (i == 0 ? "A · " : "B · ") : "";
+            string tag = shown.Count >= 2 ? Letter(i) + " · " : "";
             if (run.Kind == "fault")
             {
                 text.AppendLine(tag + Lang.T("exp.sum.faultRun", run.StartedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)));
@@ -398,12 +406,11 @@ internal sealed partial class ExperimentWindow : Window
                 text.AppendLine(Lang.T("exp.sum.fault", Lang.T("snap.phase." + (fault.Phase is "home" or "ptp" or "traj_run" or "traj_upload" or "jog" or "idle" or "disabled" ? fault.Phase : "other")), fault.Reason, fault.Driver ? " — " + Lang.T("snap.drvUndetermined") : ""));
             text.AppendLine();
         }
-        if (shown.Count == 2 && shown[0].T.Length > 0 && shown[1].T.Length > 0)
-        {
-            string Change(double a, double b) => a <= 0 ? "—" : (b / a - 1).ToString("+0%;-0%;0%", CultureInfo.InvariantCulture);
-            text.AppendLine(Lang.T("exp.sum.compare", Change(shown[0].Rmse, shown[1].Rmse), Change(shown[0].Peak, shown[1].Peak), Change(shown[0].Duration, shown[1].Duration)));
-        }
-        if (grid.SelectedItems.Count > 2) text.AppendLine(Lang.T("exp.sum.maxTwo"));
+        string Change(double a, double b) => a <= 0 ? "—" : (b / a - 1).ToString("+0%;-0%;0%", CultureInfo.InvariantCulture);
+        for (int i = 1; i < shown.Count; i++)
+            if (shown[0].T.Length > 0 && shown[i].T.Length > 0)
+                text.AppendLine(Lang.T("exp.sum.compare", Change(shown[0].Rmse, shown[i].Rmse), Change(shown[0].Peak, shown[i].Peak), Change(shown[0].Duration, shown[i].Duration), Letter(i), "A"));
+        if (grid.SelectedItems.Count > MaxCompared) text.AppendLine(Lang.T("exp.sum.maxTwo"));
         return text.ToString().TrimEnd();
     }
 
@@ -438,9 +445,9 @@ internal sealed partial class ExperimentWindow : Window
             var a = shown[i]; if (a.T.Length == 0) continue;
             double q1 = a.At(a.Q1Command, cursor), q2 = a.At(a.Q2Command, cursor), enc = a.At(a.Q1Encoder, cursor);
             var (elbow, tip) = a.Model.Forward(new JointPose(q1, q2));
-            xy.Arms.Add(new XYView.Arm((i == 0 ? "A" : "B") + " cmd", [new Point(0, 0), elbow, tip], Colours[i][0], false));
+            xy.Arms.Add(new XYView.Arm(Letter(i) + " cmd", [new Point(0, 0), elbow, tip], Colours[i][0], false));
             var (hElbow, hTip) = a.Model.Forward(new JointPose(enc, a.Q2Measured.Length==a.T.Length ? a.At(a.Q2Measured,cursor) : enc + (q2 - q1)));
-            xy.Arms.Add(new XYView.Arm((i == 0 ? "A" : "B") + " hybrid", [new Point(0, 0), hElbow, hTip], Colours[i][1], true));
+            xy.Arms.Add(new XYView.Arm(Letter(i) + " hybrid", [new Point(0, 0), hElbow, hTip], Colours[i][1], true));
         }
         xy.InvalidateVisual();
         timeText.Text = Lang.T("exp.time", cursor, tMax);

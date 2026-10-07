@@ -123,8 +123,9 @@ internal sealed partial class ExperimentWindow
 
             // Two recordings laid over each other.
             w.SelectForSelfTest(0, 1);
-            Check(w.ShownRuns == 2 && q.Series.Count == 12 && err.Series.Count == 5 && speed.Series.Count == 8 && q.Series[0].Name.StartsWith("A ") && q.Series[7].Name.StartsWith("B "), "comparison doubles the series and tags them A and B");
-            Check(w.SummaryText_.Contains("B 相对 A") && w.Plane.Paths.Count == 6 && err.Notes.Count == 4, "comparison summary and notes");
+            Check(w.ShownRuns == 2 && q.Series.Count == 12 && err.Series.Count == 6 && speed.Series.Count == 8 && q.Series[0].Name.StartsWith("A ") && q.Series[7].Name.StartsWith("B "), "comparison doubles the series and tags them A and B");
+            Check(w.SummaryText_.Contains("B 相对 A") && w.Plane.Paths.Count == 6 && err.Notes.Count == 4 && err.Series.Any(x => x.Name.StartsWith("B−A")), "comparison summary and notes");
+            Check(err.Series.First(x => x.Name.StartsWith("B−A")).Y.Length == err.Series.First(x => x.Name.StartsWith("B ")).Y.Length, "the difference curve has a point per sample of the second run");
             Check(w.Range.Max >= 10 && w.Plane.Arms.Count == 4, "both arms at the cursor");
             // Language switch rewrites everything without losing the selection.
             Lang.Toggle();
@@ -162,6 +163,13 @@ internal sealed partial class ExperimentWindow
             Check(w.SummaryText_.Contains("停机记录：停机时没有在录像") && w.SummaryText_.Contains("4 个样本") && w.SummaryText_.Contains("trajectory timing overrun"), "its summary: " + w.SummaryText_);
             w.SetCursor(w.Range.Min + 0.1);
             Check(w.LogText.Contains("HOST marker"), "the log around the cursor follows the pre-stop telemetry's host clock: " + w.LogText);
+            // More than the limit: the first four selected are shown, and the summary says so.
+            string extra1 = ExperimentArchiveTests.WriteSyntheticRun(root, DrawingShape.Line, 9000, settings.Replace("shape=2", "shape=0"), out _); Thread.Sleep(15);
+            string extra2 = ExperimentArchiveTests.WriteSyntheticRun(root, DrawingShape.Line, 9500, settings.Replace("shape=2", "shape=0"), out _);
+            w.Reload2();
+            w.SelectForSelfTest(Enumerable.Range(0, w.ListedRuns).ToArray());
+            Check(w.ListedRuns == 5 && w.ShownRuns == ExperimentWindow.MaxCompared && w.SummaryText_.Contains("最多比较四次") && w.SummaryText_.Contains("C 相对 A") && q.Series.Any(x => x.Name.StartsWith("D ")), "a fifth selection is not shown, and the others are tagged A to D: " + w.SummaryText_);
+            w.SelectForSelfTest(0, 1);
             // Nothing recorded yet: a friendly empty state, not an error.
             var empty = new ExperimentWindow(Path.Combine(temp, "nothing"));
             Check(empty.ListedRuns == 0 && empty.SummaryText_.Contains("还没有实验记录") && empty.ShownRuns == 0, "an empty archive says so");
