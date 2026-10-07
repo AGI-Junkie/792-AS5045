@@ -31,7 +31,7 @@ function Restore-CreatorProject {
 }
 Push-Location -LiteralPath $repo
 try {
-    $sources = @('DRV8825.cydsn\main.c','DRV8825.cydsn\traj.h','DRV8825.cydsn\DRV8825.cyprj','DRV8825.cydsn\DRV8825.cydwr','DRV8825.cydsn\TopDesign\TopDesign.cysch','Commissioning\Commissioning.csproj','tests\test_stage1.py','build-release.ps1','verify-creator-pins.ps1','RELEASE_VERSION','README.md','CHANGELOG.md','docs\PROTOCOL.md','docs\ARM2_FEEDBACK.md','docs\STOP_DIAG.md','docs\STATE_MODEL.md','docs\UART_DIAGNOSIS.md','docs\history\RUN_REVIEW_20260929.md','tools\check-log.py')
+    $sources = @('DRV8825.cydsn\main.c','DRV8825.cydsn\traj.h','DRV8825.cydsn\hw_ssi.h','DRV8825.cydsn\DRV8825.cyprj','DRV8825.cydsn\DRV8825.cydwr','DRV8825.cydsn\TopDesign\TopDesign.cysch','Commissioning\Commissioning.csproj','tests\test_stage1.py','build-release.ps1','verify-creator-pins.ps1','RELEASE_VERSION','README.md','CHANGELOG.md','docs\PROTOCOL.md','docs\ARM2_FEEDBACK.md','docs\STOP_DIAG.md','docs\STATE_MODEL.md','docs\UART_DIAGNOSIS.md','docs\history\RUN_REVIEW_20260929.md','tools\check-log.py')
     $sources += Get-ChildItem -LiteralPath Commissioning -Filter '*.cs' | ForEach-Object { 'Commissioning\' + $_.Name }
     $sourceHashes = @{}
     foreach ($source in $sources) { $sourceHashes[$source] = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash }
