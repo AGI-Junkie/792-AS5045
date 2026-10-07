@@ -17,6 +17,9 @@ public sealed class TimedTrajectory
     public double Duration => StopTimes[^1];
     public double Length => distances[^1];
     private readonly double[] distances;
+    // Per stroke: fraction of its time spent in each smooth speed ramp (0 = the single quintic profile), chosen by the planner.
+    private readonly double[] ramps;
+    private static readonly double[] RampChoices = [0, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40];
     private const double Rad = Math.PI / 180;
     internal void Stretch(double factor)
     {
@@ -30,21 +33,21 @@ public sealed class TimedTrajectory
         if (new[] { rates.Feed, rates.V1, rates.V2, rates.A1, rates.A2 }.Any(v => !double.IsFinite(v) || v < 0.01 || v > 1000))
             throw Lang.Error("err.planRates");
         Path = path; Rates = rates;
-        StopTimes = new double[path.Stops.Length]; distances = new double[path.Stops.Length];
+        StopTimes = new double[path.Stops.Length]; distances = new double[path.Stops.Length]; ramps = new double[path.Stops.Length - 1];
         for (int piece = 0; piece < StopTimes.Length - 1; piece++)
         {
-            double duration = 0.02;
+            // Shorter ramps cruise closer to the speed limit but accelerate harder, so the best ramp depends on which limit
+            // binds. Pick it on a coarse probe grid, then size the stroke with the full grid for that ramp only.
+            double bestRamp = 0, coarse = double.PositiveInfinity;
+            foreach (double ramp in RampChoices)
+            {
+                double d = PieceDuration(piece, ramp, 100);
+                if (d < coarse - 1e-12) { coarse = d; bestRamp = ramp; }
+            }
+            ramps[piece] = bestRamp;
             // ponytail: 1001 normalized-time probes plus 5% margin estimate peaks;
             // replace with verified continuous bounds before using this planner for hardware execution.
-            for (int i = 0; i <= 1000; i++)
-            {
-                var state = EvaluatePiece(piece, i / 1000.0, 1);
-                duration = Math.Max(duration, state.Speed / rates.Feed);
-                duration = Math.Max(duration, Math.Abs(state.Velocity.Q1) / rates.V1);
-                duration = Math.Max(duration, Math.Abs(state.Velocity.Q2 - state.Velocity.Q1) / rates.V2);
-                duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q1) / rates.A1));
-                duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q2 - state.Acceleration.Q1) / rates.A2));
-            }
+            double duration = PieceDuration(piece, bestRamp, 1000);
             if (!double.IsFinite(duration) || StopTimes[piece] + duration * 1.05 > DeviceContract.TrajTotalMaxMs / 1000.0)
                 throw Lang.Error("err.planSlow", DeviceContract.TrajTotalMaxMs / 1000);
             StopTimes[piece + 1] = StopTimes[piece] + duration * 1.05;
@@ -52,14 +55,51 @@ public sealed class TimedTrajectory
         }
     }
 
+    // Shortest stroke time (seconds) at which every rate and acceleration limit holds at `probes`+1 sampled points of the profile.
+    internal double PieceDuration(int piece, double ramp, int probes)
+    {
+        double duration = 0.02;
+        for (int i = 0; i <= probes; i++)
+        {
+            var state = EvaluatePiece(piece, i / (double)probes, 1, ramp);
+            duration = Math.Max(duration, state.Speed / Rates.Feed);
+            duration = Math.Max(duration, Math.Abs(state.Velocity.Q1) / Rates.V1);
+            duration = Math.Max(duration, Math.Abs(state.Velocity.Q2 - state.Velocity.Q1) / Rates.V2);
+            duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q1) / Rates.A1));
+            duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q2 - state.Acceleration.Q1) / Rates.A2));
+        }
+        return duration;
+    }
+
+    // Normalised stroke progress u(z) and its first and second derivative in z, z in [0,1]; zero speed and acceleration at both ends.
+    // ramp = 0: one quintic (peak speed 1.875x the average).  ramp = a: a quintic speed ramp over the first and the last a of the
+    // stroke with constant speed between (peak speed 1/(1-a)x the average, peak acceleration 1.875/(a(1-a)) against 5.77).
+    internal static (double U, double Du, double Ddu) Progress(double z, double ramp)
+    {
+        if (ramp <= 0)
+            return (z * z * z * (10 + z * (-15 + 6 * z)), 30 * z * z * (1 - z) * (1 - z), 60 * z * (1 - z) * (1 - 2 * z));
+        bool mirrored = z > 0.5;
+        double w = mirrored ? 1 - z : z, speed = 1 / (1 - ramp), u, du, ddu;
+        if (w < ramp)
+        {
+            double x = w / ramp;
+            u = speed * ramp * x * x * x * x * (2.5 + x * (-3 + x));
+            du = speed * x * x * x * (10 + x * (-15 + 6 * x));
+            ddu = speed * 30 * x * x * (1 - x) * (1 - x) / ramp;
+        }
+        else { u = speed * (ramp / 2 + w - ramp); du = speed; ddu = 0; }
+        return mirrored ? (1 - u, du, -ddu) : (u, du, ddu);
+    }
+
+    internal double Ramp(int piece) => ramps[piece];
     private double PieceLength(int piece) => Path.Pieces[piece].Length;
 
-    private TimedPose EvaluatePiece(int piece, double z, double duration)
+    private TimedPose EvaluatePiece(int piece, double z, double duration, double ramp)
     {
-        // Quintic progress: zero velocity and acceleration at both ends of every stroke.
-        double u = z * z * z * (10 + z * (-15 + 6 * z));
-        double du = 30 * z * z * (1 - z) * (1 - z) / duration;
-        double ddu = 60 * z * (1 - z) * (1 - 2 * z) / (duration * duration);
+        // Progress with zero velocity and acceleration at both ends of every stroke (see Progress).
+        var (u, dz, ddz) = Progress(z, ramp);
+        double du = dz / duration;
+        double ddu = ddz / (duration * duration);
         // The stroke's own position and first/second derivative in its parameter u (a line, the full circle, any curve).
         var (target, dp, ddp) = Path.Pieces[piece].At(u);
         var poses = Path.Model.Inverse(target.X, target.Y);
@@ -93,7 +133,7 @@ public sealed class TimedTrajectory
         int piece = Array.BinarySearch(StopTimes, time);
         piece = piece < 0 ? ~piece - 1 : Math.Min(piece, StopTimes.Length - 2);
         double duration = StopTimes[piece + 1] - StopTimes[piece];
-        var state = EvaluatePiece(piece, (time - StopTimes[piece]) / duration, duration);
+        var state = EvaluatePiece(piece, (time - StopTimes[piece]) / duration, duration, ramps[piece]);
         return state with { Time = time, Distance = distances[piece] + state.Distance };
     }
 
@@ -154,6 +194,28 @@ public sealed class TimedTrajectory
             Check(Math.Abs(slower.Duration - 2 * motion.Duration) < 1e-7, "time scaling");
             var rows = motion.ToCsv().Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
             Check(rows.All(r => r.Split(',').Length == 29), "CSV columns");
+        }
+        // Stroke progress profiles: smooth ends, continuous speed/acceleration, area 1, the advertised peak speed.
+        foreach (double ramp in RampChoices)
+        {
+            var (u0, v0, a0) = Progress(0, ramp); var (u1, v1, a1) = Progress(1, ramp);
+            Check(u0 == 0 && Math.Abs(u1 - 1) < 1e-12 && v0 == 0 && Math.Abs(v1) < 1e-12 && a0 == 0 && Math.Abs(a1) < 1e-12, $"profile ends ramp={ramp}");
+            double peak = 0, previous = 0;
+            for (int i = 1; i <= 4000; i++)
+            {
+                double z = i / 4000.0; var (u, v, a) = Progress(z, ramp); var (ub, vb, ab) = Progress(z - 1e-6, ramp);
+                Check(u >= previous - 1e-12 && v >= -1e-12, $"profile monotone ramp={ramp}");
+                Check(Math.Abs(u - ub - v * 1e-6) < 1e-8 && Math.Abs(v - vb - a * 1e-6) < 1e-4, $"profile derivatives ramp={ramp}");
+                previous = u; peak = Math.Max(peak, v);
+            }
+            Check(Math.Abs(peak - (ramp == 0 ? 1.875 : 1 / (1 - ramp))) < 1e-3, $"profile peak speed ramp={ramp}");
+        }
+        // The planner never does worse than the plain quintic, and where only a speed limit binds it cruises (about 40% faster).
+        var speedBound = new TimedTrajectory(DrawingTrajectory.Create(model, DrawingShape.Rectangle, 220, 20, 30, 40, 0), new PlanningRates(1000, 5, 3, 1000, 1000));
+        for (int piece = 0; piece < speedBound.StopTimes.Length - 1; piece++)
+        {
+            double quintic = speedBound.PieceDuration(piece, 0, 1000), chosen = speedBound.PieceDuration(piece, speedBound.Ramp(piece), 1000);
+            Check(chosen <= quintic + 1e-9 && chosen < 0.7 * quintic, "speed-bound stroke should cruise");
         }
         var circle = DrawingTrajectory.Create(model, DrawingShape.Circle, 0, 0, 100, 0, 0);
         var turn = new TimedTrajectory(circle, rates);

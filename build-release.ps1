@@ -1,6 +1,8 @@
 param(
     [string]$OutputDirectory = '',
-    [string]$Creator = 'D:\Psoc Creator\PSoC Creator\4.4\PSoC Creator\bin\cyprjmgr.exe'
+    [string]$Creator = 'D:\Psoc Creator\PSoC Creator\4.4\PSoC Creator\bin\cyprjmgr.exe',
+    # Build only into out\<release>: leave out\latest (and a host running from it) alone.
+    [switch]$NoLatestCopy
 )
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath($PSScriptRoot)
@@ -12,12 +14,24 @@ if (-not $dest.StartsWith($repo + [IO.Path]::DirectorySeparatorChar, [StringComp
 if (-not (Test-Path -LiteralPath $Creator)) { throw "PSoC Creator command not found: $Creator" }
 # Every passing build is also copied to out\latest, the one fixed place to run the host from.
 $latest = Join-Path $repo 'out\latest'
-$running = Get-Process -Name TwoLinkCommissioning -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ($_.Path.StartsWith($dest,[StringComparison]::OrdinalIgnoreCase) -or $_.Path.StartsWith($latest + '',[StringComparison]::OrdinalIgnoreCase)) }
+$running = Get-Process -Name TwoLinkCommissioning -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ($_.Path.StartsWith($dest,[StringComparison]::OrdinalIgnoreCase) -or (-not $NoLatestCopy -and $_.Path.StartsWith($latest + '',[StringComparison]::OrdinalIgnoreCase))) }
 if ($running) { throw 'Close the host from this output directory before rebuilding it.' }
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
+# Creator rewrites the tracked project file (DRV8825.cyprj: a regenerated item list) on the first build of a fresh checkout.
+# That is its bookkeeping, not a change to this project, and it would show up as a ~1400-line diff and trip the
+# "source changed during build" check below.  Keep the bytes from before the build and put them back afterwards.
+$cyprj = Join-Path $repo 'DRV8825.cydsn\DRV8825.cyprj'
+$cyprjBefore = [IO.File]::ReadAllBytes($cyprj)
+function Restore-CreatorProject {
+    $now = [IO.File]::ReadAllBytes($cyprj)
+    if (-not [System.Linq.Enumerable]::SequenceEqual([byte[]]$now, [byte[]]$cyprjBefore)) {
+        [IO.File]::WriteAllBytes($cyprj, $cyprjBefore)
+        Write-Host 'Restored DRV8825.cyprj to its pre-build content (Creator had regenerated it).'
+    }
+}
 Push-Location -LiteralPath $repo
 try {
-    $sources = @('DRV8825.cydsn\main.c','DRV8825.cydsn\DRV8825.cyprj','DRV8825.cydsn\DRV8825.cydwr','DRV8825.cydsn\TopDesign\TopDesign.cysch','Commissioning\Commissioning.csproj','tests\test_stage1.py','build-release.ps1','verify-creator-pins.ps1','RELEASE_VERSION','README.md','CHANGELOG.md','docs\PROTOCOL.md','docs\ARM2_FEEDBACK.md','docs\STOP_DIAG.md','docs\STATE_MODEL.md','docs\UART_DIAGNOSIS.md','docs\history\RUN_REVIEW_20260929.md','tools\check-log.py')
+    $sources = @('DRV8825.cydsn\main.c','DRV8825.cydsn\traj.h','DRV8825.cydsn\DRV8825.cyprj','DRV8825.cydsn\DRV8825.cydwr','DRV8825.cydsn\TopDesign\TopDesign.cysch','Commissioning\Commissioning.csproj','tests\test_stage1.py','build-release.ps1','verify-creator-pins.ps1','RELEASE_VERSION','README.md','CHANGELOG.md','docs\PROTOCOL.md','docs\ARM2_FEEDBACK.md','docs\STOP_DIAG.md','docs\STATE_MODEL.md','docs\UART_DIAGNOSIS.md','docs\history\RUN_REVIEW_20260929.md','tools\check-log.py')
     $sources += Get-ChildItem -LiteralPath Commissioning -Filter '*.cs' | ForEach-Object { 'Commissioning\' + $_.Name }
     $sourceHashes = @{}
     foreach ($source in $sources) { $sourceHashes[$source] = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash }
@@ -118,6 +132,7 @@ try {
         "Arm2 encoder feedback enabled: $(Def 'ARM2_ENCODER_FEEDBACK') (0 = arm2 commanded steps without feedback; arm1 encoder still required). Pen XY is not measured. Tracking servo, real-machine acceptance and calibration remain."
     )
     $report = @($report | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
+    Restore-CreatorProject
     foreach ($source in $sources) {
         if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $sourceHashes[$source]) {
             throw "Source changed during build: $source. Rebuild before using this package."
@@ -129,9 +144,14 @@ try {
         '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash,$_.FullName.Substring($dest.Length+1)
     } | Set-Content -Encoding ascii (Join-Path $dest 'SHA256SUMS.txt')
     Write-Host "Build and offline checks passed: $dest"
-    if ($dest -ne $latest) {
+    if ($NoLatestCopy) {
+        Write-Host "Not copied to $latest (-NoLatestCopy)"
+    } elseif ($dest -ne $latest) {
         if (Test-Path -LiteralPath $latest) { Remove-Item -LiteralPath $latest -Recurse -Force }
         Copy-Item -LiteralPath $dest -Destination $latest -Recurse
         Write-Host "Copied to $latest (run host\TwoLinkCommissioning.exe from there)"
     }
-} finally { Pop-Location }
+} finally {
+    Restore-CreatorProject
+    Pop-Location
+}

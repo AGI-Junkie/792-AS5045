@@ -27,7 +27,7 @@ public static class DeviceContract
     public const int Arm2AccelMax = 12000;          // CFG_ACCEL_MAX_AXIS2
 
     // Caps for drawing and positioning moves, per axis.
-    public const int PlanRateMax = 4000;            // PTP_RATE_MAX, TRAJ_RATE_MAX
+    public const int PlanRateMax = 2500;            // PTP_RATE_MAX, TRAJ_RATE_MAX (the foreground pulse loop completed plans up to 2486/s, stopped at 2832/s)
     public const int PlanAccelMax = 3000;           // PTP_ACCEL, TRAJ_ACCEL_MAX
     public const int HomeSlowRate = 400;            // HOME_SLOW_RATE_USTEP_S
 

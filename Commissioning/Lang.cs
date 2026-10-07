@@ -847,8 +847,12 @@ internal static class Lang
         ["plan.noRangeCheck"] = ("机械范围未检查", "mechanical range unchecked"),
         ["plan.singular"] = ("\n当前是伸直或完全折叠的奇异位形；不能据此认为连续轨迹可执行。",
             "\nSingular (straight or fully folded); do not treat a continuous trajectory as executable."),
-        ["plan.execInfo"] = ("低速执行计划 · {0} 点 · {1:F2} 秒 · 每轴 ≤{2} 微步/秒",
-            "Slow-run plan · {0} points · {1:F2} s · ≤{2} µsteps/s per axis"),
+        ["plan.execInfo"] = ("低速执行计划 · {0} 点 · {1:F2} 秒 · 每轴峰值 {3:0}/{4:0} 微步/秒（上限 {2}）",
+            "Slow-run plan · {0} points · {1:F2} s · per-axis peak {3:0}/{4:0} µsteps/s (cap {2})"),
+        ["plan.execLimited"] = ("\n比你填的速度慢 {0:0.#}%：按填的速度需 {1:F2} 秒，现为 {2:F2} 秒（每轴 ≤{3} 微步/秒的上限压住了速度）。",
+            "\n{0:0.#}% slower than the speeds you entered: {1:F2} s as entered, {2:F2} s now (held down by the ≤{3} µsteps/s per-axis cap)."),
+        ["plan.execStretch"] = ("\n另因脉冲取整/弦误差检查，整体又放慢了 {0:0.#}%。",
+            "\nPulse rounding / chord-error checks slowed the whole plan by a further {0:0.#}%."),
         ["plan.execFail"] = ("执行检查未通过：", "Execution check failed: "),
 
         // move / action status

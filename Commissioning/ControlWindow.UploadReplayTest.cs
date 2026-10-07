@@ -18,7 +18,7 @@ public sealed partial class ControlWindow
         window.heartbeatTimer.Tick -= window.OnHeartbeatTick;
         var limits = new JointLimits(-30, 30, -60, 60);
         var path = DrawingTrajectory.Create(new PlanarArm(180, 176.38), DrawingShape.Circle, 340, 0, 5, 0, 0, limits);
-        var plan = new ExecutionTrajectory(new TimedTrajectory(path, new PlanningRates(0.65, 2, 1.5, 2, 1.5)), limits);
+        var plan = new ExecutionTrajectory(new TimedTrajectory(path, new PlanningRates(0.385, 2, 1.5, 2, 1.5)), limits); // feed chosen so the plan still has ~383 nodes (the planner cruises faster since the flat-top profiles)
         if (plan.Nodes.Length < 362) throw new InvalidOperationException("Upload replay must exercise at least 362 nodes.");
         var seed = new StringBuilder();
         while (seed.Length < 92000)
@@ -219,7 +219,7 @@ public sealed partial class ControlWindow
                 report += $"\nHB#{i + 1} at {timeline[i + 1]:F1}ms: gap={timeline[i + 1] - timeline[i]:F1}ms, node={schedule.Node}, run={schedule.Run}, writer gap={schedule.Gap:F1}ms, max UI lease gap={schedule.LeaseGap:F1}ms, GC deltas={schedule.G0 - before.Item1}/{schedule.G1 - before.Item2}/{schedule.G2 - before.Item3}; frames [{frames}].";
             }
             if (longest >= 125 || lostGap >= 250) throw new InvalidOperationException(report);
-            if (longestLease >= LeaseStopMs) throw new LeaseGapException(report);
+            CheckLeaseGap(longestLease, report);
             Require(window.logCharacters == window.log.Text.Length, "log length drifted after append/trim");
             // The saved log has to state the configuration and the run's worst case on
             // its own, so a field log can be read without asking the operator anything.
