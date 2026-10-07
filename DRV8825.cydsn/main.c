@@ -31,12 +31,21 @@
  * off; encoder on the rotor cannot see gearbox backlash, so output-side
  * repeatability is bounded by backlash, not by the 0.0022 deg/LSB resolution.
  * ======================================================================== */
+/* Hardware offload switches (docs/HARDWARE_OFFLOAD_PLAN.md).  A switch is 1 only while the matching component is in
+ * TopDesign; 0 keeps the software path, which the offline fixture also builds. */
+#ifndef HW_SSI
+#define HW_SSI                      (0u) /* AS5045 read-out by the UDB SPI Master "Ssi" instead of bit-banging */
+#endif
+
 #include <cytypes.h>
 #include <cyfitter.h>
 #include <cydevice_trm.h>
 #include <cypins.h>
 #include <CyLib.h>
 #include "HostUart.h"
+#if (HW_SSI != 0u)
+#include "Ssi.h"
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -441,71 +450,11 @@ typedef struct
 } as5045_t;
 
 static uint32 g_encIrqMaxCy, g_encRetries, g_encRejected, g_encMaxGapMs, g_followPeakLsb;
-static uint32 as5045_read_raw(void)
-{
-    uint32 value = 0u;
-    uint8 i;
-    uint8 ints;
-    uint32 started, duration;
-
-    ints = CyEnterCriticalSection();
-    started = SU_NOW();
-    CyPins_ClearPin(PIN_CSN);
-    delay_us(2u);
-
-    for (i = 0u; i < 18u; i++)
-    {
-        CyPins_ClearPin(PIN_CLK);
-        delay_us(SSI_HALF_US);
-        CyPins_SetPin(PIN_CLK);
-        delay_us(SSI_SAMPLE_US);
-        value <<= 1;
-        if (CyPins_ReadPin(PIN_DO) != 0u) { value |= 1u; }
-        delay_us(SSI_HALF_US - SSI_SAMPLE_US);
-    }
-
-    CyPins_SetPin(PIN_CSN);
-    duration=SU_ELAPSED(started);
-    CyExitCriticalSection(ints);
-    if(duration>g_encIrqMaxCy) { g_encIrqMaxCy=duration; }
-    delay_us(2u);
-    return (value & FRAME_MASK);
-}
-
-/* Daisy chain: 2 x 19 clocks (18 data + 1 dummy per device).  Board 1 (wired to
- * the MCU) comes first, board 2 second.  With `clocks` = 18 only board 1 is read
- * and *second is 0: that is all the closed loop needs while arm2 has no encoder
- * feedback, and it is less than half the time (about 170 us instead of 360 us),
- * short enough to fit between two trajectory steps at 3000+ steps/s. */
-static void as5045_read_clocks(uint32 *first, uint32 *second, uint8 clocks)
-{
-    uint32 a = 0u, b = 0u;
-    uint8 i, ints;
-    uint32 started, cost;
-
-    CyPins_ClearPin(PIN_CSN);
-    delay_us(2u);
-    for (i = 0u; i < clocks; i++)
-    {
-        uint32 bit;
-        ints=CyEnterCriticalSection(); started=SU_NOW();
-        CyPins_ClearPin(PIN_CLK);
-        delay_us(SSI_HALF_US);
-        CyPins_SetPin(PIN_CLK);
-        delay_us(SSI_SAMPLE_US);
-        bit = (CyPins_ReadPin(PIN_DO) != 0u) ? 1u : 0u;
-        if (i < 18u)       { a = (a << 1) | bit; }
-        else if (i >= 19u && i < 37u) { b = (b << 1) | bit; } /* skip dummy bits 18 and 37 */
-        delay_us(SSI_HALF_US - SSI_SAMPLE_US);
-        cost=SU_ELAPSED(started); if(cost>g_encIrqMaxCy) { g_encIrqMaxCy=cost; }
-        CyExitCriticalSection(ints);
-    }
-    CyPins_SetPin(PIN_CSN);
-    delay_us(2u);
-    *first = a & FRAME_MASK;
-    *second = b & FRAME_MASK;
-}
+/* The serial read-out (bit-banged or UDB SPI Master, see hw_ssi.h) gives as5045_read_clocks() and the
+ * ssi_begin()/ssi_done()/ssi_take() trio. */
+#include "hw_ssi.h"
 static void as5045_read_chain(uint32 *first, uint32 *second) { as5045_read_clocks(first, second, 38u); }
+static uint32 as5045_read_raw(void) { uint32 first, second; as5045_read_clocks(&first, &second, 18u); return first; }
 
 static uint8 frame_parity_ok(uint32 frame)
 {
@@ -609,6 +558,7 @@ typedef struct
     uint32 lastMs;
     int32 lastCmd;
     int32 cmdUsteps, cmdLsbX100;
+    int32 snapUsteps, snapLsbX100;   /* the command as it stood when the frame now being decoded was started */
     uint8 incDir, directionKnown;
     int32 softCenter, origin;
 } enc_t;
@@ -644,7 +594,7 @@ static uint8 enc_update(enc_t *e, const as5045_t *sample, uint8 valid)
         now=wall_ms(); gap=now-e->lastMs;
         if(gap>g_encMaxGapMs) { g_encMaxGapMs=gap; }
         delta=(int32)angle_delta(sample->angle, e->lastAngle);
-        commanded=(int64)e->cmdUsteps-e->lastCmd;
+        commanded=(int64)e->snapUsteps-e->lastCmd;
         if(commanded<0) { commanded=-commanded; }
         /* commanded steps as encoder LSB; 32-bit hardware divide unless the product could overflow */
         commandedLsb=(commanded<=INT32_MAX/LSB_PER_USTEP_X100) ? (int64)((int32)commanded*LSB_PER_USTEP_X100/100)
@@ -662,41 +612,93 @@ static uint8 enc_update(enc_t *e, const as5045_t *sample, uint8 valid)
         e->pos = (int32)position;
         e->lastAngle = sample->angle;
     }
-    e->lastMs=wall_ms(); e->lastCmd=e->cmdUsteps;
+    e->lastMs=wall_ms(); e->lastCmd=e->snapUsteps;
     {
-        int64 following=(int64)(e->cmdLsbX100/100)-e->pos; /* int32 divide: same quotient, no 64-bit libcall */
+        int64 following=(int64)(e->snapLsbX100/100)-e->pos; /* int32 divide: same quotient, no 64-bit libcall */
         if(following<0) { following=-following; }
         if((uint64_t)following>g_followPeakLsb) { g_followPeakLsb=(uint32)following; }
     }
     return 1u;
 }
 
+/* The command is captured when a frame is started, not when it is decoded: with the hardware read-out the steps keep
+ * coming while the frame is on the wire. */
+static void enc_snapshot(void)
+{
+    g_enc.snapUsteps=g_enc.cmdUsteps;   g_enc.snapLsbX100=g_enc.cmdLsbX100;
+    g_enc2.snapUsteps=g_enc2.cmdUsteps; g_enc2.snapLsbX100=g_enc2.cmdLsbX100;
+}
+/* Decode one raw frame pair; true when every frame this configuration needs is usable. */
+static uint8 enc_decode_pair(uint32 raw1, uint32 raw2, as5045_t *a, as5045_t *b)
+{
+    uint8 v1, v2=0u;
+    as5045_decode(a,raw1);
+    v1=encoder_state_valid(classify(a));
+    if(ARM2_ENCODER_FEEDBACK) { as5045_decode(b,raw2); v2=encoder_state_valid(classify(b)); }
+    return (uint8)(v1 && (!ARM2_ENCODER_FEEDBACK || v2));
+}
 /* One shared transaction; a bad axis never advances its position.  With arm2 feedback off (the default) it is the
  * 18-clock read of board 1 alone and g_enc2 is left untouched: nothing uses it, and updating it from a floating
  * second frame only polluted ENC_DIAG (follow_peak_lsb, gap, rejected) with arm2's unmeasured "following error". */
+static uint8 enc_apply(const as5045_t *a, const as5045_t *b)
+{
+    uint8 ok1=enc_update(&g_enc,a,encoder_state_valid(classify(a))), ok2;
+    if(!ARM2_ENCODER_FEEDBACK) { return ok1; }
+    ok2=enc_update(&g_enc2,b,encoder_state_valid(classify(b)));
+    return (uint8)(ok1 && ok2);
+}
+#if (HW_SSI != 0u)
+static uint8 g_encFlight, g_encTry;   /* a frame is on the wire / attempts made for the current sample */
+static uint32 g_encFlightAt;
+#endif
 static uint8 enc_sample(void)
 {
     as5045_t a, b;
     uint32 raw1, raw2;
-    uint8 i, v1=0u, v2=0u, ok1, ok2;
+    uint8 i;
+#if (HW_SSI != 0u)
+    if(g_encFlight) { g_encFlight=0u; ssi_abort(); }   /* a synchronous read takes the interface over */
+#endif
     for(i=0u;i<ENCODER_READ_RETRIES;i++) {
         if(i) { g_encRetries++; }
+        enc_snapshot();
         as5045_read_clocks(&raw1,&raw2,ARM2_ENCODER_FEEDBACK ? 38u : 18u);
-        as5045_decode(&a,raw1);
-        v1=encoder_state_valid(classify(&a));
-        if(ARM2_ENCODER_FEEDBACK) { as5045_decode(&b,raw2); v2=encoder_state_valid(classify(&b)); }
-        if(v1 && (!ARM2_ENCODER_FEEDBACK || v2)) { break; }
+        if(enc_decode_pair(raw1,raw2,&a,&b)) { break; }
     }
-    ok1=enc_update(&g_enc,&a,v1);
-    if(!ARM2_ENCODER_FEEDBACK) { return ok1; }
-    ok2=enc_update(&g_enc2,&b,v2);
-    return ok1 && ok2;
+    return enc_apply(&a,&b);
 }
+#if (HW_SSI != 0u)
+/* The same sample without waiting: enc_flight_start() queues a frame, enc_flight_poll() finishes it (with the same
+ * retries) once the hardware has it.  Returns true when a sample is complete; *ok is what enc_sample() would return. */
+static void enc_flight_start(uint8 retry)
+{
+    if(retry) { g_encRetries++; }
+    enc_snapshot();
+    ssi_begin(ARM2_ENCODER_FEEDBACK ? 38u : 18u);
+    g_encFlightAt=SU_NOW(); g_encFlight=1u;
+}
+static uint8 enc_flight_poll(uint8 *ok)
+{
+    as5045_t a, b;
+    uint32 raw1=0u, raw2=0u;
+    if(!g_encFlight) { return 0u; }
+    if(ssi_done()) { ssi_take(&raw1,&raw2); }
+    else if(SU_ELAPSED(g_encFlightAt) >= SSI_TIMEOUT_US*SU_CY_PER_US) { ssi_abort(); }   /* a dead frame reads as 0 */
+    else { return 0u; }
+    if(!enc_decode_pair(raw1,raw2,&a,&b) && (uint8)(g_encTry+1u)<ENCODER_READ_RETRIES) { g_encTry++; enc_flight_start(1u); return 0u; }
+    g_encFlight=0u;
+    *ok=enc_apply(&a,&b);
+    return 1u;
+}
+#endif
 
 /* Average 12 samples relative to the first angle so the average also works
  * when the wrap lies inside the group. Used once, to set the origin. */
 static uint8 enc_set_origin(void)
 {
+#if (HW_SSI != 0u)
+    if(g_encFlight) { g_encFlight=0u; ssi_abort(); }
+#endif
     uint16 reference[2]={0u,0u};
     int32 sum[2]={0,0};
     uint8 i, axis;
@@ -738,6 +740,9 @@ static int32 cmd_lsb(void)      { return g_cmdLsbX100 / 100; }
 
 static void cmd_reset_axis(enc_t *e)
 {
+#if (HW_SSI != 0u)
+    if(g_encFlight) { g_encFlight=0u; ssi_abort(); }   /* its snapshot predates this re-anchoring */
+#endif
     e->cmdLsbX100 = e->pos * 100;
     e->cmdUsteps  = lsb_to_usteps(e->pos);
     e->lastCmd=e->cmdUsteps;
@@ -931,9 +936,13 @@ static void hw_init(void)
 {
     CyGlobalIntEnable;
 
+#if (HW_SSI != 0u)
+    Ssi_Start();   /* Creator owns CLK, CSn and DO (the SPI Master's pins); never overwrite their PC registers */
+#else
     pin_out_init(PIN_CSN, 1u);
     pin_out_init(PIN_CLK, 1u);
     CY_SET_REG8(PIN_DO, CY_PINS_DM_DIG_HIZ);
+#endif
     pin_out_init(PIN_LED, 0u);
 
     /* Driver 1 shares its STEP with the blue LED. Keep it asleep, reset and
@@ -3019,9 +3028,9 @@ static void service_motion(void)
     else { jog_axis_service(&g_arm1); jog_axis_service(&g_arm2); }
 }
 
-static void service_encoder(void)
+static void encoder_after_sample(uint8 sampleOk)
 {
-    if (enc_sample() == 0u)
+    if (sampleOk == 0u)
     {
         if (g_enc.badStreak >= ENC_BAD_LIMIT || g_enc2.badStreak >= ENC_BAD_LIMIT)
         {
@@ -3039,6 +3048,39 @@ static void service_encoder(void)
         if(!g_enc.badStreak) { jog_slip_check(&g_arm1); }
         if(g_motionEnabled && !g_enc2.badStreak) { jog_slip_check(&g_arm2); }
     }
+}
+static void service_encoder(void) { encoder_after_sample(enc_sample()); }
+
+/* Foreground encoder sampling, about once per JOG_ENC_SAMPLE_US.  Hardware read-out: never blocks, so a frame starts
+ * whenever one is due and is picked up on a later pass.  Bit-banged read-out: the frame is read in a gap between
+ * steps (jog_slot_free), or anyway after 5 sample periods. */
+static void service_encoder_sampling(void)
+{
+#if (HW_SSI != 0u)
+    {
+        uint8 sampleOk;
+        if (g_encFlight != 0u)
+        {
+            if (enc_flight_poll(&sampleOk) != 0u) { encoder_after_sample(sampleOk); }
+        }
+        else if (((g_arm1.hasEnc != 0u) || (g_arm2.hasEnc != 0u)) && (SU_ELAPSED(g_loopEnc) >= JOG_ENC_SAMPLE_CY))
+        {
+            g_loopEnc = SU_NOW();
+            g_encTry = 0u;
+            enc_flight_start(0u);
+        }
+    }
+#else
+    if (((g_arm1.hasEnc != 0u) || (g_arm2.hasEnc != 0u)) && (SU_ELAPSED(g_loopEnc) >= JOG_ENC_SAMPLE_CY))
+    {
+        if ((jog_slot_free(JOG_ENC_READ_US) != 0u) ||
+            (SU_ELAPSED(g_loopEnc) >= (5u * JOG_ENC_SAMPLE_CY)))
+        {
+            g_loopEnc = SU_NOW();
+            service_encoder();
+        }
+    }
+#endif
 }
 
 static void app_init(uint8 encOk)
@@ -3100,15 +3142,7 @@ static void app_poll(void)
 
     /* Encoder: about once per ms, in a gap between steps.  If no gap
      * appears for 5 ms take the sample anyway (one late step). */
-    if (((g_arm1.hasEnc != 0u) || (g_arm2.hasEnc != 0u)) && (SU_ELAPSED(g_loopEnc) >= JOG_ENC_SAMPLE_CY))
-    {
-        if ((jog_slot_free(JOG_ENC_READ_US) != 0u) ||
-            (SU_ELAPSED(g_loopEnc) >= (5u * JOG_ENC_SAMPLE_CY)))
-        {
-            g_loopEnc = SU_NOW();
-            service_encoder();
-        }
-    }
+    service_encoder_sampling();
 
     stage_status_service();
 

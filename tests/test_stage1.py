@@ -13,11 +13,13 @@ host_plan = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.star
 host_control = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.startswith('--host-control=')), None)
 emit_c = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.startswith('--emit-c=')), None)
 sim_mhz = int(next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--sim-mhz=')), '24'))
-sys.argv = [a for a in sys.argv if not a.startswith(('--host-plan=', '--host-control=', '--emit-c=', '--sim-mhz='))]
+extra_defs = ''.join('#define %s %s\n' % tuple(a[9:].split('=', 1)) for a in sys.argv if a.startswith('--define='))
+sys.argv = [a for a in sys.argv if not a.startswith(('--host-plan=', '--host-control=', '--emit-c=', '--sim-mhz=', '--define='))]
 source = (root / 'DRV8825.cydsn/main.c').read_text(encoding='utf-8')
 # main.c includes traj.h; the simulation compiles one file, so put the header's text where the include is.
-source = source.replace('#include "traj.h"', (root / 'DRV8825.cydsn/traj.h').read_text(encoding='utf-8'), 1)
-assert '#include "traj.h"' not in source
+for header in ['traj.h', 'hw_ssi.h']:
+    source = source.replace(f'#include "{header}"', (root / 'DRV8825.cydsn' / header).read_text(encoding='utf-8'), 1)
+    assert f'#include "{header}"' not in source
 
 def replace_once(text, old, new):
     count = text.count(old)
@@ -166,28 +168,62 @@ static uint32 mock_frame(void) {
 /* AS5045 at pin level: CSn falling latches a frame, every CLK rising edge while CSn is low presents the next bit, MSB first. */
 static uint32 simSsiFrame, simSsiFrame2; static int simSsiBits;
 static int simSsiSecondFrame=-1, simSsiDummy;
+/* DO after n CLK rising edges (n = 0 right after CSn fell); the daisy chain is board 1, a dummy, board 2, a dummy. */
+static int sim_ssi_do(int n) {
+    if(n>=20 && n<=37) return ((((simSsiSecondFrame>=0)?(uint32)simSsiSecondFrame:simSsiFrame2)>>(37-n))&1u)?1:0;
+    if(simSsiSecondFrame>=0 && (n==19 || n==38)) return simSsiDummy?1:0;
+    return (n>=1 && n<=18 && ((simSsiFrame>>(18-n))&1u))?1:0;
+}
 static int mock_read(int pin) {
-    if(pin==CYREG_PRT1_PC3) {
-        if(simSsiBits>=20 && simSsiBits<=37)
-            return ((((simSsiSecondFrame>=0)?(uint32)simSsiSecondFrame:simSsiFrame2)>>(37-simSsiBits))&1u)?16:0;
-        if(simSsiSecondFrame>=0 && (simSsiBits==19 || simSsiBits==38))return simSsiDummy?16:0;
-        return (simSsiBits>=1 && simSsiBits<=18 && ((simSsiFrame>>(18-simSsiBits))&1u))?16:0;
-    }
+    if(pin==CYREG_PRT1_PC3) return sim_ssi_do(simSsiBits)?16:0;
     if(pin==CYREG_PRT12_PC5) return simFault?0:16;
     if(pin==CYREG_PRT0_PC4) return simLimit?16:0;
     if(pin==CYREG_PRT0_PC3) return (simHome1Mode<0?0:(simHome1Mode>0?1:simStep1>=simHome1At))?16:0;
     if(pin==CYREG_PRT1_PC0) return (simHome2Mode<0?0:(simHome2Mode>0?1:simStep2>=simHome2At))?0:16;
     return simPins[pin];
 }
+/* CSn fell: both boards latch their angle. */
+static void sim_ssi_latch(void) {
+    uint32 bits, parity=0;
+    simSsiFrame=mock_frame();
+    simSsiFrame2=(((uint32)(1000+(int64)simStep2*simPolarity2*256/100+simEncoderBias2)&4095u)<<6)|0x26u;
+    for(bits=simSsiFrame2;bits;bits>>=1)parity^=bits&1;
+    simSsiFrame2=simBadEncoder2?0:simSsiFrame2|parity;
+}
+/* UDB SPI Master "Ssi": 10-bit words, 250 kHz (4 us a bit, 40 us a word), hardware SS 2 us before the first clock.  The
+ * first word written to an idle master drops SS (the boards latch); later words follow back to back.  Stream bit j
+ * is DO at the j-th sampling edge: a 1 right after CSn falls, then the daisy chain.  Word k is in the receive FIFO
+ * when it has been shifted completely. */
+static uint64_t simSsiT0; static unsigned simSsiQueued, simSsiRead, simSsiStarted, simSsiFrames;
+static unsigned simSsiDead; /* the master never finishes a frame */
+static unsigned sim_ssi_complete(void) {
+    uint64_t elapsed; unsigned n;
+    if(simSsiDead) return simSsiRead; /* a stuck master finishes nothing more */
+    if(!simSsiQueued || simClock<simSsiT0) return 0;
+    elapsed=simClock-simSsiT0; n=(unsigned)(elapsed/((uint64_t)SIM_MHZ*40u));
+    return n>simSsiQueued?simSsiQueued:n;
+}
+static void Ssi_Start(void){simSsiStarted=1;}
+static void Ssi_WriteTxData(uint16 w){
+    (void)w;
+    if(!simSsiQueued || (sim_ssi_complete()==simSsiQueued && simSsiRead==simSsiQueued)) {
+        sim_ssi_latch();simSsiQueued=0;simSsiRead=0;simSsiT0=simClock+(uint64_t)SIM_MHZ*2u;simSsiFrames++;
+    }
+    assert(simSsiQueued<4); /* the TX FIFO is four words deep */
+    simSsiQueued++;
+}
+static unsigned Ssi_GetRxBufferSize(void){return sim_ssi_complete()-simSsiRead;}
+static uint16 Ssi_ReadRxData(void){
+    uint16 w=0; unsigned j;
+    assert(simSsiRead<sim_ssi_complete());
+    for(j=simSsiRead*10u;j<simSsiRead*10u+10u;j++) w=(uint16)((w<<1)|(j==0?1:sim_ssi_do((int)j)));
+    simSsiRead++;return w;
+}
+static void Ssi_ClearRxBuffer(void){simSsiRead=sim_ssi_complete();}
+static void Ssi_ClearTxBuffer(void){simSsiQueued=sim_ssi_complete();if(simSsiRead>simSsiQueued)simSsiRead=simSsiQueued;}
 static void mock_set(int pin,int value) {
     if(pin==CYREG_PRT12_PC1 && value!=simPins[pin]) {
-        if(!value){
-            uint32 bits, parity=0;
-            simSsiFrame=mock_frame();simSsiBits=0;simRegCost=SIM_MHZ/4u;
-            simSsiFrame2=(((uint32)(1000+(int64)simStep2*simPolarity2*256/100+simEncoderBias2)&4095u)<<6)|0x26u;
-            for(bits=simSsiFrame2;bits;bits>>=1)parity^=bits&1;
-            simSsiFrame2=simBadEncoder2?0:simSsiFrame2|parity;
-        } else simRegCost=SIM_MHZ;
+        if(!value){ sim_ssi_latch();simSsiBits=0;simRegCost=SIM_MHZ/4u; } else simRegCost=SIM_MHZ;
     }
     if(pin==CYREG_PRT12_PC0 && value && !simPins[pin] && !simPins[CYREG_PRT12_PC1])simSsiBits++;
     if(value!=simPins[pin] && (pin==CYREG_PRT1_PC7 || pin==CYREG_PRT12_PC2 || pin==CYREG_PRT1_PC2 ||
@@ -221,6 +257,16 @@ harness = r'''
 #undef assert
 #define assert(ok) do { if(!(ok)) { fprintf(stderr,"check: %s line %d; encLost=%u encGap=%lu\n%s\n", \
     #ok,__LINE__,g_enc.trackingLost,(unsigned long)g_encMaxGapMs,simLog+(simLogN>1600?simLogN-1600:0)); abort(); } } while(0)
+/* Clocks of the last AS5045 frame: counted CLK edges for the bit-banged read, 10 per word for the SPI Master. */
+#if HW_SSI
+#define SIM_SSI_LAST_CLOCKS() (simSsiQueued*10u)
+#define SIM_SSI_CLK18 20u
+#define SIM_SSI_CLK38 40u
+#else
+#define SIM_SSI_LAST_CLOCKS() ((unsigned)simSsiBits)
+#define SIM_SSI_CLK18 18u
+#define SIM_SSI_CLK38 38u
+#endif
 static void sim_keys(uint8 mask);
 static uint32 simControlSequence;
 static void sim_uart_heartbeat(void) {
@@ -262,7 +308,12 @@ static void cycle(int heartbeat) {
     } else simClock+=(SIM_MHZ*1000u);
     jog_update_time();
     if(heartbeat && (g_jogMs-g_lastKeyMs>=40u)) sim_keys(0);
+#if HW_SSI
+    /* the hardware frame takes 160 us: one pass starts it, later passes (200 us apart) collect it, retries included */
+    if(g_arm1.hasEnc){unsigned k;service_encoder_sampling();for(k=0;k<8 && g_encFlight;k++){simClock+=SIM_MHZ*200u;service_encoder_sampling();}}
+#else
     if(g_arm1.hasEnc)service_encoder();
+#endif
     jog_tick();
     service_motion();
     stage_status_service();
@@ -1456,10 +1507,50 @@ int main(int argc,char **argv) {
         assert(g_motionEnabled && g_home.phase==HOME_IDLE && g_ptp.reference && !g_arm2.hasEnc && !g_enc2.directionKnown);
         { /* arm2 feedback off: the closed loop reads board 1 only (18 clocks) and never touches the arm2 encoder state */
           int32 pos2=g_enc2.pos; uint8 bad2=g_enc2.badStreak, primed2=g_enc2.primed;
-          simSsiBits=0; simClock+=(SIM_MHZ*1000u); assert(enc_sample() && simSsiBits==18);
+          simSsiBits=0; simClock+=(SIM_MHZ*1000u); assert(enc_sample() && SIM_SSI_LAST_CLOCKS()==SIM_SSI_CLK18);
           assert(g_enc2.pos==pos2 && g_enc2.badStreak==bad2 && g_enc2.primed==primed2); }
         g_enc.directionKnown=1u; simBadEncoder=1;
         for(i=0;i<ENC_BAD_LIMIT;i++)service_encoder(); assert(!g_motionEnabled);
+        puts(t);return 0;
+    }
+    if(!strncmp(t,"ssi_",4)) {
+#if HW_SSI
+        uint8 ok=0u; uint64_t t0; unsigned k; unsigned retries;
+        setup(); simClock+=SIM_MHZ*2000u; g_enc.primed=1u;
+        if(!strcmp(t,"ssi_nonblocking")) {
+            /* queueing a frame is a few register writes and masks nothing; the answer is there once 160 us have passed */
+            t0=simClock; g_encTry=0u; enc_flight_start(0u);
+            assert(simClock-t0<(uint64_t)SIM_MHZ*20u && simInts && g_encFlight);
+            simClock+=SIM_MHZ*20u; assert(!enc_flight_poll(&ok) && g_encFlight && simInts);
+            simClock+=SIM_MHZ*200u; assert(enc_flight_poll(&ok) && ok && !g_encFlight);
+            assert(!g_enc.badStreak && g_enc.pos==0);
+        } else if(!strcmp(t,"ssi_snapshot")) {
+            /* the command counted against the new angle is the one at the start of the frame, not at its end */
+            int32 at; g_encTry=0u; enc_flight_start(0u); at=g_enc.cmdUsteps;
+            g_enc.cmdUsteps+=7; g_enc.cmdLsbX100+=7*LSB_PER_USTEP_X100;
+            simClock+=SIM_MHZ*300u; assert(enc_flight_poll(&ok) && ok);
+            assert(g_enc.lastCmd==at && g_enc.cmdUsteps==at+7);
+        } else if(!strcmp(t,"ssi_retry")) {
+            /* two unusable frames, then a good one: same retries as the blocking read, no sample lost */
+            retries=g_encRetries; simBadReads=2u; g_encTry=0u; enc_flight_start(0u);
+            for(k=0;k<20 && !enc_flight_poll(&ok);k++) simClock+=SIM_MHZ*200u;
+            assert(k<20 && ok && g_encRetries==retries+2u && !g_enc.badStreak);
+        } else if(!strcmp(t,"ssi_timeout")) {
+            /* a master that never finishes costs one timeout per attempt, then reads as an unusable frame */
+            simSsiDead=1u; g_encTry=0u; enc_flight_start(0u);
+            simClock+=SIM_MHZ*500u; assert(!enc_flight_poll(&ok) && g_encFlight);
+            for(k=0;k<40 && !enc_flight_poll(&ok);k++) simClock+=SIM_MHZ*200u;
+            assert(k<40 && !ok && !g_encFlight && g_enc.badStreak==1u);
+            simSsiDead=0u; assert(enc_sample() && !g_enc.badStreak);   /* and the interface works again afterwards */
+        } else if(!strcmp(t,"ssi_takeover")) {
+            /* a synchronous read, or a re-anchored command, drops a frame that is still on the wire */
+            g_encTry=0u; enc_flight_start(0u); assert(g_encFlight);
+            assert(enc_sample() && !g_encFlight);
+            g_encTry=0u; enc_flight_start(0u); assert(g_encFlight);
+            cmd_reset_axis(&g_enc); assert(!g_encFlight);
+            assert(enc_sample());
+        }
+#endif
         puts(t);return 0;
     }
     if(!strcmp(t,"chain_frames")) {
@@ -1471,8 +1562,8 @@ int main(int argc,char **argv) {
             simAngleOverride=angles[i];simSsiSecondFrame=(int)frames[j];expected=mock_frame();
             as5045_read_chain(&first,&second);
             assert(first==expected && second==frames[j]);
-            assert(simSsiBits==38 && simPins[PIN_CSN] && simInts);
-            assert(as5045_read_raw()==expected && simSsiBits==18);
+            assert(SIM_SSI_LAST_CLOCKS()==SIM_SSI_CLK38 && (HW_SSI || simPins[PIN_CSN]) && simInts);
+            assert(as5045_read_raw()==expected && SIM_SSI_LAST_CLOCKS()==SIM_SSI_CLK18);
         }
         puts(t);return 0;
     }
@@ -1597,12 +1688,12 @@ int main(int argc,char **argv) {
     }
     if(!strcmp(t,"reverse_polarity")||!strcmp(t,"ptp_reverse")) simPolarity=-1;
     /* Operator aligned the links before power/enable; sensors remain at their real offsets. */
-    if(!strcmp(t,"traj_manual_plan") || !strncmp(t,"fuzz_",5)) {simStep1=400-22400;simStep2=120-36650;}
+    if(!strcmp(t,"traj_manual_plan") || !strncmp(t,"fuzz_",5)) {simStep1=400-22400;simStep2=120-36763;}
     /* Logged circle endpoint: q1=-14.37 deg, q2=+29.04 deg from straight. */
-    if(!strcmp(t,"home_from_drawing")) {simStep1=400-22400+2555;simStep2=120-36650-6590;}
+    if(!strcmp(t,"home_from_drawing")) {simStep1=400-22400+2555;simStep2=120-36763-6590;}
     if(!strcmp(t,"home_active_at_start")) simStep1=450;
     if(!strcmp(t,"home_from_arm2_range") || !strcmp(t,"home_long_stop"))
-        simStep2=120-36650-13616; /* +60 deg: farthest commissioned arm2 pose */
+        simStep2=120-36763-13616; /* +60 deg: farthest commissioned arm2 pose */
     setup();
     if(!strcmp(t,"traj_manual_plan") || !strncmp(t,"fuzz_",5)) {g_enc2.directionKnown=1u;g_enc2.incDir=1u;}
     if(!strncmp(t,"fuzz_",5)){fuzz_test((uint32)atoi(t+5));puts(t);return 0;}
@@ -1924,7 +2015,7 @@ int main(int argc,char **argv) {
             assert(g_home.steps==0u); /* contact stopped search and reset phase accounting */
             for(i=0;i<250000 && g_home.phase!=HOME_IDLE && g_motionEnabled;i++)cycle(1);
             assert(g_motionEnabled && g_homed1 && g_homed2 && strstr(simLog,"HOME OK:"));
-            assert(simStep1==simHome1At-22400 && simStep2==simHome2At-36650);
+            assert(simStep1==simHome1At-22400 && simStep2==simHome2At-36763);
             puts(t);return 0;
         }
         assert_stopped();puts(t);return 0;
@@ -2058,8 +2149,8 @@ int main(int argc,char **argv) {
         if(!g_homed2)fprintf(stderr,"%s\n",simLog);
         assert(g_motionEnabled && g_homed1 && g_homed2 && g_directionKnown);
         assert(home_straight_steps(1)==22400u);
-        assert(home_straight_steps(2)==36650u);
-        assert(g_arm2.usteps==-36650 && simStep2==120-36650 && g_arm1.usteps==-22400);
+        assert(home_straight_steps(2)==36763u);
+        assert(g_arm2.usteps==-36763 && simStep2==120-36763 && g_arm1.usteps==-22400);
         assert(!ARM2_NPN_ACTIVE());
         assert(abs_i32(abs_i32(lsb_to_out_deg100(g_enc.pos))-12600)<10);
         assert(strstr(simLog,"HOME OK:"));
@@ -2067,13 +2158,14 @@ int main(int argc,char **argv) {
         assert(simPulse1==p1 && simPulse2==p2);
         jog_home_all();for(i=0;i<250000&&g_home.phase!=HOME_IDLE&&g_motionEnabled;i++)cycle(1);
         assert(g_homed1 && g_homed2);
-        assert(g_arm2.usteps==-36650 && simStep2==120-36650 && g_arm1.usteps==-22400);
+        assert(g_arm2.usteps==-36763 && simStep2==120-36763 && g_arm1.usteps==-22400);
     }
     puts(t);return 0;
 }
 '''
 
 cases = ['dual_'+n for n in ['home_reverse','home_stall','wrap','loss','gap','parity','hold','derate','follow_stop','peer_bad','peer_bad_reverse','final','limit','enable_bad']]
+cases += ['ssi_nonblocking','ssi_snapshot','ssi_retry','ssi_timeout','ssi_takeover']
 cases += ['dual_snapshot_length','chain_frames','boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
          'missing_sensor','stuck_sensor','missing_npn','stalled_motor','reject_moving',
          'fault','limit','encoder_loss','jog_cancels','sensor_bounce']
@@ -2142,14 +2234,14 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     tmp = Path(temp)
     if host_plan is not None: (tmp/'host-plan.bin').write_bytes(host_plan.read_bytes())
     if host_control is not None: (tmp/'host-control.bin').write_bytes(host_control.read_bytes())
-    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h']:
+    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h']:
         (tmp/name).write_text('',encoding='ascii')
     if emit_c is not None:
         emit_c.mkdir(parents=True, exist_ok=True)
-        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h']: (emit_c/name).write_text('',encoding='ascii')
-        (emit_c/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
+        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h']: (emit_c/name).write_text('',encoding='ascii')
+        (emit_c/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
         print('wrote', emit_c/'check.c'); sys.exit(0)
-    (tmp/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
+    (tmp/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
     (tmp/'build.cmd').write_text(f'@echo off\ncall "{vcvars}" >nul\ncl /nologo /TC /std:c11 /W3 /DPTP_COMMISSIONED=0 /DARM2_ENCODER_FEEDBACK=1 /I"{tmp}" "{tmp / "check.c"}" /Fe:"{tmp / "check.exe"}" /Fo:"{tmp / "check.obj"}"\n',encoding='utf-8')
     result=subprocess.run(['cmd','/c',str(tmp/'build.cmd')],cwd=tmp,capture_output=True,text=True,errors='replace')
     if result.returncode: raise RuntimeError(result.stdout+result.stderr)
