@@ -219,7 +219,7 @@ public sealed partial class ControlWindow
                 report += $"\nHB#{i + 1} at {timeline[i + 1]:F1}ms: gap={timeline[i + 1] - timeline[i]:F1}ms, node={schedule.Node}, run={schedule.Run}, writer gap={schedule.Gap:F1}ms, max UI lease gap={schedule.LeaseGap:F1}ms, GC deltas={schedule.G0 - before.Item1}/{schedule.G1 - before.Item2}/{schedule.G2 - before.Item3}; frames [{frames}].";
             }
             if (longest >= 125 || lostGap >= 250) throw new InvalidOperationException(report);
-            if (longestLease >= LeaseStopMs) throw new LeaseGapException(report);
+            CheckLeaseGap(longestLease, report);
             Require(window.logCharacters == window.log.Text.Length, "log length drifted after append/trim");
             // The saved log has to state the configuration and the run's worst case on
             // its own, so a field log can be read without asking the operator anything.
