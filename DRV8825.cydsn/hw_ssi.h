@@ -52,8 +52,10 @@ static void ssi_begin(uint8 clocks)
     g_ssiA = a & FRAME_MASK;
     g_ssiB = b & FRAME_MASK;
 }
+static uint8 ssi_done(void) __attribute__((unused));
 static uint8 ssi_done(void)                          { return 1u; }
 static void ssi_take(uint32 *first, uint32 *second)  { *first = g_ssiA; *second = g_ssiB; }
+static void ssi_abort(void) __attribute__((unused));
 static void ssi_abort(void)                          { }
 
 #else  /* HW_SSI */

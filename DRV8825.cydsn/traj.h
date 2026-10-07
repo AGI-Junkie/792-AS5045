@@ -218,6 +218,7 @@ static void traj_next_due(const traj_t *t, const dda_t *seg, uint32 now, uint32 
 
 /* Cycles until traj_poll() can do something again: the time to the next step or to the end of the node, and never less
  * than what is left of the minimum step spacing.  An interrupt-driven caller arms its timer with this. */
+static uint32 traj_wait_cy(const traj_t *t, const dda_t *seg, uint32 now) __attribute__((unused));
 static uint32 traj_wait_cy(const traj_t *t, const dda_t *seg, uint32 now)
 {
     uint32 since, due, wait = 0u;

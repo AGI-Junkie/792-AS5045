@@ -86,6 +86,7 @@
 #include "PinIsr.h"
 #endif
 #if (HW_TXDMA != 0u)
+#include <CyDmac.h>
 #include "TxDma_dma.h"
 #ifndef TXDMA_ADDR
 #define TXDMA_ADDR(p)               LO16((uint32)(p))   /* low half of a bus address; the high half is the channel's */
@@ -882,6 +883,7 @@ static uint32 step_period_us(uint32 rate)
 
 /* Pulse edges are scheduled against the free-running SysTick: start now, end
  * at an absolute deadline, so software overhead cannot stretch the width. */
+static void pulse_hold_us(uint32 tEdge, uint32 widthUs) __attribute__((unused));   /* the PWMs time the pulse with HW_STEP */
 static void pulse_hold_us(uint32 tEdge, uint32 widthUs)
 {
     uint32 target = widthUs * SU_CY_PER_US;
@@ -3367,6 +3369,7 @@ static void encoder_after_sample(uint8 sampleOk)
         if(g_motionEnabled && !g_enc2.badStreak) { jog_slip_check(&g_arm2); }
     }
 }
+static void service_encoder(void) __attribute__((unused));   /* the offline fixture calls it; the firmware loop samples without waiting with HW_SSI */
 static void service_encoder(void) { encoder_after_sample(enc_sample()); }
 
 /* Foreground encoder sampling, about once per JOG_ENC_SAMPLE_US.  Hardware read-out: never blocks, so a frame starts

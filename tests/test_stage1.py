@@ -157,8 +157,9 @@ static void HostUart_PutChar(uint8 b){
     while(simClock<simUartTxBusyUntil){simClock+=SIM_MHZ;sim_tick_sync();}
     mock_log(b);
 }
-/* DMA channel "TxDma": text queue -> UART TX FIFO.  A transfer is logged the moment the channel is enabled and stays
- * "active" for simDmaByteCy cycles per byte (0 = the UART keeps up instantly, like the PutChar model above). */
+/* DMA channel "TxDma": text queue -> UART TX FIFO.  The channel moves one byte per simDmaByteCy cycles (0 = the UART
+ * keeps up instantly, like the PutChar model above) and the bytes appear in the log as they are moved, so a stuck wire
+ * (a huge simDmaByteCy) sends nothing and a disabled channel stops where it was. */
 #define HI16(x) ((uint16)(((uint32)(x))>>16))
 #define LO16(x) ((uint16)(x))
 #define CYDEV_SRAM_BASE 0x20000000u
@@ -173,19 +174,26 @@ static uint8 simUartTxFifoReg;
 static const void *simDmaPtrs[8]; static unsigned simDmaPtrN;
 static uint16 sim_dma_addr(const void *p){ if(simDmaPtrN>=8) simDmaPtrN=0; simDmaPtrs[simDmaPtrN]=p; return (uint16)simDmaPtrN++; }
 #define TXDMA_ADDR(p) sim_dma_addr((const void *)(p))
-static unsigned simDmaLen, simDmaTransfers, simDmaBytes, simDmaInit, simDmaByteCy; static const uint8 *simDmaSrc;
-static uint64_t simDmaDoneAt; static int simDmaActive, simDmaEnabled;
+static unsigned simDmaLen, simDmaLogged, simDmaTransfers, simDmaBytes, simDmaInit, simDmaByteCy; static const uint8 *simDmaSrc;
+static uint64_t simDmaStart; static int simDmaActive, simDmaEnabled;
+static void sim_dma_progress(void){
+    uint64_t n;
+    if(!simDmaActive) return;
+    n=simDmaByteCy?(simClock-simDmaStart)/simDmaByteCy:simDmaLen;
+    if(n>simDmaLen) n=simDmaLen;
+    while(simDmaLogged<n){ mock_log(simDmaSrc[simDmaLogged++]); simDmaBytes++; }
+    if(simDmaLogged>=simDmaLen) simDmaActive=0;
+}
 static uint8 TxDma_DmaInitialize(uint8 b,uint8 r,uint16 hs,uint16 hd){(void)b;(void)r;(void)hs;(void)hd;simDmaInit=1;return 1;}
 static uint8 CyDmaTdAllocate(void){return 3;}
 static cystatus CyDmaTdSetConfiguration(uint8 td,uint16 n,uint8 next,uint8 cfg){(void)td;(void)next;assert(cfg==CY_DMA_TD_INC_SRC_ADR && n>=1u && n<=4095u);simDmaLen=n;return 0;}
 static cystatus CyDmaTdSetAddress(uint8 td,uint16 src,uint16 dst){(void)td;(void)dst;simDmaSrc=(const uint8 *)simDmaPtrs[src];return 0;}
 static cystatus CyDmaChSetInitialTd(uint8 ch,uint8 td){(void)ch;(void)td;return 0;}
-static cystatus CyDmaChEnable(uint8 ch,uint8 keep){unsigned i;(void)ch;(void)keep;assert(simDmaInit && !simDmaActive);
-    for(i=0;i<simDmaLen;i++) mock_log(simDmaSrc[i]);
-    simDmaActive=1;simDmaEnabled=1;simDmaDoneAt=simClock+(uint64_t)simDmaLen*simDmaByteCy;simDmaTransfers++;simDmaBytes+=simDmaLen;return 0;}
+static cystatus CyDmaChEnable(uint8 ch,uint8 keep){(void)ch;(void)keep;assert(simDmaInit && !simDmaActive);
+    simDmaActive=1;simDmaEnabled=1;simDmaStart=simClock;simDmaLogged=0;simDmaTransfers++;sim_dma_progress();return 0;}
 static cystatus CyDmaChDisable(uint8 ch){(void)ch;simDmaActive=0;simDmaEnabled=0;return 0;}
 static cystatus CyDmaChStatus(uint8 ch,uint8 *td,uint8 *state){(void)ch;*td=0;simClock+=simRegCost;
-    if(simDmaActive && simClock>=simDmaDoneAt) simDmaActive=0;
+    sim_dma_progress();
     *state=simDmaActive?CY_DMA_STATUS_TD_ACTIVE:0u;return 0;}
 static uint32 mock_frame(void) {
     uint32 angle, frame, bits, parity=0;
@@ -360,6 +368,12 @@ harness = r'''
 #undef assert
 #define assert(ok) do { if(!(ok)) { fprintf(stderr,"check: %s line %d; encLost=%u encGap=%lu\n%s\n", \
     #ok,__LINE__,g_enc.trackingLost,(unsigned long)g_encMaxGapMs,simLog+(simLogN>1600?simLogN-1600:0)); abort(); } } while(0)
+/* A wire that takes nothing more: the UART's TX FIFO stays full / the DMA channel never finishes. */
+#if HW_TXDMA
+#define SIM_TX_STUCK(on) (simDmaByteCy=(on)?SIM_MHZ*1000000u:0u)
+#else
+#define SIM_TX_STUCK(on) (simUartTxFull=(on))
+#endif
 /* Clocks of the last AS5045 frame: counted CLK edges for the bit-banged read, 10 per word for the SPI Master. */
 #if HW_SSI
 #define SIM_SSI_LAST_CLOCKS() (simSsiQueued*10u)
@@ -2168,10 +2182,10 @@ int main(int argc,char **argv) {
             g_jogMs=wall_ms();g_lastKeyMs=g_jogMs;
             home_service();assert_stopped();
         } else if(!strcmp(t,"clock_tx_timeout")) {
-            g_txqHead=g_txqTail=0;JLOG("stuck TX");simUartTxFull=1;
+            g_txqHead=g_txqTail=0;JLOG("stuck TX");SIM_TX_STUCK(1);
             before=wall_ms();txq_flush_blocking();
             assert(!txq_pending() && wall_ms()-before>=100u && wall_ms()-before<110u);
-            simUartTxFull=0;
+            SIM_TX_STUCK(0);
         } else assert(0);
         puts(t);return 0;
     }
@@ -2203,9 +2217,9 @@ int main(int argc,char **argv) {
             g_txqTail=g_txqHead;
         } else if(!strcmp(t,"hw_uart_tx_full")) {
             simLogN=0;simLog[0]=0;g_txqHead=g_txqTail=0;
-            JLOG("ACK\r\n");simUartTxFull=1;txq_send_one();
+            JLOG("ACK\r\n");SIM_TX_STUCK(1);txq_send_one();
             assert(txq_pending() && simLogN==0);
-            simUartTxFull=0;txq_flush_blocking();assert(!strcmp(simLog,"ACK\r\n"));
+            SIM_TX_STUCK(0);txq_flush_blocking();assert(!strcmp(simLog,"ACK\r\n"));
         } else if(!strcmp(t,"hw_uart_stop")) {
             g_ptpRx.active=1;sim_uart_push(JOG_CMD_STOP);jog_rx_service();assert_stopped();
         } else {
@@ -2470,11 +2484,11 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     tmp = Path(temp)
     if host_plan is not None: (tmp/'host-plan.bin').write_bytes(host_plan.read_bytes())
     if host_control is not None: (tmp/'host-control.bin').write_bytes(host_control.read_bytes())
-    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','PinIsr.h']:
+    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','PinIsr.h','CyDmac.h']:
         (tmp/name).write_text('',encoding='ascii')
     if emit_c is not None:
         emit_c.mkdir(parents=True, exist_ok=True)
-        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','PinIsr.h']: (emit_c/name).write_text('',encoding='ascii')
+        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','PinIsr.h','CyDmac.h']: (emit_c/name).write_text('',encoding='ascii')
         (emit_c/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
         print('wrote', emit_c/'check.c'); sys.exit(0)
     (tmp/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
