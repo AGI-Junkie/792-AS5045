@@ -1,5 +1,5 @@
 """Actual firmware C with simulated GPIO/encoder/time; never touches serial or a board.
-Run: python tests/test_stage1.py (requires installed Visual Studio C++ tools).
+Run: python tests/test_stage1.py (requires installed Visual Studio C++ tools).  Options: --sim-mhz=N (bus clock of the simulation, default 48), --define=NAME=VALUE (e.g. HW_SSI=1u), --emit-c=DIR.
 This verifies control flow, not real UART timing, motor torque or sensor wiring.
 """
 from pathlib import Path
@@ -12,7 +12,7 @@ root = Path(__file__).resolve().parents[1]
 host_plan = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.startswith('--host-plan=')), None)
 host_control = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.startswith('--host-control=')), None)
 emit_c = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.startswith('--emit-c=')), None)
-sim_mhz = int(next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--sim-mhz=')), '24'))
+sim_mhz = int(next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--sim-mhz=')), '48'))
 extra_defs = ''.join('#define %s %s\n' % tuple(a[9:].split('=', 1)) for a in sys.argv if a.startswith('--define='))
 sys.argv = [a for a in sys.argv if not a.startswith(('--host-plan=', '--host-control=', '--emit-c=', '--sim-mhz=', '--define='))]
 source = (root / 'DRV8825.cydsn/main.c').read_text(encoding='utf-8')
@@ -411,6 +411,21 @@ static void sim_check_traj_boundary(void) {
     assert(g_arm2.usteps==g_ptp.origin[1]-ptp_offset(1,node->q2-node->q1));
     simBoundaryChecks++;
 }
+/* Let `us` microseconds pass in 20 us steps, each ending in a register read, so that an interrupt due in between is
+ * taken about when it is due and not at the end of the whole span. */
+static void sim_advance_us(unsigned us) {
+    unsigned q;
+    for(q=0;q<us/20u;q++){simClock+=(uint64_t)SIM_MHZ*20u;(void)SU_NOW();}
+}
+/* A traj run is advanced in 100 us slices (1 ms in all); with the event timer the slices are 20 us, because the
+ * interrupt is taken at the first register read after its terminal count. */
+#if HW_EVT
+#define SIM_SUBS 50u
+#define SIM_SUB_US 20u
+#else
+#define SIM_SUBS 10u
+#define SIM_SUB_US 100u
+#endif
 static void cycle(int heartbeat) {
     if(g_traj.state==3u && g_ptp.active==1u) {
         /* The real foreground services pulses continuously, independently of
@@ -418,8 +433,8 @@ static void cycle(int heartbeat) {
          * falsely caps 1667 us pulse spacing at 500 Hz. Preserve elapsed time,
          * but service at 100 us resolution for the newly uncapped host plans. */
         unsigned sub;
-        for(sub=0;sub<10;sub++) {
-            simClock+=SIM_MHZ*100u;FG_PASS_MARK();alive_kick();jog_update_time();
+        for(sub=0;sub<SIM_SUBS;sub++) {
+            simClock+=SIM_MHZ*SIM_SUB_US;FG_PASS_MARK();alive_kick();jog_update_time();
             if(!jog_safety_blocked() && g_ptp.active)ptp_service();
         }
     } else simClock+=(SIM_MHZ*1000u);
@@ -428,7 +443,7 @@ static void cycle(int heartbeat) {
     if(heartbeat && (g_jogMs-g_lastKeyMs>=40u)) sim_keys(0);
 #if HW_SSI
     /* the hardware frame takes 160 us: one pass starts it, later passes (200 us apart) collect it, retries included */
-    if(g_arm1.hasEnc){unsigned k;service_encoder_sampling();for(k=0;k<8 && g_encFlight;k++){simClock+=SIM_MHZ*200u;service_encoder_sampling();}}
+    if(g_arm1.hasEnc){unsigned k;service_encoder_sampling();for(k=0;k<8 && g_encFlight;k++){sim_advance_us(200u);service_encoder_sampling();}}
 #else
     if(g_arm1.hasEnc)service_encoder();
 #endif
@@ -1092,8 +1107,24 @@ static void host_rates_config(void) {
 #define SCHED_C1 2844u
 #define SCHED_C2 0u
 /* The trace is taken in 24 MHz-equivalent cycles, so a different bus clock reproduces the pulse counts and the axis order
- * exactly but lands some pulses one foreground pass later: each clock has its own recorded hashes (48 MHz: 10-08). */
-#if SIM_MHZ == 48
+ * exactly but lands some pulses one foreground pass later: each clock has its own recorded hashes (48 MHz: 10-08).  The
+ * hardware offload moves every pulse again (no busy-waits, the SPI Master, the event timer): a build with every switch
+ * on has its own set as well.  Any other combination checks the pulse counts and the axis order only (SCHED_HASHED 0). */
+#define SCHED_ALL_HW (HW_SSI && HW_STEP && HW_EVT && HW_DEAD && HW_PINIRQ && HW_TXDMA)
+#define SCHED_NO_HW  (!HW_SSI && !HW_STEP && !HW_EVT && !HW_DEAD && !HW_PINIRQ && !HW_TXDMA)
+#if SIM_MHZ == 48 && SCHED_ALL_HW
+#define SCHED_HASHED 1
+#if ARM2_ENCODER_FEEDBACK
+#define SCHED_AH 0xca446ce5u
+#define SCHED_BH 0x6db0cb80u
+#define SCHED_CH 0x66f9bb75u
+#else
+#define SCHED_AH 0xa4aec715u
+#define SCHED_BH 0x3c70b458u
+#define SCHED_CH 0xb35393cdu
+#endif
+#elif SIM_MHZ == 48 && SCHED_NO_HW
+#define SCHED_HASHED 1
 #if ARM2_ENCODER_FEEDBACK
 #define SCHED_AH 0xbdc7f313u
 #define SCHED_BH 0x50f57facu
@@ -1103,7 +1134,9 @@ static void host_rates_config(void) {
 #define SCHED_BH 0xe469fbb6u
 #define SCHED_CH 0x77bd772bu
 #endif
-#elif ARM2_ENCODER_FEEDBACK /* the second encoder frame lengthens the foreground pass, which moves where each pulse lands */
+#elif SIM_MHZ == 24 && SCHED_NO_HW
+#define SCHED_HASHED 1
+#if ARM2_ENCODER_FEEDBACK /* the second encoder frame lengthens the foreground pass, which moves where each pulse lands */
 #define SCHED_AH 0x4e7b6b67u
 #define SCHED_BH 0xae4b8b3cu
 #define SCHED_CH 0x1b50e5abu
@@ -1111,6 +1144,12 @@ static void host_rates_config(void) {
 #define SCHED_AH 0x8ab0b9d5u
 #define SCHED_BH 0xe469fbb6u
 #define SCHED_CH 0x4ed142dbu
+#endif
+#else
+#define SCHED_HASHED 0
+#define SCHED_AH 0u
+#define SCHED_BH 0u
+#define SCHED_CH 0u
 #endif
 typedef struct { unsigned n; int16 q1[128], q2[128]; uint16 ms[128]; } sched_plan_t;
 static void sched_build(sched_plan_t *p, const uint16 *ms, unsigned n, int a1, int ae, unsigned dwellMs) {
@@ -1138,7 +1177,7 @@ static void sched_run(const char *name, const sched_plan_t *p, uint32 *seq, unsi
     printf("TRAJ_SCHEDULE %s pulses1=%u pulses2=%u trace=0x%08lx lag_us=%lu\n",name,simPulse1-p1,simPulse2-p2,
            (unsigned long)simTrace,(unsigned long)(g_traj.lagMaxCy/SU_CY_PER_US));fflush(stdout);
 #ifndef SCHED_RECORD /* compile with /DSCHED_RECORD to print new values instead of checking them */
-    assert(simPulse1-p1==exp1&&simPulse2-p2==exp2&&simTrace==expTrace);
+    assert(simPulse1-p1==exp1&&simPulse2-p2==exp2&&(!SCHED_HASHED||simTrace==expTrace));
 #else
     (void)exp1;(void)exp2;(void)expTrace;
 #endif
