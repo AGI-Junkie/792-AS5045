@@ -46,6 +46,14 @@ internal sealed class LogIndex
         return best;
     }
 
+    // The last line containing `text` between two times of day, or null.
+    public string? LastMatch(string text, double from, double to)
+    {
+        int hi = Array.BinarySearch(Seconds, to); if (hi < 0) hi = ~hi - 1; else while (hi + 1 < Seconds.Length && Seconds[hi + 1] == to) hi++;
+        for (int i = hi; i >= 0 && Seconds[i] >= from; i--) if (Lines[i].Contains(text, StringComparison.Ordinal)) return Lines[i];
+        return null;
+    }
+
     // Lines within `radius` seconds of `time` (time of day), at most `limit`, nearest the cursor first-class: the window is centred on it.
     public IEnumerable<string> Around(double time, double radius, int limit, Func<string, bool>? keep = null)
     {
@@ -79,7 +87,8 @@ internal sealed partial class ExperimentWindow : Window
     private readonly XYView xy = new() { MinHeight = 240 };
     private readonly Slider timeSlider = new() { Minimum = 0, Maximum = 1, MinWidth = 260, Margin = new Thickness(6, 2, 6, 2), VerticalAlignment = VerticalAlignment.Center };
     private readonly Button play = new() { MinWidth = 90, Margin = new Thickness(4) }, refresh = new() { Margin = new Thickness(4), Padding = new Thickness(10, 2, 10, 2) }, openFolder = new() { Margin = new Thickness(4), Padding = new Thickness(10, 2, 10, 2) },
-        exportList = new() { Margin = new Thickness(4), Padding = new Thickness(10, 2, 10, 2) };
+        exportList = new() { Margin = new Thickness(4), Padding = new Thickness(10, 2, 10, 2) }, exportImage = new() { Margin = new Thickness(4), Padding = new Thickness(10, 2, 10, 2) };
+    private readonly StackPanel charts = new();
     private readonly ComboBox speed = new() { Width = 70, Margin = new Thickness(4) };
     private readonly TextBlock timeText = new() { Margin = new Thickness(8, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center, FontFamily = WorkbenchTheme.Mono, FontSize = 12 };
     private readonly TextBox logBox = new() { IsReadOnly = true, FontFamily = WorkbenchTheme.Mono, FontSize = 11, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, MinHeight = 90, TextWrapping = TextWrapping.NoWrap };
@@ -93,8 +102,7 @@ internal sealed partial class ExperimentWindow : Window
     private int unreadable;
     private double tMin, tMax, cursor;
     private bool settingSlider;
-    private LogIndex? log;
-    private string? logFor;
+    private readonly Dictionary<string, LogIndex?> logs = [];
 
     private static readonly Brush[][] Colours = [
         [WorkbenchTheme.Blue, WorkbenchTheme.Teal, WorkbenchTheme.Brush("#7B8794"), WorkbenchTheme.Brush("#7C3AED")],
@@ -113,7 +121,7 @@ internal sealed partial class ExperimentWindow : Window
         // Left: the list, its buttons, and the written summary of what is shown.
         var left = new Grid(); left.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); left.RowDefinitions.Add(new RowDefinition { Height = new GridLength(2, GridUnitType.Star), MinHeight = 130 });
         left.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); left.RowDefinitions.Add(new RowDefinition { Height = new GridLength(3, GridUnitType.Star), MinHeight = 120 });
-        var bar = new WrapPanel { Margin = new Thickness(4) }; bar.Children.Add(refresh); bar.Children.Add(openFolder); bar.Children.Add(exportList);
+        var bar = new WrapPanel { Margin = new Thickness(4) }; bar.Children.Add(refresh); bar.Children.Add(openFolder); bar.Children.Add(exportList); bar.Children.Add(exportImage);
         left.Children.Add(WorkbenchTheme.Edge(new StackPanel { Children = { bar, listHint } }, WorkbenchTheme.Bar));
         Grid.SetRow(grid, 1); left.Children.Add(grid);
         var summaryTitle = WorkbenchTheme.Caption("exp.summary"); Grid.SetRow(summaryTitle, 2); left.Children.Add(summaryTitle);
@@ -129,7 +137,7 @@ internal sealed partial class ExperimentWindow : Window
         right.Children.Add(WorkbenchTheme.Edge(replay, WorkbenchTheme.Bar));
         var middle = new Grid(); Grid.SetRow(middle, 1);
         middle.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(3, GridUnitType.Star) }); middle.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2, GridUnitType.Star), MinWidth = 260 });
-        var charts = new StackPanel(); foreach (var plot in new[] { qPlot, errPlot, speedPlot, accelPlot }) { plot.Height = 190; plot.Margin = new Thickness(2, 2, 2, 4); plot.CursorChanged += t => { PausePlayback(); SetCursor(t); }; charts.Children.Add(plot); }
+        foreach (var plot in new[] { qPlot, errPlot, speedPlot, accelPlot }) { plot.Height = 190; plot.Margin = new Thickness(2, 2, 2, 4); plot.CursorChanged += t => { PausePlayback(); SetCursor(t); }; charts.Children.Add(plot); }
         middle.Children.Add(new ScrollViewer { Content = charts, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
         var plane = new DockPanel { Margin = new Thickness(2) }; Grid.SetColumn(plane, 1);
         DockPanel.SetDock(wholeArm, Dock.Top); plane.Children.Add(wholeArm); plane.Children.Add(xy);
@@ -148,6 +156,7 @@ internal sealed partial class ExperimentWindow : Window
         play.Click += (_, _) => TogglePlayback();
         refresh.Click += (_, _) => Reload();
         exportList.Click += (_, _) => ExportList();
+        exportImage.Click += (_, _) => ExportImage();
         openFolder.Click += (_, _) => { try { Directory.CreateDirectory(root); System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe", root) { UseShellExecute = true }); } catch (Exception ex) when (ex is IOException or System.ComponentModel.Win32Exception) { summary.Text = ex.Message; } };
         quietLog.Checked += (_, _) => UpdateLog(); quietLog.Unchecked += (_, _) => UpdateLog();
         wholeArm.Checked += (_, _) => xy.WholeArm = true; wholeArm.Unchecked += (_, _) => xy.WholeArm = false;
@@ -192,7 +201,7 @@ internal sealed partial class ExperimentWindow : Window
     private void ApplyLanguage()
     {
         Title = Lang.T("exp.title");
-        refresh.Content = Lang.T("exp.refresh"); openFolder.Content = Lang.T("btn.openData"); exportList.Content = Lang.T("exp.export");
+        refresh.Content = Lang.T("exp.refresh"); openFolder.Content = Lang.T("btn.openData"); exportList.Content = Lang.T("exp.export"); exportImage.Content = Lang.T("exp.exportImage");
         quietLog.Content = Lang.T("exp.log.quiet"); wholeArm.Content = Lang.T("exp.xy.whole");
         logTitle.Text = Lang.T("exp.log.title");
         play.Content = timer.IsEnabled ? Lang.T("exp.pause") : Lang.T("exp.play");
@@ -209,6 +218,32 @@ internal sealed partial class ExperimentWindow : Window
         if (dialog.ShowDialog(this) != true) return;
         try { File.WriteAllText(dialog.FileName, ExperimentArchive.ReportCsv(rows.Select(r => r.Run)), new System.Text.UTF8Encoding(true)); summary.Text = Lang.T("exp.exported", dialog.FileName); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { summary.Text = Lang.T("exp.exportFail") + ex.Message; }
+    }
+
+    // The four charts and the plane as one PNG (what is on screen, cursor and legend values included): the figure for the thesis.
+    internal void RenderImage(string path)
+    {
+        double cw = charts.ActualWidth, ch = charts.ActualHeight, pw = xy.ActualWidth, ph = xy.ActualHeight, h = Math.Max(ch, ph);
+        if (cw < 1 || h < 1) throw new InvalidOperationException("nothing to render");
+        var visual = new DrawingVisual();
+        using (var dc = visual.RenderOpen())
+        {
+            dc.DrawRectangle(Brushes.White, null, new Rect(0, 0, cw + pw + 8, h));
+            dc.DrawRectangle(new VisualBrush(charts) { Stretch = Stretch.None, AlignmentX = AlignmentX.Left, AlignmentY = AlignmentY.Top }, null, new Rect(0, 0, cw, ch));
+            dc.DrawRectangle(new VisualBrush(xy) { Stretch = Stretch.None, AlignmentX = AlignmentX.Left, AlignmentY = AlignmentY.Top }, null, new Rect(cw + 8, 0, pw, ph));
+        }
+        var image = new System.Windows.Media.Imaging.RenderTargetBitmap((int)Math.Ceiling(cw + pw + 8), (int)Math.Ceiling(h), 96, 96, PixelFormats.Pbgra32); image.Render(visual);
+        var png = new System.Windows.Media.Imaging.PngBitmapEncoder(); png.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(image));
+        using var stream = File.Create(path); png.Save(stream);
+    }
+
+    private void ExportImage()
+    {
+        if (shown.Count == 0) { summary.Text = Lang.T("exp.exportImage.none"); return; }
+        var dialog = new Microsoft.Win32.SaveFileDialog { Title = Lang.T("exp.exportImage"), Filter = Lang.T("exp.pngFilter"), DefaultExt = ".png", FileName = $"{shown[0].Run.Id}.png" };
+        if (dialog.ShowDialog(this) != true) return;
+        try { RenderImage(dialog.FileName); summary.Text = Lang.T("exp.exported", dialog.FileName); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException) { summary.Text = Lang.T("exp.exportFail") + ex.Message; }
     }
 
     // ---- selection -> charts -----------------------------------------------------------------------------------------
@@ -229,7 +264,7 @@ internal sealed partial class ExperimentWindow : Window
             catch (Exception ex) when (ex is IOException or FormatException or UnauthorizedAccessException) { summary.Text = Lang.T("exp.sum.readFail", run.Id) + ex.Message; }
         }
         foreach (var plot in new[] { qPlot, errPlot, speedPlot, accelPlot }) plot.Clear();
-        xy.Clear(); logBox.Clear(); log = null; logFor = null;
+        xy.Clear(); logBox.Clear();
         if (shown.Count == 0)
         {
             foreach (var plot in new[] { qPlot, errPlot, speedPlot, accelPlot }) { plot.Title = ""; plot.InvalidateVisual(); }
@@ -237,7 +272,8 @@ internal sealed partial class ExperimentWindow : Window
             return;
         }
         bool compare = shown.Count == 2;
-        tMin = shown.Min(a => Math.Min(a.T.Length > 0 ? a.T[0] : 0, a.HasPlan ? 0 : double.MaxValue)); tMax = shown.Max(a => Math.Max(a.T.Length > 0 ? a.T[^1] : 0, a.Duration));
+        tMin = shown.Min(a => Math.Min(Math.Min(a.T.Length > 0 ? a.T[0] : 0, a.PreT.Length > 0 ? a.PreT[0] : 0), a.HasPlan ? 0 : double.MaxValue));
+        tMax = shown.Max(a => Math.Max(Math.Max(a.T.Length > 0 ? a.T[^1] : 0, a.PreT.Length > 0 ? a.PreT[^1] : 0), a.Duration));
         if (tMax - tMin < 0.5) tMax = tMin + 0.5;
         for (int i = 0; i < shown.Count; i++)
         {
@@ -259,8 +295,19 @@ internal sealed partial class ExperimentWindow : Window
                 var mark = new PlotMark(ev.Time, tag + label, c[0], Labelled: i == 0);
                 errPlot.Marks.Add(mark); qPlot.Marks.Add(mark with { Labelled = false });
             }
-            if (ExperimentArchive.ReadFault(a.Run) is { } fault && a.Aligned)
-                errPlot.Marks.Add(new PlotMark((fault.DeviceMs - a.AlignmentOffsetMs) / 1000.0, tag + Lang.T("exp.ev.fault") + " " + fault.Reason, WorkbenchTheme.Red));
+            // Telemetry the recording lacks from the seconds around a stop (pre_fault.csv), drawn thin so it is not mistaken for the run itself.
+            if (a.PreT.Length > 0)
+            {
+                qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.pre") + " " + Lang.T("exp.s.enc"), a.PreT, a.PreQ1Encoder, c[2]) { Thickness = 1.0, Unit = "°" });
+                errPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.pre") + " " + Lang.T("exp.s.err"), a.PreT, a.PreQ1Error, c[2]) { Thickness = 1.0, Unit = "°", Decimals = 4 });
+            }
+            // The stop is on the samples' own axis, so the joint and error charts always show it; the plan charts only when the plan is aligned to it.
+            if (!double.IsNaN(a.FaultTime) && ExperimentArchive.ReadFault(a.Run) is { } fault)
+            {
+                var stop = new PlotMark(a.FaultTime, tag + Lang.T("exp.ev.fault") + " " + fault.Reason, WorkbenchTheme.Red);
+                errPlot.Marks.Add(stop); qPlot.Marks.Add(stop with { Labelled = false });
+                if (a.Aligned) { speedPlot.Marks.Add(stop with { Labelled = false }); accelPlot.Marks.Add(stop with { Labelled = false }); }
+            }
             if (a.HasPlan)
             {
                 speedPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.m1"), a.PlanVT, a.PlanV1, c[0]) { Unit = "°/s", Decimals = 2 });
@@ -317,6 +364,8 @@ internal sealed partial class ExperimentWindow : Window
             if (a.HasPlan) text.AppendLine(Lang.T("exp.sum.limit", LimiterText(a)));
             if (a.Aligned) text.AppendLine(a.AlignmentResidualDeg <= 1 ? Lang.T("exp.sum.align.good", a.AlignmentOffsetMs, a.AlignmentResidualDeg) : Lang.T("exp.sum.align.poor", a.AlignmentResidualDeg));
             if (a.Data.SkippedRows > 0) text.AppendLine(Lang.T("exp.sum.skipped", a.Data.SkippedRows));
+            if (TimingText(a) is { } timing) text.AppendLine(timing);
+            if (a.PreT.Length > 0) text.AppendLine(Lang.T("exp.sum.pre", a.PreT.Length));
             if (ExperimentArchive.ReadFault(run) is { } fault)
                 text.AppendLine(Lang.T("exp.sum.fault", Lang.T("snap.phase." + (fault.Phase is "home" or "ptp" or "traj_run" or "traj_upload" or "jog" or "idle" or "disabled" ? fault.Phase : "other")), fault.Reason, fault.Driver ? " — " + Lang.T("snap.drvUndetermined") : ""));
             text.AppendLine();
@@ -328,6 +377,25 @@ internal sealed partial class ExperimentWindow : Window
         }
         if (grid.SelectedItems.Count > 2) text.AppendLine(Lang.T("exp.sum.maxTwo"));
         return text.ToString().TrimEnd();
+    }
+
+    // The firmware's own TIMING line for this run, from the session log: the last one after the run started and before 20 s after its last sample
+    // (the status block after a stop or a finish). The values are maxima since ENABLE, so a run that follows at once would show up in them too.
+    private LogIndex? LogOf(RunAnalysis a)
+    {
+        if (!logs.TryGetValue(a.Run.Directory, out var index))
+            logs[a.Run.Directory] = index = LogIndex.Find(LogRoot, a.Run.StartedUtc.ToLocalTime()) is { } file ? LogIndex.Load(file) : null;
+        return index;
+    }
+
+    private string? TimingText(RunAnalysis a)
+    {
+        if (LogOf(a) is not { } index) return null;
+        double from = a.Run.StartedUtc.ToLocalTime().TimeOfDay.TotalSeconds, to = (a.HostUtc.Length > 0 ? a.HostUtc[^1] : a.Run.StartedUtc).ToLocalTime().TimeOfDay.TotalSeconds + 20;
+        if (index.LastMatch("TIMING ", from, to) is not { } line) return Lang.T("exp.sum.timing.none");
+        long? Field(string name) => System.Text.RegularExpressions.Regex.Match(line, name + @"=(\d+)") is { Success: true } m ? long.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture) : null;
+        if (Field("traj_lag_max_us") is not { } lag) return Lang.T("exp.sum.timing.none");
+        return Field("traj_slip_us") is { } slip ? Lang.T("exp.sum.timing", lag, slip) : Lang.T("exp.sum.timing.old", lag);
     }
 
     // ---- replay -----------------------------------------------------------------------------------------------------
@@ -365,12 +433,7 @@ internal sealed partial class ExperimentWindow : Window
     {
         if (shown.Count == 0) { logBox.Clear(); return; }
         var a = shown[0];
-        if (logFor != a.Run.Directory)
-        {
-            logFor = a.Run.Directory;
-            string? file = LogIndex.Find(LogRoot, a.Run.StartedUtc.ToLocalTime());
-            log = file is null ? null : LogIndex.Load(file);
-        }
+        var log = LogOf(a);
         if (log is null) { logBox.Text = Lang.T("exp.log.none"); return; }
         if (a.T.Length == 0) { logBox.Clear(); return; }
         int i = 0; double best = double.MaxValue;

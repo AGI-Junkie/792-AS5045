@@ -57,7 +57,8 @@ public sealed class ExperimentRun
 public sealed record FeedbackRow(DateTime HostUtc, uint DeviceMs, uint Epoch, uint Sequence, string Phase, int Segment, double Q1Command, double Q1Encoder,
     double Q1Error, double Q2Command, double XCommand, double YCommand, double XHybrid, double YHybrid, int Slip, int Inputs, uint Drops, double? Q2Measured = null);
 public sealed record PlanNode(int Index, int TimeMs, double Q1, double Q2);
-public sealed record RunData(PlanNode[] Plan, FeedbackRow[] Feedback, int SkippedRows);
+public sealed record PreFaultRow(double DeviceMs, double Q1Command, double Q1Encoder, double Q1Error);
+public sealed record RunData(PlanNode[] Plan, FeedbackRow[] Feedback, int SkippedRows, PreFaultRow[]? PreFault = null);
 
 public static class ExperimentArchive
 {
@@ -180,7 +181,28 @@ public static class ExperimentArchive
                 }
             }
         }
-        return new RunData(plan.ToArray(), rows.ToArray(), skipped);
+        return new RunData(plan.ToArray(), rows.ToArray(), skipped, LoadPreFault(run));
+    }
+
+    // pre_fault.csv: the telemetry of the seconds before a stop, saved next to fault.json. Unreadable rows are dropped, not fatal.
+    private static PreFaultRow[] LoadPreFault(ExperimentRun run)
+    {
+        string path = Path.Combine(run.Directory, "pre_fault.csv");
+        if (!File.Exists(path)) return [];
+        var lines = File.ReadAllLines(path);
+        if (lines.Length < 2) return [];
+        var names = SplitCsv(lines[0]); var at = new Dictionary<string, int>();
+        for (int i = 0; i < names.Length; i++) at[names[i]] = i;
+        string[] need = ["device_ms", "q1_command_deg", "q1_encoder_deg", "q1_error_deg"];
+        if (need.Any(n => !at.ContainsKey(n))) return [];
+        var rows = new List<PreFaultRow>();
+        foreach (string line in lines.Skip(1))
+        {
+            var f = line.Split(',');
+            bool Get(string name, out double v) { v = 0; return at[name] < f.Length && double.TryParse(f[at[name]], NumberStyles.Float, CultureInfo.InvariantCulture, out v); }
+            if (Get("device_ms", out double ms) && Get("q1_command_deg", out double c) && Get("q1_encoder_deg", out double e) && Get("q1_error_deg", out double err)) rows.Add(new PreFaultRow(ms, c, e, err));
+        }
+        return rows.OrderBy(r => r.DeviceMs).ToArray();
     }
 }
 
@@ -226,6 +248,11 @@ public sealed class RunAnalysis
     public double[] PlanA2 { get; init; } = [];
     public RunEvent[] Events { get; init; } = [];
     public SegmentStat[] Segments { get; init; } = [];
+    // The seconds before a stop (pre_fault.csv) that the recording itself does not hold: before its first moving sample or after its last. Same time axis as T.
+    public double[] PreT { get; init; } = [];
+    public double[] PreQ1Encoder { get; init; } = [];
+    public double[] PreQ1Error { get; init; } = [];
+    public double FaultTime { get; init; } = double.NaN;            // the stop snapshot on the same axis as T (NaN = no snapshot)
     public AxisUse[] Axes { get; init; } = [];                      // peak speed and acceleration of each motor against its cap
     public string[] LimitingAxes { get; init; } = [];
     public double Rmse { get; init; }
@@ -277,6 +304,8 @@ public sealed class RunAnalysis
             }
             offsetMs = bestOffset * 1000; residual = Math.Sqrt(best / motion.Length); aligned = true;
         }
+        var pre = (data.PreFault ?? []).Where(r => motion.Length == 0 || r.DeviceMs < motion[0].DeviceMs - 1 || r.DeviceMs > motion[^1].DeviceMs + 1).ToArray();
+        if (motion.Length == 0 && pre.Length > 0) offsetMs = pre[0].DeviceMs;
         double[] T = motion.Select(r => (r.DeviceMs - offsetMs) / 1000.0).ToArray();
         // Plan profile: speed of each motor over each segment, acceleration at each node between two segments.
         var vt = new List<double>(); var v1 = new List<double>(); var v2 = new List<double>(); var at = new List<double>(); var a1 = new List<double>(); var a2 = new List<double>();
@@ -338,6 +367,8 @@ public sealed class RunAnalysis
             PlanVT = vt.ToArray(), PlanV1 = v1.ToArray(), PlanV2 = v2.ToArray(), PlanAT = at.ToArray(), PlanA1 = a1.ToArray(), PlanA2 = a2.ToArray(),
             Events = events.ToArray(), Segments = segments.ToArray(), Axes = axes, LimitingAxes = axes.Where(a => a.Utilization >= 0.9).Select(a => a.Name).ToArray(),
             Rmse = moving > 0 ? Math.Sqrt(sum / moving) : 0, Peak = peak, Duration = planT.Length > 0 ? planT[^1] : T.Length > 0 ? T[^1] - T[0] : 0,
+            PreT = pre.Select(r => (r.DeviceMs - offsetMs) / 1000.0).ToArray(), PreQ1Encoder = pre.Select(r => r.Q1Encoder).ToArray(), PreQ1Error = pre.Select(r => r.Q1Error).ToArray(),
+            FaultTime = ExperimentArchive.ReadFault(run) is { } fault ? (fault.DeviceMs - offsetMs) / 1000.0 : double.NaN,
             AlignmentOffsetMs = offsetMs, AlignmentResidualDeg = residual, Aligned = aligned };
     }
 }

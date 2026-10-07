@@ -36,6 +36,12 @@ internal sealed partial class ExperimentWindow
             using (var doc = JsonDocument.Parse(meta)) meta = meta.Replace(doc.RootElement.GetProperty("started_utc").GetString()!, baseUtc.ToString("O", CultureInfo.InvariantCulture)).Replace("\"schema\": 1", "\"schema\": 1");
             File.WriteAllText(Path.Combine(rect, "metadata.json"), meta);
             File.WriteAllText(Path.Combine(rect, "fault.json"), JsonSerializer.Serialize(new { schema = 1, snapshot = new { Milliseconds = 8200 + 12000, Phase = "traj_run", Reason = "DRV8825 nFAULT; drivers OFF", Driver = "nfault_undetermined" } }));
+            // The seconds before the stop: two samples inside the recording (must not be drawn twice) and three after its last sample.
+            double lastMs = double.Parse(lines[^1].Split(',')[1], CultureInfo.InvariantCulture);
+            File.WriteAllLines(Path.Combine(rect, "pre_fault.csv"), [
+                "host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_encoder_deg,q2_error_deg,slip_motor_lsb,inputs_active_mask,slip2_motor_lsb",
+                .. new[] { lastMs - 200, lastMs - 100 }.Select(ms => $"{baseUtc:O},{ms:F0},5,1,10,10,0,0,0,0,0,0,0"),
+                .. new[] { lastMs + 500, lastMs + 1000, lastMs + 1500 }.Select(ms => $"{baseUtc:O},{ms:F0},5,1,10,10.5,0.5,0,0,0,0,0,0"), "garbage"], new UTF8Encoding(true));
             // The log of that session: a marker line every second, and status-block noise between them.
             var baseLocal = baseUtc.ToLocalTime();
             var log = new List<string>();
@@ -43,6 +49,7 @@ internal sealed partial class ExperimentWindow
             {
                 var at = baseLocal.AddSeconds(s);
                 log.Add($"[{at:HH:mm:ss.fff}] HOST marker {s}");
+                if (s == 20) log.Add($"[{at.AddMilliseconds(250):HH:mm:ss.fff}] TIMING loop_max_ms=3 tick_lag_max_ms=1 clock=hardware wdt=256-384ms key_age_ms=10 key_max_gap_ms=40 status_max_us=900 traj_lag_max_us=17321 traj_slip_us=6520");
                 log.Add($"[{at.AddMilliseconds(500):HH:mm:ss.fff}] TELEM t=1 epoch=5 seq=1 ref=1 source=2 p1=0 p2=0 e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
             }
             string logFile = Path.Combine(logs, $"stage1-{baseLocal.AddMinutes(-1):yyyyMMdd-HHmmss}-000.log");
@@ -62,9 +69,13 @@ internal sealed partial class ExperimentWindow
             // One recording: the curves, the events, the written summary.
             w.SelectForSelfTest(rectRow);
             var (q, err, speed, accel) = (w.Plots[0], w.Plots[1], w.Plots[2], w.Plots[3]);
-            Check(w.ShownRuns == 1 && q.Series.Count == 5 && err.Series.Count == 2 && speed.Series.Count == 2 && accel.Series.Count == 2, "series per chart");
+            Check(w.ShownRuns == 1 && q.Series.Count == 6 && err.Series.Count == 3 && speed.Series.Count == 2 && accel.Series.Count == 2, "series per chart");
             Check(err.Marks.Count(m => m.Label is "起步" or "停机" or "拐角 1" or "拐角 2" or "拐角 3") == 5 && err.Marks.Any(m => m.Label.StartsWith("故障 ")), "the plan's events and the stop snapshot are marked on the error chart");
             Check(Math.Abs(err.Marks.First(m => m.Label.StartsWith("故障")).X - 12.0) < 0.02, "the stop snapshot is placed at its device time on the aligned axis");
+            Check(new[] { q, speed, accel }.All(p => p.Marks.Any(m => Math.Abs(m.X - 12.0) < 0.02 && m.Color == WorkbenchTheme.Red)), "the stop is marked on every chart");
+            Check(q.Series.Count(x => x.Name.StartsWith("停机前遥测")) == 1 && err.Series.Count(x => x.Name.StartsWith("停机前遥测")) == 1, "the pre-stop telemetry is a thin series on the joint and error charts");
+            Check(q.Series.First(x => x.Name.StartsWith("停机前遥测")).X.Length == 3 && w.Range.Max >= q.Series.First(x => x.Name.StartsWith("停机前遥测")).X[^1] - 1e-9, "only the pre-stop samples the recording lacks are drawn, and the time range covers them");
+            Check(w.SummaryText_.Contains("最大滞后 17321 µs") && w.SummaryText_.Contains("压着走累计 6520 µs") && w.SummaryText_.Contains("3 个停机前遥测样本"), "summary: firmware TIMING from the session log, and the pre-stop samples: " + w.SummaryText_);
             Check(speed.Lines.Count == 4 && speed.Lines.Any(l => l.Label.StartsWith("电机1 上限")) && accel.Lines.Count == 4, "the caps are drawn as reference lines");
             Check(w.Plots.All(p => p.XRange.Min <= 0.001 && p.XRange.Max > 10) && w.Range.Max > 10, "one shared time range");
             Check(err.SymmetricY && q.Source.Contains("40:1") && err.Source.Contains("不是笔尖位置误差") && speed.Source.Contains("不是实测速度") && w.Plane.Source.Contains("不是实测笔尖位置"), "every chart states where its data comes from, and what it is not");
@@ -99,7 +110,7 @@ internal sealed partial class ExperimentWindow
 
             // Two recordings laid over each other.
             w.SelectForSelfTest(0, 1);
-            Check(w.ShownRuns == 2 && q.Series.Count == 10 && err.Series.Count == 4 && speed.Series.Count == 4 && q.Series[0].Name.StartsWith("A ") && q.Series[5].Name.StartsWith("B "), "comparison doubles the series and tags them A and B");
+            Check(w.ShownRuns == 2 && q.Series.Count == 11 && err.Series.Count == 5 && speed.Series.Count == 4 && q.Series[0].Name.StartsWith("A ") && q.Series[6].Name.StartsWith("B "), "comparison doubles the series and tags them A and B");
             Check(w.SummaryText_.Contains("B 相对 A") && w.Plane.Paths.Count == 6 && err.Notes.Count == 2, "comparison summary and notes");
             Check(w.Range.Max >= 10 && w.Plane.Arms.Count == 4, "both arms at the cursor");
             // Language switch rewrites everything without losing the selection.
@@ -113,6 +124,14 @@ internal sealed partial class ExperimentWindow
             Check(w.ColumnHeaders[0] == "开始时间" && q.Series[0].Name.StartsWith("A 命令"), "and back");
             w.Reload2();
             Check(w.ListedRuns == 2 && w.ShownRuns == 2, "refreshing the list keeps the selection");
+            // The figure export: the four charts and the plane in one image, as wide as both and as tall as the taller.
+            w.Width = 1320; w.Height = 860; w.Show(); w.UpdateLayout();
+            string figure = Path.Combine(temp, "figure.png");
+            w.RenderImage(figure);
+            var decoder = BitmapDecoder.Create(new Uri(figure), BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+            Check(decoder.Frames[0].PixelWidth > w.Plane.ActualWidth + 300 && decoder.Frames[0].PixelHeight >= 700, "the exported figure holds the charts and the plane");
+            w.Hide();
+            Check(w.ColumnHeaders.Length == 11 && w.ExportImageText == "导出图片 PNG", "the export button is labelled");
             // Nothing recorded yet: a friendly empty state, not an error.
             var empty = new ExperimentWindow(Path.Combine(temp, "nothing"));
             Check(empty.ListedRuns == 0 && empty.SummaryText_.Contains("还没有实验记录") && empty.ShownRuns == 0, "an empty archive says so");
@@ -136,4 +155,5 @@ internal sealed partial class ExperimentWindow
         finally { LogRootOverride = null; if (Directory.Exists(temp)) Directory.Delete(temp, true); }
     }
     internal void Reload2() => Reload();
+    internal string ExportImageText => exportImage.Content?.ToString() ?? "";
 }
