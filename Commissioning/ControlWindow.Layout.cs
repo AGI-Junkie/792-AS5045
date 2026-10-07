@@ -20,8 +20,10 @@ public sealed partial class ControlWindow
     private readonly Queue<double> errorHistory2 = new();
     private readonly Button readInputs = MakeButton(Lang.T("btn.readInputs"));
     private readonly Expander diagnostics = new() { Header=Lang.T("diag.header"), IsExpanded=true, Background=WorkbenchTheme.Head, BorderBrush=WorkbenchTheme.Line, BorderThickness=new Thickness(0,1,0,0), Padding=new Thickness(0) };
-    private static string[] JointNames => [Lang.T("joint.q1cmd"), Lang.T("joint.q1enc"), Lang.T("joint.q1err"), Lang.T("joint.q2cmd"), Lang.T("joint.q2enc"), Lang.T("joint.q2err"), Lang.T("joint.x"), Lang.T("joint.y"), Lang.T("joint.drops")];
-    private static readonly string[] JointUnits = ["°","°","°","°","°","°","mm","mm",""];
+    private static string[] JointNames => [Lang.T("joint.q1cmd"), Lang.T("joint.q1enc"), Lang.T("joint.q1err"), Lang.T("joint.q2cmd"), Lang.T("joint.q2enc"), Lang.T("joint.q2err"), Lang.T("joint.tip"), Lang.T("joint.tipSpeed"), Lang.T("joint.drops")];
+    private static readonly string[] JointUnits = ["°","°","°","°","°","°","mm","mm/s",""];
+    private static readonly string?[] JointTipKeys = [null, null, null, null, null, null, "joint.tip.tip", "joint.tipSpeed.tip", null];
+    private (double X, double Y, uint Ms)? lastTip;   // previous painted tip, for the speed estimate
     private static string[] LedNames => [Lang.T("led.enable"), Lang.T("led.ref"), Lang.T("led.limits"), Lang.T("led.arm1"), Lang.T("led.arm2"), Lang.T("led.fault")];
     private readonly TextBlock[] jointValues = Enumerable.Range(0, JointNames.Length).Select(_ => new TextBlock { Text = "—", FontFamily = WorkbenchTheme.Mono, TextAlignment = TextAlignment.Right, VerticalAlignment = VerticalAlignment.Center }).ToArray();
     private readonly Ellipse[] leds = Enumerable.Range(0, 6).Select(_ => new Ellipse { Width = 10, Height = 10, Fill = WorkbenchTheme.Idle, VerticalAlignment = VerticalAlignment.Center }).ToArray();
@@ -67,7 +69,7 @@ public sealed partial class ControlWindow
         if (logTab is { } lt) { lt.Header = Lang.T("tab.log"); lt.ToolTip = Lang.T("tab.log.tip"); }
         if (jointNameBlocks.Length == JointNames.Length) {
             string[] names = JointNames;
-            for (int i = 0; i < JointNames.Length; i++) jointNameBlocks[i].Text = names[i];
+            for (int i = 0; i < JointNames.Length; i++) { jointNameBlocks[i].Text = names[i]; if (JointTipKeys[i] is { } key) jointNameBlocks[i].ToolTip = Lang.T(key); }
         }
         if (ledNameBlocks.Length == 6) {
             string[] names = LedNames;
@@ -157,8 +159,9 @@ public sealed partial class ControlWindow
         string[] jnames = JointNames;
         for(int i = 0; i < jnames.Length; i++) {
             var row = new Grid { Margin = new Thickness(10,3,10,3) };
-            row.ColumnDefinitions.Add(new ColumnDefinition()); row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(64) }); row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });
+            row.ColumnDefinitions.Add(new ColumnDefinition()); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto, MinWidth = 64 }); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto, MinWidth = 30 });
             var name = WorkbenchTheme.Label(jnames[i]); name.VerticalAlignment = VerticalAlignment.Center; jointNameBlocks[i] = name; Grid.SetColumn(jointValues[i], 1);
+            if (JointTipKeys[i] is { } tipKey) { name.ToolTip = Lang.T(tipKey); ToolTipService.SetShowOnDisabled(name, true); }
             var unit = new TextBlock { Text = JointUnits[i], Foreground = WorkbenchTheme.Muted, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6,0,0,0) }; Grid.SetColumn(unit, 2);
             row.Children.Add(name); row.Children.Add(jointValues[i]); row.Children.Add(unit); jointGroup.Children.Add(Rule(row));
         }
@@ -240,8 +243,15 @@ public sealed partial class ControlWindow
         if (sample is { Referenced: true }) {
             v[0] = $"{sample.Command.Q1:F3}"; v[1] = $"{sample.Measured1:F3}"; v[2] = $"{sample.Error1:+0.000;-0.000;0.000}"; v[3] = $"{sample.Command.Q2:F3}";
             if(sample.Measured2 is double q2 && sample.Error2 is double error2) { v[4] = $"{q2:F3}"; v[5] = $"{error2:+0.000;-0.000;0.000}"; }
-            try { var tip = xyPreview.Model.Forward(new(sample.Measured1, (sample.Measured2 ?? sample.Measured1 + sample.Command.Q2 - sample.Command.Q1))).Tip; v[6] = $"{tip.X:F2}"; v[7] = $"{tip.Y:F2}"; } catch (ArgumentException) { /* invalid link lengths: leave the estimate blank */ }
+            try {
+                var tip = xyPreview.Model.Forward(new(sample.Measured1, (sample.Measured2 ?? sample.Measured1 + sample.Command.Q2 - sample.Command.Q1))).Tip;
+                v[6] = $"({tip.X:F2}, {tip.Y:F2})";
+                // Speed between this and the previous painted sample, by the device clock (uint wrap-safe); only for a gap that is a stream interval.
+                if (lastTip is { } prev && unchecked(sample.Milliseconds - prev.Ms) is var dt and > 0 and <= 2000) v[7] = $"{Math.Sqrt((tip.X - prev.X) * (tip.X - prev.X) + (tip.Y - prev.Y) * (tip.Y - prev.Y)) * 1000.0 / dt:F1}";
+                lastTip = (tip.X, tip.Y, sample.Milliseconds);
+            } catch (ArgumentException) { lastTip = null; /* invalid link lengths: leave the estimate blank */ }
         }
+        if (sample is not { Referenced: true }) lastTip = null;
         if (sample is not null) v[8] = sample.Drops.ToString();
         for (int i = 0; i < v.Length; i++) jointValues[i].Text = v[i];
         for (int bit = 0; bit < 4; bit++) leds[2 + bit].Fill = sample is null ? WorkbenchTheme.Idle : (sample.Inputs >> bit & 1) == 0 ? WorkbenchTheme.Ok : WorkbenchTheme.Red;

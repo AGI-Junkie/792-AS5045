@@ -96,7 +96,6 @@ public sealed partial class ControlWindow : Window
     private PtpState? ptp;
     private DateTime lastPtpAt, pointRequestedAt;
     private bool stage2, homed, feedbackReady, hardwareReady, supportsManualReference, manualReferencePending;
-    private bool manualPolarityReady;
     private bool arm2FeedbackEnabled = true;
     private uint pointSequence, pendingPoint;
     private uint lastMoveSequence;   // the last point move or RUN in this reference epoch; 0 while disabled (see AtStart)
@@ -214,7 +213,7 @@ public sealed partial class ControlWindow : Window
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Referenced: true, Epoch: > 0 } &&
         (DateTime.UtcNow - lastPtpAt).TotalSeconds < 2 && (!supportsTelemetry ||
         telemetry is { Referenced: true, Inputs: 0 } && telemetry.Epoch == ptp.Epoch && (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2);
-    private bool CanManualReference => LimitsReady && supportsManualReference && manualPolarityReady && compatible && enabled && hardwareReady && !homing && !stopPending && !PointBusy && uploaded is null &&
+    private bool CanManualReference => LimitsReady && supportsManualReference && compatible && enabled && hardwareReady && !homing && !stopPending && !PointBusy && (uploaded is null || uploadedRan) &&   // firmware refuses only a plan still waiting for RUN (TRAJ_READY), not a finished one (TRAJ_DONE)
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Epoch: > 0 } &&
         (DateTime.UtcNow - lastPtpAt).TotalSeconds < 2;
     private bool CanJog => LimitsReady && compatible && enabled && !homing && !stopPending && !PointBusy && IsActive && (DateTime.UtcNow - lastStateAt).TotalSeconds < 2;
@@ -377,7 +376,6 @@ public sealed partial class ControlWindow : Window
                 (!arm2FeedbackEnabled || !match.Groups[8].Success || match.Groups[8].Value == "1");
             feedbackReady = hardwareReady && match.Groups[7].Value == "1" &&
                 (!arm2FeedbackEnabled || !match.Groups[8].Success || match.Groups[9].Value == "1");
-            manualPolarityReady = !arm2FeedbackEnabled || !match.Groups[8].Success || match.Groups[9].Value == "1";
             bool wasEnabled = enabled;
             enabled = match.Groups[1].Value == "1"; homing = match.Groups[2].Value != "0";
             if ((pendingControl == "使能" && enabled) || (pendingControl == "回零" && homing)) pendingControl = null;
@@ -1037,6 +1035,7 @@ public sealed partial class ControlWindow : Window
         Check(!window.executing && window.uploaded == execution && window.uploadedRan); // the device keeps a finished plan
         window.TestLine($"PTP_STATE lock=0 ref=1 active=0 epoch=8 seq={window.trajectoryRunSequence} min1=-6000 max1=6000 min2=-9000 max2=9000 emin=-15500 emax=15500");
         StartSample(8,window.trajectoryRunSequence);
+        Check(window.CanManualReference && window.manualReference.IsEnabled); // a finished plan (device TRAJ_DONE) does not block the manual zero; only one still waiting for RUN does
         window.RequestExecute(); Check(window.uploading is not null && window.uploaded is null && window.pointWire.Count == 36); // repeat: RUN only, no upload
         window.TestLine($"TRAJ_STATE state=3 count={execution.Nodes.Length} total={execution.Nodes.Length} index=1 seq={window.pendingPoint} epoch=8");
         window.TestLine($"TRAJ_STATE state=4 count={execution.Nodes.Length} total={execution.Nodes.Length} index={execution.Nodes.Length} seq={window.trajectoryRunSequence} epoch=8");

@@ -60,7 +60,8 @@ public sealed partial class XYPreviewPanel : UserControl
         updating=true;
         try { shape.SelectedIndex=p.Shape; branch.SelectedIndex=p.Branch; direction.SelectedIndex=p.Direction;
             // A field the file does not have keeps its default: the elbow range, c and the custom contour empty, rotation 0, scale 1.
-            for(int i=0;i<ParameterFields.Length;i++) ParameterFields[i].Text=i<p.Fields.Length?p.Fields[i]:ParameterFields[i]==rotation?"0":ParameterFields[i]==scale?"1":""; }
+            for(int i=0;i<ParameterFields.Length;i++) ParameterFields[i].Text=i<p.Fields.Length?p.Fields[i]:ParameterFields[i]==rotation?"0":ParameterFields[i]==scale?"1":"";
+            ClampRateFields(); }
         finally { updating=false; ShapeFields(); Refresh(); NotifyLimitsChanged(); }
     }
     private static string ParametersPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "parameters.json");
@@ -353,6 +354,7 @@ public sealed partial class XYPreviewPanel : UserControl
         moveState.FontSize = 12;
         foreach(var control in new Control[] { l1,l2,x,y,a,b,c,rotation,scale,custom,direction,min1,max1,min2,max2,elbowMin,elbowMax,v1,v2,acc1,acc2,shape,branch,play,rewind,cursor }) editControls.Add(control);
         foreach (var field in new[] { l1, l2, x, y, a, b, c, rotation, scale, custom, min1, max1, min2, max2, elbowMin, elbowMax, v1, v2, acc1, acc2 }) field.TextChanged += (_, _) => ParametersChanged();
+        foreach (var field in new[] { v1, v2, acc1, acc2 }) field.LostFocus += (_, _) => ClampRateFields();
         direction.SelectionChanged += (_, _) => ParametersChanged();
         foreach (var help in rangeHelp) editControls.Add(help);
         branch.SelectionChanged += (_, _) => ParametersChanged();

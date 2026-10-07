@@ -78,7 +78,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r2500-slip-trajh"
+#define FW_BUILD_ID                 "stage2-v11-r2500-slip-mref2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -177,6 +177,10 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
 /* Confirmed by physical homing logs on 2026-09-24: encoder increases at DIR=1.
  * Manual referencing uses this bench calibration, with no automatic probe motion. */
 #define MANUAL_ENC_INC_DIR           (1u)
+/* arm2 counterpart, used by a manual reference only while homing has not learned arm2's polarity (power-up).
+ * Bench evidence is one homing log (2026-10-07: "increase DIR=1", same as arm1).  A wrong value cannot move the arm
+ * silently: the first move ends in an encoder following-error stop, and a homing run learns the real polarity. */
+#define MANUAL_ENC2_INC_DIR          (1u)
 
 /* ------------------------------ mechanics ------------------------------- */
 #define GEAR_RATIO                  (40)     /* 42 motor + 40:1 gearbox      */
@@ -1873,11 +1877,11 @@ static void ptp_accept(void)
         if(q1!=0 || q2!=0 || rate!=0u || g_traj.state==TRAJ_UPLOADING || g_traj.state==TRAJ_READY) {
             JLOG("PTP refused: manual reference payload/busy\r\n"); return;
         }
-        if(ARM2_ENCODER_FEEDBACK && !g_enc2.directionKnown) { JLOG("MANUAL REF refused: home first to learn arm2 encoder polarity\r\n"); return; }
         if(!enc_sample()) { stage_stop("manual reference encoder invalid",0u); return; }
         jog_stop_now(&g_arm1); jog_stop_now(&g_arm2);
         ptp_invalidate(); /* discard old targets and increment reference epoch */
         g_encIncDir=MANUAL_ENC_INC_DIR; g_directionKnown=1u;
+        if(ARM2_ENCODER_FEEDBACK && !g_enc2.directionKnown) { g_enc2.incDir=MANUAL_ENC2_INC_DIR; g_enc2.directionKnown=1u; JLOG("MANUAL REF: arm2 encoder polarity from bench calibration (not learned by homing)\r\n"); }
         cmd_reset_to_measured(); cmd_reset_axis(&g_enc2); g_arm1SoftCenter=g_enc.pos; g_enc2.softCenter=g_enc2.pos;
         g_ptp.origin[0]=g_arm1.usteps; g_ptp.origin[1]=g_arm2.usteps;
         g_ptp.encoderOrigin=g_enc.pos; g_enc.origin=g_enc.pos; g_enc2.origin=g_enc2.pos; g_ptp.referenceSource=2u;

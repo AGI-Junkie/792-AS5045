@@ -1142,10 +1142,8 @@ static void manual_test(const char *t) {
     if(!strcmp(t,"manual_stop")) {
         jog_handle_byte(JOG_CMD_STOP);assert_stopped();assert(!g_ptp.reference);
         sim_keys(0);stage_enable();traj_send(5,2,0,0,0);
-        assert(g_ptp.reference==!ARM2_ENCODER_FEEDBACK && !g_enc2.directionKnown && p1==simPulse1 && p2==simPulse2);
-        /* A fresh enable invalidates polarity: model a new successful calibration. */
-        g_enc2.directionKnown=1u;g_enc2.incDir=1u;traj_send(5,2,0,0,0);
-        assert(g_ptp.reference&&!g_ptp.active&&p1==simPulse1&&p2==simPulse2);return;
+        /* A fresh enable invalidates polarity: the manual reference still works and takes the bench polarity for arm2. */
+        assert(g_ptp.reference && g_enc2.directionKnown==(ARM2_ENCODER_FEEDBACK?1u:0u) && !g_ptp.active && p1==simPulse1 && p2==simPulse2);return;
     }
     ptp_send(2,g_ptp.epoch,20,30,200,0);assert(g_ptp.active);
     for(i=0;i<5000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
@@ -1537,8 +1535,9 @@ int main(int argc,char **argv) {
         } else if(!strcmp(t,"dual_manual_unknown")) {
             packetType = 5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;txq_flush_blocking();
             assert(!simPulse1 && !simPulse2);
-            if(ARM2_ENCODER_FEEDBACK) assert(!g_ptp.reference && strstr(simLog,"home first to learn arm2"));
-            else assert(g_ptp.reference && strstr(simLog,"MANUAL REF OK"));
+            /* power-up, arm2 polarity not learned: the manual reference is accepted with the bench polarity (no pulses) */
+            assert(g_ptp.reference && strstr(simLog,"MANUAL REF OK"));
+            assert(g_enc2.directionKnown==(ARM2_ENCODER_FEEDBACK?1u:0u) && (!ARM2_ENCODER_FEEDBACK || (g_enc2.incDir==MANUAL_ENC2_INC_DIR && strstr(simLog,"bench calibration"))));
         } else if(!strcmp(t,"dual_ptp_follow")) {
             g_enc.directionKnown=g_enc2.directionKnown=1u;g_enc.incDir=g_enc2.incDir=1u;
             g_homed1=g_homed2=g_ptp.reference=1u;g_ptp.active=1u;

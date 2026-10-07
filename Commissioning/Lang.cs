@@ -229,8 +229,10 @@ internal static class Lang
         ["joint.q2err"] = ("q2 姿态误差 / °", "q2 pose error / °"),
         ["exp.rmse2"] = ("；arm2 跟随 RMSE {0:F3}°", "; arm2 follow RMSE {0:F3}°"),
         ["joint.q2cmd"] = ("q2 命令", "q2 cmd"),
-        ["joint.x"] = ("末端 X（估算）", "Tip X (est)"),
-        ["joint.y"] = ("末端 Y（估算）", "Tip Y (est)"),
+        ["joint.tip"] = ("末端 (x, y)", "Tip (x, y)"),
+        ["joint.tipSpeed"] = ("末端速度", "Tip speed"),
+        ["joint.tip.tip"] = ("由编码器角度和杆长算出的末端位置，是模型估算，不是实测。", "Tip position from the encoder angles and link lengths: a model estimate, not measured."),
+        ["joint.tipSpeed.tip"] = ("相邻两次反馈之间末端位置的变化除以设备时间，是估算值；没有连续反馈时显示 —。", "Tip position change between consecutive feedback samples divided by device time: an estimate; — without consecutive samples."),
         ["joint.drops"] = ("累计丢包", "Drops"),
         ["led.enable"] = ("使能", "Enable"),
         ["led.ref"] = ("坐标参考", "Ref"),
@@ -515,8 +517,8 @@ internal static class Lang
         ["live.none"] = ("—", "—"),
 
         // notes
-        ["note.jogManual"] = ("arm2 反馈启用时先回零识别方向；未启用时可直接人工摆直确认。",
-            "With arm2 feedback enabled, home first to learn its polarity; otherwise confirm straight directly."),
+        ["note.jogManual"] = ("上电使能后可直接人工摆直确认；arm2 编码器方向先取台架标定值，回零后改用实测值。",
+            "After power-up and enable, straighten by hand and confirm directly; arm2 encoder polarity uses the bench value until homing measures it."),
         ["note.jogStop"] = ("点动松开或切换窗口即停；回零和轨迹可在后台继续。",
             "Jog stops on release or when the window loses focus; homing and trajectories may continue."),
         ["note.splitter"] = ("拖动调整栏宽", "Drag to resize columns"),

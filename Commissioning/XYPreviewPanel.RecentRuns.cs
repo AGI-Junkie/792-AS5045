@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.Json;
@@ -17,6 +18,7 @@ public sealed partial class XYPreviewPanel
     // the branch and the four motion rates, and checks them; nothing moves. It never touches the link lengths or the
     // joint/elbow ranges: those describe the machine, not the drawing, and changing them needs a STOP.
     private static readonly string[] PresetKeys = ["shape", "branch", "x", "y", "a", "b", "c", "rotation", "scale", "direction", "v1", "v2", "a1", "a2"];
+    private static readonly string[] FigureKeys = ["shape", "branch", "x", "y", "a", "b", "c", "rotation", "scale", "direction"];
     private const int RecentCount = 8;
     internal static string? RunsRootOverride, FavoritesPathOverride;   // tests keep the real archive and file untouched
     private static string RunsRoot => RunsRootOverride ?? ControlWindow.ExperimentRoot;
@@ -47,6 +49,7 @@ public sealed partial class XYPreviewPanel
                 }
             }
             if (shownShape >= 0) shapeDims[shownShape] = [a.Text, b.Text, c.Text];
+            ClampRateFields();
         }
         finally { updating = false; ShapeFields(); Refresh(); NotifyLimitsChanged(); }
     }
@@ -94,7 +97,12 @@ public sealed partial class XYPreviewPanel
     private void ShowRecentRuns()
     {
         recentList.Children.Clear(); recentRows.Clear();
-        foreach (var run in recentRuns.Where(r => favorites.Contains(r.Id)).Concat(recentRuns.Where(r => !favorites.Contains(r.Id)).Take(RecentCount)))
+        // The same figure run again (same shape, sizes, transform, branch and direction) is one row: the newest run of it.
+        // Speeds are left out of the identity, a slower repeat is still the same figure. Runs that cannot be loaded stay apart.
+        var seen = new HashSet<string>();
+        bool NewFigure(ExperimentRun r) => RunValues(r.SettingsText) is not { } v || seen.Add(string.Join("|", FigureKeys.Select(k => v.GetValueOrDefault(k))));
+        var starredRuns = recentRuns.Where(r => favorites.Contains(r.Id)).Where(NewFigure).ToList();
+        foreach (var run in starredRuns.Concat(recentRuns.Where(r => !favorites.Contains(r.Id)).Where(NewFigure).Take(RecentCount)))
         {
             var values = RunValues(run.SettingsText);
             bool starred = favorites.Contains(run.Id);
@@ -135,6 +143,17 @@ public sealed partial class XYPreviewPanel
     }
 
     private void RefreshRecentLanguage() { ShowRecentRuns(); Lang.RefreshText(recentNote); }
+
+    // The motor speed/accel boxes show what will really be used: a value above the per-axis cap (2500 µsteps/s etc.) is written back as the cap,
+    // the same number the slider tops out at. Called when a box loses focus and when values are loaded; typing is never rewritten mid-edit.
+    private void ClampRateFields()
+    {
+        foreach (var (field, cap) in new[] { (v1, RateCap(0)), (v2, RateCap(1)), (acc1, AccelCap(0)), (acc2, AccelCap(1)) })
+        {
+            double top = Math.Floor(cap * 10) / 10;
+            if (double.TryParse(field.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double value) && value > top) field.Text = Mm(top);
+        }
+    }
 
     // The two values the calibration wizard may offer back to the planner, only when its apply buttons are clicked.
     internal void SetLinkLengths(double length1, double length2)
@@ -253,6 +272,15 @@ public sealed partial class XYPreviewPanel
             File.WriteAllText(FavoritesPathOverride, "not json");
             var broken = new XYPreviewPanel(); broken.RefreshRecentRuns();
             if (broken.recentRows.Count != 2 || broken.recentRows.Any(r => (string)r.Star.Content == "★")) Fail("损坏的收藏文件应被忽略");
+            // The same figure run again (only the speed differs) stays one row, showing the newest run; a different figure is a new row.
+            Thread.Sleep(15);
+            ExperimentArchiveTests.WriteSyntheticRun(RunsRootOverride, DrawingShape.Rectangle, 8200, settings.Replace("v1=6.5", "v1=3"), out _);
+            broken.RefreshRecentRuns();
+            if (broken.recentRows.Count != 2 || !((TextBlock)broken.recentRows[0].Load.Content).Text.Contains("v3/3")) Fail("同一个图形重复运行应只占一行并显示最新一次");
+            Thread.Sleep(15);
+            ExperimentArchiveTests.WriteSyntheticRun(RunsRootOverride, DrawingShape.Rectangle, 8200, settings.Replace("a=10", "a=12"), out _);
+            broken.RefreshRecentRuns();
+            if (broken.recentRows.Count != 3) Fail("尺寸不同就是另一个图形，应新增一行");
 
             // The calibration wizard may put measured link lengths and an elbow range into the boxes: the preview is re-planned from them, nothing moves.
             var before = panel.execution ?? throw new InvalidOperationException("填杆长前应有已检查的图形");
@@ -261,6 +289,11 @@ public sealed partial class XYPreviewPanel
             // would no longer match one already uploaded.
             if (panel.Model.L1 != 181.5 || panel.Model.L2 != 175.25 || panel.RequestedLimits is not { ElbowMin: -147, ElbowMax: 155 } || panel.execution is not { } after || after == before || after.Nodes[0].Pose == before.Nodes[0].Pose) Fail("向导填入的杆长/肘范围应进入规划参数，并按新数值重新规划");
             if (requests != 0) Fail("向导填入参数不得请求任何运动");
+
+            // The speed boxes show the capped value once edited: 99 °/s becomes the slider's top, a value under the cap is left alone.
+            var capped = new XYPreviewPanel();
+            capped.v1.Text = "99"; capped.v2.Text = "5"; capped.acc1.Text = "999"; capped.v1.RaiseEvent(new RoutedEventArgs(UIElement.LostFocusEvent));
+            if (capped.v1.Text != Mm(Math.Floor(RateCap(0) * 10) / 10) || capped.v2.Text != "5" || capped.acc1.Text != Mm(Math.Floor(AccelCap(0) * 10) / 10)) Fail("超过上限的电机速度/加速度应在失焦后改回上限：" + capped.v1.Text + " / " + capped.v2.Text + " / " + capped.acc1.Text);
 
             // The lamps. Nothing saved yet: unsaved. After a save the group is saved; editing one group only un-saves that group.
             var p = new XYPreviewPanel();
