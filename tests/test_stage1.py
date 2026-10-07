@@ -12,7 +12,8 @@ root = Path(__file__).resolve().parents[1]
 host_plan = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.startswith('--host-plan=')), None)
 host_control = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.startswith('--host-control=')), None)
 emit_c = next((Path(a.split('=', 1)[1]).resolve() for a in sys.argv if a.startswith('--emit-c=')), None)
-sys.argv = [a for a in sys.argv if not a.startswith(('--host-plan=', '--host-control=', '--emit-c='))]
+sim_mhz = int(next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--sim-mhz=')), '24'))
+sys.argv = [a for a in sys.argv if not a.startswith(('--host-plan=', '--host-control=', '--emit-c=', '--sim-mhz='))]
 source = (root / 'DRV8825.cydsn/main.c').read_text(encoding='utf-8')
 # main.c includes traj.h; the simulation compiles one file, so put the header's text where the include is.
 source = source.replace('#include "traj.h"', (root / 'DRV8825.cydsn/traj.h').read_text(encoding='utf-8'), 1)
@@ -40,7 +41,10 @@ mock = r'''
 typedef uint8_t uint8; typedef uint16_t uint16; typedef uint32_t uint32;
 typedef int8_t int8; typedef int16_t int16; typedef int32_t int32; typedef int64_t int64;
 #define __attribute__(x)
-#define BCLK__BUS_CLK__HZ 24000000u
+#ifndef SIM_MHZ
+#define SIM_MHZ 24u
+#endif
+#define BCLK__BUS_CLK__HZ (SIM_MHZ*1000000u)
 #define CYREG_NVIC_SYSTICK_CURRENT 100
 #define CYREG_NVIC_SYSTICK_RELOAD 101
 #define CYREG_NVIC_SYSTICK_CTL 102
@@ -75,7 +79,7 @@ static int simPins[128], simStep1, simStep2, simBadEncoder, simBadReads;
 static int simFault, simLimit, simHome1Mode, simHome2Mode, simStall, simPolarity=1, simStiction;
 static int simHome1At=400, simHome2At=120;
 static int simRateLimited; static uint32 simLastMotorPulse;
-static int simRxActive; static uint32 simRxBase, simRxOffset;
+static int simRxActive; static uint64_t simRxBase, simRxOffset;
 static uint8 simPtpWire[36], simPtpWireN;
 static uint8 simPtpReceived[256];static unsigned simPtpReceivedN;
 static int simAngleOverride=-1;
@@ -92,10 +96,10 @@ static char simLog[1048576]; static unsigned simLogN;
 static unsigned simFormatCostUs;
 static int mock_snprintf(char *dst,size_t size,const char *fmt,...) {
     int n; va_list ap; va_start(ap,fmt);n=vsnprintf(dst,size,fmt,ap);va_end(ap);
-    simClock+=(uint64_t)simFormatCostUs*24u;sim_tick_sync();return n;
+    simClock+=(uint64_t)simFormatCostUs*SIM_MHZ;sim_tick_sync();return n;
 }
 #define snprintf mock_snprintf
-static unsigned simRegCost=24;
+static unsigned simRegCost=SIM_MHZ;
 static uint32 mock_reg(uint32 reg) {
     simClock+=simRegCost;sim_tick_sync();
     if(reg==CYREG_NVIC_INTR_CTRL_STATE)return simTickPending?0x04000000u:0;
@@ -126,7 +130,7 @@ static void sim_uart_push(uint8 b) {
 static void sim_uart_fill(void) {
     uint32 us;
     if(!simRxActive)return;
-    us=(simClock-simRxBase+simRxOffset)/24u;
+    us=(simClock-simRxBase+simRxOffset)/SIM_MHZ;
     while(simUartPacketIndex<simPtpWireN && us>=5000u+(simUartChunk?
         (simUartPacketIndex/simUartChunk)*40000u+(simUartPacketIndex%simUartChunk)*87u:simUartPacketIndex*87u))
         sim_uart_push(simPtpWire[simUartPacketIndex++]);
@@ -146,7 +150,7 @@ static void HostUart_ClearRxBuffer(void){simUartHead=simUartTail=simUartCount=0;
 static unsigned HostUart_GetTxBufferSize(void){return (simUartTxFull || simClock<simUartTxBusyUntil)?255:0;}
 static void HostUart_PutChar(uint8 b){
     assert(!simUartTxFull);
-    while(simClock<simUartTxBusyUntil){simClock+=24u;sim_tick_sync();}
+    while(simClock<simUartTxBusyUntil){simClock+=SIM_MHZ;sim_tick_sync();}
     mock_log(b);
 }
 static uint32 mock_frame(void) {
@@ -179,24 +183,24 @@ static void mock_set(int pin,int value) {
     if(pin==CYREG_PRT12_PC1 && value!=simPins[pin]) {
         if(!value){
             uint32 bits, parity=0;
-            simSsiFrame=mock_frame();simSsiBits=0;simRegCost=6;
+            simSsiFrame=mock_frame();simSsiBits=0;simRegCost=SIM_MHZ/4u;
             simSsiFrame2=(((uint32)(1000+(int64)simStep2*simPolarity2*256/100+simEncoderBias2)&4095u)<<6)|0x26u;
             for(bits=simSsiFrame2;bits;bits>>=1)parity^=bits&1;
             simSsiFrame2=simBadEncoder2?0:simSsiFrame2|parity;
-        } else simRegCost=24;
+        } else simRegCost=SIM_MHZ;
     }
     if(pin==CYREG_PRT12_PC0 && value && !simPins[pin] && !simPins[CYREG_PRT12_PC1])simSsiBits++;
     if(value!=simPins[pin] && (pin==CYREG_PRT1_PC7 || pin==CYREG_PRT12_PC2 || pin==CYREG_PRT1_PC2 ||
         pin==CYREG_PRT2_PC7 || pin==CYREG_PRT2_PC2 || pin==CYREG_PRT2_PC3))simDriverSwitches++;
     if(value && !simPins[pin]) {
         if(pin==CYREG_PRT12_PC3 && !simPins[CYREG_PRT1_PC7] && simPins[CYREG_PRT12_PC2] && simPins[CYREG_PRT1_PC2]) {
-            int tracks=!simRateLimited || simClock-simLastMotorPulse>=24u*1250u;
+            int tracks=!simRateLimited || simClock-simLastMotorPulse>=SIM_MHZ*1250u;
             simLastMotorPulse=simClock; /* fixture motor tracks at most the configured 800 ustep/s jog rate */
-            simPulse1++; simTrace=(simTrace^(uint32)(simClock-simTraceBase))*16777619u; simTrace=(simTrace^(simPins[CYREG_PRT12_PC4]?1u:2u))*16777619u;
+            simPulse1++; simTrace=(simTrace^(uint32)((simClock-simTraceBase)*24u/SIM_MHZ))*16777619u; simTrace=(simTrace^(simPins[CYREG_PRT12_PC4]?1u:2u))*16777619u;
             if(tracks && !simStall && !(simStiction && simPulse1<=24)) simStep1+=simPins[CYREG_PRT12_PC4]?1:-1;
         }
         if(pin==CYREG_PRT2_PC1 && !simPins[CYREG_PRT2_PC7] && simPins[CYREG_PRT2_PC2] && simPins[CYREG_PRT2_PC3]) {
-            simPulse2++; simTrace=(simTrace^(uint32)(simClock-simTraceBase))*16777619u; simTrace=(simTrace^(simPins[CYREG_PRT2_PC0]?3u:4u))*16777619u;
+            simPulse2++; simTrace=(simTrace^(uint32)((simClock-simTraceBase)*24u/SIM_MHZ))*16777619u; simTrace=(simTrace^(simPins[CYREG_PRT2_PC0]?3u:4u))*16777619u;
             if(!simStall2)simStep2+=simPins[CYREG_PRT2_PC0]?1:-1;
         }
     }
@@ -210,7 +214,7 @@ static void mock_set(int pin,int value) {
 #define CyPins_ClearPin(p) mock_set((p),0)
 #define CyEnterCriticalSection() mock_critical_enter()
 #define CyExitCriticalSection(x) mock_critical_exit(x)
-static void CyDelay(uint32 ms) { simClock+=ms*24000u; }
+static void CyDelay(uint32 ms) { simClock+=ms*(SIM_MHZ*1000u); }
 '''
 
 harness = r'''
@@ -252,10 +256,10 @@ static void cycle(int heartbeat) {
          * but service at 100 us resolution for the newly uncapped host plans. */
         unsigned sub;
         for(sub=0;sub<10;sub++) {
-            simClock+=2400u;jog_update_time();
+            simClock+=SIM_MHZ*100u;jog_update_time();
             if(!jog_safety_blocked() && g_ptp.active)ptp_service();
         }
-    } else simClock+=24000u;
+    } else simClock+=(SIM_MHZ*1000u);
     jog_update_time();
     if(heartbeat && (g_jogMs-g_lastKeyMs>=40u)) sim_keys(0);
     if(g_arm1.hasEnc)service_encoder();
@@ -270,7 +274,7 @@ static void sim_run(int init) {
     if(init)app_init(1);
     app_start();
     if(!init)simRxBase=simClock;
-    while(simClock-simRxBase<24000000u*2u)app_poll();
+    while(simClock-simRxBase<(SIM_MHZ*1000000u)*2u)app_poll();
 }
 static void run_until(home_phase_t phase, int arm) {
     unsigned i;
@@ -725,7 +729,7 @@ static void ptp_test(const char *t) {
         if(!strcmp(t,"ptp_uart_paced"))simUartChunk=8;
         int logged=!strncmp(t,"ptp_uart_logged_",16);
         ptp_send(1,epoch,logged?-2195:125,logged?4437:-250,200,4);
-        simRxActive=1;simRxOffset=(uint32)atoi(t+(logged?16:9))*24u;
+        simRxActive=1;simRxOffset=(uint32)atoi(t+(logged?16:9))*SIM_MHZ;
         simLogN=0;simLog[0]=0;
         sim_run(0);
         if(!g_ptp.active||g_ptp.sequence!=1){fprintf(stderr,"%s\nRX:",simLog);for(i=0;i<simPtpReceivedN;i++)fprintf(stderr,"%02X ",simPtpReceived[i]);}
@@ -917,7 +921,19 @@ static void host_rates_config(void) {
 #define SCHED_B2 3178u
 #define SCHED_C1 2844u
 #define SCHED_C2 0u
-#if ARM2_ENCODER_FEEDBACK /* the second encoder frame lengthens the foreground pass, which moves where each pulse lands */
+/* The trace is taken in 24 MHz-equivalent cycles, so a different bus clock reproduces the pulse counts and the axis order
+ * exactly but lands some pulses one foreground pass later: each clock has its own recorded hashes (48 MHz: 10-08). */
+#if SIM_MHZ == 48
+#if ARM2_ENCODER_FEEDBACK
+#define SCHED_AH 0xbdc7f313u
+#define SCHED_BH 0x50f57facu
+#define SCHED_CH 0x1b50e5abu
+#else
+#define SCHED_AH 0xd407c905u
+#define SCHED_BH 0xe469fbb6u
+#define SCHED_CH 0x77bd772bu
+#endif
+#elif ARM2_ENCODER_FEEDBACK /* the second encoder frame lengthens the foreground pass, which moves where each pulse lands */
 #define SCHED_AH 0x4e7b6b67u
 #define SCHED_BH 0xae4b8b3cu
 #define SCHED_CH 0x1b50e5abu
@@ -1048,7 +1064,7 @@ static void traj_test(const char *t) {
     if(!strcmp(t,"traj_uart_upload") || !strcmp(t,"traj_uart_upload_paced")) {
         if(!strcmp(t,"traj_uart_upload_paced"))simUartChunk=8;
         packetType=3;ptp_send(2,g_ptp.epoch,10,-10,250,4);packetType=1;
-        simRxActive=1;simRxOffset=137u*24u;sim_run(0);
+        simRxActive=1;simRxOffset=137u*SIM_MHZ;sim_run(0);
         assert(g_motionEnabled&&g_traj.count==2&&!g_ptp.active&&p1==simPulse1&&p2==simPulse2);return;
     }
     if(!strcmp(t,"traj_partial") || !strcmp(t,"traj_order") || !strcmp(t,"traj_range") ||
@@ -1080,8 +1096,8 @@ static void traj_test(const char *t) {
     if(!strcmp(t,"traj_uart_run") || !strcmp(t,"traj_uart_run_paced")) {
         if(!strcmp(t,"traj_uart_run_paced"))simUartChunk=8;
         packetType=4;ptp_send(++seq,g_ptp.epoch,0,0,0,4);packetType=1;
-        simRxActive=1;simRxOffset=499u*24u;sim_run(0);
-        if(!g_motionEnabled||g_traj.state!=4)fprintf(stderr,"%s\n",simLog);
+        simRxActive=1;simRxOffset=499u*SIM_MHZ;sim_run(0);
+        if(!g_motionEnabled||g_traj.state!=4)fprintf(stderr,"DBG en=%d st=%d act=%d idx=%u/%u stop=%s pulses=%u/%u wall=%lu pi=%u/%u cnt=%u off=%lu act=%d rxbase=%llu clk=%llu\n%s\n",g_motionEnabled,g_traj.state,g_ptp.active,(unsigned)g_traj.index,(unsigned)g_traj.count,g_lastStop,simPulse1-p1,simPulse2-p2,(unsigned long)wall_ms(),simUartPacketIndex,simPtpWireN,simUartCount,(unsigned long)simRxOffset,simRxActive,(unsigned long long)simRxBase,(unsigned long long)simClock,simLog);
         assert(g_motionEnabled&&!g_ptp.active&&g_traj.state==4&&g_arm1.usteps==origin1&&g_arm2.usteps==origin2);
         assert(simPulse1-p1==72&&simPulse2-p2==90);return;
     }
@@ -1089,7 +1105,7 @@ static void traj_test(const char *t) {
     assert(g_traj.state==3&&g_ptp.active==1);
     if(!strcmp(t,"traj_rx_motion")){HostUart_errorStatus=HostUart_RX_STS_STOP_ERROR;jog_rx_service();assert_stopped();return;}
     if(!strcmp(t,"traj_duplicate")) {traj_send(4,seq,0,0,0);assert(g_traj.index==1);}
-    if(!strcmp(t,"traj_overrun"))simClock+=24u*300000u;
+    if(!strcmp(t,"traj_overrun"))simClock+=SIM_MHZ*300000u;
     for(i=0;i<100;i++)cycle(1);
     if(!strcmp(t,"traj_stop"))jog_handle_byte(JOG_CMD_STOP);
     if(!strcmp(t,"traj_fault"))simFault=1;
@@ -1306,10 +1322,10 @@ int main(int argc,char **argv) {
         g_ptp.active=1u;{int32 pos[2];pos[0]=g_arm1.usteps;pos[1]=g_arm2.usteps;g_traj.elapsedCy=0;g_traj.clock=g_traj.lastStep=SU_NOW();traj_segment(&g_traj,&g_ptp.seg,g_ptp.origin,pos);}
         assert(g_ptp.seg.total==785u); CyILO_Start1K();CyWdtStart(CYWDT_128_TICKS,CYWDT_LPMODE_NOCHANGE);start=simClock;
         simFormatCostUs=2500u; /* 12 format calls in one burst cost about the observed 30 ms loop gap. */
-        while(g_motionEnabled && g_traj.index<g_traj.count && simClock-start<600000u*24u) {
-            if(!requested && simClock-start>=389000u*24u){requested=1;stage_status();} /* 8 ms before the planned end, as before */
+        while(g_motionEnabled && g_traj.index<g_traj.count && simClock-start<600000u*SIM_MHZ) {
+            if(!requested && simClock-start>=389000u*SIM_MHZ){requested=1;stage_status();} /* 8 ms before the planned end, as before */
             if(g_jogMs-g_lastKeyMs>=35u)short_send(0,0);
-            app_poll();simClock+=24u;
+            app_poll();simClock+=SIM_MHZ;
         }
         if(!g_motionEnabled)fprintf(stderr,"status stress stop: %s\n",g_lastStop);
         assert(requested && g_motionEnabled && g_traj.index==g_traj.count);
@@ -1347,7 +1363,7 @@ int main(int argc,char **argv) {
     if(!strcmp(t,"hot_arith")) {
         /* The 32-bit fast paths must equal the original 64-bit arithmetic, inside and outside their bounds. */
         const uint32 totals[]={1u,2u,3u,785u,2000u,65535u,65536u,70000u};
-        const uint32 durations[]={24000u*50u,24000u*248u,24000u*249u+7u,24000u*500u};
+        const uint32 durations[]={(SIM_MHZ*1000u)*50u,(SIM_MHZ*1000u)*248u,(SIM_MHZ*1000u)*249u+7u,(SIM_MHZ*1000u)*500u};
         unsigned a, ti, di; int32 v;
         setup();
         for(a=0;a<2;a++) {
@@ -1440,7 +1456,7 @@ int main(int argc,char **argv) {
         assert(g_motionEnabled && g_home.phase==HOME_IDLE && g_ptp.reference && !g_arm2.hasEnc && !g_enc2.directionKnown);
         { /* arm2 feedback off: the closed loop reads board 1 only (18 clocks) and never touches the arm2 encoder state */
           int32 pos2=g_enc2.pos; uint8 bad2=g_enc2.badStreak, primed2=g_enc2.primed;
-          simSsiBits=0; simClock+=24000u; assert(enc_sample() && simSsiBits==18);
+          simSsiBits=0; simClock+=(SIM_MHZ*1000u); assert(enc_sample() && simSsiBits==18);
           assert(g_enc2.pos==pos2 && g_enc2.badStreak==bad2 && g_enc2.primed==primed2); }
         g_enc.directionKnown=1u; simBadEncoder=1;
         for(i=0;i<ENC_BAD_LIMIT;i++)service_encoder(); assert(!g_motionEnabled);
@@ -1473,18 +1489,18 @@ int main(int argc,char **argv) {
             int32 first=g_enc.pos;
             for(i=0;i<14;i++) {
                 simEncoderBias2+=250;g_enc2.cmdUsteps+=98;g_enc2.cmdLsbX100+=25000;
-                simClock+=24000u;assert(enc_sample());
+                simClock+=(SIM_MHZ*1000u);assert(enc_sample());
             }
             assert(g_enc2.pos==3500 && g_enc.pos==first && g_enc2.lastAngle==404);
-            for(i=0;i<20;i++) {simEncoderBias2-=250;g_enc2.cmdUsteps-=98;g_enc2.cmdLsbX100-=25000;simClock+=24000u;assert(enc_sample());}
+            for(i=0;i<20;i++) {simEncoderBias2-=250;g_enc2.cmdUsteps-=98;g_enc2.cmdLsbX100-=25000;simClock+=(SIM_MHZ*1000u);assert(enc_sample());}
             assert(g_enc2.pos==-1500 && g_enc.pos==first && g_enc2.lastAngle==3596);
         } else if(!strcmp(t,"dual_loss")) {
             simBadEncoder2=1;
-            for(i=0;i<ENC_BAD_LIMIT;i++){simClock+=24000u;service_encoder();}
+            for(i=0;i<ENC_BAD_LIMIT;i++){simClock+=(SIM_MHZ*1000u);service_encoder();}
             assert(!g_motionEnabled && !g_arm2.hasEnc && g_arm1.hasEnc && !g_enc.badStreak && !g_ptp.reference);
             {
                 uint32 epoch=g_ptp.epoch, faults=g_jogFaultCount;
-                for(i=0;i<20;i++){simClock+=24000u;service_encoder();}
+                for(i=0;i<20;i++){simClock+=(SIM_MHZ*1000u);service_encoder();}
                 assert(g_ptp.epoch==epoch && g_jogFaultCount==faults && !g_enc.badStreak);
             }
         } else if(!strcmp(t,"dual_gap")) {
@@ -1492,28 +1508,28 @@ int main(int argc,char **argv) {
             service_encoder();assert(g_enc2.trackingLost && !g_enc.trackingLost && !g_motionEnabled);
         } else if(!strcmp(t,"dual_parity")) {
             simSsiSecondFrame=(int)(simSsiFrame2^1u);
-            for(i=0;i<ENC_BAD_LIMIT;i++){simClock+=24000u;service_encoder();}
+            for(i=0;i<ENC_BAD_LIMIT;i++){simClock+=(SIM_MHZ*1000u);service_encoder();}
             assert(!g_motionEnabled && g_enc2.badStreak>=ENC_BAD_LIMIT && !g_enc.badStreak);
         } else if(!strcmp(t,"dual_hold")) {
             g_enc2.incDir=1u;g_enc2.directionKnown=1u;
             jog_axis_settled(&g_arm2);assert(g_arm2.holding && g_arm2.holdTarget==0);
-            simEncoderBias2=20;simClock+=24000u;assert(enc_sample());
+            simEncoderBias2=20;simClock+=(SIM_MHZ*1000u);assert(enc_sample());
             p1=simPulse1;p2=simPulse2;
             for(i=0;i<150;i++)cycle(1);
             assert(g_motionEnabled && abs_i32(g_enc2.pos)<=CL_DEADBAND_LSB && simPulse2>p2 && simPulse1==p1);
         } else if(!strcmp(t,"dual_derate") || !strcmp(t,"dual_follow_stop")) {
             g_enc2.incDir=1u;g_enc2.directionKnown=1u;g_arm2.moving=1;
-            g_arm2.rate=600;g_arm2.rateCap=600;g_arm2.periodCy=24000000u/600;
+            g_arm2.rate=600;g_arm2.rateCap=600;g_arm2.periodCy=(SIM_MHZ*1000000u)/600;
             simStall2=1;
             for(i=0;i<(!strcmp(t,"dual_derate")?20u:150u);i++)jog_step(&g_arm2,1);
-            simClock+=24000u;service_encoder();
+            simClock+=(SIM_MHZ*1000u);service_encoder();
             if(!strcmp(t,"dual_derate")) {assert(g_motionEnabled && g_arm2.derates==1 && g_arm2.rateCap==300 && !g_arm1.derates);}
             else {assert(!g_motionEnabled && !g_ptp.reference);}
         } else if(!strcmp(t,"dual_peer_bad") || !strcmp(t,"dual_peer_bad_reverse")) {
             jog_axis_t *healthy=!strcmp(t,"dual_peer_bad") ? &g_arm1 : &g_arm2;
             enc_t *e=axis_encoder(healthy);
             e->incDir=e->directionKnown=1u;e->cmdLsbX100=SLIP_FAIL_LSB*100;
-            healthy->moving=1;healthy->rate=600;healthy->periodCy=24000000u/600;
+            healthy->moving=1;healthy->rate=600;healthy->periodCy=(SIM_MHZ*1000000u)/600;
             if(healthy==&g_arm1)simBadEncoder2=1;else simBadEncoder=1;
             service_encoder();txq_flush_blocking();
             assert(!g_motionEnabled && !e->badStreak && strstr(simLog,"jog encoder following error"));
@@ -1552,7 +1568,7 @@ int main(int argc,char **argv) {
     }
     if(!strcmp(t,"boot_tx_backlog")) {
         hw_init();assert(enc_set_origin());
-        simRxActive=1;simRxBase=simClock;simUartTxBusyUntil=simClock+120u*24000u;
+        simRxActive=1;simRxBase=simClock;simUartTxBusyUntil=simClock+120u*(SIM_MHZ*1000u);
         sim_run(1);
         assert(!g_motionEnabled && !simPulse1 && !simPulse2);
         assert(g_arm1.hasEnc && !g_enc.trackingLost && g_encMaxGapMs<10u);
@@ -1695,7 +1711,7 @@ int main(int argc,char **argv) {
                 g_statusNext=8u;g_statusEpoch=g_ptp.epoch; /* previous running block has already published its old epoch */
                 seq=g_controlSequence+1;epoch=g_ptp.epoch;ptp_send(seq,epoch,0,0,0,0);
                 /* Drain the requested sliced block without waiting for the next periodic status. */
-                for(i=0;i<80u && g_statusNext;i++){simClock+=24000u;jog_update_time();stage_status_service();txq_flush_blocking();}
+                for(i=0;i<80u && g_statusNext;i++){simClock+=(SIM_MHZ*1000u);jog_update_time();stage_status_service();txq_flush_blocking();}
                 txq_flush_blocking();
                 assert(g_motionEnabled && g_home.phase!=HOME_IDLE && g_ptp.epoch==epoch+1);
                 assert(JOG_STATUS_MS>JOG_DEADMAN_MS && wall_ms()-requested<JOG_DEADMAN_MS);
@@ -1705,12 +1721,12 @@ int main(int argc,char **argv) {
             } else if(!strcmp(t,"control_replay_deadman")) {
                 packetType=6;seq=g_controlSequence+1;ptp_send(seq,g_ptp.epoch,0,0,0,0);
                 for(i=0;i<260;i++) {
-                    simClock+=24000u;jog_update_time();
+                    simClock+=(SIM_MHZ*1000u);jog_update_time();
                     ptp_send(seq,g_ptp.epoch,0,0,0,0);
                 }
                 assert_stopped();
             } else if(!strcmp(t,"control_raw_deadman")) {
-                for(i=0;i<260;i++){simClock+=24000u;jog_update_time();jog_handle_byte(0x41);}
+                for(i=0;i<260;i++){simClock+=(SIM_MHZ*1000u);jog_update_time();jog_handle_byte(0x41);}
                 assert_stopped();
             } else if(!strcmp(t,"control_stale_epoch_lease")) {
                 /* Field defect: homing bumps the epoch, the host keeps sending the
@@ -1722,7 +1738,7 @@ int main(int argc,char **argv) {
                  * and silently drop the announcement this test is looking for. */
                 txq_flush_blocking();
                 for(i=0;i<300;i++) {
-                    simClock+=24000u;jog_update_time();
+                    simClock+=(SIM_MHZ*1000u);jog_update_time();
                     packetType=6;ptp_send(g_controlSequence+1u,staleEpoch,0,0,0,0);packetType=1;
                     txq_flush_blocking();
                 }
@@ -1749,7 +1765,7 @@ int main(int argc,char **argv) {
                 seq=g_controlSequence+1;epoch=g_ptp.epoch;ptp_send(seq,epoch,0,0,0,0);packetType=1;
                 assert(g_motionEnabled && g_home.phase!=HOME_IDLE && g_ptp.epoch==epoch+1);
                 for(i=0;i<300;i++) {
-                    simClock+=24000u;jog_update_time();
+                    simClock+=(SIM_MHZ*1000u);jog_update_time();
                     packetType=6;ptp_send(g_controlSequence+1u,epoch,0,0,0,0);packetType=1;
                     txq_flush_blocking();
                 }
@@ -1761,7 +1777,7 @@ int main(int argc,char **argv) {
                  * must hold the lease through a long stretch of clock advance. */
                 uint32 before=g_shortRxOk;
                 for(i=0;i<300;i++) {
-                    simClock+=24000u;jog_update_time();
+                    simClock+=(SIM_MHZ*1000u);jog_update_time();
                     short_send(0,0);
                 }
                 txq_flush_blocking();
@@ -1772,7 +1788,7 @@ int main(int argc,char **argv) {
                 /* A corrupt compact heartbeat must not renew the lease. */
                 assert(g_shortRxOk==0u);
                 for(i=0;i<300;i++) {
-                    simClock+=24000u;   /* 1 ms per iteration: 300 ms total */
+                    simClock+=(SIM_MHZ*1000u);   /* 1 ms per iteration: 300 ms total */
                     jog_update_time();
                     short_send(0,1);
                 }
@@ -1796,7 +1812,7 @@ int main(int argc,char **argv) {
     }
     if(!strncmp(t,"encoder_guard_",14)) {
         int32 position=g_enc.pos;uint16 angle=g_enc.lastAngle;
-        if(!strcmp(t,"encoder_guard_gap")) simClock+=101u*24000u;
+        if(!strcmp(t,"encoder_guard_gap")) simClock+=101u*(SIM_MHZ*1000u);
         else if(!strcmp(t,"encoder_guard_jump"))simAngleOverride=(angle+1000u)&4095u;
         else if(!strcmp(t,"encoder_guard_overflow")) {
             g_enc.pos=INT32_MAX;position=g_enc.pos;simAngleOverride=(angle+1u)&4095u;
@@ -1809,21 +1825,21 @@ int main(int argc,char **argv) {
     if(!strncmp(t,"clock_",6)) {
         uint32 before=wall_ms();
         if(!strcmp(t,"clock_wraps")) {
-            simClock+=3u*24000000u;assert(wall_ms()-before==3000u);
+            simClock+=3u*(SIM_MHZ*1000000u);assert(wall_ms()-before==3000u);
             before=wall_ms();simInts=0;
             simClock+=0x1000000u; /* pending wrap must not be lost or counted twice */
-            assert(wall_ms()-before>=699u);simInts=1;sim_tick_sync();
-            assert(wall_ms()-before>=699u && wall_ms()-before<=700u);
+            assert(wall_ms()-before>=SU_WRAP_MS);simInts=1;sim_tick_sync();
+            assert(wall_ms()-before>=SU_WRAP_MS && wall_ms()-before<=SU_WRAP_MS+1u);
         } else if(!strcmp(t,"clock_ms_wrap")) {
-            simClock+=(uint64_t)0xfffffff0u*24000u;before=wall_ms();
-            simClock+=40u*24000u;assert(wall_ms()-before==40u);
+            simClock+=(uint64_t)0xfffffff0u*(SIM_MHZ*1000u);before=wall_ms();
+            simClock+=40u*(SIM_MHZ*1000u);assert(wall_ms()-before==40u);
         } else if(!strcmp(t,"clock_deadman_stall")) {
-            jog_home_all();simClock+=251u*24000u;
+            jog_home_all();simClock+=251u*(SIM_MHZ*1000u);
             jog_update_time();assert(!g_motionEnabled && g_jogMs-g_lastKeyMs>=251u);
             sim_keys(0);assert_stopped();
         } else if(!strcmp(t,"clock_home_timeout")) {
             jog_home_all();home_enter(HOME_RELEASE);g_home.sinceMs=wall_ms();
-            simClock+=(uint64_t)HOME_PHASE_TIMEOUT_MS*24000u;
+            simClock+=(uint64_t)HOME_PHASE_TIMEOUT_MS*(SIM_MHZ*1000u);
             g_jogMs=wall_ms();g_lastKeyMs=g_jogMs;
             home_service();assert_stopped();
         } else if(!strcmp(t,"clock_tx_timeout")) {
@@ -1955,7 +1971,7 @@ int main(int argc,char **argv) {
         run_until(HOME_SETTLE,1);
         while(g_jogMs-g_home.sinceMs<HOME_SETTLE_MS-2u)cycle(1);
         assert(g_home.zeroSamples==0 && !g_homed1);
-        simClock+=(HOME_SETTLE_MS-(g_jogMs-g_home.sinceMs))*24000u;
+        simClock+=(HOME_SETTLE_MS-(g_jogMs-g_home.sinceMs))*(SIM_MHZ*1000u);
         simHome1Mode=1;
         g_enc.lastAngle=negative?1:4094;g_enc.pos=0;cmd_reset_to_measured();
         p1=simPulse1;p2=simPulse2;
@@ -1980,7 +1996,7 @@ int main(int argc,char **argv) {
         puts(t);return 0;
     }
     if(!strncmp(t,"uart_load_",10)) {
-        simRxActive=1;simRxBase=simClock;simRxOffset=(uint32)atoi(t+10)*24u;
+        simRxActive=1;simRxBase=simClock;simRxOffset=(uint32)atoi(t+10)*SIM_MHZ;
         sim_run(1);
         if(!g_motionEnabled)fprintf(stderr,"%s\n",simLog);
         assert(g_motionEnabled && g_rxGood>15 && !strstr(simLog,"heartbeat timeout"));
@@ -2131,9 +2147,9 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     if emit_c is not None:
         emit_c.mkdir(parents=True, exist_ok=True)
         for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h']: (emit_c/name).write_text('',encoding='ascii')
-        (emit_c/'check.c').write_text(pin_defs+'\n'+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
+        (emit_c/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
         print('wrote', emit_c/'check.c'); sys.exit(0)
-    (tmp/'check.c').write_text(pin_defs+'\n'+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
+    (tmp/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
     (tmp/'build.cmd').write_text(f'@echo off\ncall "{vcvars}" >nul\ncl /nologo /TC /std:c11 /W3 /DPTP_COMMISSIONED=0 /DARM2_ENCODER_FEEDBACK=1 /I"{tmp}" "{tmp / "check.c"}" /Fe:"{tmp / "check.exe"}" /Fo:"{tmp / "check.obj"}"\n',encoding='utf-8')
     result=subprocess.run(['cmd','/c',str(tmp/'build.cmd')],cwd=tmp,capture_output=True,text=True,errors='replace')
     if result.returncode: raise RuntimeError(result.stdout+result.stderr)

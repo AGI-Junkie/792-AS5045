@@ -1,6 +1,6 @@
 /* ========================================================================
  * AS5045 + DRV8825: two-joint arm firmware (stage2-v11, see FW_BUILD_ID)
- * Target: CY8CKIT-059 (PSoC 5LP) @ 24 MHz BUS_CLK, GPIO + UDB host UART.
+ * Target: CY8CKIT-059 (PSoC 5LP), BUS_CLK as set in the Clocks tab (24 MHz until the clock step, then 48 MHz), GPIO + UDB host UART.
  *
  * MECHANICS: arm1 = 42 mm 1.8 deg stepper on DRV2 / stepper2 behind a 40:1
  * gearbox.  The AS5045 magnet sits on the MOTOR REAR SHAFT, so the encoder
@@ -311,40 +311,47 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
 #define SU_ELAPSED(t0)              (((t0) - SU_NOW()) & 0x00FFFFFFu)
 #define SU_CY_PER_US                (BCLK__BUS_CLK__HZ / 1000000u)
 
-/* Extend the existing free-running 24-bit down-counter without changing pulse
- * timing. The ISR only counts wraps; foreground stalls do not slow deadlines. */
-static volatile uint32 g_clockWraps;
-CY_ISR(clock_wrap_isr) { g_clockWraps++; }
-/* floor((wraps * 2^24 + elapsed cycles) / 24000) in 32-bit arithmetic: the 64-bit divide it replaces was a libgcc
- * call (several us at 24 MHz) made twice on every pass of the main loop.  2^24 = 699 * 24000 + 1216 and
- * 1216 / 24000 = 19 / 375, so with wraps = 375 * k + r the quotient is 699 * wraps + 19 * k + (1216 * r + x) / 24000.
- * Every term is exact modulo 2^32, which is also how the 64-bit result was truncated. */
-_Static_assert(BCLK__BUS_CLK__HZ == 24000000u, "wall_ms is written for the 24 MHz bus clock");
+/* Extend the existing free-running 24-bit down-counter without changing pulse timing. The ISR only accounts for
+ * wraps; foreground stalls do not slow deadlines.  One wrap is 2^24 cycles = SU_WRAP_MS whole milliseconds plus
+ * SU_WRAP_REM cycles at any whole-MHz bus clock, so the ISR keeps (milliseconds, remainder cycles) exactly and
+ * wall_ms() needs one divide by a constant: ms = g_wallMs + (g_wallRemCy + cycles since the last wrap) / SU_CY_PER_MS.
+ * (24 MHz: 699 ms + 1216 cycles per wrap; 48 MHz: 349 ms + 25216 cycles.) */
+#define SU_CY_PER_MS                (BCLK__BUS_CLK__HZ / 1000u)
+#define SU_WRAP_MS                  (0x01000000u / SU_CY_PER_MS)
+#define SU_WRAP_REM                 (0x01000000u % SU_CY_PER_MS)
+_Static_assert(BCLK__BUS_CLK__HZ % 1000000u == 0u, "SU_CY_PER_US needs a whole-MHz bus clock");
+static volatile uint32 g_clockWraps, g_wallMs, g_wallRemCy;
+static void clock_wrap_account(volatile uint32 *ms, volatile uint32 *rem)
+{
+    *ms += SU_WRAP_MS; *rem += SU_WRAP_REM;
+    if (*rem >= SU_CY_PER_MS) { *rem -= SU_CY_PER_MS; (*ms)++; }
+}
+CY_ISR(clock_wrap_isr) { g_clockWraps++; clock_wrap_account(&g_wallMs, &g_wallRemCy); }
 static uint32 wall_ms(void)
 {
-    uint32 wraps, current;
+    uint32 ms, rem, current;
     uint8 ints = CyEnterCriticalSection();
-    wraps = g_clockWraps;
+    ms = g_wallMs; rem = g_wallRemCy;
     current = SU_NOW();
     if (CY_GET_REG32(CYREG_NVIC_INTR_CTRL_STATE) & 0x04000000u) {
         /* A wrap occurred while interrupts were masked; count it exactly once. */
-        wraps++;
+        clock_wrap_account(&ms, &rem);
         current = SU_NOW();
     }
     CyExitCriticalSection(ints);
-    return wraps * 699u + (wraps / 375u) * 19u + ((wraps % 375u) * 1216u + (0x00FFFFFFu - current)) / 24000u;
+    return ms + (rem + (0x00FFFFFFu - current)) / SU_CY_PER_MS;
 }
 
 static void su_timer_start(void)
 {
-    g_clockWraps = 0u;
+    g_clockWraps = 0u; g_wallMs = 0u; g_wallRemCy = 0u;
     (void)CyIntSetSysVector(CY_INT_SYSTICK_IRQN, clock_wrap_isr);
     CY_SET_REG32(CYREG_NVIC_SYSTICK_RELOAD,  0x00FFFFFFu);
     CY_SET_REG32(CYREG_NVIC_SYSTICK_CURRENT, 0u);
     CY_SET_REG32(CYREG_NVIC_SYSTICK_CTL,     0x07u);
 }
 
-/* Keep each call below the approximately 0.69 s SysTick wrap at 24 MHz. */
+/* Keep each call far below one SysTick wrap (SU_WRAP_MS: 699 ms at 24 MHz, 349 ms at 48 MHz). */
 static void delay_us(uint32 us)
 {
     uint32 t0 = SU_NOW();
