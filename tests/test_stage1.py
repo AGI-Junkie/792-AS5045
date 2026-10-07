@@ -221,6 +221,29 @@ static uint16 Ssi_ReadRxData(void){
 }
 static void Ssi_ClearRxBuffer(void){simSsiRead=sim_ssi_complete();}
 static void Ssi_ClearTxBuffer(void){simSsiQueued=sim_ssi_complete();if(simSsiRead>simSsiQueued)simSsiRead=simSsiQueued;}
+/* One STEP pulse reaching a driver that is awake and enabled: the arm's motor moves one microstep along DIR.  The
+ * bit-banged path calls these on the pin edge that ends the pulse, the PWM path when the pulse is requested. */
+static void sim_pulse_arm1(void) {
+    if(!simPins[CYREG_PRT1_PC7] && simPins[CYREG_PRT12_PC2] && simPins[CYREG_PRT1_PC2]) {
+        int tracks=!simRateLimited || simClock-simLastMotorPulse>=SIM_MHZ*1250u;
+        simLastMotorPulse=simClock; /* fixture motor tracks at most the configured 800 ustep/s jog rate */
+        simPulse1++; simTrace=(simTrace^(uint32)((simClock-simTraceBase)*24u/SIM_MHZ))*16777619u; simTrace=(simTrace^(simPins[CYREG_PRT12_PC4]?1u:2u))*16777619u;
+        if(tracks && !simStall && !(simStiction && simPulse1<=24)) simStep1+=simPins[CYREG_PRT12_PC4]?1:-1;
+    }
+}
+static void sim_pulse_arm2(void) {
+    if(!simPins[CYREG_PRT2_PC7] && simPins[CYREG_PRT2_PC2] && simPins[CYREG_PRT2_PC3]) {
+        simPulse2++; simTrace=(simTrace^(uint32)((simClock-simTraceBase)*24u/SIM_MHZ))*16777619u; simTrace=(simTrace^(simPins[CYREG_PRT2_PC0]?3u:4u))*16777619u;
+        if(!simStall2)simStep2+=simPins[CYREG_PRT2_PC0]?1:-1;
+    }
+}
+/* Control_Regs "StepArm1Req" / "StepArm2Req" (PulseMode, one bit each) + one-shot PWMs "StepArm1" / "StepArm2": writing 1
+ * requests one pulse.  A write of 0 requests nothing. */
+static unsigned simStepStarted, simStepWrites1, simStepWrites2;
+static void StepArm1_Start(void){simStepStarted|=1u;}
+static void StepArm2_Start(void){simStepStarted|=2u;}
+static void StepArm1Req_Write(uint8 v){ if(v&1u){simStepWrites1++; sim_pulse_arm1();} }
+static void StepArm2Req_Write(uint8 v){ if(v&1u){simStepWrites2++; sim_pulse_arm2();} }
 static void mock_set(int pin,int value) {
     if(pin==CYREG_PRT12_PC1 && value!=simPins[pin]) {
         if(!value){ sim_ssi_latch();simSsiBits=0;simRegCost=SIM_MHZ/4u; } else simRegCost=SIM_MHZ;
@@ -229,16 +252,8 @@ static void mock_set(int pin,int value) {
     if(value!=simPins[pin] && (pin==CYREG_PRT1_PC7 || pin==CYREG_PRT12_PC2 || pin==CYREG_PRT1_PC2 ||
         pin==CYREG_PRT2_PC7 || pin==CYREG_PRT2_PC2 || pin==CYREG_PRT2_PC3))simDriverSwitches++;
     if(value && !simPins[pin]) {
-        if(pin==CYREG_PRT12_PC3 && !simPins[CYREG_PRT1_PC7] && simPins[CYREG_PRT12_PC2] && simPins[CYREG_PRT1_PC2]) {
-            int tracks=!simRateLimited || simClock-simLastMotorPulse>=SIM_MHZ*1250u;
-            simLastMotorPulse=simClock; /* fixture motor tracks at most the configured 800 ustep/s jog rate */
-            simPulse1++; simTrace=(simTrace^(uint32)((simClock-simTraceBase)*24u/SIM_MHZ))*16777619u; simTrace=(simTrace^(simPins[CYREG_PRT12_PC4]?1u:2u))*16777619u;
-            if(tracks && !simStall && !(simStiction && simPulse1<=24)) simStep1+=simPins[CYREG_PRT12_PC4]?1:-1;
-        }
-        if(pin==CYREG_PRT2_PC1 && !simPins[CYREG_PRT2_PC7] && simPins[CYREG_PRT2_PC2] && simPins[CYREG_PRT2_PC3]) {
-            simPulse2++; simTrace=(simTrace^(uint32)((simClock-simTraceBase)*24u/SIM_MHZ))*16777619u; simTrace=(simTrace^(simPins[CYREG_PRT2_PC0]?3u:4u))*16777619u;
-            if(!simStall2)simStep2+=simPins[CYREG_PRT2_PC0]?1:-1;
-        }
+        if(pin==CYREG_PRT12_PC3) sim_pulse_arm1();
+        if(pin==CYREG_PRT2_PC1) sim_pulse_arm2();
     }
     simPins[pin]=value;
 }
@@ -1513,6 +1528,31 @@ int main(int argc,char **argv) {
         for(i=0;i<ENC_BAD_LIMIT;i++)service_encoder(); assert(!g_motionEnabled);
         puts(t);return 0;
     }
+    if(!strncmp(t,"step_hw_",8)) {
+#if HW_STEP
+        uint64_t t0; int32 u1, u2; int8 both[2];
+        setup(); assert(simStepStarted==3u);
+        if(!strcmp(t,"step_hw_request")) {
+            /* one step = one register write and no busy-wait: only the DIR set-up (when the direction changes) takes time */
+            u1=g_arm1.usteps; g_arm1.lastDirLevel=0xFFu; t0=simClock;
+            jog_step(&g_arm1,1); assert(g_arm1.usteps==u1+1 && simStepWrites1==1u && simStepWrites2==0u && simPulse1==1u);
+            assert(simClock-t0<(uint64_t)SIM_MHZ*(DIR_SETUP_US+8u));
+            t0=simClock; jog_step(&g_arm1,1);
+            assert(g_arm1.usteps==u1+2 && simStepWrites1==2u && simClock-t0<(uint64_t)SIM_MHZ*8u);   /* same direction: no wait at all */
+            u2=g_arm2.usteps; jog_step(&g_arm2,-1);
+            assert(g_arm2.usteps==u2-1 && simStepWrites2==1u && simPulse2==1u);
+            /* both axes of one coordinated step are separate requests: neither can cancel the other */
+            both[0]=1; both[1]=-1; assert(pulse_axes(both,"test"));
+            assert(simStepWrites1==3u && simStepWrites2==2u && simPulse1==3u && simPulse2==2u);
+        } else {
+            /* the STEP pins (STEP1 is the blue LED too) are the PWMs', never driven from software */
+            assert(!simPins[PIN_STEP1] && !simPins[PIN_STEP2]);
+            jog_step(&g_arm1,1); jog_step(&g_arm2,1); stage_stop("test",0u);
+            assert(!simPins[PIN_STEP1] && !simPins[PIN_STEP2]);
+        }
+#endif
+        puts(t);return 0;
+    }
     if(!strncmp(t,"ssi_",4)) {
 #if HW_SSI
         uint8 ok=0u; uint64_t t0; unsigned k; unsigned retries;
@@ -2166,6 +2206,7 @@ int main(int argc,char **argv) {
 
 cases = ['dual_'+n for n in ['home_reverse','home_stall','wrap','loss','gap','parity','hold','derate','follow_stop','peer_bad','peer_bad_reverse','final','limit','enable_bad']]
 cases += ['ssi_nonblocking','ssi_snapshot','ssi_retry','ssi_timeout','ssi_takeover']
+cases += ['step_hw_request','step_hw_pins']
 cases += ['dual_snapshot_length','chain_frames','boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
          'missing_sensor','stuck_sensor','missing_npn','stalled_motor','reject_moving',
          'fault','limit','encoder_loss','jog_cancels','sensor_bounce']
@@ -2234,11 +2275,11 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     tmp = Path(temp)
     if host_plan is not None: (tmp/'host-plan.bin').write_bytes(host_plan.read_bytes())
     if host_control is not None: (tmp/'host-control.bin').write_bytes(host_control.read_bytes())
-    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h']:
+    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h']:
         (tmp/name).write_text('',encoding='ascii')
     if emit_c is not None:
         emit_c.mkdir(parents=True, exist_ok=True)
-        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h']: (emit_c/name).write_text('',encoding='ascii')
+        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h']: (emit_c/name).write_text('',encoding='ascii')
         (emit_c/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
         print('wrote', emit_c/'check.c'); sys.exit(0)
     (tmp/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')

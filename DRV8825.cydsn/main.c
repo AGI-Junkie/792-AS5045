@@ -36,6 +36,9 @@
 #ifndef HW_SSI
 #define HW_SSI                      (0u) /* AS5045 read-out by the UDB SPI Master "Ssi" instead of bit-banging */
 #endif
+#ifndef HW_STEP
+#define HW_STEP                     (0u) /* STEP pulses from Control_Regs "StepArm1Req"/"StepArm2Req" + UDB PWMs, no busy-wait */
+#endif
 
 #include <cytypes.h>
 #include <cyfitter.h>
@@ -45,6 +48,12 @@
 #include "HostUart.h"
 #if (HW_SSI != 0u)
 #include "Ssi.h"
+#endif
+#if (HW_STEP != 0u)
+#include "StepArm1Req.h"
+#include "StepArm2Req.h"
+#include "StepArm1.h"
+#include "StepArm2.h"
 #endif
 #include <stdint.h>
 #include <stdio.h>
@@ -229,7 +238,11 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
 #define HOME_PROBE_SETTLE_US        (20000u)
 
 #define STEP_LOW_US                 (10u)
+#if (HW_STEP != 0u)
+#define DIR_SETUP_US                (2u)     /* DRV8825 needs 650 ns; the pulse also starts >= 1 us after the request */
+#else
 #define DIR_SETUP_US                (20u)
+#endif
 #define ENCODER_READ_RETRIES        (3u)
 /* ======================================================================== */
 
@@ -782,7 +795,9 @@ static void stepper2_disable(void)
     pin_write(PIN_EN2, 1u);
     pin_write(PIN_SLEEP2, 0u);
     pin_write(PIN_RST2, 0u);
+#if (HW_STEP == 0u)
     pin_write(PIN_STEP2, 1u);
+#endif
     g_last_dir_level = 0xFFu;
 }
 
@@ -803,12 +818,16 @@ static void stepper1_disable(void)
     pin_write(PIN_EN1, 1u);
     pin_write(PIN_SLEEP1, 0u);
     pin_write(PIN_RST1, 0u);
+#if (HW_STEP == 0u)
     pin_write(PIN_STEP1, 0u);
+#endif
 }
 
 static void stepper1_enable(void)
 {
+#if (HW_STEP == 0u)
     pin_write(PIN_STEP1, 0u);
+#endif
     pin_write(PIN_RST1, 1u);
     pin_write(PIN_SLEEP1, 1u);
     CyDelay(2u);                      /* DRV8825 needs 1.7 ms wake-up       */
@@ -833,6 +852,7 @@ static void pulse_hold_us(uint32 tEdge, uint32 widthUs)
     while (((tEdge - SU_NOW()) & 0x00FFFFFFu) < target) { }
 }
 
+#if (HW_STEP == 0u)
 static void pulse_step_pin(uint32 pinPC, uint8 idleHigh)
 {
     uint32 t0 = SU_NOW();
@@ -840,6 +860,19 @@ static void pulse_step_pin(uint32 pinPC, uint8 idleHigh)
     pulse_hold_us(t0, STEP_LOW_US);
     pin_write(pinPC, idleHigh);
 }
+#else
+/* One register write per axis: "StepArm1Req" / "StepArm2Req" are 1-bit PulseMode Control_Regs on the 12 MHz step clock,
+ * each triggering a one-shot PWM ("StepArm1": STEP2, low pulse, idle high; "StepArm2": STEP1, high pulse, idle low)
+ * whose period is the pulse width (STEP_LOW_US).  The two axes have separate registers on purpose: a write to a shared
+ * register would clear the other axis' request before the 12 MHz clock had sampled it. */
+#define STEP_ARM1                   (1u)
+#define STEP_ARM2                   (2u)
+static void step_fire(uint8 mask)
+{
+    if ((mask & STEP_ARM1) != 0u) { StepArm1Req_Write(1u); }
+    if ((mask & STEP_ARM2) != 0u) { StepArm2Req_Write(1u); }
+}
+#endif
 
 /* ========================= trapezoidal ramp ============================= */
 /* AVR446 integer recurrence: c0 = 0.676e6 * sqrt(2/a) us, then
@@ -943,7 +976,12 @@ static void hw_init(void)
     pin_out_init(PIN_CLK, 1u);
     CY_SET_REG8(PIN_DO, CY_PINS_DM_DIG_HIZ);
 #endif
+#if (HW_STEP == 0u)
     pin_out_init(PIN_LED, 0u);
+#else
+    StepArm1_Start();   /* Creator owns STEP1 (it is the LED pin) and STEP2: both are PWM outputs, idle until a request */
+    StepArm2_Start();
+#endif
 
     /* Driver 1 shares its STEP with the blue LED. Keep it asleep, reset and
      * disabled during start-up so the status LED can never move stepper1;
@@ -957,7 +995,9 @@ static void hw_init(void)
     pin_out_init(PIN_M1_0,   M0_LVL);
 
     pin_out_init(PIN_EN2,    1u);
+#if (HW_STEP == 0u)
     pin_out_init(PIN_STEP2,  1u);
+#endif
     pin_out_init(PIN_DIR2,   0u);
     pin_out_init(PIN_SLEEP2, 0u);
     pin_out_init(PIN_RST2,   0u);
@@ -1582,7 +1622,11 @@ static void jog_step(jog_axis_t *a, int8 s)
         delay_us(DIR_SETUP_US);
         a->lastDirLevel = lvl;
     }
+#if (HW_STEP != 0u)
+    step_fire((a == &g_arm1) ? STEP_ARM1 : STEP_ARM2);
+#else
     pulse_step_pin(a->pinStep, a->stepIdleHigh);
+#endif
     a->usteps += s;
     if (a->hasEnc != 0u)
     {
