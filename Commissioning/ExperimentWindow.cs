@@ -20,13 +20,16 @@ internal sealed class LogIndex
     public static LogIndex? Load(string path)
     {
         var seconds = new List<double>(); var lines = new List<string>();
+        double dayOffset = 0;
         try
         {
             foreach (string line in File.ReadLines(path))
             {
                 // "[19:08:46.137] text": local time of day of the host receiving the line.
                 if (line.Length < 15 || line[0] != '[' || line[13] != ']' || !TimeSpan.TryParseExact(line.AsSpan(1, 12), @"hh\:mm\:ss\.fff", CultureInfo.InvariantCulture, out var t)) continue;
-                seconds.Add(t.TotalSeconds); lines.Add(line);
+                // A session that runs past midnight: the time of day jumps back, so carry on from 24:00 (the host's own time of day is shifted the same way when it is searched).
+                if (seconds.Count > 0 && t.TotalSeconds + dayOffset < seconds[^1] - 3600) dayOffset += 86400;
+                seconds.Add(t.TotalSeconds + dayOffset); lines.Add(line);
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
@@ -51,6 +54,7 @@ internal sealed class LogIndex
     // The last line containing `text` between two times of day, or null.
     public string? LastMatch(string text, double from, double to)
     {
+        if (Seconds.Length > 0 && from < Seconds[0]) { from += 86400; to += 86400; }
         int hi = Array.BinarySearch(Seconds, to); if (hi < 0) hi = ~hi - 1; else while (hi + 1 < Seconds.Length && Seconds[hi + 1] == to) hi++;
         for (int i = hi; i >= 0 && Seconds[i] >= from; i--) if (Lines[i].Contains(text, StringComparison.Ordinal)) return Lines[i];
         return null;
@@ -59,6 +63,7 @@ internal sealed class LogIndex
     // Lines within `radius` seconds of `time` (time of day), at most `limit`, nearest the cursor first-class: the window is centred on it.
     public IEnumerable<string> Around(double time, double radius, int limit, Func<string, bool>? keep = null)
     {
+        if (Seconds.Length > 0 && time < Seconds[0]) time += 86400;
         int lo = Array.BinarySearch(Seconds, time - radius); if (lo < 0) lo = ~lo;
         int count = 0;
         for (int i = lo; i < Seconds.Length && Seconds[i] <= time + radius && count < limit; i++)
@@ -96,6 +101,8 @@ internal sealed partial class ExperimentWindow : Window
     private readonly ComboBox speed = new() { Width = 70, Margin = new Thickness(4) };
     private readonly TextBlock timeText = new() { Margin = new Thickness(8, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center, FontFamily = WorkbenchTheme.Mono, FontSize = 12 };
     private readonly TextBox logBox = new() { IsReadOnly = true, FontFamily = WorkbenchTheme.Mono, FontSize = 11, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, MinHeight = 90, TextWrapping = TextWrapping.NoWrap };
+    private readonly ComboBox logSource = new() { MinWidth = 70, Margin = new Thickness(4, 1, 4, 1), FontSize = 11 };
+    private bool settingLogSource;
     private readonly CheckBox quietLog = new() { IsChecked = true, Margin = new Thickness(6, 2, 6, 2), FontSize = 11 };
     private readonly TextBlock logTitle = new() { FontWeight = FontWeights.SemiBold, FontSize = 11, Margin = new Thickness(6, 4, 6, 0) };
     private readonly CheckBox wholeArm = new() { Margin = new Thickness(6, 2, 6, 2), FontSize = 11 };
@@ -154,7 +161,7 @@ internal sealed partial class ExperimentWindow : Window
         middle.Children.Add(plane);
         right.Children.Add(middle);
         var logPanel = new DockPanel();
-        var logHead = new DockPanel(); DockPanel.SetDock(quietLog, Dock.Right); logHead.Children.Add(quietLog); logHead.Children.Add(logTitle); DockPanel.SetDock(logHead, Dock.Top);
+        var logHead = new DockPanel(); DockPanel.SetDock(quietLog, Dock.Right); logHead.Children.Add(quietLog); DockPanel.SetDock(logSource, Dock.Right); logHead.Children.Add(logSource); logHead.Children.Add(logTitle); DockPanel.SetDock(logHead, Dock.Top);
         logPanel.Children.Add(logHead); logPanel.Children.Add(logBox);
         var logEdge = WorkbenchTheme.Edge(logPanel, Brushes.White, new Thickness(0, 1, 0, 0)); Grid.SetRow(logEdge, 2); right.Children.Add(logEdge);
         shell.Children.Add(right);
@@ -170,6 +177,7 @@ internal sealed partial class ExperimentWindow : Window
         exportList.Click += (_, _) => ExportList();
         exportImage.Click += (_, _) => ExportImage();
         openFolder.Click += (_, _) => { try { Directory.CreateDirectory(root); System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe", root) { UseShellExecute = true }); } catch (Exception ex) when (ex is IOException or System.ComponentModel.Win32Exception) { summary.Text = ex.Message; } };
+        logSource.SelectionChanged += (_, _) => { if (!settingLogSource) UpdateLog(); };
         quietLog.Checked += (_, _) => UpdateLog(); quietLog.Unchecked += (_, _) => UpdateLog();
         wholeArm.Checked += (_, _) => xy.WholeArm = true; wholeArm.Unchecked += (_, _) => xy.WholeArm = false;
         timer.Tick += (_, _) => Advance(0.033 * (speed.SelectedItem is ComboBoxItem { Tag: double s } ? s : 1));
@@ -216,7 +224,7 @@ internal sealed partial class ExperimentWindow : Window
         Title = Lang.T("exp.title");
         refresh.Content = Lang.T("exp.refresh"); openFolder.Content = Lang.T("btn.openData"); exportList.Content = Lang.T("exp.export"); exportImage.Content = Lang.T("exp.exportImage");
         quietLog.Content = Lang.T("exp.log.quiet"); loop.Content = Lang.T("exp.loop"); stepBack.ToolTip = Lang.T("exp.step.back"); stepForward.ToolTip = Lang.T("exp.step.forward"); speed.ToolTip = Lang.T("exp.keys"); wholeArm.Content = Lang.T("exp.xy.whole");
-        logTitle.Text = Lang.T("exp.log.title");
+        logTitle.Text = Lang.T("exp.log.title"); logSource.ToolTip = Lang.T("exp.log.source");
         play.Content = timer.IsEnabled ? Lang.T("exp.pause") : Lang.T("exp.play");
         BuildColumns();
         if (rows.Count > 0) { var selected = grid.SelectedItems.OfType<Row>().Select(r => r.Run.Directory).ToHashSet(); rows = rows.Select(r => MakeRow(r.Run)).ToList(); grid.ItemsSource = rows; foreach (var row in rows.Where(r => selected.Contains(r.Run.Directory))) grid.SelectedItems.Add(row); }
@@ -359,6 +367,12 @@ internal sealed partial class ExperimentWindow : Window
         for (int i = 0; i < shown.Count; i++) speedPlot.Notes.Add((compare ? Letter(i) + " " : "") + LimiterText(shown[i]));
         xy.Source = Lang.T("exp.src.xy"); xy.ReachRadius = shown[0].Model.OuterRadius;
         foreach (var plot in new[] { qPlot, errPlot, speedPlot, accelPlot }) plot.XRange = (tMin, tMax);
+        // Which run's log the lower panel follows (the first, unless chosen).
+        settingLogSource = true;
+        int wanted = Math.Max(logSource.SelectedIndex, 0);
+        logSource.Items.Clear(); for (int i = 0; i < shown.Count; i++) logSource.Items.Add(Lang.T("exp.log.of", Letter(i)));
+        logSource.SelectedIndex = Math.Min(wanted, shown.Count - 1); logSource.Visibility = shown.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
+        settingLogSource = false;
         settingSlider = true; timeSlider.Minimum = tMin; timeSlider.Maximum = tMax; settingSlider = false;
         summary.Text = SummaryText();
         SetCursor(tMin);
@@ -426,7 +440,7 @@ internal sealed partial class ExperimentWindow : Window
     private string? TimingText(RunAnalysis a)
     {
         if (LogOf(a) is not { } index) return null;
-        double from = a.Run.StartedUtc.ToLocalTime().TimeOfDay.TotalSeconds - (a.Run.Kind == "fault" ? 5 : 0), to = (a.HostUtc.Length > 0 ? a.HostUtc[^1] : a.Run.StartedUtc).ToLocalTime().TimeOfDay.TotalSeconds + 20;
+        double start = a.Run.StartedUtc.ToLocalTime().TimeOfDay.TotalSeconds, from = start - (a.Run.Kind == "fault" ? 5 : 0), to = start + ((a.HostUtc.Length > 0 ? a.HostUtc[^1] : a.Run.StartedUtc) - a.Run.StartedUtc).TotalSeconds + 20;
         if (index.LastMatch("TIMING ", from, to) is not { } line) return Lang.T("exp.sum.timing.none");
         long? Field(string name) => System.Text.RegularExpressions.Regex.Match(line, name + @"=(\d+)") is { Success: true } m ? long.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture) : null;
         if (Field("traj_lag_max_us") is not { } lag) return Lang.T("exp.sum.timing.none");
@@ -503,7 +517,7 @@ internal sealed partial class ExperimentWindow : Window
     private void UpdateLog()
     {
         if (shown.Count == 0) { logBox.Clear(); return; }
-        var a = shown[0];
+        var a = shown[Math.Clamp(logSource.SelectedIndex, 0, shown.Count - 1)];
         var log = LogOf(a);
         if (log is null) { logBox.Text = Lang.T("exp.log.none"); return; }
         var (times, hosts) = a.T.Length > 0 ? (a.T, a.HostUtc) : (a.PreT, a.PreHostUtc);
@@ -529,6 +543,7 @@ internal sealed partial class ExperimentWindow : Window
     internal void SelectForSelfTest(params int[] indexes) { grid.SelectedItems.Clear(); foreach (int i in indexes) grid.SelectedItems.Add(rows[i]); }
     internal string[] ColumnHeaders => grid.Columns.Select(c => c.Header?.ToString() ?? "").ToArray();
     internal string RowText(int index) => string.Join("|", new[] { rows[index].Time, rows[index].Kind, rows[index].Shape, rows[index].Speed, rows[index].Reference, rows[index].Status, rows[index].Rmse, rows[index].Peak, rows[index].Rmse2, rows[index].Hz, rows[index].Calibration, rows[index].Fault });
+    internal int LogSourceIndex { get => logSource.SelectedIndex; set => logSource.SelectedIndex = value; }
     internal bool Loop { get => loop.IsChecked == true; set => loop.IsChecked = value; }
     internal bool QuietLog { get => quietLog.IsChecked == true; set => quietLog.IsChecked = value; }
     internal void TogglePlayForSelfTest() => TogglePlayback();

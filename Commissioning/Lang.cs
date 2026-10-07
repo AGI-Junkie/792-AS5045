@@ -451,6 +451,8 @@ internal static class Lang
         ["exp.s.cmd"] = ("命令", "command"),
         ["exp.s.enc"] = ("编码器", "encoder"),
         ["exp.s.slope"] = ("实测差分", "encoder slope"),
+        ["exp.log.of"] = ("日志 {0}", "Log {0}"),
+        ["exp.log.source"] = ("下面的日志跟随哪一次实验", "Which run the log below follows"),
         ["exp.loop"] = ("循环", "Loop"),
         ["exp.step.back"] = ("上一个样本", "Previous sample"),
         ["exp.step.forward"] = ("下一个样本", "Next sample"),

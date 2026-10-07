@@ -127,6 +127,16 @@ internal sealed partial class ExperimentWindow
             Check(w.SummaryText_.Contains("B 相对 A") && w.Plane.Paths.Count == 6 && err.Notes.Count == 4 && err.Series.Any(x => x.Name.StartsWith("B−A")), "comparison summary and notes");
             Check(err.Series.First(x => x.Name.StartsWith("B−A")).Y.Length == err.Series.First(x => x.Name.StartsWith("B ")).Y.Length, "the difference curve has a point per sample of the second run");
             Check(w.Range.Max >= 10 && w.Plane.Arms.Count == 4, "both arms at the cursor");
+            // The log follows the chosen run; the first by default.
+            string logA = w.LogText; w.LogSourceIndex = 1; string logB = w.LogText; w.LogSourceIndex = 0;
+            Check(logA != logB && (logA + logB).Contains("HOST marker") && w.LogText == logA, "the log panel follows the run chosen in its selector");
+            // A session log that runs past midnight stays in order and can be searched on both sides of it.
+            string midnight = Path.Combine(temp, "midnight.log");
+            File.WriteAllLines(midnight, ["[23:59:58.000] HOST before", "[23:59:59.500] HOST just before", "[00:00:01.000] HOST just after", "[00:00:01.500] TIMING traj_lag_max_us=7 traj_slip_us=0", "[00:00:02.000] HOST later"]);
+            var wrapped = LogIndex.Load(midnight)!;
+            Check(wrapped.Seconds.Zip(wrapped.Seconds.Skip(1)).All(p => p.Second > p.First) && wrapped.Seconds[^1] > 86400, "log times keep increasing across midnight");
+            Check(wrapped.Around(1.0, 2.0, 10).Count() == 4 && wrapped.Around(86399.0, 1.0, 10).Count() == 2, "lines are found on both sides of midnight, however the time of day is given");
+            Check(wrapped.LastMatch("TIMING", 0.5, 25) is { } t1 && t1.Contains("lag_max_us=7") && wrapped.LastMatch("TIMING", 86398, 86410) is not null && wrapped.LastMatch("TIMING", 86398, 86399) is null, "a time window can start before midnight and end after it");
             // Language switch rewrites everything without losing the selection.
             Lang.Toggle();
             try
