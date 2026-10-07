@@ -1056,7 +1056,7 @@ public sealed partial class XYPreviewPanel : UserControl
         if (!panel.movePoint.IsEnabled || panel.execution is null || !panel.result.Text.Contains("整条轨迹检查通过"))
             throw new InvalidOperationException("335/0/r15 must produce a full executable circle inside current firmware limits");
         panel.x.Text = "340"; panel.a.Text = "5";
-        string parameterFile = Path.Combine(Path.GetTempPath(), "two-link-parameters-" + Guid.NewGuid().ToString("N") + ".json");
+        string parameterFile = Path.Combine(Path.GetTempPath(), "Two-Arm-parameters-" + Guid.NewGuid().ToString("N") + ".json");
         int saves = 0; panel.ParametersSaved += () => saves++;
         try {
             panel.SaveCurrentParameters(parameterFile);

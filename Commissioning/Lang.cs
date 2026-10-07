@@ -153,7 +153,7 @@ internal static class Lang
     private static readonly Dictionary<string, (string Zh, string En)> Table = new()
     {
         // window / chrome
-        ["app.title"] = ("Two-Link Studio · 轨迹工作台 · v7 全局运动参数", "Two-Link Studio · Trajectory Workbench · v7 Global Motion"),
+        ["app.title"] = ("Two-Arm Studio · 轨迹工作台 · v7 全局运动参数", "Two-Arm Studio · Trajectory Workbench · v7 Global Motion"),
         ["lang.toggle"] = ("EN", "中"),
         ["lang.toggle.tip"] = ("Switch to English（切换到英文）", "切换到中文（Switch to Chinese）"),
 
