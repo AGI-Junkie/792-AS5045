@@ -2,6 +2,15 @@
 
 最新在前。每条写“改了什么、验证到哪一步”；“未烧录”指固件镜像没有下载到板子上。
 
+## 2026-10-08：下位机硬件卸载（BUS_CLK 48 MHz；SSI、步进脉冲、事件定时器、deadman、串口 DMA、引脚中断；开关默认关；未烧录，TopDesign 组件未放）
+
+计划与依据见 [docs/HARDWARE_OFFLOAD_PLAN.md](docs/HARDWARE_OFFLOAD_PLAN.md)，要在 Creator 里放的组件见 [docs/TOPDESIGN_RECIPE.md](docs/TOPDESIGN_RECIPE.md)。分支 `hw-offload`，基于 main 6610a30，**没有上板**。
+
+- **时钟**：`DRV8825.cydwr` 里 PLL 输出 24 → 48 MHz（IMO 3 MHz × 16）。按 CY8C58LP 数据手册定：FCPU ≤ 80 MHz，UDB ≤ 67 MHz，48 MHz 的 UART 分频比与 24 MHz 完全相同（923.077 kHz，+0.16%）。无头 `cyprjmgr` 构建：无时序违例，Flash 36848 / SRAM 19849 字节，0 警告。`wall_ms()` 不再写死 24 MHz（SysTick 回绕 ISR 精确记 ms 和余数周期，349 ms 一圈）。看门狗 256–384 ms 比 48 MHz 的 SysTick 回绕（349 ms）略长，现有用 SysTick 判断的间隔都在 60 ms 以内，已审计。
+- **六个开关**（`main.c` 顶部，默认 `(0u)`，各自对应 TopDesign 里的组件，放好组件、构建通过后再改成 `(1u)`）：`HW_SSI`（UDB SPI Master 读 AS5045，`hw_ssi.h`，不再关中断约 360 µs，读之前抓取指令快照）；`HW_STEP`（每轴一个 PulseMode Control_Reg 触发 UDB PWM 单次脉冲，去掉每步 10–20 µs 忙等，DIR 建立 20 → 2 µs）；`HW_EVT`（轨迹由固定功能定时器中断逐步发出，中断里只做 `traj_poll` 和发脉冲，前台保留所有监督，前台 40 ms 没跑完一圈中断自己停下）；`HW_DEAD`（前台每圈写 AliveReq，100 ms 没写则硬件锁死两路 PWM，只有操作员使能才能解除）；`HW_TXDMA`（调试串口发送由 DMA 把文本队列搬进 UART FIFO）；`HW_PINIRQ`（nFAULT / P0[4] 引脚中断在优先级 0 立即锁死 PWM）。状态行新增 `HWOFFLOAD`（任一开关打开时）。
+- **验证**：夹具新增 `--sim-mhz=N`（默认 48）、`--define=NAME=VAL`，以及 SPI Master、PWM/Control_Reg、定时器中断（按模拟时间触发）、DMA、deadman、引脚中断的模型和 14 个新用例（`ssi_*`、`step_hw_*`、`traj_evt_*`、`dead_kill`、`txdma_*`、`pin_irq_kill`，均做过变异验证）。开关全关时 24 / 48 MHz 的逐脉冲哈希各自记录；六个开关全开、48 MHz 时整套 554 例通过（默认配置、48 MHz、开关全关的完整闸门同样 554 例通过），脉冲数与轴顺序与软件版完全一致（5 边形 7112 / 6808），`traj_lag_max_us` 受模拟步长限制为 21 µs（不是板上数字）。夹具只能证明逻辑，**所有硬件时序（SPI 模式与位偏移、PWM 脉宽、`EVT_RESTART_LAG_US`、Latched kill 能否由 Stop+Start 清除、引脚中断接法）都要上板确认**。
+- **顺带修了 main 上的两处问题**：`12f78c7` 带着旧的 `main.c` 覆盖了 `0db9561` 的手动归零改动（`MANUAL_ENC2_INC_DIR`、build id `mref2`），`tests/test_stage1.py` 在 main 上编译不过，已恢复；`ARM2_STRAIGHT_OUT_DEG10` 保留 main 上较新的 1620，测试里的 36650 随之改为 36763。`verify-creator-pins.ps1` 在 main 上本来就失败（`Missing instance: Pin_17 ...`），本次没动。
+
 ## 2026-10-08：实验分析窗口——实测速度、回放控制、四次对比、日志选择、导出不卡界面、列表管理（仅上位机，未上实机）
 
 - **实测速度**：速度图在规划速度旁画编码器差分速度（约 0.4 s 窗口，细线，粗略），摘要写实测峰值；电机 2 需要 arm2 自己的编码器。

@@ -675,8 +675,10 @@ static uint8 enc_update(enc_t *e, const as5045_t *sample, uint8 valid)
  * coming while the frame is on the wire. */
 static void enc_snapshot(void)
 {
+    uint8 ints=CyEnterCriticalSection();   /* the event timer may add a step between two of these reads */
     g_enc.snapUsteps=g_enc.cmdUsteps;   g_enc.snapLsbX100=g_enc.cmdLsbX100;
     g_enc2.snapUsteps=g_enc2.cmdUsteps; g_enc2.snapLsbX100=g_enc2.cmdLsbX100;
+    CyExitCriticalSection(ints);
 }
 /* Decode one raw frame pair; true when every frame this configuration needs is usable. */
 static uint8 enc_decode_pair(uint32 raw1, uint32 raw2, as5045_t *a, as5045_t *b)
