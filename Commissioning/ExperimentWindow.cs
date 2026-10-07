@@ -2,6 +2,8 @@ using System.Globalization;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 
@@ -89,6 +91,8 @@ internal sealed partial class ExperimentWindow : Window
     private readonly Button play = new() { MinWidth = 90, Margin = new Thickness(4) }, refresh = new() { Margin = new Thickness(4), Padding = new Thickness(10, 2, 10, 2) }, openFolder = new() { Margin = new Thickness(4), Padding = new Thickness(10, 2, 10, 2) },
         exportList = new() { Margin = new Thickness(4), Padding = new Thickness(10, 2, 10, 2) }, exportImage = new() { Margin = new Thickness(4), Padding = new Thickness(10, 2, 10, 2) };
     private readonly StackPanel charts = new();
+    private readonly Button stepBack = new() { Content = "◀", MinWidth = 28, Margin = new Thickness(2) }, stepForward = new() { Content = "▶", MinWidth = 28, Margin = new Thickness(2) };
+    private readonly CheckBox loop = new() { Margin = new Thickness(4, 0, 4, 0), FontSize = 11, VerticalAlignment = VerticalAlignment.Center };
     private readonly ComboBox speed = new() { Width = 70, Margin = new Thickness(4) };
     private readonly TextBlock timeText = new() { Margin = new Thickness(8, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center, FontFamily = WorkbenchTheme.Mono, FontSize = 12 };
     private readonly TextBox logBox = new() { IsReadOnly = true, FontFamily = WorkbenchTheme.Mono, FontSize = 11, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, MinHeight = 90, TextWrapping = TextWrapping.NoWrap };
@@ -133,20 +137,21 @@ internal sealed partial class ExperimentWindow : Window
         right.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); right.RowDefinitions.Add(new RowDefinition { Height = new GridLength(5, GridUnitType.Star) }); right.RowDefinitions.Add(new RowDefinition { Height = new GridLength(2, GridUnitType.Star), MinHeight = 110 });
         var replay = new DockPanel { Margin = new Thickness(4) };
         DockPanel.SetDock(play, Dock.Left); replay.Children.Add(play); DockPanel.SetDock(speed, Dock.Left); replay.Children.Add(speed);
+        DockPanel.SetDock(stepBack, Dock.Left); replay.Children.Add(stepBack); DockPanel.SetDock(stepForward, Dock.Left); replay.Children.Add(stepForward); DockPanel.SetDock(loop, Dock.Left); replay.Children.Add(loop);
         DockPanel.SetDock(timeText, Dock.Right); replay.Children.Add(timeText); replay.Children.Add(timeSlider);
         right.Children.Add(WorkbenchTheme.Edge(replay, WorkbenchTheme.Bar));
         var middle = new Grid(); Grid.SetRow(middle, 1);
         middle.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(3, GridUnitType.Star) }); middle.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2, GridUnitType.Star), MinWidth = 260 });
-        foreach (var plot in new[] { qPlot, errPlot, speedPlot, accelPlot }) { plot.Height = 190; plot.Margin = new Thickness(2, 2, 2, 4); plot.CursorChanged += t => { PausePlayback(); SetCursor(t); }; charts.Children.Add(plot); }
+        foreach (var plot in new[] { qPlot, errPlot, speedPlot, accelPlot }) { plot.Height = 190; plot.Margin = new Thickness(2, 2, 2, 4); plot.CursorChanged += t => { PausePlayback(); SetCursor(t); Keyboard.Focus(this); }; charts.Children.Add(plot); }
         middle.Children.Add(new ScrollViewer { Content = charts, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
         var plane = new DockPanel { Margin = new Thickness(2) }; Grid.SetColumn(plane, 1);
         DockPanel.SetDock(wholeArm, Dock.Top); plane.Children.Add(wholeArm); plane.Children.Add(xy);
         middle.Children.Add(plane);
         right.Children.Add(middle);
-        var logPanel = new DockPanel(); Grid.SetRow(logPanel, 2);
+        var logPanel = new DockPanel();
         var logHead = new DockPanel(); DockPanel.SetDock(quietLog, Dock.Right); logHead.Children.Add(quietLog); logHead.Children.Add(logTitle); DockPanel.SetDock(logHead, Dock.Top);
         logPanel.Children.Add(logHead); logPanel.Children.Add(logBox);
-        right.Children.Add(WorkbenchTheme.Edge(logPanel, Brushes.White, new Thickness(0, 1, 0, 0)));
+        var logEdge = WorkbenchTheme.Edge(logPanel, Brushes.White, new Thickness(0, 1, 0, 0)); Grid.SetRow(logEdge, 2); right.Children.Add(logEdge);
         shell.Children.Add(right);
 
         speed.Items.Add(new ComboBoxItem { Content = "0.5×", Tag = 0.5 }); speed.Items.Add(new ComboBoxItem { Content = "1×", Tag = 1.0 }); speed.Items.Add(new ComboBoxItem { Content = "2×", Tag = 2.0 }); speed.Items.Add(new ComboBoxItem { Content = "5×", Tag = 5.0 });
@@ -154,6 +159,8 @@ internal sealed partial class ExperimentWindow : Window
         grid.SelectionChanged += (_, _) => ShowSelection();
         timeSlider.ValueChanged += (_, _) => { if (!settingSlider) { PausePlayback(); SetCursor(timeSlider.Value); } };
         play.Click += (_, _) => TogglePlayback();
+        stepBack.Click += (_, _) => Step(-1); stepForward.Click += (_, _) => Step(1);
+        PreviewKeyDown += (_, e) => { if (!TypingOrBrowsing(e.OriginalSource as DependencyObject) && HandleKey(e.Key)) e.Handled = true; };
         refresh.Click += (_, _) => Reload();
         exportList.Click += (_, _) => ExportList();
         exportImage.Click += (_, _) => ExportImage();
@@ -203,7 +210,7 @@ internal sealed partial class ExperimentWindow : Window
     {
         Title = Lang.T("exp.title");
         refresh.Content = Lang.T("exp.refresh"); openFolder.Content = Lang.T("btn.openData"); exportList.Content = Lang.T("exp.export"); exportImage.Content = Lang.T("exp.exportImage");
-        quietLog.Content = Lang.T("exp.log.quiet"); wholeArm.Content = Lang.T("exp.xy.whole");
+        quietLog.Content = Lang.T("exp.log.quiet"); loop.Content = Lang.T("exp.loop"); stepBack.ToolTip = Lang.T("exp.step.back"); stepForward.ToolTip = Lang.T("exp.step.forward"); speed.ToolTip = Lang.T("exp.keys"); wholeArm.Content = Lang.T("exp.xy.whole");
         logTitle.Text = Lang.T("exp.log.title");
         play.Content = timer.IsEnabled ? Lang.T("exp.pause") : Lang.T("exp.play");
         BuildColumns();
@@ -448,7 +455,43 @@ internal sealed partial class ExperimentWindow : Window
         timer.Start(); play.Content = Lang.T("exp.pause");
     }
     internal void PausePlayback() { timer.Stop(); play.Content = Lang.T("exp.play"); }
-    internal void Advance(double seconds) { if (cursor + seconds >= tMax) { SetCursor(tMax); PausePlayback(); } else SetCursor(cursor + seconds); }
+    internal void Advance(double seconds)
+    {
+        if (cursor + seconds < tMax) SetCursor(cursor + seconds);
+        else if (loop.IsChecked == true) SetCursor(tMin);
+        else { SetCursor(tMax); PausePlayback(); }
+    }
+
+    // One sample back or forward (the first selected run's own sample times), for reading a moment off frame by frame.
+    internal void Step(int direction)
+    {
+        PausePlayback();
+        if (shown.Count == 0) return;
+        var times = shown[0].T.Length > 0 ? shown[0].T : shown[0].PreT;
+        if (times.Length == 0) return;
+        SetCursor(direction > 0 ? times.FirstOrDefault(t => t > cursor + 1e-9, tMax) : times.LastOrDefault(t => t < cursor - 1e-9, tMin));
+    }
+
+    // Space plays and pauses, the arrows step, Home/End jump. Not while typing or moving about in the list, where the same keys mean something else.
+    internal bool HandleKey(Key key)
+    {
+        if (shown.Count == 0) return false;
+        switch (key)
+        {
+            case Key.Space: TogglePlayback(); return true;
+            case Key.Left: Step(-1); return true;
+            case Key.Right: Step(1); return true;
+            case Key.Home: PausePlayback(); SetCursor(tMin); return true;
+            case Key.End: PausePlayback(); SetCursor(tMax); return true;
+            default: return false;
+        }
+    }
+    private static bool TypingOrBrowsing(DependencyObject? source)
+    {
+        for (var node = source; node is not null; node = node is Visual or System.Windows.Media.Media3D.Visual3D ? VisualTreeHelper.GetParent(node) : LogicalTreeHelper.GetParent(node))
+            if (node is TextBoxBase or ComboBox or DataGrid) return true;
+        return false;
+    }
 
     private void UpdateLog()
     {
@@ -479,6 +522,7 @@ internal sealed partial class ExperimentWindow : Window
     internal void SelectForSelfTest(params int[] indexes) { grid.SelectedItems.Clear(); foreach (int i in indexes) grid.SelectedItems.Add(rows[i]); }
     internal string[] ColumnHeaders => grid.Columns.Select(c => c.Header?.ToString() ?? "").ToArray();
     internal string RowText(int index) => string.Join("|", new[] { rows[index].Time, rows[index].Kind, rows[index].Shape, rows[index].Speed, rows[index].Reference, rows[index].Status, rows[index].Rmse, rows[index].Peak, rows[index].Rmse2, rows[index].Hz, rows[index].Calibration, rows[index].Fault });
+    internal bool Loop { get => loop.IsChecked == true; set => loop.IsChecked = value; }
     internal bool QuietLog { get => quietLog.IsChecked == true; set => quietLog.IsChecked = value; }
     internal void TogglePlayForSelfTest() => TogglePlayback();
 }

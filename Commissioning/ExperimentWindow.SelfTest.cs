@@ -106,6 +106,17 @@ internal sealed partial class ExperimentWindow
             w.Advance(2.0); Check(Math.Abs(w.CursorTime - (w.Range.Min + 2.0)) < 1e-9 && w.Playing, "playback advances");
             w.Advance(1e6); Check(!w.Playing && w.CursorTime == w.Range.Max, "playback stops at the end");
             w.TogglePlayForSelfTest(); Check(w.Playing && w.CursorTime == w.Range.Min, "playing again from the end restarts"); w.PausePlayback();
+            // One sample at a time, the keyboard, and looping.
+            w.SetCursor(5.0); w.Step(1);
+            double nextT = analysis.T.First(t => t > 5.0 + 1e-9), prevT = analysis.T.Last(t => t < nextT - 1e-9);
+            Check(Math.Abs(w.CursorTime - nextT) < 1e-9, "stepping forward lands on the next sample");
+            w.Step(-1); Check(Math.Abs(w.CursorTime - prevT) < 1e-9 && !w.Playing, "stepping back lands on the previous sample");
+            w.SetCursor(w.Range.Min); w.Step(-1); Check(w.CursorTime == w.Range.Min, "stepping back at the start stays there");
+            w.HandleKey(System.Windows.Input.Key.End); Check(w.CursorTime == w.Range.Max, "End jumps to the end");
+            w.HandleKey(System.Windows.Input.Key.Home); Check(w.CursorTime == w.Range.Min, "Home jumps to the start");
+            Check(w.HandleKey(System.Windows.Input.Key.Space) && w.Playing && w.HandleKey(System.Windows.Input.Key.Space) && !w.Playing && !w.HandleKey(System.Windows.Input.Key.A), "Space toggles playback; other keys are left alone");
+            w.Loop = true; w.SetCursor(w.Range.Max - 0.01); w.TogglePlayForSelfTest(); w.Advance(1.0);
+            Check(w.Playing && w.CursorTime == w.Range.Min, "with Loop on, playback wraps to the start instead of stopping"); w.PausePlayback(); w.Loop = false;
             // Pulling the cursor (a click on a chart) pauses.
             w.TogglePlayForSelfTest(); w.SetCursor(w.Range.Min); w.Plots[1].RaiseCursor(3.0);
             Check(!w.Playing && w.CursorTime == 3.0 && w.Plots.All(p => p.CursorX == 3.0), "clicking a chart pauses and moves every view to that time");
@@ -166,8 +177,9 @@ internal sealed partial class ExperimentWindow
                     var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(image));
                     using var stream = File.Create(Path.Combine(dir, name)); png.Save(stream); w.Hide();
                 }
-                w.SelectForSelfTest(rectRow); w.SetCursor(9.0); Snap("experiment-replay.png");
-                w.SelectForSelfTest(0, 1); w.SetCursor(12.0); Snap("experiment-compare.png");
+                int shotRect = Enumerable.Range(0, w.ListedRuns).First(k => w.RowText(k).Contains("|矩形|")), shotCircle = Enumerable.Range(0, w.ListedRuns).First(k => w.RowText(k).Contains("|圆|"));
+                w.SelectForSelfTest(shotRect); w.SetCursor(9.0); Snap("experiment-replay.png");
+                w.SelectForSelfTest(shotRect, shotCircle); w.SetCursor(12.0); Snap("experiment-compare.png");
             }
             w.Close();
         }
