@@ -78,7 +78,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-hotpath2"
+#define FW_BUILD_ID                 "stage2-v11-hotpath2-r2500-slip"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -161,7 +161,7 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
     PTP_MINE_CD < -CFG_JOINT_CD_MAX || PTP_MAXE_CD > CFG_JOINT_CD_MAX)
 #error "PTP requires an elbow bound within +/-180 deg containing straight zero"
 #endif
-#define PTP_RATE_MAX                 (4000u)
+#define PTP_RATE_MAX                 (2500u)
 #define PTP_ACCEL                    (3000u)
 #define PTP_FRAME_BYTES              (17u)
 #define PTP_FRAME_START              (0xD1u)
@@ -1220,10 +1220,19 @@ static uint32 motion_min(uint32 a, uint32 b) { return a < b ? a : b; }
 /* Whole-path preload: no movement until every numbered node is accepted.  The plan's data and rules are in traj.h; the
  * numbers it is built on stay here, where the release gate reads them against DeviceContract.cs. */
 #define TRAJ_CAPACITY 2048u
-#define TRAJ_RATE_MAX 4000u
+#define TRAJ_RATE_MAX 2500u
 #define TRAJ_ACCEL_MAX 3000u
-/* Never pulse a trajectory faster than its own rate cap, even when catching up. */
-#define TRAJ_STEP_MIN_US (1000000u / TRAJ_RATE_MAX)
+/* Never pulse a trajectory faster than this, even when catching up.  Deliberately NOT tied to TRAJ_RATE_MAX: the plan stays
+ * under 2500 steps/s, but a loop that fell a little behind must still be able to close the gap (250 us is the spacing the
+ * hardware-tested builds used). */
+#define TRAJ_BURST_RATE_MAX 4000u
+#define TRAJ_STEP_MIN_US (1000000u / TRAJ_BURST_RATE_MAX)
+/* Ride the limit instead of stopping: a step more than TRAJ_LATE_SOFT_US behind its due time means the loop cannot keep this
+ * plan's pace right now, so the plan clock is held back by the excess (the segment simply takes longer; every segment still
+ * gets exactly its step count, so the drawn shape is unchanged).  Only a stall that outlasts the 20 ms segment margin, or a
+ * total stretch beyond TRAJ_SLIP_MAX_MS (the run is not sustainable at all), still stops. */
+#define TRAJ_LATE_SOFT_US 1000u
+#define TRAJ_SLIP_MAX_MS 5000u
 #include "traj.h"
 
 static struct {
@@ -2016,6 +2025,7 @@ static void traj_service(void)
     int8 step[2];
     switch(traj_poll(&g_traj,&g_ptp.seg,g_ptp.origin,SU_NOW(),step)) {
     case TRAJ_POLL_OVERRUN: stage_stop("trajectory timing overrun",0u); break;
+    case TRAJ_POLL_UNSUSTAINED: stage_stop("trajectory rate not sustained",0u); break;
     case TRAJ_POLL_STEP: (void)pulse_axes(step,"trajectory pulse blocked"); break;
     case TRAJ_POLL_DONE: g_ptp.active=2u; g_ptp.settleMs=g_jogMs; break;
     default: break;
@@ -2420,10 +2430,10 @@ static void stage_status_line(void)
           (unsigned long)g_rxRejected, (unsigned long)g_ptpEpochRejected,
           (unsigned)g_rxLastBad[(g_rxLastBadIdx + 7u) % 8u]); break;
     case 9u:
-    JLOGF("TIMING loop_max_ms=%lu tick_lag_max_ms=%lu clock=hardware wdt=256-384ms key_age_ms=%lu key_max_gap_ms=%lu status_max_us=%lu traj_lag_max_us=%lu\r\n",
+    JLOGF("TIMING loop_max_ms=%lu tick_lag_max_ms=%lu clock=hardware wdt=256-384ms key_age_ms=%lu key_max_gap_ms=%lu status_max_us=%lu traj_lag_max_us=%lu traj_slip_us=%lu\r\n",
           (unsigned long)g_loopMaxMs,(unsigned long)g_tickMaxLagMs,
           (unsigned long)(g_keysSeen ? (g_jogMs - g_lastKeyMs) : 0u),(unsigned long)g_keyMaxGapMs,(unsigned long)(g_statusMaxCy/SU_CY_PER_US),
-          (unsigned long)(g_traj.lagMaxCy/SU_CY_PER_US)); break;
+          (unsigned long)(g_traj.lagMaxCy/SU_CY_PER_US),(unsigned long)(g_traj.slipCy/SU_CY_PER_US)); break;
     case 10u:
     JLOGF("ENC_DIAG irq_max_us=%lu retries=%lu rejected=%lu gap_max_ms=%lu follow_peak_lsb=%lu\r\n",
           (unsigned long)(g_encIrqMaxCy/SU_CY_PER_US),(unsigned long)g_encRetries,

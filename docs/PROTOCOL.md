@@ -1,4 +1,4 @@
-# 上位机 ↔ 固件 通信协议（stage2-v11-hotpath2，proto=4）
+# 上位机 ↔ 固件 通信协议（stage2-v11-hotpath2-r2500-slip，proto=4）
 
 本页只写当前源码里**已经存在**的行为，均已对照 `DRV8825.cydsn/main.c` 与 `Commissioning/` 核对；有出入以源码为准。设计过程和现场日志分析见 `docs/history/WORKBENCH_HARDENING.md`。状态机见 [STATE_MODEL.md](STATE_MODEL.md)。
 
@@ -15,7 +15,7 @@
 
 | type | 含义 | q1 / q2 / value | 序号 |
 |---|---|---|---|
-| 1 | PTP 单点 | q1、q2 目标；value = 速度 20…4000 微步/秒 | PTP |
+| 1 | PTP 单点 | q1、q2 目标；value = 速度 20…2500 微步/秒（`PTP_RATE_MAX`，轨迹每轴速度也不得超过 2500） | PTP |
 | 2 | 轨迹 BEGIN | q1、q2 = 起点（必须就是当前位姿）；value = 节点数 2…2048 | PTP |
 | 3 | 轨迹 NODE | q1、q2；value = 该段时长 50…500 ms | PTP（须连续） |
 | 4 | 轨迹 RUN | 全 0 | PTP（须连续） |
@@ -82,7 +82,7 @@
 
 ## 6. 版本与兼容
 
-- 固件标识 `FW_BUILD_ID`（现为 `stage2-v11-hotpath2`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。行为不变的结构性重构（例如 2026-09-30 的循环拆分）没有改它，靠 `firmware.hex` 的 SHA-256 区分。
+- 固件标识 `FW_BUILD_ID`（现为 `stage2-v11-hotpath2-r2500-slip`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。行为不变的结构性重构（例如 2026-09-30 的循环拆分）没有改它，靠 `firmware.hex` 的 SHA-256 区分。
 - **proto=2（肘范围）**：type 9 新增轴 2（肘），`PTP_STATE` 末尾新增 `emin=<cd> emax=<cd>`，并把肘范围纳入 PTP/轨迹/点动的校验。固件开机默认 ∓155°（`PTP_ELBOW_DEFAULT_CD`，与 `DeviceContract.ElbowDefaultCd` 同值、由发布闸门核对）：这是暂定值，不是实测机械行程。上位机连接后把界面里的肘范围同步给固件，和 q1/q2 范围一样，确认一致才允许运动；proto=1 的固件会被拒绝运动并提示更新。
 - **能力位（不改 proto）**：`traj_repeat=1` 已运行过的已缓存图形接受再次 RUN，没有它的固件第二次 RUN 会被拒绝并停止，上位机据此在运行一次后要求重新上传；`fault_snapshot=1` 每次停止先打印 `FAULT_SNAPSHOT`；`telem_hz=<n>` 出现表示支持 type 11，值是当前速率。上位机对没声明的固件不发 type 11、不指望快照。
 - **proto=3（双编码器历史版本）**：STATE 新增 enc2/dir2；TELEM 与 FAULT_SNAPSHOT 新增 e2/err2；同次 SSI 读取更新两路，任一路失效都会保护停机。人工参考要求 arm2 方向已由本次使能后的回零识别。

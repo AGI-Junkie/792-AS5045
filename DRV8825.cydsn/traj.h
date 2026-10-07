@@ -11,7 +11,9 @@
  * The host (main.c) must provide, before this header is included:
  *   TRAJ_CAPACITY, TRAJ_NODE_MIN_MS, TRAJ_NODE_MAX_MS, TRAJ_TOTAL_MAX_MS   (the host/firmware contract; the release
  *                                                                          gate reads them from main.c)
- *   TRAJ_STEP_MIN_US                                                       (never pulse faster than the rate cap)
+ *   TRAJ_STEP_MIN_US                                                       (never pulse faster than this, even when catching up)
+ *   TRAJ_LATE_SOFT_US, TRAJ_SLIP_MAX_MS                                    (how late a step may be before the plan clock is held back,
+ *                                                                          and how much total holding back a run may take)
  *   SU_CY_PER_US, abs_i32()
  * and, after it (a forward declaration here, the definition there):
  *   traj_joint_steps()                                                     (kinematics: joint angles -> steps)
@@ -20,8 +22,8 @@
 #define TRAJ_H
 
 #if !defined(TRAJ_CAPACITY) || !defined(TRAJ_NODE_MIN_MS) || !defined(TRAJ_NODE_MAX_MS) || !defined(TRAJ_TOTAL_MAX_MS) || \
-    !defined(TRAJ_STEP_MIN_US) || !defined(SU_CY_PER_US)
-#error "define the TRAJ_* contract macros, TRAJ_STEP_MIN_US and SU_CY_PER_US before including traj.h"
+    !defined(TRAJ_STEP_MIN_US) || !defined(TRAJ_LATE_SOFT_US) || !defined(TRAJ_SLIP_MAX_MS) || !defined(SU_CY_PER_US)
+#error "define the TRAJ_* contract macros, TRAJ_STEP_MIN_US, TRAJ_LATE_SOFT_US, TRAJ_SLIP_MAX_MS and SU_CY_PER_US before including traj.h"
 #endif
 
 /* A node running this much longer than planned stops the run (the foreground has stalled). */
@@ -66,7 +68,7 @@ static inline __attribute__((always_inline)) void dda_step(dda_t *d, int8 step[2
 
 /* When step k of a segment is due: floor(k * duration / total) cycles.  With q = duration / total and
  * r = duration % total that is k*q + k*r/total, which stays in 32 bits while total < 65536 (a node is at most 500 ms
- * at 4000 steps/s), so the hot loop needs no 64-bit divide.  The last answer is kept because one pass of the main
+ * at under 4000 steps/s), so the hot loop needs no 64-bit divide.  The last answer is kept because one pass of the main
  * loop asks for the same step from the trajectory service, the encoder slot check and the TX slot check. */
 static uint32 traj_due_cy(uint32 k, uint32 duration, uint32 total)
 {
@@ -88,6 +90,7 @@ typedef struct {
     uint32 elapsedCy, clock;  /* time spent in node `index`, and the SysTick count it was last advanced at */
     uint32 lastStep;          /* SysTick count of the last step pulse */
     uint32 lagMaxCy;          /* worst lateness of a step behind its due time; the owner clears it (ENABLE) */
+    uint32 slipCy;            /* total plan-clock stretch of the current run (see TRAJ_LATE_SOFT_US); cleared by traj_start */
     int32 velocity[2];
     traj_node_t nodes[TRAJ_CAPACITY];
 } traj_t;
@@ -155,17 +158,20 @@ static void traj_segment(const traj_t *t, dda_t *seg, const int32 origin[2], con
 /* Start at node 1 (node 0 is where the machine already stands, at `pos`); `now` is the SysTick count. */
 static void traj_start(traj_t *t, dda_t *seg, const int32 origin[2], const int32 pos[2], uint32 now)
 {
-    t->state = TRAJ_RUNNING; t->index = 1u; t->elapsedCy = 0u; t->clock = now; t->lastStep = now;
+    t->state = TRAJ_RUNNING; t->index = 1u; t->elapsedCy = 0u; t->clock = now; t->lastStep = now; t->slipCy = 0u;
     traj_segment(t, seg, origin, pos);
 }
 
-typedef enum { TRAJ_POLL_IDLE = 0, TRAJ_POLL_STEP, TRAJ_POLL_DONE, TRAJ_POLL_OVERRUN } traj_poll_t;
+typedef enum { TRAJ_POLL_IDLE = 0, TRAJ_POLL_STEP, TRAJ_POLL_DONE, TRAJ_POLL_OVERRUN, TRAJ_POLL_UNSUSTAINED } traj_poll_t;
 
 /* Advance a running plan to `now`.  Call as often as the foreground allows; each call does at most one thing:
  *   STEP     one DDA event is due: step[i] says which axes pulse and which way.  The caller pulses them.
  *   DONE     the last node's time is up (the caller starts its settle check).
  *   OVERRUN  the current node has run TRAJ_OVERRUN_US past its time: the caller stops the machine.
+ *   UNSUSTAINED  the run has been held back more than TRAJ_SLIP_MAX_MS in all: the caller stops the machine.
  *   IDLE     nothing is due (a node boundary may have been crossed).
+ * A step more than TRAJ_LATE_SOFT_US behind its due time holds the plan clock back by the excess instead of letting the
+ * lateness pile up to the overrun stop: the segment takes longer, its step count (the drawn shape) is unchanged.
  * A step is never issued sooner than TRAJ_STEP_MIN_US after the previous one, even when catching up.  The next
  * segment starts from where the last one aimed, which is where the pulses put the axes. */
 static traj_poll_t traj_poll(traj_t *t, dda_t *seg, const int32 origin[2], uint32 now, int8 step[2])
@@ -176,7 +182,14 @@ static traj_poll_t traj_poll(traj_t *t, dda_t *seg, const int32 origin[2], uint3
     if (seg->done < seg->total) {
         uint32 due = traj_due_cy(seg->done + 1u, duration, seg->total);
         if (t->elapsedCy < due || ((t->lastStep - now) & 0x00FFFFFFu) < TRAJ_STEP_MIN_US * SU_CY_PER_US) { return TRAJ_POLL_IDLE; }
-        if (t->elapsedCy - due > t->lagMaxCy) { t->lagMaxCy = t->elapsedCy - due; }
+        {
+            uint32 late = t->elapsedCy - due, soft = TRAJ_LATE_SOFT_US * SU_CY_PER_US;
+            if (late > t->lagMaxCy) { t->lagMaxCy = late; }
+            if (late > soft) {
+                t->elapsedCy -= late - soft; t->slipCy += late - soft;
+                if (t->slipCy > TRAJ_SLIP_MAX_MS * 1000u * SU_CY_PER_US) { return TRAJ_POLL_UNSUSTAINED; }
+            }
+        }
         t->lastStep = now;
         dda_step(seg, step);
         return TRAJ_POLL_STEP;

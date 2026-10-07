@@ -908,7 +908,9 @@ static void host_rates_config(void) {
 /* Characterization of the trajectory executor: the exact pulse schedule of fixed plans.  The plans are out-and-back smoothsteps
  * built with integer arithmetic only, so they are identical on every compiler; the hashes were recorded from the firmware as of
  * the time-in traj_poll (the move into traj.h left them unchanged; making time an argument removed SysTick reads, which moved
- * every pulse by less than one foreground pass, with the same pulse counts and axis order).  Any other change is a change of behaviour. */
+ * every pulse by less than one foreground pass, with the same pulse counts and axis order).  The rate cap and the ride-the-limit
+ * code changed nothing here (with the log text of the previous build the old hashes come back exactly); the new hashes only
+ * reflect the longer FW_BUILD_ID and the traj_slip_us field in the status lines.  Any other change is a change of behaviour. */
 #define SCHED_A1 7112u
 #define SCHED_A2 6808u
 #define SCHED_B1 3200u
@@ -916,13 +918,13 @@ static void host_rates_config(void) {
 #define SCHED_C1 2844u
 #define SCHED_C2 0u
 #if ARM2_ENCODER_FEEDBACK /* the second encoder frame lengthens the foreground pass, which moves where each pulse lands */
-#define SCHED_AH 0x7065db97u
-#define SCHED_BH 0xebc07474u
-#define SCHED_CH 0xafd22703u
+#define SCHED_AH 0xc6caae81u
+#define SCHED_BH 0xf7e7e694u
+#define SCHED_CH 0x32e65821u
 #else
-#define SCHED_AH 0x0b38f375u
-#define SCHED_BH 0x7762a1cau
-#define SCHED_CH 0x124b175bu
+#define SCHED_AH 0xc8cfd969u
+#define SCHED_BH 0xc9d37faeu
+#define SCHED_CH 0x33cd067du
 #endif
 typedef struct { unsigned n; int16 q1[128], q2[128]; uint16 ms[128]; } sched_plan_t;
 static void sched_build(sched_plan_t *p, const uint16 *ms, unsigned n, int a1, int ae, unsigned dwellMs) {
@@ -1302,12 +1304,12 @@ int main(int argc,char **argv) {
         setup();g_enc2.directionKnown=1u;g_enc2.incDir=1u;
         packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;txq_flush_blocking();
         g_traj.state=3u;g_traj.count=2u;g_traj.index=1u;
-        g_traj.nodes[1].q1=-139;g_traj.nodes[1].q2=207;g_traj.nodes[1].ms=248;
+        g_traj.nodes[1].q1=-139;g_traj.nodes[1].q2=207;g_traj.nodes[1].ms=397; /* 785 steps = 1977/s, 79% of TRAJ_RATE_MAX (was 248 ms = 3165/s = 79% of the old 4000 cap) */
         g_ptp.active=1u;{int32 pos[2];pos[0]=g_arm1.usteps;pos[1]=g_arm2.usteps;g_traj.elapsedCy=0;g_traj.clock=g_traj.lastStep=SU_NOW();traj_segment(&g_traj,&g_ptp.seg,g_ptp.origin,pos);}
         assert(g_ptp.seg.total==785u); CyILO_Start1K();CyWdtStart(CYWDT_128_TICKS,CYWDT_LPMODE_NOCHANGE);start=simClock;
         simFormatCostUs=2500u; /* 12 format calls in one burst cost about the observed 30 ms loop gap. */
-        while(g_motionEnabled && g_traj.index<g_traj.count && simClock-start<400000u*24u) {
-            if(!requested && simClock-start>=240000u*24u){requested=1;stage_status();}
+        while(g_motionEnabled && g_traj.index<g_traj.count && simClock-start<600000u*24u) {
+            if(!requested && simClock-start>=389000u*24u){requested=1;stage_status();} /* 8 ms before the planned end, as before */
             if(g_jogMs-g_lastKeyMs>=35u)short_send(0,0);
             app_poll();simClock+=24u;
         }
@@ -1316,7 +1318,7 @@ int main(int argc,char **argv) {
         assert(simBoundaryChecks==1u && g_ptp.seg.done==785u);
         { unsigned long lag; const char *p; simLogN=0;simLog[0]=0;g_statusNext=9u;stage_status_line();txq_flush_blocking();
           p=strstr(simLog,"traj_lag_max_us="); assert(p && sscanf(p,"traj_lag_max_us=%lu",&lag)==1 && lag==g_traj.lagMaxCy/SU_CY_PER_US); }
-        printf("%s: 248 ms / 785 steps completed with injected formatting cost\n",t);return 0;
+        printf("%s: 397 ms / 785 steps completed with injected formatting cost\n",t);return 0;
     }
     if(!strcmp(t,"jog_arm2_limit")) {
         /* jog_axis_tick() must refuse an outward arm2 jog at the elbow bound and say so, with or without arm2 feedback. */
@@ -1368,6 +1370,27 @@ int main(int argc,char **argv) {
                 assert(traj_due_cy(k,durations[di],totals[ti])==(uint32)((int64)k*durations[di]/totals[ti]));
             assert(traj_due_cy(totals[ti],durations[di],totals[ti])==durations[di]); /* the last step is due exactly at the end */
         }
+        puts(t);return 0;
+    }
+    if(!strcmp(t,"traj_slip")) {
+        /* Ride the limit: a step far behind its due time stretches the plan clock instead of stopping; only an
+         * unsustainable total stretch (TRAJ_SLIP_MAX_MS) stops, with its own reason. */
+        setup(); txq_flush_blocking(); simLogN=0;simLog[0]=0;
+        g_traj.state=3u;g_traj.count=2u;g_traj.index=1u;g_traj.nodes[1].ms=248u;
+        g_ptp.active=1u;g_ptp.seg.done=0u;g_ptp.seg.total=100u;g_traj.slipCy=0u;g_traj.lagMaxCy=0u;
+        g_traj.lastStep=SU_NOW(); simClock+=1000u*SU_CY_PER_US;
+        g_traj.elapsedCy=10000u*SU_CY_PER_US;g_traj.clock=SU_NOW(); /* step 1 is due at 2.48 ms: 7.52 ms late */
+        traj_service();
+        assert(g_motionEnabled && g_ptp.seg.done==1u);
+        /* register reads cost a few cycles in the fixture, hence the +-5 us windows */
+        assert(g_traj.lagMaxCy/SU_CY_PER_US>=7515u && g_traj.lagMaxCy/SU_CY_PER_US<=7525u);
+        assert(g_traj.slipCy/SU_CY_PER_US>=6515u && g_traj.slipCy/SU_CY_PER_US<=6525u);   /* everything beyond the 1 ms soft margin */
+        assert(g_traj.elapsedCy/SU_CY_PER_US>=3475u && g_traj.elapsedCy/SU_CY_PER_US<=3485u); /* 10 ms - 6.52 ms: now 1 ms behind step 1's due time */
+        g_traj.lastStep=SU_NOW(); simClock+=1000u*SU_CY_PER_US;
+        g_traj.elapsedCy=7960u*SU_CY_PER_US;g_traj.clock=SU_NOW();   /* step 2 due at 4.96 ms: 3 ms late */
+        g_traj.slipCy=(TRAJ_SLIP_MAX_MS*1000u-1000u)*SU_CY_PER_US;    /* 1 ms of stretch left */
+        traj_service();
+        assert(!g_motionEnabled && strstr(g_lastStop,"reason=\"trajectory rate not sustained\"") && g_ptp.seg.done==1u);
         puts(t);return 0;
     }
     if(!strcmp(t,"pulse_blocked")) {
@@ -2079,7 +2102,7 @@ ptp_cases += ['traj_'+name for name in ['success','dwell','duplicate','capacity'
     'upload_stop','upload_jog','upload_timeout','crc','ptp_busy','stop','fault','limit','home1','npn','encoder','timeout','overrun','uart_upload','uart_run']]
 ptp_cases += ['manual_'+name for name in ['success','duplicate','stop','old_epoch','disabled','moving','busy','upload','sensor','fault','encoder','timeout','stale','payload','crc']]
 ptp_cases += ['fuzz_%d' % n for n in range(1, 7)]   # the gate's share; long campaigns: --emit-c=DIR and run fuzz_<seed> in parallel
-ptp_cases += ['dual_manual_unknown','dual_ptp_follow','stop_latch','traj_status_cost','hot_arith','jog_arm2_limit','origin_retry','traj_schedule','pulse_blocked']
+ptp_cases += ['dual_manual_unknown','dual_ptp_follow','stop_latch','traj_slip','traj_status_cost','hot_arith','jog_arm2_limit','origin_retry','traj_schedule','pulse_blocked']
 if host_plan is not None: ptp_cases += ['traj_host_plan','traj_manual_plan','traj_host_plan_offset','traj_host_plan_rx_retry']
 if len(sys.argv)>1:
     cases=[c for c in cases if c in sys.argv[1:]]
