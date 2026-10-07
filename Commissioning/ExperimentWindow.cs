@@ -82,7 +82,7 @@ internal sealed partial class ExperimentWindow : Window
     {
         public required ExperimentRun Run { get; init; }
         public string Time { get; set; } = ""; public string Kind { get; set; } = ""; public string Shape { get; set; } = ""; public string Speed { get; set; } = "";
-        public string Reference { get; set; } = ""; public string Status { get; set; } = ""; public string Rmse { get; set; } = ""; public string Peak { get; set; } = ""; public string Rmse2 { get; set; } = "";
+        public string Reference { get; set; } = ""; public string Status { get; set; } = ""; public string Rmse { get; set; } = ""; public string Peak { get; set; } = ""; public string Rmse2 { get; set; } = ""; public string Note { get; set; } = "";
         public string Hz { get; set; } = ""; public string Fault { get; set; } = ""; public string Calibration { get; set; } = "";
     }
 
@@ -110,6 +110,13 @@ internal sealed partial class ExperimentWindow : Window
     private readonly Dictionary<string, RunAnalysis> cache = [];
     private readonly List<RunAnalysis> shown = [];
     private List<Row> rows = [];
+    private List<ExperimentRun> runsAll = [];
+    internal int ListLimit = ExperimentArchive.ListLimit;
+    private readonly TextBox filterBox = new() { Width = 130, Margin = new Thickness(4), VerticalContentAlignment = VerticalAlignment.Center };
+    private readonly Button deleteRuns = new() { Margin = new Thickness(4), Padding = new Thickness(10, 2, 10, 2) };
+    private readonly TextBox noteBox = new() { Margin = new Thickness(4, 2, 4, 2), VerticalContentAlignment = VerticalAlignment.Center, IsEnabled = false };
+    private readonly TextBlock noteLabel = new() { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 4, 0), FontSize = 11, Foreground = WorkbenchTheme.Muted };
+    private Row? noteRow;
     private int unreadable;
     private double tMin, tMax, cursor;
     private bool settingSlider;
@@ -136,12 +143,13 @@ internal sealed partial class ExperimentWindow : Window
         shell.ColumnDefinitions.Add(new ColumnDefinition { MinWidth = 520 });
         // Left: the list, its buttons, and the written summary of what is shown.
         var left = new Grid(); left.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); left.RowDefinitions.Add(new RowDefinition { Height = new GridLength(2, GridUnitType.Star), MinHeight = 130 });
-        left.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); left.RowDefinitions.Add(new RowDefinition { Height = new GridLength(3, GridUnitType.Star), MinHeight = 120 });
-        var bar = new WrapPanel { Margin = new Thickness(4) }; bar.Children.Add(refresh); bar.Children.Add(openFolder); bar.Children.Add(exportList); bar.Children.Add(exportImage);
+        left.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); left.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); left.RowDefinitions.Add(new RowDefinition { Height = new GridLength(3, GridUnitType.Star), MinHeight = 120 });
+        var bar = new WrapPanel { Margin = new Thickness(4) }; bar.Children.Add(refresh); bar.Children.Add(openFolder); bar.Children.Add(exportList); bar.Children.Add(exportImage); bar.Children.Add(deleteRuns); bar.Children.Add(Lang.Bind(new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0), FontSize = 11, Foreground = WorkbenchTheme.Muted }, TextBlock.TextProperty, "exp.filter")); bar.Children.Add(filterBox);
         left.Children.Add(WorkbenchTheme.Edge(new StackPanel { Children = { bar, listHint } }, WorkbenchTheme.Bar));
         Grid.SetRow(grid, 1); left.Children.Add(grid);
-        var summaryTitle = WorkbenchTheme.Caption("exp.summary"); Grid.SetRow(summaryTitle, 2); left.Children.Add(summaryTitle);
-        var summaryBox = new Border { Background = Brushes.White, Child = summary }; Grid.SetRow(summaryBox, 3); left.Children.Add(summaryBox);
+        var noteBar = new DockPanel { Background = Brushes.White }; DockPanel.SetDock(noteLabel, Dock.Left); noteBar.Children.Add(noteLabel); noteBar.Children.Add(noteBox); Grid.SetRow(noteBar, 2); left.Children.Add(noteBar);
+        var summaryTitle = WorkbenchTheme.Caption("exp.summary"); Grid.SetRow(summaryTitle, 3); left.Children.Add(summaryTitle);
+        var summaryBox = new Border { Background = Brushes.White, Child = summary }; Grid.SetRow(summaryBox, 4); left.Children.Add(summaryBox);
         shell.Children.Add(left);
         var splitter = new GridSplitter { Width = 5, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Stretch, Background = WorkbenchTheme.Line, ResizeBehavior = GridResizeBehavior.PreviousAndNext }; Grid.SetColumn(splitter, 1); shell.Children.Add(splitter);
         // Right: replay bar on top, charts and the plane in the middle, the log below.
@@ -168,7 +176,10 @@ internal sealed partial class ExperimentWindow : Window
 
         speed.Items.Add(new ComboBoxItem { Content = "0.5×", Tag = 0.5 }); speed.Items.Add(new ComboBoxItem { Content = "1×", Tag = 1.0 }); speed.Items.Add(new ComboBoxItem { Content = "2×", Tag = 2.0 }); speed.Items.Add(new ComboBoxItem { Content = "5×", Tag = 5.0 });
         speed.SelectedIndex = 1;
-        grid.SelectionChanged += (_, _) => ShowSelection();
+        grid.SelectionChanged += (_, _) => { ShowNote(); ShowSelection(); };
+        filterBox.TextChanged += (_, _) => FillList();
+        deleteRuns.Click += (_, _) => DeleteSelected();
+        noteBox.LostFocus += (_, _) => SaveNote();
         timeSlider.ValueChanged += (_, _) => { if (!settingSlider) { PausePlayback(); SetCursor(timeSlider.Value); } };
         play.Click += (_, _) => TogglePlayback();
         stepBack.Click += (_, _) => Step(-1); stepForward.Click += (_, _) => Step(1);
@@ -197,48 +208,109 @@ internal sealed partial class ExperimentWindow : Window
             Speed = s is null ? "—" : $"{s.V1:0.#} / {s.V2:0.#}", Reference = run.Reference,
             Status = run.Kind == "fault" ? Lang.T("exp.status.fault") : run.Complete ? Lang.T("exp.status.complete") : run.Outcome == "interrupted" ? Lang.T("exp.status.interrupted") : Lang.T("exp.status.other", run.Outcome),
             Rmse = run.Rmse is { } r ? r.ToString("0.0000", CultureInfo.InvariantCulture) : "—", Peak = run.Peak is { } p ? p.ToString("0.0000", CultureInfo.InvariantCulture) : "—", Rmse2 = run.Rmse2 is { } r2 ? r2.ToString("0.0000", CultureInfo.InvariantCulture) : "—",
-            Hz = run.Kind == "fault" ? "—" : run.TelemetryHz > 0 ? run.TelemetryHz + " Hz" : "~2 Hz", Fault = run.HasFault ? "⚠" : "", Calibration = run.CalibrationVersion.Length > 0 ? run.CalibrationVersion : "—" };
+            Hz = run.Kind == "fault" ? "—" : run.TelemetryHz > 0 ? run.TelemetryHz + " Hz" : "~2 Hz", Fault = run.HasFault ? "⚠" : "", Note = run.Note.ReplaceLineEndings(" "), Calibration = run.CalibrationVersion.Length > 0 ? run.CalibrationVersion : "—" };
     }
     private void BuildColumns()
     {
         grid.Columns.Clear();
         (string key, string property, double width)[] columns = [("exp.col.time", nameof(Row.Time), 100), ("exp.col.kind", nameof(Row.Kind), 48), ("exp.col.shape", nameof(Row.Shape), 70), ("exp.col.speed", nameof(Row.Speed), 96),
-            ("exp.col.ref", nameof(Row.Reference), 96), ("exp.col.status", nameof(Row.Status), 110), ("exp.col.rmse", nameof(Row.Rmse), 64), ("exp.col.peak", nameof(Row.Peak), 64), ("exp.col.rmse2", nameof(Row.Rmse2), 64), ("exp.col.hz", nameof(Row.Hz), 52), ("exp.col.cal", nameof(Row.Calibration), 46), ("exp.col.fault", nameof(Row.Fault), 36)];
+            ("exp.col.ref", nameof(Row.Reference), 96), ("exp.col.status", nameof(Row.Status), 110), ("exp.col.rmse", nameof(Row.Rmse), 64), ("exp.col.peak", nameof(Row.Peak), 64), ("exp.col.rmse2", nameof(Row.Rmse2), 64), ("exp.col.hz", nameof(Row.Hz), 52), ("exp.col.cal", nameof(Row.Calibration), 46), ("exp.col.fault", nameof(Row.Fault), 36), ("exp.col.note", nameof(Row.Note), 160)];
         foreach (var (key, property, width) in columns)
             grid.Columns.Add(new DataGridTextColumn { Header = Lang.T(key), Binding = new System.Windows.Data.Binding(property), Width = width, SortMemberPath = property });
     }
 
     private void Reload()
     {
-        var selected = grid.SelectedItems.OfType<Row>().Select(r => r.Run.Directory).ToHashSet();
+        SaveNote();
         var (runs, bad) = ExperimentArchive.List(root, includeFaults: true); unreadable = bad;
-        rows = runs.Select(MakeRow).ToList();
+        limited = runs.Count >= ListLimit;                    // the archive stops at ExperimentArchive.ListLimit, so a full list may be cut
+        runsAll = runs.Take(ListLimit).ToList();
+        FillList();
+        ShowSelection();
+    }
+
+    private bool limited;
+
+    // The list as filtered by the text box, keeping what is selected.
+    private void FillList()
+    {
+        var selected = grid.SelectedItems.OfType<Row>().Select(r => r.Run.Directory).ToHashSet();
+        string f = filterBox.Text.Trim();
+        rows = runsAll.Select(MakeRow).Where(r => f.Length == 0 || string.Join(" ", r.Time, r.Kind, r.Shape, r.Reference, r.Status, r.Note, r.Calibration, r.Run.Id).Contains(f, StringComparison.OrdinalIgnoreCase)).ToList();
         grid.ItemsSource = rows;
         foreach (var row in rows.Where(r => selected.Contains(r.Run.Directory))) grid.SelectedItems.Add(row);
-        listHint.Text = rows.Count == 0 ? Lang.T("exp.sum.none") : Lang.T("exp.hint") + (unreadable > 0 ? " " + Lang.T("exp.sum.unreadable", unreadable) : "");
-        ShowSelection();
+        listHint.Text = runsAll.Count == 0 ? Lang.T("exp.sum.none") : Lang.T("exp.hint") + (f.Length > 0 ? " " + Lang.T("exp.hint.filtered", rows.Count, runsAll.Count) : "") + (limited ? " " + Lang.T("exp.hint.limit", ListLimit) : "") + (unreadable > 0 ? " " + Lang.T("exp.sum.unreadable", unreadable) : "");
+        if (grid.SelectedItems.Count == 0) ShowNote();
+    }
+
+    // ---- notes, deleting ---------------------------------------------------------------------------------------------
+    private void ShowNote()
+    {
+        SaveNote();
+        noteRow = grid.SelectedItems.Count == 1 ? grid.SelectedItems[0] as Row : null;
+        noteBox.IsEnabled = noteRow is not null; noteBox.Text = noteRow?.Run.Note.ReplaceLineEndings(" ") ?? "";
+    }
+
+    private void SaveNote()
+    {
+        if (noteRow is not { } row || noteBox.Text.Trim() == row.Run.Note.ReplaceLineEndings(" ")) return;
+        try { ExperimentArchive.SaveNote(row.Run, noteBox.Text); row.Note = row.Run.Note.ReplaceLineEndings(" "); grid.Items.Refresh(); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { summary.Text = Lang.T("exp.note.fail") + ex.Message; }
+    }
+
+    // To the recycle bin by default. A folder written to in the last few seconds is a recording in progress and is left alone.
+    internal (int Deleted, int Busy) DeleteRuns(IEnumerable<ExperimentRun> runs, bool recycle = true)
+    {
+        int deleted = 0, busy = 0;
+        foreach (var run in runs)
+        {
+            if (Directory.EnumerateFiles(run.Directory).Any(f => (DateTime.UtcNow - File.GetLastWriteTimeUtc(f)).TotalSeconds < 5)) { busy++; continue; }
+            try
+            {
+                if (recycle) Microsoft.VisualBasic.FileIO.FileSystem.DeleteDirectory(run.Directory, Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+                else Directory.Delete(run.Directory, true);
+                deleted++; cache.Remove(run.Directory);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException) { summary.Text = Lang.T("exp.delete.fail", run.Id) + ex.Message; }
+        }
+        return (deleted, busy);
+    }
+
+    private void DeleteSelected()
+    {
+        var runs = grid.SelectedItems.OfType<Row>().Select(r => r.Run).ToList();
+        if (runs.Count == 0) { summary.Text = Lang.T("exp.delete.none"); return; }
+        if (MessageBox.Show(this, Lang.T("exp.delete.confirm", runs.Count), Lang.T("exp.delete"), MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+        noteRow = null;
+        var (deleted, busy) = DeleteRuns(runs);
+        Reload();
+        summary.Text = Lang.T("exp.delete.done", deleted) + (busy > 0 ? " " + Lang.T("exp.delete.busy", busy) : "");
     }
 
     private void ApplyLanguage()
     {
         Title = Lang.T("exp.title");
-        refresh.Content = Lang.T("exp.refresh"); openFolder.Content = Lang.T("btn.openData"); exportList.Content = Lang.T("exp.export"); exportImage.Content = Lang.T("exp.exportImage");
+        refresh.Content = Lang.T("exp.refresh"); openFolder.Content = Lang.T("btn.openData"); exportList.Content = Lang.T("exp.export"); exportImage.Content = Lang.T("exp.exportImage"); deleteRuns.Content = Lang.T("exp.delete"); filterBox.ToolTip = Lang.T("exp.filter.tip"); noteLabel.Text = Lang.T("exp.note"); noteBox.ToolTip = Lang.T("exp.note.tip");
         quietLog.Content = Lang.T("exp.log.quiet"); loop.Content = Lang.T("exp.loop"); stepBack.ToolTip = Lang.T("exp.step.back"); stepForward.ToolTip = Lang.T("exp.step.forward"); speed.ToolTip = Lang.T("exp.keys"); wholeArm.Content = Lang.T("exp.xy.whole");
         logTitle.Text = Lang.T("exp.log.title"); logSource.ToolTip = Lang.T("exp.log.source");
         play.Content = timer.IsEnabled ? Lang.T("exp.pause") : Lang.T("exp.play");
         BuildColumns();
-        if (rows.Count > 0) { var selected = grid.SelectedItems.OfType<Row>().Select(r => r.Run.Directory).ToHashSet(); rows = rows.Select(r => MakeRow(r.Run)).ToList(); grid.ItemsSource = rows; foreach (var row in rows.Where(r => selected.Contains(r.Run.Directory))) grid.SelectedItems.Add(row); }
-        listHint.Text = rows.Count == 0 ? Lang.T("exp.sum.none") : Lang.T("exp.hint") + (unreadable > 0 ? " " + Lang.T("exp.sum.unreadable", unreadable) : "");
+        FillList();
         if (shown.Count > 0) ShowSelection();
     }
 
     // The table as a CSV: what to hand over with the thesis figures, and the check that each drawing's plan lines up with its samples.
-    private void ExportList()
+    // The alignment search runs for every recording, so it is off the UI thread: the window stays alive while a long list is analysed.
+    internal Task<string> BuildReport() { var runs = rows.Select(r => r.Run).ToList(); return Task.Run(() => ExperimentArchive.ReportCsv(runs)); }
+
+    private async void ExportList()
     {
         var dialog = new Microsoft.Win32.SaveFileDialog { Title = Lang.T("exp.export"), Filter = Lang.T("vp.csvFilter"), DefaultExt = ".csv", FileName = $"experiments-{DateTime.Now:yyyyMMdd-HHmmss}.csv" };
         if (dialog.ShowDialog(this) != true) return;
-        try { File.WriteAllText(dialog.FileName, ExperimentArchive.ReportCsv(rows.Select(r => r.Run)), new System.Text.UTF8Encoding(true)); summary.Text = Lang.T("exp.exported", dialog.FileName); }
+        exportList.IsEnabled = false; summary.Text = Lang.T("exp.exporting", rows.Count);
+        try { string csv = await BuildReport(); await File.WriteAllTextAsync(dialog.FileName, csv, new System.Text.UTF8Encoding(true)); summary.Text = Lang.T("exp.exported", dialog.FileName); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { summary.Text = Lang.T("exp.exportFail") + ex.Message; }
+        finally { exportList.IsEnabled = true; }
     }
 
     // The four charts and the plane as one PNG (what is on screen, cursor and legend values included): the figure for the thesis.
@@ -534,6 +606,13 @@ internal sealed partial class ExperimentWindow : Window
     internal PlotView[] Plots => [qPlot, errPlot, speedPlot, accelPlot];
     internal XYView Plane => xy;
     internal int ListedRuns => rows.Count;
+    internal string Filter { get => filterBox.Text; set => filterBox.Text = value; }
+    internal string HintText => listHint.Text;
+    internal string NoteText { get => noteBox.Text; set => noteBox.Text = value; }
+    internal bool NoteEnabled => noteBox.IsEnabled;
+    internal void CommitNote() => SaveNote();
+    internal string CellNote(int index) => rows[index].Note;
+    internal string RunDirectory(int index) => rows[index].Run.Directory;
     internal int ShownRuns => shown.Count;
     internal double CursorTime => cursor;
     internal (double Min, double Max) Range => (tMin, tMax);

@@ -52,6 +52,7 @@ public sealed class ExperimentRun
     public double L1 { get; init; } = 180;
     public double L2 { get; init; } = 176.38;
     public bool HasFault { get; init; }
+    public string Note { get; set; } = "";                        // free text kept next to the recording in note.txt (never in metadata.json, which the recorder owns)
     public string CalibrationId { get; init; } = "";               // the calibration current when it ran ("" = none recorded)
     public string CalibrationVersion => CalibrationId.Contains("-v") ? "v" + CalibrationId[(CalibrationId.LastIndexOf("-v", StringComparison.Ordinal) + 2)..] : "";
 }
@@ -91,13 +92,27 @@ public static class ExperimentArchive
         return (runs, unreadable);
     }
 
+    private static string ReadNote(string directory)
+    {
+        try { string path = Path.Combine(directory, "note.txt"); return File.Exists(path) ? File.ReadAllText(path).Trim() : ""; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return ""; }
+    }
+
+    // An empty note removes the file.
+    public static void SaveNote(ExperimentRun run, string text)
+    {
+        text = text.Trim(); string path = Path.Combine(run.Directory, "note.txt");
+        if (text.Length == 0) File.Delete(path); else File.WriteAllText(path, text, new System.Text.UTF8Encoding(true));
+        run.Note = text;
+    }
+
     // A stop bundle with no recording: when the host saved it, and how many telemetry samples came with it.
     private static ExperimentRun ReadFaultRun(string directory)
     {
         using var document = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "fault.json")));
         var root = document.RootElement;
         if (!root.TryGetProperty("host_utc", out var at) || !at.TryGetDateTime(out var savedUtc)) throw new FormatException("host_utc");
-        return new ExperimentRun { Directory = directory, Kind = "fault", StartedUtc = savedUtc.ToUniversalTime(), Outcome = "fault", HasFault = true,
+        return new ExperimentRun { Directory = directory, Kind = "fault", StartedUtc = savedUtc.ToUniversalTime(), Outcome = "fault", HasFault = true, Note = ReadNote(directory),
             Samples = root.TryGetProperty("pre_fault_samples", out var n) && n.ValueKind == JsonValueKind.Number ? n.GetInt32() : 0 };
     }
 
@@ -125,7 +140,7 @@ public static class ExperimentArchive
             Directory = directory, Kind = Text(root, "kind"), StartedUtc = startedUtc.ToUniversalTime(), Sequence = (uint)Number(root, "sequence", 0), Reference = Text(root, "reference"),
             Outcome = outcome, Samples = samples, MotionSamples = motion, Rmse = rmse, Peak = peak, Rmse2 = rmse2, Peak2 = peak2, TelemetryHz = (int)Number(root, "telemetry_hz", 0),
             Settings = RunSettings.Parse(Text(root, "settings")), SettingsText = Text(root, "settings"), L1 = Number(root, "L1", 180), L2 = Number(root, "L2", 176.38),
-            HasFault = File.Exists(Path.Combine(directory, "fault.json")), CalibrationId = Text(root, "calibration_id") };
+            HasFault = File.Exists(Path.Combine(directory, "fault.json")), Note = ReadNote(directory), CalibrationId = Text(root, "calibration_id") };
     }
 
     // The table as a CSV (numbers in invariant format), with how well each drawing's plan lines up with what was commanded: the

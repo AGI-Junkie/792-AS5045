@@ -60,7 +60,7 @@ internal sealed partial class ExperimentWindow
             bool zh = !Lang.IsEn;
             Check(zh, "the test runs in Chinese");
             var w = new ExperimentWindow(root);
-            Check(w.ListedRuns == 2 && w.ColumnHeaders.Length == 12 && w.ColumnHeaders[0] == "开始时间" && w.ColumnHeaders[8] == "arm2 RMSE °" && w.ColumnHeaders[6] == "RMSE °", "list and localized headers");
+            Check(w.ListedRuns == 2 && w.ColumnHeaders.Length == 13 && w.ColumnHeaders[0] == "开始时间" && w.ColumnHeaders[8] == "arm2 RMSE °" && w.ColumnHeaders[6] == "RMSE °", "list and localized headers");
             int rectRow = Enumerable.Range(0, 2).First(i => w.RowText(i).Contains("矩形")), circleRow = 1 - rectRow;
             string rowText = w.RowText(rectRow);
             Check(rowText.Contains("|图形|矩形|5 / 3|人工伸直零位|完整|") && rowText.Contains("10 Hz|—|") && rowText.EndsWith("|⚠") && w.RowText(circleRow).Contains("|圆|4 / 3|") && !w.RowText(circleRow).EndsWith("⚠"), "row facts: shape, speeds, reference, outcome, telemetry rate and the fault mark: " + rowText);
@@ -155,7 +155,7 @@ internal sealed partial class ExperimentWindow
             var decoder = BitmapDecoder.Create(new Uri(figure), BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
             Check(decoder.Frames[0].PixelWidth > w.Plane.ActualWidth + 300 && decoder.Frames[0].PixelHeight >= 700, "the exported figure holds the charts and the plane");
             w.Hide();
-            Check(w.ColumnHeaders.Length == 12 && w.ExportImageText == "导出图片 PNG", "the export button is labelled");
+            Check(w.ColumnHeaders.Length == 13 && w.ExportImageText == "导出图片 PNG", "the export button is labelled");
             // A stop with nothing recording is saved under "faults": listed, readable, and its pre-stop telemetry and log are replayable.
             string faultDir = Path.Combine(root, "faults", "20261001-000000-000-traj_run"); Directory.CreateDirectory(faultDir);
             var stopAt = baseUtc.AddSeconds(25);
@@ -180,6 +180,24 @@ internal sealed partial class ExperimentWindow
             w.SelectForSelfTest(Enumerable.Range(0, w.ListedRuns).ToArray());
             Check(w.ListedRuns == 5 && w.ShownRuns == ExperimentWindow.MaxCompared && w.SummaryText_.Contains("最多比较四次") && w.SummaryText_.Contains("C 相对 A") && q.Series.Any(x => x.Name.StartsWith("D ")), "a fifth selection is not shown, and the others are tagged A to D: " + w.SummaryText_);
             w.SelectForSelfTest(0, 1);
+            // Filter, notes, the long-list notice, the off-thread report, deleting.
+            w.SelectForSelfTest(0);
+            Check(w.NoteEnabled, "one selected run can be annotated");
+            w.NoteText = "第一次试跑，磁铁偏了"; w.CommitNote();
+            Check(w.CellNote(0) == "第一次试跑，磁铁偏了" && File.ReadAllText(Path.Combine(w.RunDirectory(0), "note.txt")).Contains("磁铁偏了") && ExperimentArchive.List(root).Runs.Any(r => r.Note.Contains("磁铁偏了")), "the note is kept in the run's folder and read back");
+            w.Filter = "磁铁"; Check(w.ListedRuns == 1 && w.HintText.Contains("筛选后 1/5"), "the filter matches the note: " + w.HintText);
+            w.Filter = "矩形"; Check(w.ListedRuns >= 1 && Enumerable.Range(0, w.ListedRuns).All(k => w.RowText(k).Contains("矩形")), "the filter matches the shape");
+            w.Filter = "";
+            Check(w.ListedRuns == 5, "clearing the filter lists everything again");
+            w.ListLimit = 3; w.Reload2(); Check(w.ListedRuns == 3 && w.HintText.Contains("只列出最新的 3 条"), "a list cut at the limit says so: " + w.HintText); w.ListLimit = ExperimentArchive.ListLimit; w.Reload2();
+            string report = w.BuildReport().GetAwaiter().GetResult();
+            Check(report.TrimEnd().Split("\r\n").Length == 1 + w.ListedRuns, "the report is built off the UI thread and has a line per listed run");
+            int before = w.ListedRuns; var doomed = ExperimentArchive.List(root, true).Runs.Where(r => r.Kind == "fault" || r.Directory == extra1).ToList();
+            Thread.Sleep(5200);
+            var (gone, busy) = w.DeleteRuns(doomed, recycle: false); w.Reload2();
+            Check(gone == 2 && busy == 0 && w.ListedRuns == before - 2 && !Directory.Exists(extra1) && !Directory.Exists(faultDir), "deleting removes the folders and the rows");
+            File.WriteAllText(Path.Combine(extra2, "feedback.csv"), File.ReadAllText(Path.Combine(extra2, "feedback.csv")));
+            Check(w.DeleteRuns(ExperimentArchive.List(root).Runs.Where(r => r.Directory == extra2), recycle: false) is (0, 1) && Directory.Exists(extra2), "a folder that was just written to is left alone");
             // Nothing recorded yet: a friendly empty state, not an error.
             var empty = new ExperimentWindow(Path.Combine(temp, "nothing"));
             Check(empty.ListedRuns == 0 && empty.SummaryText_.Contains("还没有实验记录") && empty.ShownRuns == 0, "an empty archive says so");
