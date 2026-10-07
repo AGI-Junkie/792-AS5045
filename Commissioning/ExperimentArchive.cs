@@ -211,7 +211,7 @@ public static class ExperimentArchive
 }
 
 public sealed record RunEvent(double Time, string Kind);                                  // Kind: start, dwell, stop
-public sealed record SegmentStat(int Index, double Start, double End, int Samples, double Rmse, double Peak);
+public sealed record SegmentStat(int Index, double Start, double End, int Samples, double Rmse, double Peak, double? Rmse2 = null);
 public sealed record AxisUse(string Name, double Peak, double Cap, string Unit)
 {
     public double Utilization => Cap > 0 ? Peak / Cap : 0;
@@ -344,6 +344,7 @@ public sealed class RunAnalysis
         // Error statistics over the moving part, per stroke between events.
         double sum = 0, peak = 0; int moving = 0;
         for (int i = 0; i < motion.Length; i++) { sum += motion[i].Q1Error * motion[i].Q1Error; peak = Math.Max(peak, Math.Abs(motion[i].Q1Error)); moving++; }
+        double[] q2Error = motion.Length > 0 && motion.All(r => r.Q2Measured.HasValue) ? motion.Select(r => r.Q2Measured!.Value - r.Q2Command).ToArray() : [];
         var segments = new List<SegmentStat>();
         if (aligned && events.Count >= 2)
             for (int k = 0; k + 1 < events.Count; k++)
@@ -351,9 +352,9 @@ public sealed class RunAnalysis
                 var inside = Enumerable.Range(0, motion.Length).Where(i => T[i] >= events[k].Time && T[i] < events[k + 1].Time).ToArray();
                 if (inside.Length == 0) { segments.Add(new SegmentStat(k + 1, events[k].Time, events[k + 1].Time, 0, 0, 0)); continue; }
                 segments.Add(new SegmentStat(k + 1, events[k].Time, events[k + 1].Time, inside.Length,
-                    Math.Sqrt(inside.Average(i => motion[i].Q1Error * motion[i].Q1Error)), inside.Max(i => Math.Abs(motion[i].Q1Error))));
+                    Math.Sqrt(inside.Average(i => motion[i].Q1Error * motion[i].Q1Error)), inside.Max(i => Math.Abs(motion[i].Q1Error)),
+                    q2Error.Length > 0 ? Math.Sqrt(inside.Average(i => q2Error[i] * q2Error[i])) : null));
             }
-        double[] q2Error = motion.Length > 0 && motion.All(r => r.Q2Measured.HasValue) ? motion.Select(r => r.Q2Measured!.Value - r.Q2Command).ToArray() : [];
         // Which motor limits the drawing speed: the caps are the ones the plan was built with.
         AxisUse[] axes = [];
         if (run.Settings is { } s && v1.Count > 0)

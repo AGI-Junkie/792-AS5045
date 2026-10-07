@@ -72,7 +72,7 @@ public static partial class ExperimentArchiveTests
             Check(a.T.Length > 40 && a.T.Zip(a.T.Skip(1)).All(p => p.Second > p.First) && a.T[0] > -0.2 && a.T[^1] > a.Duration - 0.3, "time axis starts with the plan");
             Check(a.Events.Length == 5 && a.Events[0] is { Kind: "start", Time: 0 } && a.Events[1..4].All(e => e.Kind == "dwell") && a.Events[4].Kind == "stop" && a.Events.Zip(a.Events.Skip(1)).All(p => p.Second.Time > p.First.Time), "a rectangle has a start, three corner dwells and a stop: " + string.Join(",", a.Events.Select(e => e.Kind)));
             Check(Math.Abs(a.Events[4].Time - a.Duration) < 0.1, "the stop is at the end of the plan");
-            Check(a.Segments.Length == 4 && a.Segments.All(s => s.Samples > 3) && a.Segments.All(s => s.Rmse is > 0.001 and < 0.03), "per-stroke error statistics");
+            Check(a.Segments.Length == 4 && a.Segments.All(s => s.Samples > 3) && a.Segments.All(s => s.Rmse is > 0.001 and < 0.03), "per-stroke error statistics"); Check(a.Segments.All(s => s.Rmse2 is > 0.001 and < 0.03), "per-stroke arm2 statistics");
             Check(Math.Abs(a.Rmse - 0.02 / Math.Sqrt(2)) < 0.02 / Math.Sqrt(2) * 0.15 && a.Peak is > 0.017 and <= 0.03, $"RMSE and peak of the known error: {a.Rmse} {a.Peak}");
             Check(Math.Abs(a.Rmse - run.Rmse!.Value) < 0.003, "recomputed RMSE agrees with the recorder's summary");
             // The profile: motor 2's speed is the elbow's (q2 - q1), and one motor runs at its cap (the planner stretches time until nothing exceeds it).

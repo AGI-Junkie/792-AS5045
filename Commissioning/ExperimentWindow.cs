@@ -364,6 +364,7 @@ internal sealed partial class ExperimentWindow : Window
             text.AppendLine(Lang.T("exp.sum.err", a.Rmse, a.Peak, a.T.Length, run.TelemetryHz > 0 ? run.TelemetryHz + " Hz" : "~2 Hz"));
             if (a.Rmse2 is { } rmse2 && a.Peak2 is { } peak2) text.AppendLine(Lang.T("exp.sum.err2", rmse2, peak2));
             if (a.Segments.Length > 0) text.AppendLine(Lang.T("exp.sum.seg", string.Join("  ", a.Segments.Select(g => $"{g.Index}: {g.Rmse:0.0000}"))));
+            if (a.Segments.Length > 0 && a.Rmse2 is not null) text.AppendLine(Lang.T("exp.sum.seg2", string.Join("  ", a.Segments.Select(g => $"{g.Index}: {g.Rmse2:0.0000}"))));
             if (a.HasPlan) text.AppendLine(Lang.T("exp.sum.limit", LimiterText(a)));
             if (a.Aligned) text.AppendLine(a.AlignmentResidualDeg <= 1 ? Lang.T("exp.sum.align.good", a.AlignmentOffsetMs, a.AlignmentResidualDeg) : Lang.T("exp.sum.align.poor", a.AlignmentResidualDeg));
             if (a.Data.SkippedRows > 0) text.AppendLine(Lang.T("exp.sum.skipped", a.Data.SkippedRows));

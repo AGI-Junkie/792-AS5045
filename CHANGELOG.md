@@ -4,7 +4,7 @@
 
 ## 2026-10-08：实验分析窗口——arm2 误差统计与配色（仅上位机，未上实机）
 
-- **arm2 误差统计**：arm2 有自己的编码器时，摘要和误差图注写 arm2 的 RMSE/峰值（`q2 实测 − q2 命令`），误差图加 q2 的 ±RMSE 线；实验列表多一列“arm2 RMSE °”（读 `summary.json` 里已有的 `q2_rmse_deg`）；导出 CSV 多 `q2_rmse_deg`、`q2_peak_deg` 两列。没有 arm2 数据的旧记录显示“—”。分段 RMSE 仍只算 arm1。
+- **arm2 误差统计**：arm2 有自己的编码器时，摘要和误差图注写 arm2 的 RMSE/峰值（`q2 实测 − q2 命令`），误差图加 q2 的 ±RMSE 线；实验列表多一列“arm2 RMSE °”（读 `summary.json` 里已有的 `q2_rmse_deg`）；导出 CSV 多 `q2_rmse_deg`、`q2_peak_deg` 两列。没有 arm2 数据的旧记录显示“—”。摘要里分段 RMSE 也多一行 arm2 的；误差图的来源说明补上 arm2。
 - **配色**：q2 实测曲线原来和 q1 编码器同色（青色虚线）；改成 q2 命令的浅色（A 浅紫、B 浅粉）虚线。
 - **验证**：`--self-test`（新增：样本算出的 arm2 RMSE/峰值与记录器的 summary 一致、CSV 有 arm2 列、两条曲线颜色不同）和 `--language-self-test` 通过；没有真实 arm2 数据。
 
