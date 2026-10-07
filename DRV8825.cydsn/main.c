@@ -42,14 +42,17 @@
 #ifndef HW_EVT
 #define HW_EVT                      (0u) /* trajectory steps from the EvtTimer interrupt instead of the foreground poll */
 #endif
+#ifndef HW_PINIRQ
+#define HW_PINIRQ                   (0u) /* nFAULT / global limit pin interrupts kill the STEP PWMs at once (needs HW_STEP) */
+#endif
 #ifndef HW_TXDMA
 #define HW_TXDMA                    (0u) /* debug-UART transmit by DMA from the text queue into the UART's TX FIFO */
 #endif
 #ifndef HW_DEAD
 #define HW_DEAD                     (0u) /* hardware deadman: DeadTimer + AliveReq cut the STEP PWMs if the foreground stalls */
 #endif
-#if (HW_EVT != 0u || HW_DEAD != 0u) && (HW_STEP == 0u)
-#error "HW_EVT and HW_DEAD need HW_STEP: the interrupt must not busy-wait for pulses, the deadman acts on the STEP PWMs"
+#if (HW_EVT != 0u || HW_DEAD != 0u || HW_PINIRQ != 0u) && (HW_STEP == 0u)
+#error "HW_EVT, HW_DEAD and HW_PINIRQ need HW_STEP: the interrupt must not busy-wait for pulses, the kills act on the STEP PWMs"
 #endif
 
 #include <cytypes.h>
@@ -75,6 +78,12 @@
 #if (HW_DEAD != 0u)
 #include "AliveReq.h"
 #include "DeadTimer.h"
+#endif
+#if (HW_PINIRQ != 0u)
+#include "FAULT.h"
+#include "LIMIT2.h"
+#include "StepKill.h"
+#include "PinIsr.h"
 #endif
 #if (HW_TXDMA != 0u)
 #include "TxDma_dma.h"
@@ -998,6 +1007,9 @@ static void evt_init(void);
 #if (HW_TXDMA != 0u)
 static void txdma_init(void);
 #endif
+#if (HW_PINIRQ != 0u)
+static void pinirq_init(void);
+#endif
 static void hw_init(void)
 {
     CyGlobalIntEnable;
@@ -1044,6 +1056,9 @@ static void hw_init(void)
 
 #if (HW_EVT != 0u)
     evt_init();
+#endif
+#if (HW_PINIRQ != 0u)
+    pinirq_init();
 #endif
 #if (USE_DEBUG_UART != 0u)
     /* Creator owns the UART pin routing; never overwrite its PC registers. */
@@ -1528,6 +1543,28 @@ static uint8 deadman_tripped(void) { return ((DeadTimer_ReadStatusRegister() & D
 #define alive_kick()     ((void)0)
 #define deadman_arm()    ((void)0)
 #define deadman_tripped() (0u)
+#endif
+
+/* Pin interrupts (HW_PINIRQ): nFAULT falling / P0[4] rising kill both STEP PWMs from priority 0 through StepKill (a
+ * Control_Reg wired into their kill input) before any foreground code has looked at the pins; the foreground then stops
+ * the stage, whether or not the pin is still active (a pulse is a stop too).  Only an operator enable clears the kill. */
+#if (HW_PINIRQ != 0u)
+static volatile uint8 g_pinStop;
+CY_ISR(pin_stop_isr)
+{
+    (void)FAULT_ClearInterrupt();
+    (void)LIMIT2_ClearInterrupt();
+    StepKill_Write(1u);
+    g_pinStop = 1u;
+}
+static void pinirq_init(void)
+{
+    PinIsr_StartEx(pin_stop_isr);
+    PinIsr_SetPriority(0u);
+}
+static void step_unkill(void) { g_pinStop = 0u; StepKill_Write(0u); }
+#else
+#define step_unkill()   ((void)0)
 #endif
 
 /* Forget the held trajectory (and any upload isolation) without touching the reference. */
@@ -2670,7 +2707,7 @@ static uint8 status_moving(void)
 {
     return g_motionEnabled && (g_ptp.active || g_home.phase!=HOME_IDLE || g_arm1.moving || g_arm2.moving);
 }
-#if (HW_SSI != 0u || HW_STEP != 0u || HW_EVT != 0u || HW_DEAD != 0u)
+#if (HW_SSI != 0u || HW_STEP != 0u || HW_EVT != 0u || HW_DEAD != 0u || HW_PINIRQ != 0u || HW_TXDMA != 0u)
 #define STATUS_LINES                (13u)    /* one more line when any hardware offload is on */
 #else
 #define STATUS_LINES                (12u)
@@ -2716,7 +2753,7 @@ static void stage_status_line(void)
           (unsigned)g_telemHz,(unsigned long)g_telemSent,(unsigned long)g_telemSkipped,(unsigned long)(g_telemMaxCy/SU_CY_PER_US)); break;
     case 12u:
     telem_line(); break;
-#if (HW_SSI != 0u || HW_STEP != 0u || HW_EVT != 0u || HW_DEAD != 0u)
+#if (HW_SSI != 0u || HW_STEP != 0u || HW_EVT != 0u || HW_DEAD != 0u || HW_PINIRQ != 0u || HW_TXDMA != 0u)
     case 13u:
     {
 #if (HW_EVT != 0u)
@@ -2725,8 +2762,9 @@ static void stage_status_line(void)
 #else
         unsigned long isrMaxUs=0ul, events=0ul, busyPermille=0ul;
 #endif
-        JLOGF("HWOFFLOAD bus_mhz=%u ssi=%u step=%u evt=%u dead=%u evt_isr_max_us=%lu evt_isr_busy_permille=%lu evt_events=%lu\r\n",
+        JLOGF("HWOFFLOAD bus_mhz=%u ssi=%u step=%u evt=%u dead=%u pinirq=%u txdma=%u evt_isr_max_us=%lu evt_isr_busy_permille=%lu evt_events=%lu\r\n",
               (unsigned)(BCLK__BUS_CLK__HZ/1000000u),(unsigned)HW_SSI,(unsigned)HW_STEP,(unsigned)HW_EVT,(unsigned)HW_DEAD,
+              (unsigned)HW_PINIRQ,(unsigned)HW_TXDMA,
               isrMaxUs,busyPermille,events);
     } break;
 #endif
@@ -2757,6 +2795,7 @@ static void stage_enable(void)
     if (g_motionEnabled != 0u) { JLOG("ENABLE: already enabled\r\n"); return; }
     ptp_invalidate();
     deadman_arm();   /* an operator enable is what clears a latched hardware kill */
+    step_unkill();
     if (!host_input_idle() || !motion_inputs_clear())
     { JLOG("ENABLE refused: fresh idle heartbeat and clear nFAULT/P0[4] required\r\n"); return; }
     if (enc_set_origin() == 0u)
@@ -3290,6 +3329,16 @@ static uint32 g_loopAt;     /* wall_ms() at the start of the previous pass */
 
 static void service_motion(void)
 {
+#if (HW_PINIRQ != 0u)
+    if (g_pinStop != 0u)
+    {
+        g_pinStop = 0u;
+        /* A pin that is still active is handled, with its own reason, by jog_safety_blocked() below; one that has
+         * already gone again killed the PWMs all the same and stops the stage here. */
+        if ((g_motionEnabled != 0u) && !FAULT_ACTIVE() && !HARD_LIMIT_ACTIVE())
+        { stage_stop("nFAULT or P0[4] pulse (pin interrupt); PWMs killed", 0u); return; }
+    }
+#endif
     if (deadman_tripped() != 0u) { stage_stop("hardware deadman: foreground stalled", 0u); return; }
     if (jog_safety_blocked() != 0u) { return; }
     if (g_home.phase != HOME_IDLE) { home_service(); }

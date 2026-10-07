@@ -272,7 +272,22 @@ static void EvtIsr_SetPriority(uint8 prio){ (void)prio; }
 static void EvtIsr_Enable(void){ simEvtIsrOn=1; }
 static void EvtIsr_Disable(void){ simEvtIsrOn=0; }
 static void EvtIsr_ClearPending(void){ simEvtPendingIrq=0; }
+/* Pin interrupts: PinIsr fires on nFAULT falling (simFault 0 -> 1) and P0[4] rising (simLimit 0 -> 1); StepKill is the
+ * Control_Reg wired into the PWMs' kill input (1 = no pulses leave the chip). */
+static void (*simPinHandler)(void); static int simPinIrqPrio=-1, simPinPrevFault, simPinPrevLimit, simStepKill, simPinInIsr;
+static unsigned simPinIrqCount;
+static uint8 FAULT_ClearInterrupt(void){return 0;}
+static uint8 LIMIT2_ClearInterrupt(void){return 0;}
+static void StepKill_Write(uint8 v){simStepKill=v&1;}
+static void PinIsr_StartEx(void (*h)(void)){simPinHandler=h;}
+static void PinIsr_SetPriority(uint8 prio){simPinIrqPrio=prio;}
+static void sim_pin_service(void) {
+    int edge=(simFault && !simPinPrevFault) || (simLimit && !simPinPrevLimit);
+    if(simInts && !simPinInIsr) { simPinPrevFault=simFault; simPinPrevLimit=simLimit; }
+    if(edge && simInts && !simPinInIsr && simPinHandler) { simPinInIsr=1; simPinIrqCount++; simPinHandler(); simPinInIsr=0; }
+}
 static void sim_evt_service(void) {
+    sim_pin_service();
     if(simEvtArmed && simClock>=simEvtDue) {
         simEvtArmed=0; simEvtStatusTc=1u; simEvtPendingIrq=1;
         if(simClock-simEvtDue>simEvtLateMaxCy) simEvtLateMaxCy=simClock-simEvtDue;
@@ -293,7 +308,7 @@ static uint8 DeadTimer_ReadStatusRegister(void){ uint8 s; sim_dead_check(); s=si
 /* One STEP pulse reaching a driver that is awake and enabled: the arm's motor moves one microstep along DIR.  The
  * bit-banged path calls these on the pin edge that ends the pulse, the PWM path when the pulse is requested. */
 static void sim_pulse_arm1(void) {
-    sim_dead_check(); if(simDeadKilled) return;
+    sim_dead_check(); if(simDeadKilled || simStepKill) return;
     if(!simPins[CYREG_PRT1_PC7] && simPins[CYREG_PRT12_PC2] && simPins[CYREG_PRT1_PC2]) {
         int tracks=!simRateLimited || simClock-simLastMotorPulse>=SIM_MHZ*1250u;
         simLastMotorPulse=simClock; /* fixture motor tracks at most the configured 800 ustep/s jog rate */
@@ -302,7 +317,7 @@ static void sim_pulse_arm1(void) {
     }
 }
 static void sim_pulse_arm2(void) {
-    sim_dead_check(); if(simDeadKilled) return;
+    sim_dead_check(); if(simDeadKilled || simStepKill) return;
     if(!simPins[CYREG_PRT2_PC7] && simPins[CYREG_PRT2_PC2] && simPins[CYREG_PRT2_PC3]) {
         simPulse2++; simTrace=(simTrace^(uint32)((simClock-simTraceBase)*24u/SIM_MHZ))*16777619u; simTrace=(simTrace^(simPins[CYREG_PRT2_PC0]?3u:4u))*16777619u;
         if(!simStall2)simStep2+=simPins[CYREG_PRT2_PC0]?1:-1;
@@ -1670,6 +1685,25 @@ int main(int argc,char **argv) {
 #endif
         puts(t);return 0;
     }
+    if(!strcmp(t,"pin_irq_kill")) {
+#if HW_PINIRQ
+        int32 u1;
+        setup(); assert(simPinIrqPrio==0 && !simStepKill);
+        jog_step(&g_arm1,1); assert(simPulse1==1u);
+        /* nFAULT drops for a moment: the interrupt has killed the PWMs before anyone looked at the pin, so a step that
+         * the pin check no longer refuses still does not leave the chip */
+        simFault=1; (void)SU_NOW(); assert(simPinIrqCount==1u && simStepKill);
+        simFault=0; u1=g_arm1.usteps;
+        jog_step(&g_arm1,1); assert(g_arm1.usteps==u1+1 && simPulse1==1u);
+        service_motion(); assert(!g_motionEnabled && strstr(g_lastStop,"pin interrupt"));
+        /* only an operator enable clears it */
+        g_homeNeedKeyRelease=0u; sim_keys(0); stage_enable(); assert(g_motionEnabled && !simStepKill);
+        jog_step(&g_arm1,1); assert(simPulse1==2u);
+        /* the global limit does the same */
+        simLimit=1; (void)SU_NOW(); assert(simPinIrqCount==2u && simStepKill);
+#endif
+        puts(t);return 0;
+    }
     if(!strcmp(t,"dead_kill")) {
 #if HW_DEAD
         int32 u1;
@@ -2366,7 +2400,7 @@ int main(int argc,char **argv) {
 
 cases = ['dual_'+n for n in ['home_reverse','home_stall','wrap','loss','gap','parity','hold','derate','follow_stop','peer_bad','peer_bad_reverse','final','limit','enable_bad']]
 cases += ['ssi_nonblocking','ssi_snapshot','ssi_retry','ssi_timeout','ssi_takeover']
-cases += ['step_hw_request','step_hw_pins','dead_kill','txdma_order','txdma_busy']
+cases += ['step_hw_request','step_hw_pins','dead_kill','txdma_order','txdma_busy','pin_irq_kill']
 cases += ['dual_snapshot_length','chain_frames','boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
          'missing_sensor','stuck_sensor','missing_npn','stalled_motor','reject_moving',
          'fault','limit','encoder_loss','jog_cancels','sensor_bounce']
@@ -2436,11 +2470,11 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     tmp = Path(temp)
     if host_plan is not None: (tmp/'host-plan.bin').write_bytes(host_plan.read_bytes())
     if host_control is not None: (tmp/'host-control.bin').write_bytes(host_control.read_bytes())
-    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h']:
+    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','PinIsr.h']:
         (tmp/name).write_text('',encoding='ascii')
     if emit_c is not None:
         emit_c.mkdir(parents=True, exist_ok=True)
-        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h']: (emit_c/name).write_text('',encoding='ascii')
+        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','PinIsr.h']: (emit_c/name).write_text('',encoding='ascii')
         (emit_c/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
         print('wrote', emit_c/'check.c'); sys.exit(0)
     (tmp/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
