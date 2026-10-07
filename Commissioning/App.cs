@@ -445,11 +445,8 @@ public sealed partial class ControlWindow : Window
             // The compact heartbeat is only sent to firmware that advertises it; an
             // older firmware keeps receiving the full 17-byte heartbeat frame.  Say so
             // in the log, because "which heartbeat is running" decides the margin.
-            int fwAt = line.IndexOf("fw=", StringComparison.Ordinal);
-            if (fwAt >= 0) {
-                int fwEnd = line.IndexOf(' ', fwAt);
-                lastFirmwareBuild = fwEnd < 0 ? line[(fwAt + 3)..] : line[(fwAt + 3)..fwEnd];
-            }
+            lastFirmwareBuild = line.Split(' ').FirstOrDefault(w => w.StartsWith("fw=", StringComparison.Ordinal))?[3..] ?? "unknown";
+            RefreshFirmwareStatus();
             bool compact = line.Contains("short_hb=1");
             if (compact != supportsShortHeartbeat)
                 Append(compact ? "HOST heartbeat: compact 6 wire bytes per beat, 20 ms idle target"
@@ -783,6 +780,7 @@ public sealed partial class ControlWindow : Window
         manualReferencePending = supportsManualReference = hardwareReady = false;
         try { Send(0x79); } catch { /* Firmware heartbeat timeout remains the fallback. */ }
         hardwareUart = false; supportsShortHeartbeat = false; connectionBadge.ToolTip = null; lastLinkLine = null;
+        RefreshFirmwareStatus();
         try { FinishExperiment("disconnected: " + reason()); } catch(Exception ex) { Lang.Text(experimentResult, () => Lang.T("fault.saveSummary2") + ex.Message); }
         lastExperimentOutcome = null; trajectoryRanOnce = false;
         try { serial?.Dispose(); } catch { }

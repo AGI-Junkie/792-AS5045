@@ -209,6 +209,8 @@ internal static class Lang
         ["section.checks"] = ("查看规划检查详情", "Planning Check Details"),
 
         // status bar
+        ["status.firmware"] = ("固件：{0}", "Firmware: {0}"),
+        ["status.firmware.unknown"] = ("未知", "Unknown"),
         ["status.ref"] = ("坐标参考：", "Ref: "),
         ["status.ref.on"] = ("已建立", "Established"),
         ["status.ref.off"] = ("未建立", "Not set"),

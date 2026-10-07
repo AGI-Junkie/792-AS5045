@@ -12,6 +12,7 @@ namespace TwoLinkCommissioning;
 public sealed partial class ControlWindow
 {
     private readonly TextBlock connectionBadge = WorkbenchTheme.Text(Lang.T("badge.offline"), 12, Brushes.White);
+    private readonly TextBlock firmwareStatus = WorkbenchTheme.Text("", 12, Brushes.White);
     private readonly TextBlock referenceStatus = WorkbenchTheme.Text(Lang.T("status.ref") + Lang.T("status.ref.off"), 12, Brushes.White), rangeStatus = WorkbenchTheme.Text(Lang.T("status.range") + Lang.T("status.range.off"), 12, Brushes.White);
     private readonly TextBox liveValues = new() { IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent, TextWrapping = TextWrapping.Wrap, Text = Lang.T("live.waiting"), FontSize = 12 };
     private readonly TextBox experimentResult = new() { IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent, TextWrapping = TextWrapping.Wrap, Text = Lang.T("live.experimentHint"), FontSize = 12 };
@@ -45,9 +46,16 @@ public sealed partial class ControlWindow
     }
     private TextBlock? noteJogManual, noteJogStop;
     private string? lastExperimentDirectory;
+    private void RefreshFirmwareStatus()
+    {
+        Lang.Text(firmwareStatus, () => lastLinkLine is null ? "" : Lang.T("status.firmware",
+            string.IsNullOrEmpty(lastFirmwareBuild) || lastFirmwareBuild == "unknown" ? Lang.T("status.firmware.unknown") : lastFirmwareBuild));
+        firmwareStatus.ToolTip = firmwareStatus.Text.Length > 0 ? firmwareStatus.Text : null;
+    }
     private void RefreshLanguageLayout()
     {
         Title = Lang.T("app.title");
+        RefreshFirmwareStatus();
         connectionBadge.Text = compatible ? (framedControl ? Lang.T("badge.v7") : hardwareUart ? Lang.T("badge.v6") : supportsTelemetry ? Lang.T("badge.v5") : Lang.T("badge.old")) : Lang.T("badge.offline");
         referenceStatus.Text = Lang.T("status.ref") + (ptp is { Referenced: true } ? Lang.T("status.ref.on") + (telemetry is { Referenced: true } ? " · " + telemetry.ReferenceName : "") : Lang.T("status.ref.off"));
         rangeStatus.Text = Lang.T("status.range") + (LimitsReady ? Lang.T("status.range.on") : Lang.T("status.range.off"));
@@ -89,10 +97,11 @@ public sealed partial class ControlWindow
         var shell = new DockPanel { Background = WorkbenchTheme.Background }; Content = shell;
 
         // Status bar (bottom-most), then the log dock, then the toolbar; the body fills the rest.
-        var status = new DockPanel { Height = 24, Background = WorkbenchTheme.Blue, LastChildFill = false };
+        var status = new DockPanel { Height = 24, Background = WorkbenchTheme.Blue };
         var link = WorkbenchTheme.Text("115200 · KitProg", 12, Brushes.White); link.FontFamily = WorkbenchTheme.Mono; link.Margin = new Thickness(12,0,12,0); link.VerticalAlignment = VerticalAlignment.Center;
         DockPanel.SetDock(link, Dock.Right); status.Children.Add(link);
-        foreach(var item in new[] { connectionBadge, referenceStatus, rangeStatus }) { item.Margin = new Thickness(12,0,10,0); item.VerticalAlignment = VerticalAlignment.Center; DockPanel.SetDock(item, Dock.Left); status.Children.Add(item); }
+        firmwareStatus.TextWrapping = TextWrapping.NoWrap; firmwareStatus.TextTrimming = TextTrimming.CharacterEllipsis;
+        foreach(var item in new[] { connectionBadge, referenceStatus, rangeStatus, firmwareStatus }) { item.Margin = new Thickness(12,0,10,0); item.VerticalAlignment = VerticalAlignment.Center; DockPanel.SetDock(item, Dock.Left); status.Children.Add(item); }
         DockPanel.SetDock(status, Dock.Bottom); shell.Children.Add(status);
 
         var tabs = new TabControl { Height = 190 };
