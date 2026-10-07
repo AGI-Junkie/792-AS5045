@@ -59,7 +59,7 @@ public sealed class ExperimentRun
 public sealed record FeedbackRow(DateTime HostUtc, uint DeviceMs, uint Epoch, uint Sequence, string Phase, int Segment, double Q1Command, double Q1Encoder,
     double Q1Error, double Q2Command, double XCommand, double YCommand, double XHybrid, double YHybrid, int Slip, int Inputs, uint Drops, double? Q2Measured = null);
 public sealed record PlanNode(int Index, int TimeMs, double Q1, double Q2);
-public sealed record PreFaultRow(double DeviceMs, double Q1Command, double Q1Encoder, double Q1Error);
+public sealed record PreFaultRow(double DeviceMs, double Q1Command, double Q1Encoder, double Q1Error, DateTime HostUtc = default);
 public sealed record RunData(PlanNode[] Plan, FeedbackRow[] Feedback, int SkippedRows, PreFaultRow[]? PreFault = null);
 
 public static class ExperimentArchive
@@ -67,7 +67,8 @@ public static class ExperimentArchive
     public const int ListLimit = 500;
 
     // Newest first. A folder that cannot be read is counted, not fatal: one damaged recording must not hide the others.
-    public static (List<ExperimentRun> Runs, int Unreadable) List(string root)
+    // includeFaults also lists the stop bundles saved under "faults" when nothing was recording (kind "fault": fault.json and pre_fault.csv only).
+    public static (List<ExperimentRun> Runs, int Unreadable) List(string root, bool includeFaults = false)
     {
         var runs = new List<ExperimentRun>(); int unreadable = 0;
         if (!System.IO.Directory.Exists(root)) return (runs, 0);
@@ -77,9 +78,27 @@ public static class ExperimentArchive
             try { runs.Add(ReadRun(directory)); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or FormatException or InvalidOperationException) { unreadable++; }
         }
+        string faults = Path.Combine(root, "faults");
+        if (includeFaults && System.IO.Directory.Exists(faults))
+            foreach (string directory in System.IO.Directory.EnumerateDirectories(faults))
+            {
+                if (!File.Exists(Path.Combine(directory, "fault.json")) || File.Exists(Path.Combine(directory, "metadata.json"))) continue;
+                try { runs.Add(ReadFaultRun(directory)); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or FormatException or InvalidOperationException) { unreadable++; }
+            }
         runs.Sort((a, b) => b.StartedUtc.CompareTo(a.StartedUtc));
         if (runs.Count > ListLimit) runs.RemoveRange(ListLimit, runs.Count - ListLimit);
         return (runs, unreadable);
+    }
+
+    // A stop bundle with no recording: when the host saved it, and how many telemetry samples came with it.
+    private static ExperimentRun ReadFaultRun(string directory)
+    {
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "fault.json")));
+        var root = document.RootElement;
+        if (!root.TryGetProperty("host_utc", out var at) || !at.TryGetDateTime(out var savedUtc)) throw new FormatException("host_utc");
+        return new ExperimentRun { Directory = directory, Kind = "fault", StartedUtc = savedUtc.ToUniversalTime(), Outcome = "fault", HasFault = true,
+            Samples = root.TryGetProperty("pre_fault_samples", out var n) && n.ValueKind == JsonValueKind.Number ? n.GetInt32() : 0 };
     }
 
     private static ExperimentRun ReadRun(string directory)
@@ -204,7 +223,8 @@ public static class ExperimentArchive
         {
             var f = line.Split(',');
             bool Get(string name, out double v) { v = 0; return at[name] < f.Length && double.TryParse(f[at[name]], NumberStyles.Float, CultureInfo.InvariantCulture, out v); }
-            if (Get("device_ms", out double ms) && Get("q1_command_deg", out double c) && Get("q1_encoder_deg", out double e) && Get("q1_error_deg", out double err)) rows.Add(new PreFaultRow(ms, c, e, err));
+            var host = at.TryGetValue("host_utc", out int h) && h < f.Length && DateTime.TryParse(f[h], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsed) ? parsed.ToUniversalTime() : default;
+            if (Get("device_ms", out double ms) && Get("q1_command_deg", out double c) && Get("q1_encoder_deg", out double e) && Get("q1_error_deg", out double err)) rows.Add(new PreFaultRow(ms, c, e, err, host));
         }
         return rows.OrderBy(r => r.DeviceMs).ToArray();
     }
@@ -254,6 +274,8 @@ public sealed class RunAnalysis
     public SegmentStat[] Segments { get; init; } = [];
     // The seconds before a stop (pre_fault.csv) that the recording itself does not hold: before its first moving sample or after its last. Same time axis as T.
     public double[] PreT { get; init; } = [];
+    public double[] PreQ1Command { get; init; } = [];
+    public DateTime[] PreHostUtc { get; init; } = [];
     public double[] PreQ1Encoder { get; init; } = [];
     public double[] PreQ1Error { get; init; } = [];
     public double FaultTime { get; init; } = double.NaN;            // the stop snapshot on the same axis as T (NaN = no snapshot)
@@ -375,7 +397,7 @@ public sealed class RunAnalysis
             PlanVT = vt.ToArray(), PlanV1 = v1.ToArray(), PlanV2 = v2.ToArray(), PlanAT = at.ToArray(), PlanA1 = a1.ToArray(), PlanA2 = a2.ToArray(),
             Events = events.ToArray(), Segments = segments.ToArray(), Axes = axes, LimitingAxes = axes.Where(a => a.Utilization >= 0.9).Select(a => a.Name).ToArray(),
             Rmse = moving > 0 ? Math.Sqrt(sum / moving) : 0, Peak = peak, Duration = planT.Length > 0 ? planT[^1] : T.Length > 0 ? T[^1] - T[0] : 0,
-            PreT = pre.Select(r => (r.DeviceMs - offsetMs) / 1000.0).ToArray(), PreQ1Encoder = pre.Select(r => r.Q1Encoder).ToArray(), PreQ1Error = pre.Select(r => r.Q1Error).ToArray(),
+            PreT = pre.Select(r => (r.DeviceMs - offsetMs) / 1000.0).ToArray(), PreQ1Command = pre.Select(r => r.Q1Command).ToArray(), PreHostUtc = pre.Select(r => r.HostUtc).ToArray(), PreQ1Encoder = pre.Select(r => r.Q1Encoder).ToArray(), PreQ1Error = pre.Select(r => r.Q1Error).ToArray(),
             FaultTime = ExperimentArchive.ReadFault(run) is { } fault ? (fault.DeviceMs - offsetMs) / 1000.0 : double.NaN,
             AlignmentOffsetMs = offsetMs, AlignmentResidualDeg = residual, Aligned = aligned };
     }

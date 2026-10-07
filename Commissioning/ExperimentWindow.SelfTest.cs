@@ -69,11 +69,11 @@ internal sealed partial class ExperimentWindow
             // One recording: the curves, the events, the written summary.
             w.SelectForSelfTest(rectRow);
             var (q, err, speed, accel) = (w.Plots[0], w.Plots[1], w.Plots[2], w.Plots[3]);
-            Check(w.ShownRuns == 1 && q.Series.Count == 6 && err.Series.Count == 3 && speed.Series.Count == 2 && accel.Series.Count == 2, "series per chart");
+            Check(w.ShownRuns == 1 && q.Series.Count == 7 && err.Series.Count == 3 && speed.Series.Count == 2 && accel.Series.Count == 2, "series per chart");
             Check(err.Marks.Count(m => m.Label is "起步" or "停机" or "拐角 1" or "拐角 2" or "拐角 3") == 5 && err.Marks.Any(m => m.Label.StartsWith("故障 ")), "the plan's events and the stop snapshot are marked on the error chart");
             Check(Math.Abs(err.Marks.First(m => m.Label.StartsWith("故障")).X - 12.0) < 0.02, "the stop snapshot is placed at its device time on the aligned axis");
             Check(new[] { q, speed, accel }.All(p => p.Marks.Any(m => Math.Abs(m.X - 12.0) < 0.02 && m.Color == WorkbenchTheme.Red)), "the stop is marked on every chart");
-            Check(q.Series.Count(x => x.Name.StartsWith("停机前遥测")) == 1 && err.Series.Count(x => x.Name.StartsWith("停机前遥测")) == 1, "the pre-stop telemetry is a thin series on the joint and error charts");
+            Check(q.Series.Count(x => x.Name.StartsWith("停机前遥测")) == 2 && err.Series.Count(x => x.Name.StartsWith("停机前遥测")) == 1, "the pre-stop telemetry is a thin series on the joint and error charts");
             Check(q.Series.First(x => x.Name.StartsWith("停机前遥测")).X.Length == 3 && w.Range.Max >= q.Series.First(x => x.Name.StartsWith("停机前遥测")).X[^1] - 1e-9, "only the pre-stop samples the recording lacks are drawn, and the time range covers them");
             Check(w.SummaryText_.Contains("最大滞后 17321 µs") && w.SummaryText_.Contains("压着走累计 6520 µs") && w.SummaryText_.Contains("3 个停机前遥测样本"), "summary: firmware TIMING from the session log, and the pre-stop samples: " + w.SummaryText_);
             Check(speed.Lines.Count == 4 && speed.Lines.Any(l => l.Label.StartsWith("电机1 上限")) && accel.Lines.Count == 4, "the caps are drawn as reference lines");
@@ -112,7 +112,7 @@ internal sealed partial class ExperimentWindow
 
             // Two recordings laid over each other.
             w.SelectForSelfTest(0, 1);
-            Check(w.ShownRuns == 2 && q.Series.Count == 11 && err.Series.Count == 5 && speed.Series.Count == 4 && q.Series[0].Name.StartsWith("A ") && q.Series[6].Name.StartsWith("B "), "comparison doubles the series and tags them A and B");
+            Check(w.ShownRuns == 2 && q.Series.Count == 12 && err.Series.Count == 5 && speed.Series.Count == 4 && q.Series[0].Name.StartsWith("A ") && q.Series[7].Name.StartsWith("B "), "comparison doubles the series and tags them A and B");
             Check(w.SummaryText_.Contains("B 相对 A") && w.Plane.Paths.Count == 6 && err.Notes.Count == 4, "comparison summary and notes");
             Check(w.Range.Max >= 10 && w.Plane.Arms.Count == 4, "both arms at the cursor");
             // Language switch rewrites everything without losing the selection.
@@ -134,6 +134,23 @@ internal sealed partial class ExperimentWindow
             Check(decoder.Frames[0].PixelWidth > w.Plane.ActualWidth + 300 && decoder.Frames[0].PixelHeight >= 700, "the exported figure holds the charts and the plane");
             w.Hide();
             Check(w.ColumnHeaders.Length == 12 && w.ExportImageText == "导出图片 PNG", "the export button is labelled");
+            // A stop with nothing recording is saved under "faults": listed, readable, and its pre-stop telemetry and log are replayable.
+            string faultDir = Path.Combine(root, "faults", "20261001-000000-000-traj_run"); Directory.CreateDirectory(faultDir);
+            var stopAt = baseUtc.AddSeconds(25);
+            File.WriteAllText(Path.Combine(faultDir, "fault.json"), JsonSerializer.Serialize(new { schema = 1, host_utc = stopAt, pre_fault_samples = 4, snapshot = new { Milliseconds = 50300, Phase = "traj_run", Reason = "trajectory timing overrun", Driver = "ok" } }));
+            File.WriteAllLines(Path.Combine(faultDir, "pre_fault.csv"), [
+                "host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_encoder_deg,q2_error_deg,slip_motor_lsb,inputs_active_mask,slip2_motor_lsb",
+                .. Enumerable.Range(0, 4).Select(k => $"{stopAt.AddMilliseconds(k * 100 - 400):O},{50000 + k * 100},5,1,{10 + k},{10 + k + 0.1:F1},0.1,0,0,0,0,0,0")], new UTF8Encoding(true));
+            Check(ExperimentArchive.List(root).Runs.Count == 2, "stop-only bundles stay out of the plain list (the recent-runs panel)");
+            w.Reload2();
+            Check(w.ListedRuns == 3, "the stop bundle is listed with the recordings");
+            int faultRow = Enumerable.Range(0, 3).First(k => w.RowText(k).Contains("|停机|"));
+            Check(w.RowText(faultRow).Contains("停机记录（当时没有录像）") && w.RowText(faultRow).EndsWith("|⚠"), "its row: kind, status and the fault mark: " + w.RowText(faultRow));
+            w.SelectForSelfTest(faultRow);
+            Check(w.ShownRuns == 1 && q.Series.Count == 2 && q.Series.All(x => x.Name.StartsWith("停机前遥测")) && err.Series.Count == 1 && err.Marks.Any(m => m.Label.StartsWith("故障 trajectory timing overrun")), "a stop-only run shows its pre-stop curves and the stop mark");
+            Check(w.SummaryText_.Contains("停机记录：停机时没有在录像") && w.SummaryText_.Contains("4 个样本") && w.SummaryText_.Contains("trajectory timing overrun"), "its summary: " + w.SummaryText_);
+            w.SetCursor(w.Range.Min + 0.1);
+            Check(w.LogText.Contains("HOST marker"), "the log around the cursor follows the pre-stop telemetry's host clock: " + w.LogText);
             // Nothing recorded yet: a friendly empty state, not an error.
             var empty = new ExperimentWindow(Path.Combine(temp, "nothing"));
             Check(empty.ListedRuns == 0 && empty.SummaryText_.Contains("还没有实验记录") && empty.ShownRuns == 0, "an empty archive says so");

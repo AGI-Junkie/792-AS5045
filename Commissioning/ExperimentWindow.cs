@@ -168,15 +168,16 @@ internal sealed partial class ExperimentWindow : Window
 
     // ---- list ------------------------------------------------------------------------------------------------------
     private string ShapeName(ExperimentRun run) => run.Settings is { } s && s.Shape >= 0 && s.Shape <= 10 ? Lang.T("xy.shape" + s.Shape) : "—";
+    private static string KindKey(ExperimentRun run) => run.Kind switch { "point" => "exp.kind.point", "fault" => "exp.kind.fault", _ => "exp.kind.trajectory" };
     private Row MakeRow(ExperimentRun run)
     {
         var s = run.Settings;
         return new Row {
-            Run = run, Time = run.StartedUtc.ToLocalTime().ToString("MM-dd HH:mm:ss", CultureInfo.InvariantCulture), Kind = Lang.T(run.Kind == "point" ? "exp.kind.point" : "exp.kind.trajectory"), Shape = ShapeName(run),
+            Run = run, Time = run.StartedUtc.ToLocalTime().ToString("MM-dd HH:mm:ss", CultureInfo.InvariantCulture), Kind = Lang.T(KindKey(run)), Shape = ShapeName(run),
             Speed = s is null ? "—" : $"{s.V1:0.#} / {s.V2:0.#}", Reference = run.Reference,
-            Status = run.Complete ? Lang.T("exp.status.complete") : run.Outcome == "interrupted" ? Lang.T("exp.status.interrupted") : Lang.T("exp.status.other", run.Outcome),
+            Status = run.Kind == "fault" ? Lang.T("exp.status.fault") : run.Complete ? Lang.T("exp.status.complete") : run.Outcome == "interrupted" ? Lang.T("exp.status.interrupted") : Lang.T("exp.status.other", run.Outcome),
             Rmse = run.Rmse is { } r ? r.ToString("0.0000", CultureInfo.InvariantCulture) : "—", Peak = run.Peak is { } p ? p.ToString("0.0000", CultureInfo.InvariantCulture) : "—", Rmse2 = run.Rmse2 is { } r2 ? r2.ToString("0.0000", CultureInfo.InvariantCulture) : "—",
-            Hz = run.TelemetryHz > 0 ? run.TelemetryHz + " Hz" : "~2 Hz", Fault = run.HasFault ? "⚠" : "", Calibration = run.CalibrationVersion.Length > 0 ? run.CalibrationVersion : "—" };
+            Hz = run.Kind == "fault" ? "—" : run.TelemetryHz > 0 ? run.TelemetryHz + " Hz" : "~2 Hz", Fault = run.HasFault ? "⚠" : "", Calibration = run.CalibrationVersion.Length > 0 ? run.CalibrationVersion : "—" };
     }
     private void BuildColumns()
     {
@@ -190,7 +191,7 @@ internal sealed partial class ExperimentWindow : Window
     private void Reload()
     {
         var selected = grid.SelectedItems.OfType<Row>().Select(r => r.Run.Directory).ToHashSet();
-        var (runs, bad) = ExperimentArchive.List(root); unreadable = bad;
+        var (runs, bad) = ExperimentArchive.List(root, includeFaults: true); unreadable = bad;
         rows = runs.Select(MakeRow).ToList();
         grid.ItemsSource = rows;
         foreach (var row in rows.Where(r => selected.Contains(r.Run.Directory))) grid.SelectedItems.Add(row);
@@ -278,15 +279,18 @@ internal sealed partial class ExperimentWindow : Window
         for (int i = 0; i < shown.Count; i++)
         {
             var a = shown[i]; var c = Colours[i]; string tag = compare ? (i == 0 ? "A " : "B ") : "";
-            qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.cmd"), a.T, a.Q1Command, c[0]) { Unit = "°" });
-            qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.enc"), a.T, a.Q1Encoder, c[1]) { Dashed = true, Thickness = 1.3, Unit = "°" });
+            if (a.T.Length > 0)
+            {
+                qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.cmd"), a.T, a.Q1Command, c[0]) { Unit = "°" });
+                qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.enc"), a.T, a.Q1Encoder, c[1]) { Dashed = true, Thickness = 1.3, Unit = "°" });
+            }
             if(a.Q2Measured.Length==a.T.Length && a.T.Length>0) {
                 qPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.cmd"),a.T,a.Q2Command,c[3]) { Unit="°" });
                 qPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.enc"),a.T,a.Q2Measured,c[4]) { Unit="°",Dashed=true });
                 errPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.err"),a.T,a.Q2Error,c[3]) { Unit="°",Decimals=4 });
             }
             if (a.HasPlan) qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.plan"), a.PlanT, a.PlanQ1, c[2]) { Dashed = true, Thickness = 1.1, Unit = "°" });
-            errPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.err"), a.T, a.Q1Error, c[0]) { Unit = "°", Decimals = 4, Dots = a.T.Length < 120 });
+            if (a.T.Length > 0) errPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.err"), a.T, a.Q1Error, c[0]) { Unit = "°", Decimals = 4, Dots = a.T.Length < 120 });
             if (a.T.Length > 0) { errPlot.Lines.Add(new PlotLine(a.Rmse, tag + "RMSE " + a.Rmse.ToString("0.0000", CultureInfo.InvariantCulture), c[0])); errPlot.Lines.Add(new PlotLine(-a.Rmse, "", c[0])); }
             if (a.Rmse2 is { } rmse2) { errPlot.Lines.Add(new PlotLine(rmse2, tag + "q2 RMSE " + rmse2.ToString("0.0000", CultureInfo.InvariantCulture), c[3])); errPlot.Lines.Add(new PlotLine(-rmse2, "", c[3])); }
             foreach (var ev in a.Events)
@@ -299,6 +303,7 @@ internal sealed partial class ExperimentWindow : Window
             // Telemetry the recording lacks from the seconds around a stop (pre_fault.csv), drawn thin so it is not mistaken for the run itself.
             if (a.PreT.Length > 0)
             {
+                qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.pre") + " " + Lang.T("exp.s.cmd"), a.PreT, a.PreQ1Command, c[0]) { Thickness = 1.0, Unit = "°" });
                 qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.pre") + " " + Lang.T("exp.s.enc"), a.PreT, a.PreQ1Encoder, c[2]) { Thickness = 1.0, Unit = "°" });
                 errPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.pre") + " " + Lang.T("exp.s.err"), a.PreT, a.PreQ1Error, c[2]) { Thickness = 1.0, Unit = "°", Decimals = 4 });
             }
@@ -357,6 +362,15 @@ internal sealed partial class ExperimentWindow : Window
         {
             var a = shown[i]; var run = a.Run; var s = run.Settings;
             string tag = shown.Count == 2 ? (i == 0 ? "A · " : "B · ") : "";
+            if (run.Kind == "fault")
+            {
+                text.AppendLine(tag + Lang.T("exp.sum.faultRun", run.StartedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)));
+                if (TimingText(a) is { } faultTiming) text.AppendLine(faultTiming);
+                if (a.PreT.Length > 0) text.AppendLine(Lang.T("exp.sum.preOnly", a.PreT.Length));
+                if (ExperimentArchive.ReadFault(run) is { } stop)
+                    text.AppendLine(Lang.T("exp.sum.fault", Lang.T("snap.phase." + (stop.Phase is "home" or "ptp" or "traj_run" or "traj_upload" or "jog" or "idle" or "disabled" ? stop.Phase : "other")), stop.Reason, stop.Driver ? " — " + Lang.T("snap.drvUndetermined") : ""));
+                text.AppendLine(); continue;
+            }
             text.AppendLine(tag + Lang.T("exp.sum.run", run.StartedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture), Lang.T(run.Kind == "point" ? "exp.kind.point" : "exp.kind.trajectory"), ShapeName(run),
                 s?.V1 ?? 0, s?.V2 ?? 0, s?.A1 ?? 0, s?.A2 ?? 0, run.Reference, run.Complete ? Lang.T("exp.status.complete") : run.Outcome == "interrupted" ? Lang.T("exp.status.interrupted") : Lang.T("exp.status.other", run.Outcome)));
             text.AppendLine(Lang.T("exp.sum.cal", run.CalibrationId.Length > 0 ? run.CalibrationId : Lang.T("exp.sum.noCal")));
@@ -395,7 +409,7 @@ internal sealed partial class ExperimentWindow : Window
     private string? TimingText(RunAnalysis a)
     {
         if (LogOf(a) is not { } index) return null;
-        double from = a.Run.StartedUtc.ToLocalTime().TimeOfDay.TotalSeconds, to = (a.HostUtc.Length > 0 ? a.HostUtc[^1] : a.Run.StartedUtc).ToLocalTime().TimeOfDay.TotalSeconds + 20;
+        double from = a.Run.StartedUtc.ToLocalTime().TimeOfDay.TotalSeconds - (a.Run.Kind == "fault" ? 5 : 0), to = (a.HostUtc.Length > 0 ? a.HostUtc[^1] : a.Run.StartedUtc).ToLocalTime().TimeOfDay.TotalSeconds + 20;
         if (index.LastMatch("TIMING ", from, to) is not { } line) return Lang.T("exp.sum.timing.none");
         long? Field(string name) => System.Text.RegularExpressions.Regex.Match(line, name + @"=(\d+)") is { Success: true } m ? long.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture) : null;
         if (Field("traj_lag_max_us") is not { } lag) return Lang.T("exp.sum.timing.none");
@@ -439,10 +453,11 @@ internal sealed partial class ExperimentWindow : Window
         var a = shown[0];
         var log = LogOf(a);
         if (log is null) { logBox.Text = Lang.T("exp.log.none"); return; }
-        if (a.T.Length == 0) { logBox.Clear(); return; }
+        var (times, hosts) = a.T.Length > 0 ? (a.T, a.HostUtc) : (a.PreT, a.PreHostUtc);
+        if (times.Length == 0 || hosts[0] == default) { logBox.Clear(); return; }
         int i = 0; double best = double.MaxValue;
-        for (int k = 0; k < a.T.Length; k++) { double d = Math.Abs(a.T[k] - cursor); if (d < best) { best = d; i = k; } }
-        var host = a.HostUtc[i].AddSeconds(cursor - a.T[i]).ToLocalTime();
+        for (int k = 0; k < times.Length; k++) { double d = Math.Abs(times[k] - cursor); if (d < best) { best = d; i = k; } }
+        var host = hosts[i].AddSeconds(cursor - times[i]).ToLocalTime();
         double tod = host.TimeOfDay.TotalSeconds;
         var lines = log.Around(tod, 1.0, 60, quietLog.IsChecked == true ? line => LogLevels.Classify(line) >= LogLevel.Info : null).ToList();
         logBox.Text = lines.Count == 0 ? Lang.T("exp.log.empty") : string.Join("\n", lines);
