@@ -8,6 +8,8 @@ public sealed class ExecutionTrajectory
     public ExecutionNode[] Nodes { get; }
     public TimedTrajectory Timing { get; }
     public double Duration => Nodes.Sum(n => n.Milliseconds) / 1000.0;
+    // 1 when the plan fitted at its first timing; 1.15^n when pulse rounding / chord error made the planner slow it down n times.
+    public double RetryStretch { get; }
     public ExecutionTrajectory(TimedTrajectory preview, JointLimits limits)
     {
         var profile = MotionProfile.From(preview.Rates);
@@ -15,7 +17,7 @@ public sealed class ExecutionTrajectory
         // Quantized pulse chords must pass the real device bounds as well as IK.
         // Slow the same visible time plan when quantization needs extra margin.
         for (int attempt=0; ; attempt++) {
-            try { Nodes=Build(Timing,limits,profile); return; }
+            try { Nodes=Build(Timing,limits,profile); RetryStretch=Math.Pow(1.15,attempt); return; }
             catch (Lang.ValidationException ex) when(attempt<12 && ex.Key is "err.execPulse" or "err.chord") {
                 Timing.Stretch(1.15);
             }
@@ -55,6 +57,15 @@ public sealed class ExecutionTrajectory
             nodes.Add(new(nodes[^1].Pose, DeviceContract.TrajNodeMinMs));
         }
         var result=nodes.ToArray(); Validate(result, limits, profile); return result;
+    }
+    // Highest step rate of any chord (microsteps/s, per axis), measured exactly like the firmware's per-node rate check.
+    public (double Arm1, double Arm2) PeakRates()
+    {
+        double[] peak = [0, 0];
+        for (int i = 1; i < Nodes.Length; i++)
+            for (int axis = 0; axis < 2; axis++)
+                peak[axis] = Math.Max(peak[axis], Math.Abs(Counts(axis, Nodes[i].Pose) - Counts(axis, Nodes[i - 1].Pose)) * 1000.0 / Nodes[i].Milliseconds);
+        return (peak[0], peak[1]);
     }
     public static int Counts(int axis, JointPose pose)
     {
@@ -108,6 +119,9 @@ public sealed class ExecutionTrajectory
                 shape == DrawingShape.Line ? 250 : 10, shape == DrawingShape.Circle ? 0 : 20, 0, limits);
             var plan = new ExecutionTrajectory(new TimedTrajectory(path, new PlanningRates(20, 5, 3, 10, 6)), limits);
             if (plan.Nodes.Length < 2 || plan.Duration <= 0) throw new InvalidOperationException("Execution plan missing");
+            var (peak1, peak2) = plan.PeakRates();
+            if (!(peak1 <= DeviceContract.PlanRateMax && peak2 <= DeviceContract.PlanRateMax && plan.RetryStretch >= 1))
+                throw new InvalidOperationException("Execution plan peak step rate above the cap");
             var slow=new ExecutionTrajectory(new TimedTrajectory(path,new PlanningRates(1,1,1,1,1)),limits);
             Validate(slow.Nodes,limits,MotionProfile.From(new PlanningRates(1,1,1,1,1)));
             if(slow.Duration<=plan.Duration || slow.Timing.Rates.Feed!=1 || slow.Timing.Path!=path)

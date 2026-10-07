@@ -573,9 +573,14 @@ public sealed partial class XYPreviewPanel : UserControl
         execution = null; Lang.Text(executionInfo, () => "");
         if (timing is null || planningLimits is not { } range) return;
         try {
+            double asked = timing.Duration;   // the speeds as entered, before the per-axis cap
             execution = new ExecutionTrajectory(timing, range);
             timing = execution.Timing;
-            Lang.Text(executionInfo, () => Lang.T("plan.execInfo", execution.Nodes.Length, execution.Duration, DeviceContract.PlanRateMax));
+            var shown = execution; var (peak1, peak2) = shown.PeakRates();
+            double capped = shown.Timing.Duration / shown.RetryStretch, slower = (capped / asked - 1) * 100, extra = (shown.RetryStretch - 1) * 100;
+            Lang.Text(executionInfo, () => Lang.T("plan.execInfo", shown.Nodes.Length, shown.Duration, DeviceContract.PlanRateMax, peak1, peak2) +
+                (slower >= 0.5 ? Lang.T("plan.execLimited", slower, asked, capped, DeviceContract.PlanRateMax) : "") +
+                (extra >= 0.5 ? Lang.T("plan.execStretch", extra) : ""));
         } catch (ArgumentException ex) { Lang.Text(executionInfo, () => Lang.T("plan.execFail") + ex.Message); }
     }
     // WPF compares reference values by reference, so re-assigning an equal string still raises a change: the status
@@ -766,6 +771,14 @@ public sealed partial class XYPreviewPanel : UserControl
             slider.Value = end;
             _ = MotionProfile.From(panel.RequestedRates);   // throws if a slider end is outside what the firmware accepts
         }
+        // The plan summary shows the per-axis peak step rate, and says so when the cap makes the run slower than the speeds entered.
+        panel.v1.Text = "5"; panel.v2.Text = "3"; panel.acc1.Text = "10"; panel.acc2.Text = "6"; panel.x.Text = "260"; panel.y.Text = "0"; panel.a.Text = "50"; panel.Refresh();
+        if (panel.execution is null || !panel.executionInfo.Text.Contains("每轴峰值") || panel.executionInfo.Text.Contains("比你填的速度慢"))
+            throw new InvalidOperationException("低于上限的速度应显示峰值步频，且不提示被上限压慢：" + panel.executionInfo.Text);
+        panel.v1.Text = "99"; panel.v2.Text = "99"; panel.acc1.Text = "99"; panel.acc2.Text = "99"; panel.x.Text = "260"; panel.y.Text = "0"; panel.a.Text = "70"; panel.Refresh();   // a big circle at the accel caps is speed-bound
+        var (peak1, peak2) = panel.execution?.PeakRates() ?? (double.NaN, double.NaN);
+        if (panel.execution is null || !panel.executionInfo.Text.Contains("比你填的速度慢") || !(peak1 <= DeviceContract.PlanRateMax) || !(peak2 <= DeviceContract.PlanRateMax))
+            throw new InvalidOperationException("超过上限的速度应提示被压慢，且每轴峰值不超过上限：" + panel.executionInfo.Text + " / " + panel.result.Text + $" / peaks {peak1:0}/{peak2:0}");
     }
     // The elbow (q2 - q1) range from the box to the plan, the point-move gate and the saved file.
     private static void ElbowLimitSelfTest()

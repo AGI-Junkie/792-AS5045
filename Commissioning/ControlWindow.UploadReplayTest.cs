@@ -18,7 +18,7 @@ public sealed partial class ControlWindow
         window.heartbeatTimer.Tick -= window.OnHeartbeatTick;
         var limits = new JointLimits(-30, 30, -60, 60);
         var path = DrawingTrajectory.Create(new PlanarArm(180, 176.38), DrawingShape.Circle, 340, 0, 5, 0, 0, limits);
-        var plan = new ExecutionTrajectory(new TimedTrajectory(path, new PlanningRates(0.65, 2, 1.5, 2, 1.5)), limits);
+        var plan = new ExecutionTrajectory(new TimedTrajectory(path, new PlanningRates(0.385, 2, 1.5, 2, 1.5)), limits); // feed chosen so the plan still has ~383 nodes (the planner cruises faster since the flat-top profiles)
         if (plan.Nodes.Length < 362) throw new InvalidOperationException("Upload replay must exercise at least 362 nodes.");
         var seed = new StringBuilder();
         while (seed.Length < 92000)
