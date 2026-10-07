@@ -78,7 +78,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-hotpath2-r2500-slip"
+#define FW_BUILD_ID                 "stage2-v11-r2500-slip-trajh"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id

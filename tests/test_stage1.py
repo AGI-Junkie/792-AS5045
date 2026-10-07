@@ -918,13 +918,13 @@ static void host_rates_config(void) {
 #define SCHED_C1 2844u
 #define SCHED_C2 0u
 #if ARM2_ENCODER_FEEDBACK /* the second encoder frame lengthens the foreground pass, which moves where each pulse lands */
-#define SCHED_AH 0xc6caae81u
-#define SCHED_BH 0xf7e7e694u
-#define SCHED_CH 0x32e65821u
+#define SCHED_AH 0x4e7b6b67u
+#define SCHED_BH 0xae4b8b3cu
+#define SCHED_CH 0x1b50e5abu
 #else
-#define SCHED_AH 0xc8cfd969u
-#define SCHED_BH 0xc9d37faeu
-#define SCHED_CH 0x33cd067du
+#define SCHED_AH 0x8ab0b9d5u
+#define SCHED_BH 0xe469fbb6u
+#define SCHED_CH 0x4ed142dbu
 #endif
 typedef struct { unsigned n; int16 q1[128], q2[128]; uint16 ms[128]; } sched_plan_t;
 static void sched_build(sched_plan_t *p, const uint16 *ms, unsigned n, int a1, int ae, unsigned dwellMs) {
