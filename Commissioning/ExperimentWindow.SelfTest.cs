@@ -60,7 +60,7 @@ internal sealed partial class ExperimentWindow
             bool zh = !Lang.IsEn;
             Check(zh, "the test runs in Chinese");
             var w = new ExperimentWindow(root);
-            Check(w.ListedRuns == 2 && w.ColumnHeaders.Length == 11 && w.ColumnHeaders[0] == "开始时间" && w.ColumnHeaders[6] == "RMSE °", "list and localized headers");
+            Check(w.ListedRuns == 2 && w.ColumnHeaders.Length == 12 && w.ColumnHeaders[0] == "开始时间" && w.ColumnHeaders[8] == "arm2 RMSE °" && w.ColumnHeaders[6] == "RMSE °", "list and localized headers");
             int rectRow = Enumerable.Range(0, 2).First(i => w.RowText(i).Contains("矩形")), circleRow = 1 - rectRow;
             string rowText = w.RowText(rectRow);
             Check(rowText.Contains("|图形|矩形|5 / 3|人工伸直零位|完整|") && rowText.Contains("10 Hz|—|") && rowText.EndsWith("|⚠") && w.RowText(circleRow).Contains("|圆|4 / 3|") && !w.RowText(circleRow).EndsWith("⚠"), "row facts: shape, speeds, reference, outcome, telemetry rate and the fault mark: " + rowText);
@@ -80,6 +80,8 @@ internal sealed partial class ExperimentWindow
             Check(w.Plots.All(p => p.XRange.Min <= 0.001 && p.XRange.Max > 10) && w.Range.Max > 10, "one shared time range");
             Check(err.SymmetricY && q.Source.Contains("40:1") && err.Source.Contains("不是笔尖位置误差") && speed.Source.Contains("不是实测速度") && w.Plane.Source.Contains("不是实测笔尖位置"), "every chart states where its data comes from, and what it is not");
             Check(w.Plane.Paths.Count == 3 && w.Plane.Paths[0].Name == "规划轨迹（模型）" && w.Plane.Paths.Any(p => p.Name == "混合反馈估算"), "plane: plan, command and hybrid paths");
+            Check(w.SummaryText_.Contains("arm2 误差：RMSE") && err.Notes.Any(n => n.StartsWith("arm2 误差")) && err.Lines.Any(l => l.Label.StartsWith("q2 RMSE")), "arm2's error statistics are in the summary, the chart note and as ±RMSE lines");
+            Check(q.Series.First(x => x.Name == "q2 编码器").Color != q.Series.First(x => x.Name == "编码器").Color && q.Series.First(x => x.Name == "q2 编码器").Color != q.Series.First(x => x.Name == "q2 命令").Color, "arm2's measured curve has a colour of its own, not arm1's encoder colour");
             Check(w.SummaryText_.Contains("RMSE") && w.SummaryText_.Contains("限速") && w.SummaryText_.Contains("时间对齐") && w.SummaryText_.Contains("停机快照") && w.SummaryText_.Contains("原因待诊断") && w.SummaryText_.Contains("分段 RMSE"), "summary: error, limiter, alignment, stop snapshot (cause undetermined), strokes: " + w.SummaryText_);
             Check(w.Plane.Arms.Count == 2 && w.CursorTime == w.Range.Min, "the replay starts at the beginning, with both arms drawn");
 
@@ -111,7 +113,7 @@ internal sealed partial class ExperimentWindow
             // Two recordings laid over each other.
             w.SelectForSelfTest(0, 1);
             Check(w.ShownRuns == 2 && q.Series.Count == 11 && err.Series.Count == 5 && speed.Series.Count == 4 && q.Series[0].Name.StartsWith("A ") && q.Series[6].Name.StartsWith("B "), "comparison doubles the series and tags them A and B");
-            Check(w.SummaryText_.Contains("B 相对 A") && w.Plane.Paths.Count == 6 && err.Notes.Count == 2, "comparison summary and notes");
+            Check(w.SummaryText_.Contains("B 相对 A") && w.Plane.Paths.Count == 6 && err.Notes.Count == 4, "comparison summary and notes");
             Check(w.Range.Max >= 10 && w.Plane.Arms.Count == 4, "both arms at the cursor");
             // Language switch rewrites everything without losing the selection.
             Lang.Toggle();
@@ -131,7 +133,7 @@ internal sealed partial class ExperimentWindow
             var decoder = BitmapDecoder.Create(new Uri(figure), BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
             Check(decoder.Frames[0].PixelWidth > w.Plane.ActualWidth + 300 && decoder.Frames[0].PixelHeight >= 700, "the exported figure holds the charts and the plane");
             w.Hide();
-            Check(w.ColumnHeaders.Length == 11 && w.ExportImageText == "导出图片 PNG", "the export button is labelled");
+            Check(w.ColumnHeaders.Length == 12 && w.ExportImageText == "导出图片 PNG", "the export button is labelled");
             // Nothing recorded yet: a friendly empty state, not an error.
             var empty = new ExperimentWindow(Path.Combine(temp, "nothing"));
             Check(empty.ListedRuns == 0 && empty.SummaryText_.Contains("还没有实验记录") && empty.ShownRuns == 0, "an empty archive says so");

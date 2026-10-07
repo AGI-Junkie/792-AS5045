@@ -44,6 +44,8 @@ public sealed class ExperimentRun
     public int MotionSamples { get; init; }
     public double? Rmse { get; init; }
     public double? Peak { get; init; }
+    public double? Rmse2 { get; init; }                             // arm2's own encoder, null when the run had none
+    public double? Peak2 { get; init; }
     public int TelemetryHz { get; init; }                           // 0 = the old ~2 Hz status-block telemetry
     public RunSettings? Settings { get; init; }
     public string SettingsText { get; init; } = "";                 // as recorded, so the fields can be restored exactly
@@ -86,7 +88,7 @@ public static class ExperimentArchive
         var root = meta.RootElement;
         string Text(JsonElement e, string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
         double Number(JsonElement e, string name, double fallback) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDouble() : fallback;
-        string outcome = "interrupted"; int samples = 0, motion = 0; double? rmse = null, peak = null;
+        string outcome = "interrupted"; int samples = 0, motion = 0; double? rmse = null, peak = null, rmse2 = null, peak2 = null;
         string summaryPath = Path.Combine(directory, "summary.json");
         if (File.Exists(summaryPath))
         {
@@ -96,11 +98,13 @@ public static class ExperimentArchive
             samples = (int)Number(s, "samples", 0); motion = (int)Number(s, "motion_samples", 0);
             if (s.TryGetProperty("q1_rmse_deg", out var r) && r.ValueKind == JsonValueKind.Number) rmse = r.GetDouble();
             if (s.TryGetProperty("q1_peak_abs_error_deg", out var p) && p.ValueKind == JsonValueKind.Number) peak = p.GetDouble();
+            if (s.TryGetProperty("q2_rmse_deg", out var r2) && r2.ValueKind == JsonValueKind.Number) rmse2 = r2.GetDouble();
+            if (s.TryGetProperty("q2_peak_abs_error_deg", out var p2) && p2.ValueKind == JsonValueKind.Number) peak2 = p2.GetDouble();
         }
         if (!root.TryGetProperty("started_utc", out var started) || !started.TryGetDateTime(out var startedUtc)) throw new FormatException("started_utc");
         return new ExperimentRun {
             Directory = directory, Kind = Text(root, "kind"), StartedUtc = startedUtc.ToUniversalTime(), Sequence = (uint)Number(root, "sequence", 0), Reference = Text(root, "reference"),
-            Outcome = outcome, Samples = samples, MotionSamples = motion, Rmse = rmse, Peak = peak, TelemetryHz = (int)Number(root, "telemetry_hz", 0),
+            Outcome = outcome, Samples = samples, MotionSamples = motion, Rmse = rmse, Peak = peak, Rmse2 = rmse2, Peak2 = peak2, TelemetryHz = (int)Number(root, "telemetry_hz", 0),
             Settings = RunSettings.Parse(Text(root, "settings")), SettingsText = Text(root, "settings"), L1 = Number(root, "L1", 180), L2 = Number(root, "L2", 176.38),
             HasFault = File.Exists(Path.Combine(directory, "fault.json")), CalibrationId = Text(root, "calibration_id") };
     }
@@ -110,7 +114,7 @@ public static class ExperimentArchive
     public static string ReportCsv(IEnumerable<ExperimentRun> runs, bool analyse = true)
     {
         static string N(double? v) => v is { } x ? x.ToString("0.######", CultureInfo.InvariantCulture) : "";
-        var csv = new System.Text.StringBuilder("id,started_utc,kind,shape_index,branch,v1_deg_s,v2_deg_s,a1_deg_s2,a2_deg_s2,reference,outcome,q1_rmse_deg,q1_peak_deg,telemetry_hz,samples,motion_samples,has_fault,calibration_id,aligned,align_offset_ms,align_residual_deg,limiting_axes\r\n");
+        var csv = new System.Text.StringBuilder("id,started_utc,kind,shape_index,branch,v1_deg_s,v2_deg_s,a1_deg_s2,a2_deg_s2,reference,outcome,q1_rmse_deg,q1_peak_deg,q2_rmse_deg,q2_peak_deg,telemetry_hz,samples,motion_samples,has_fault,calibration_id,aligned,align_offset_ms,align_residual_deg,limiting_axes\r\n");
         foreach (var run in runs)
         {
             var s = run.Settings; string aligned = "", offset = "", residual = "", limiting = "";
@@ -118,7 +122,7 @@ public static class ExperimentArchive
                 try { var a = RunAnalysis.Create(run, Load(run)); aligned = a.Aligned ? "1" : "0"; offset = a.Aligned ? N(a.AlignmentOffsetMs) : ""; residual = a.Aligned ? N(a.AlignmentResidualDeg) : ""; limiting = string.Join("+", a.LimitingAxes); }
                 catch (Exception ex) when (ex is IOException or FormatException or UnauthorizedAccessException) { aligned = "error"; }
             csv.Append(string.Join(",", run.Id, run.StartedUtc.ToString("O", CultureInfo.InvariantCulture), run.Kind, s?.Shape.ToString() ?? "", s?.Branch.ToString() ?? "", N(s?.V1), N(s?.V2), N(s?.A1), N(s?.A2),
-                run.Reference.Replace(',', ';'), run.Outcome.Replace(',', ';').Replace('\r', ' ').Replace('\n', ' '), N(run.Rmse), N(run.Peak), run.TelemetryHz, run.Samples, run.MotionSamples, run.HasFault ? 1 : 0, run.CalibrationId, aligned, offset, residual, limiting)).Append("\r\n");
+                run.Reference.Replace(',', ';'), run.Outcome.Replace(',', ';').Replace('\r', ' ').Replace('\n', ' '), N(run.Rmse), N(run.Peak), N(run.Rmse2), N(run.Peak2), run.TelemetryHz, run.Samples, run.MotionSamples, run.HasFault ? 1 : 0, run.CalibrationId, aligned, offset, residual, limiting)).Append("\r\n");
         }
         return csv.ToString();
     }
@@ -257,6 +261,8 @@ public sealed class RunAnalysis
     public string[] LimitingAxes { get; init; } = [];
     public double Rmse { get; init; }
     public double Peak { get; init; }
+    public double? Rmse2 { get; init; }                             // arm2 error (its own encoder minus the command); null when the run has no arm2 measurement
+    public double? Peak2 { get; init; }
     public double Duration { get; init; }
     public double AlignmentOffsetMs { get; init; }                  // device clock at plan time zero
     public double AlignmentResidualDeg { get; init; }               // how well the plan matches the commanded motion after aligning; large = do not trust the markers
@@ -347,6 +353,7 @@ public sealed class RunAnalysis
                 segments.Add(new SegmentStat(k + 1, events[k].Time, events[k + 1].Time, inside.Length,
                     Math.Sqrt(inside.Average(i => motion[i].Q1Error * motion[i].Q1Error)), inside.Max(i => Math.Abs(motion[i].Q1Error))));
             }
+        double[] q2Error = motion.Length > 0 && motion.All(r => r.Q2Measured.HasValue) ? motion.Select(r => r.Q2Measured!.Value - r.Q2Command).ToArray() : [];
         // Which motor limits the drawing speed: the caps are the ones the plan was built with.
         AxisUse[] axes = [];
         if (run.Settings is { } s && v1.Count > 0)
@@ -361,7 +368,7 @@ public sealed class RunAnalysis
             Q1Command = motion.Select(r => r.Q1Command).ToArray(), Q1Encoder = motion.Select(r => r.Q1Encoder).ToArray(), Q1Error = motion.Select(r => r.Q1Error).ToArray(),
             Q2Command = motion.Select(r => r.Q2Command).ToArray(),
             Q2Measured = motion.All(r=>r.Q2Measured.HasValue) ? motion.Select(r=>r.Q2Measured!.Value).ToArray() : [],
-            Q2Error = motion.All(r=>r.Q2Measured.HasValue) ? motion.Select(r=>r.Q2Measured!.Value-r.Q2Command).ToArray() : [], XCommand = motion.Select(r => r.XCommand).ToArray(), YCommand = motion.Select(r => r.YCommand).ToArray(),
+            Q2Error = q2Error, Rmse2 = q2Error.Length > 0 ? Math.Sqrt(q2Error.Average(e => e * e)) : null, Peak2 = q2Error.Length > 0 ? q2Error.Max(Math.Abs) : null, XCommand = motion.Select(r => r.XCommand).ToArray(), YCommand = motion.Select(r => r.YCommand).ToArray(),
             XHybrid = motion.Select(r => r.XHybrid).ToArray(), YHybrid = motion.Select(r => r.YHybrid).ToArray(), Segment = motion.Select(r => r.Segment).ToArray(),
             PlanT = planT, PlanQ1 = planQ1, PlanQ2 = planQ2, PlanX = xy.Select(p => p.X).ToArray(), PlanY = xy.Select(p => p.Y).ToArray(),
             PlanVT = vt.ToArray(), PlanV1 = v1.ToArray(), PlanV2 = v2.ToArray(), PlanAT = at.ToArray(), PlanA1 = a1.ToArray(), PlanA2 = a2.ToArray(),

@@ -66,6 +66,8 @@ public static partial class ExperimentArchiveTests
             var data = ExperimentArchive.Load(run);
             Check(data.Plan.Length == plan.Nodes.Length && data.Feedback.Length > 50 && data.SkippedRows == 0, "plan and feedback loaded");
             var a = RunAnalysis.Create(run, data);
+            Check(a.Rmse2 is { } r2 && run.Rmse2 is { } s2 && Math.Abs(r2 - s2) < 1e-3 && a.Peak2 is { } k2 && run.Peak2 is { } sk2 && Math.Abs(k2 - sk2) < 1e-3, $"arm2 statistics from the samples must equal the recorder's summary: {a.Rmse2} vs {run.Rmse2}");
+            Check(csvRows[0].Contains("q2_rmse_deg,q2_peak_deg") && csvRows[2].Split(',')[Array.IndexOf(csvRows[0].Split(','), "q2_rmse_deg")] != "", "the report carries arm2's statistics");
             Check(a.Aligned && Math.Abs(a.AlignmentOffsetMs - 8200) <= 10 && a.AlignmentResidualDeg < 0.02, $"the plan must be aligned to the device clock within 10 ms: {a.AlignmentOffsetMs} residual {a.AlignmentResidualDeg}");
             Check(a.T.Length > 40 && a.T.Zip(a.T.Skip(1)).All(p => p.Second > p.First) && a.T[0] > -0.2 && a.T[^1] > a.Duration - 0.3, "time axis starts with the plan");
             Check(a.Events.Length == 5 && a.Events[0] is { Kind: "start", Time: 0 } && a.Events[1..4].All(e => e.Kind == "dwell") && a.Events[4].Kind == "stop" && a.Events.Zip(a.Events.Skip(1)).All(p => p.Second.Time > p.First.Time), "a rectangle has a start, three corner dwells and a stop: " + string.Join(",", a.Events.Select(e => e.Kind)));

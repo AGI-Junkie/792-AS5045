@@ -75,7 +75,7 @@ internal sealed partial class ExperimentWindow : Window
     {
         public required ExperimentRun Run { get; init; }
         public string Time { get; set; } = ""; public string Kind { get; set; } = ""; public string Shape { get; set; } = ""; public string Speed { get; set; } = "";
-        public string Reference { get; set; } = ""; public string Status { get; set; } = ""; public string Rmse { get; set; } = ""; public string Peak { get; set; } = "";
+        public string Reference { get; set; } = ""; public string Status { get; set; } = ""; public string Rmse { get; set; } = ""; public string Peak { get; set; } = ""; public string Rmse2 { get; set; } = "";
         public string Hz { get; set; } = ""; public string Fault { get; set; } = ""; public string Calibration { get; set; } = "";
     }
 
@@ -105,8 +105,8 @@ internal sealed partial class ExperimentWindow : Window
     private readonly Dictionary<string, LogIndex?> logs = [];
 
     private static readonly Brush[][] Colours = [
-        [WorkbenchTheme.Blue, WorkbenchTheme.Teal, WorkbenchTheme.Brush("#7B8794"), WorkbenchTheme.Brush("#7C3AED")],
-        [WorkbenchTheme.Brush("#C66B05"), WorkbenchTheme.Brush("#B7791F"), WorkbenchTheme.Brush("#A8A29E"), WorkbenchTheme.Brush("#DB2777")]];
+        [WorkbenchTheme.Blue, WorkbenchTheme.Teal, WorkbenchTheme.Brush("#7B8794"), WorkbenchTheme.Brush("#7C3AED"), WorkbenchTheme.Brush("#A78BFA")],
+        [WorkbenchTheme.Brush("#C66B05"), WorkbenchTheme.Brush("#B7791F"), WorkbenchTheme.Brush("#A8A29E"), WorkbenchTheme.Brush("#DB2777"), WorkbenchTheme.Brush("#F472B6")]];
 
     public ExperimentWindow(string experimentRoot)
     {
@@ -175,14 +175,14 @@ internal sealed partial class ExperimentWindow : Window
             Run = run, Time = run.StartedUtc.ToLocalTime().ToString("MM-dd HH:mm:ss", CultureInfo.InvariantCulture), Kind = Lang.T(run.Kind == "point" ? "exp.kind.point" : "exp.kind.trajectory"), Shape = ShapeName(run),
             Speed = s is null ? "—" : $"{s.V1:0.#} / {s.V2:0.#}", Reference = run.Reference,
             Status = run.Complete ? Lang.T("exp.status.complete") : run.Outcome == "interrupted" ? Lang.T("exp.status.interrupted") : Lang.T("exp.status.other", run.Outcome),
-            Rmse = run.Rmse is { } r ? r.ToString("0.0000", CultureInfo.InvariantCulture) : "—", Peak = run.Peak is { } p ? p.ToString("0.0000", CultureInfo.InvariantCulture) : "—",
+            Rmse = run.Rmse is { } r ? r.ToString("0.0000", CultureInfo.InvariantCulture) : "—", Peak = run.Peak is { } p ? p.ToString("0.0000", CultureInfo.InvariantCulture) : "—", Rmse2 = run.Rmse2 is { } r2 ? r2.ToString("0.0000", CultureInfo.InvariantCulture) : "—",
             Hz = run.TelemetryHz > 0 ? run.TelemetryHz + " Hz" : "~2 Hz", Fault = run.HasFault ? "⚠" : "", Calibration = run.CalibrationVersion.Length > 0 ? run.CalibrationVersion : "—" };
     }
     private void BuildColumns()
     {
         grid.Columns.Clear();
         (string key, string property, double width)[] columns = [("exp.col.time", nameof(Row.Time), 100), ("exp.col.kind", nameof(Row.Kind), 48), ("exp.col.shape", nameof(Row.Shape), 70), ("exp.col.speed", nameof(Row.Speed), 96),
-            ("exp.col.ref", nameof(Row.Reference), 96), ("exp.col.status", nameof(Row.Status), 110), ("exp.col.rmse", nameof(Row.Rmse), 64), ("exp.col.peak", nameof(Row.Peak), 64), ("exp.col.hz", nameof(Row.Hz), 52), ("exp.col.cal", nameof(Row.Calibration), 46), ("exp.col.fault", nameof(Row.Fault), 36)];
+            ("exp.col.ref", nameof(Row.Reference), 96), ("exp.col.status", nameof(Row.Status), 110), ("exp.col.rmse", nameof(Row.Rmse), 64), ("exp.col.peak", nameof(Row.Peak), 64), ("exp.col.rmse2", nameof(Row.Rmse2), 64), ("exp.col.hz", nameof(Row.Hz), 52), ("exp.col.cal", nameof(Row.Calibration), 46), ("exp.col.fault", nameof(Row.Fault), 36)];
         foreach (var (key, property, width) in columns)
             grid.Columns.Add(new DataGridTextColumn { Header = Lang.T(key), Binding = new System.Windows.Data.Binding(property), Width = width, SortMemberPath = property });
     }
@@ -282,12 +282,13 @@ internal sealed partial class ExperimentWindow : Window
             qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.enc"), a.T, a.Q1Encoder, c[1]) { Dashed = true, Thickness = 1.3, Unit = "°" });
             if(a.Q2Measured.Length==a.T.Length && a.T.Length>0) {
                 qPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.cmd"),a.T,a.Q2Command,c[3]) { Unit="°" });
-                qPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.enc"),a.T,a.Q2Measured,c[1]) { Unit="°",Dashed=true });
+                qPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.enc"),a.T,a.Q2Measured,c[4]) { Unit="°",Dashed=true });
                 errPlot.Series.Add(new PlotSeries(tag + "q2 " + Lang.T("exp.s.err"),a.T,a.Q2Error,c[3]) { Unit="°",Decimals=4 });
             }
             if (a.HasPlan) qPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.plan"), a.PlanT, a.PlanQ1, c[2]) { Dashed = true, Thickness = 1.1, Unit = "°" });
             errPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.err"), a.T, a.Q1Error, c[0]) { Unit = "°", Decimals = 4, Dots = a.T.Length < 120 });
             if (a.T.Length > 0) { errPlot.Lines.Add(new PlotLine(a.Rmse, tag + "RMSE " + a.Rmse.ToString("0.0000", CultureInfo.InvariantCulture), c[0])); errPlot.Lines.Add(new PlotLine(-a.Rmse, "", c[0])); }
+            if (a.Rmse2 is { } rmse2) { errPlot.Lines.Add(new PlotLine(rmse2, tag + "q2 RMSE " + rmse2.ToString("0.0000", CultureInfo.InvariantCulture), c[3])); errPlot.Lines.Add(new PlotLine(-rmse2, "", c[3])); }
             foreach (var ev in a.Events)
             {
                 int dwell = a.Events.Where(e => e.Kind == "dwell" && e.Time <= ev.Time).Count();
@@ -332,6 +333,7 @@ internal sealed partial class ExperimentWindow : Window
         errPlot.SymmetricY = true; speedPlot.SymmetricY = true; accelPlot.SymmetricY = true;
         qPlot.Source = Lang.T("exp.src.q1"); errPlot.Source = Lang.T("exp.src.err"); speedPlot.Source = Lang.T("exp.src.plan"); accelPlot.Source = Lang.T("exp.src.plan");
         for (int i = 0; i < shown.Count; i++) errPlot.Notes.Add((compare ? (i == 0 ? "A " : "B ") : "") + Lang.T("exp.sum.err", shown[i].Rmse, shown[i].Peak, shown[i].T.Length, shown[i].Run.TelemetryHz > 0 ? shown[i].Run.TelemetryHz + " Hz" : "~2 Hz"));
+        for (int i = 0; i < shown.Count; i++) if (shown[i].Rmse2 is { } r2 && shown[i].Peak2 is { } p2) errPlot.Notes.Add((compare ? (i == 0 ? "A " : "B ") : "") + Lang.T("exp.sum.err2", r2, p2));
         for (int i = 0; i < shown.Count; i++) speedPlot.Notes.Add((compare ? (i == 0 ? "A " : "B ") : "") + LimiterText(shown[i]));
         xy.Source = Lang.T("exp.src.xy"); xy.ReachRadius = shown[0].Model.OuterRadius;
         foreach (var plot in new[] { qPlot, errPlot, speedPlot, accelPlot }) plot.XRange = (tMin, tMax);
@@ -360,6 +362,7 @@ internal sealed partial class ExperimentWindow : Window
             text.AppendLine(Lang.T("exp.sum.cal", run.CalibrationId.Length > 0 ? run.CalibrationId : Lang.T("exp.sum.noCal")));
             if (a.T.Length == 0) { text.AppendLine(Lang.T("exp.sum.nodata")); text.AppendLine(); continue; }
             text.AppendLine(Lang.T("exp.sum.err", a.Rmse, a.Peak, a.T.Length, run.TelemetryHz > 0 ? run.TelemetryHz + " Hz" : "~2 Hz"));
+            if (a.Rmse2 is { } rmse2 && a.Peak2 is { } peak2) text.AppendLine(Lang.T("exp.sum.err2", rmse2, peak2));
             if (a.Segments.Length > 0) text.AppendLine(Lang.T("exp.sum.seg", string.Join("  ", a.Segments.Select(g => $"{g.Index}: {g.Rmse:0.0000}"))));
             if (a.HasPlan) text.AppendLine(Lang.T("exp.sum.limit", LimiterText(a)));
             if (a.Aligned) text.AppendLine(a.AlignmentResidualDeg <= 1 ? Lang.T("exp.sum.align.good", a.AlignmentOffsetMs, a.AlignmentResidualDeg) : Lang.T("exp.sum.align.poor", a.AlignmentResidualDeg));
@@ -456,7 +459,7 @@ internal sealed partial class ExperimentWindow : Window
     internal bool Playing => timer.IsEnabled;
     internal void SelectForSelfTest(params int[] indexes) { grid.SelectedItems.Clear(); foreach (int i in indexes) grid.SelectedItems.Add(rows[i]); }
     internal string[] ColumnHeaders => grid.Columns.Select(c => c.Header?.ToString() ?? "").ToArray();
-    internal string RowText(int index) => string.Join("|", new[] { rows[index].Time, rows[index].Kind, rows[index].Shape, rows[index].Speed, rows[index].Reference, rows[index].Status, rows[index].Rmse, rows[index].Peak, rows[index].Hz, rows[index].Calibration, rows[index].Fault });
+    internal string RowText(int index) => string.Join("|", new[] { rows[index].Time, rows[index].Kind, rows[index].Shape, rows[index].Speed, rows[index].Reference, rows[index].Status, rows[index].Rmse, rows[index].Peak, rows[index].Rmse2, rows[index].Hz, rows[index].Calibration, rows[index].Fault });
     internal bool QuietLog { get => quietLog.IsChecked == true; set => quietLog.IsChecked = value; }
     internal void TogglePlayForSelfTest() => TogglePlayback();
 }
