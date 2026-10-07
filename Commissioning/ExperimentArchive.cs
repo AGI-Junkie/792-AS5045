@@ -273,6 +273,11 @@ public sealed class RunAnalysis
     public RunEvent[] Events { get; init; } = [];
     public SegmentStat[] Segments { get; init; } = [];
     // The seconds before a stop (pre_fault.csv) that the recording itself does not hold: before its first moving sample or after its last. Same time axis as T.
+    // Speed of each motor from the encoders, as a slope over a window of MeasuredSpeedWindow seconds: a rough estimate (the telemetry is 2-10 Hz and the encoders are quantised).
+    // Motor 2 turns the elbow q2 - q1, so it needs arm2's own encoder; without one the array is empty.
+    public const double MeasuredSpeedWindow = 0.4;
+    public double[] V1Measured { get; init; } = [];
+    public double[] V2Measured { get; init; } = [];
     public double[] PreT { get; init; } = [];
     public double[] PreQ1Command { get; init; } = [];
     public DateTime[] PreHostUtc { get; init; } = [];
@@ -300,6 +305,17 @@ public sealed class RunAnalysis
         int i = Array.BinarySearch(xs, x); if (i >= 0) return ys[i];
         i = ~i; double u = (x - xs[i - 1]) / (xs[i] - xs[i - 1]);
         return ys[i - 1] + (ys[i] - ys[i - 1]) * u;
+    }
+    private static double[] Slope(double[] t, double[] y, double window)
+    {
+        var v = new double[t.Length];
+        for (int i = 0; i < t.Length; i++)
+        {
+            int lo = i, hi = i;
+            while (t[hi] - t[lo] < window && (lo > 0 || hi < t.Length - 1)) { if (lo > 0) lo--; if (t[hi] - t[lo] < window && hi < t.Length - 1) hi++; }
+            v[i] = hi > lo && t[hi] > t[lo] ? (y[hi] - y[lo]) / (t[hi] - t[lo]) : 0;
+        }
+        return v;
     }
     public double At(double[] series, double time) => Lerp(T, series, time);
     public double PlanAt(double[] series, double time) => Lerp(PlanT, series, time);
@@ -390,6 +406,8 @@ public sealed class RunAnalysis
             Run = run, Data = data, Model = model, T = T, HostUtc = motion.Select(r => r.HostUtc).ToArray(),
             Q1Command = motion.Select(r => r.Q1Command).ToArray(), Q1Encoder = motion.Select(r => r.Q1Encoder).ToArray(), Q1Error = motion.Select(r => r.Q1Error).ToArray(),
             Q2Command = motion.Select(r => r.Q2Command).ToArray(),
+            V1Measured = T.Length >= 3 ? Slope(T, motion.Select(r => r.Q1Encoder).ToArray(), MeasuredSpeedWindow) : [],
+            V2Measured = T.Length >= 3 && q2Error.Length > 0 ? Slope(T, motion.Select(r => r.Q2Measured!.Value - r.Q1Encoder).ToArray(), MeasuredSpeedWindow) : [],
             Q2Measured = motion.All(r=>r.Q2Measured.HasValue) ? motion.Select(r=>r.Q2Measured!.Value).ToArray() : [],
             Q2Error = q2Error, Rmse2 = q2Error.Length > 0 ? Math.Sqrt(q2Error.Average(e => e * e)) : null, Peak2 = q2Error.Length > 0 ? q2Error.Max(Math.Abs) : null, XCommand = motion.Select(r => r.XCommand).ToArray(), YCommand = motion.Select(r => r.YCommand).ToArray(),
             XHybrid = motion.Select(r => r.XHybrid).ToArray(), YHybrid = motion.Select(r => r.YHybrid).ToArray(), Segment = motion.Select(r => r.Segment).ToArray(),

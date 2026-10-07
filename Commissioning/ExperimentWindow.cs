@@ -318,6 +318,8 @@ internal sealed partial class ExperimentWindow : Window
             {
                 speedPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.m1"), a.PlanVT, a.PlanV1, c[0]) { Unit = "°/s", Decimals = 2 });
                 speedPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.m2"), a.PlanVT, a.PlanV2, c[3]) { Unit = "°/s", Decimals = 2 });
+                if (a.V1Measured.Length > 0) speedPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.m1") + " " + Lang.T("exp.s.slope"), a.T, a.V1Measured, c[1]) { Thickness = 1.0, Unit = "°/s", Decimals = 2 });
+                if (a.V2Measured.Length > 0) speedPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.m2") + " " + Lang.T("exp.s.slope"), a.T, a.V2Measured, c[4]) { Thickness = 1.0, Unit = "°/s", Decimals = 2 });
                 accelPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.m1"), a.PlanAT, a.PlanA1, c[0]) { Unit = "°/s²", Decimals = 2 });
                 accelPlot.Series.Add(new PlotSeries(tag + Lang.T("exp.s.m2"), a.PlanAT, a.PlanA2, c[3]) { Unit = "°/s²", Decimals = 2 });
                 if (a.Axes.Length == 4)
@@ -336,7 +338,7 @@ internal sealed partial class ExperimentWindow : Window
         }
         qPlot.Title = Lang.T("exp.chart.q1"); errPlot.Title = Lang.T("exp.chart.err"); speedPlot.Title = Lang.T("exp.chart.speed"); accelPlot.Title = Lang.T("exp.chart.accel");
         errPlot.SymmetricY = true; speedPlot.SymmetricY = true; accelPlot.SymmetricY = true;
-        qPlot.Source = Lang.T("exp.src.q1"); errPlot.Source = Lang.T("exp.src.err"); speedPlot.Source = Lang.T("exp.src.plan"); accelPlot.Source = Lang.T("exp.src.plan");
+        qPlot.Source = Lang.T("exp.src.q1"); errPlot.Source = Lang.T("exp.src.err"); speedPlot.Source = Lang.T("exp.src.speed"); accelPlot.Source = Lang.T("exp.src.plan");
         for (int i = 0; i < shown.Count; i++) errPlot.Notes.Add((compare ? (i == 0 ? "A " : "B ") : "") + Lang.T("exp.sum.err", shown[i].Rmse, shown[i].Peak, shown[i].T.Length, shown[i].Run.TelemetryHz > 0 ? shown[i].Run.TelemetryHz + " Hz" : "~2 Hz"));
         for (int i = 0; i < shown.Count; i++) if (shown[i].Rmse2 is { } r2 && shown[i].Peak2 is { } p2) errPlot.Notes.Add((compare ? (i == 0 ? "A " : "B ") : "") + Lang.T("exp.sum.err2", r2, p2));
         for (int i = 0; i < shown.Count; i++) speedPlot.Notes.Add((compare ? (i == 0 ? "A " : "B ") : "") + LimiterText(shown[i]));
@@ -380,6 +382,7 @@ internal sealed partial class ExperimentWindow : Window
             if (a.Segments.Length > 0) text.AppendLine(Lang.T("exp.sum.seg", string.Join("  ", a.Segments.Select(g => $"{g.Index}: {g.Rmse:0.0000}"))));
             if (a.Segments.Length > 0 && a.Rmse2 is not null) text.AppendLine(Lang.T("exp.sum.seg2", string.Join("  ", a.Segments.Select(g => $"{g.Index}: {g.Rmse2:0.0000}"))));
             if (a.HasPlan) text.AppendLine(Lang.T("exp.sum.limit", LimiterText(a)));
+            if (a.V1Measured.Length > 0) text.AppendLine(Lang.T("exp.sum.slope", a.V1Measured.Max(Math.Abs), a.V2Measured.Length > 0 ? a.V2Measured.Max(Math.Abs).ToString("F1", CultureInfo.InvariantCulture) : "—", RunAnalysis.MeasuredSpeedWindow));
             if (a.Aligned) text.AppendLine(a.AlignmentResidualDeg <= 1 ? Lang.T("exp.sum.align.good", a.AlignmentOffsetMs, a.AlignmentResidualDeg) : Lang.T("exp.sum.align.poor", a.AlignmentResidualDeg));
             if (a.Data.SkippedRows > 0) text.AppendLine(Lang.T("exp.sum.skipped", a.Data.SkippedRows));
             if (TimingText(a) is { } timing) text.AppendLine(timing);

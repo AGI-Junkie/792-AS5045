@@ -69,7 +69,7 @@ internal sealed partial class ExperimentWindow
             // One recording: the curves, the events, the written summary.
             w.SelectForSelfTest(rectRow);
             var (q, err, speed, accel) = (w.Plots[0], w.Plots[1], w.Plots[2], w.Plots[3]);
-            Check(w.ShownRuns == 1 && q.Series.Count == 7 && err.Series.Count == 3 && speed.Series.Count == 2 && accel.Series.Count == 2, "series per chart");
+            Check(w.ShownRuns == 1 && q.Series.Count == 7 && err.Series.Count == 3 && speed.Series.Count == 4 && accel.Series.Count == 2, "series per chart");
             Check(err.Marks.Count(m => m.Label is "起步" or "停机" or "拐角 1" or "拐角 2" or "拐角 3") == 5 && err.Marks.Any(m => m.Label.StartsWith("故障 ")), "the plan's events and the stop snapshot are marked on the error chart");
             Check(Math.Abs(err.Marks.First(m => m.Label.StartsWith("故障")).X - 12.0) < 0.02, "the stop snapshot is placed at its device time on the aligned axis");
             Check(new[] { q, speed, accel }.All(p => p.Marks.Any(m => Math.Abs(m.X - 12.0) < 0.02 && m.Color == WorkbenchTheme.Red)), "the stop is marked on every chart");
@@ -78,7 +78,7 @@ internal sealed partial class ExperimentWindow
             Check(w.SummaryText_.Contains("最大滞后 17321 µs") && w.SummaryText_.Contains("压着走累计 6520 µs") && w.SummaryText_.Contains("3 个停机前遥测样本"), "summary: firmware TIMING from the session log, and the pre-stop samples: " + w.SummaryText_);
             Check(speed.Lines.Count == 4 && speed.Lines.Any(l => l.Label.StartsWith("电机1 上限")) && accel.Lines.Count == 4, "the caps are drawn as reference lines");
             Check(w.Plots.All(p => p.XRange.Min <= 0.001 && p.XRange.Max > 10) && w.Range.Max > 10, "one shared time range");
-            Check(err.SymmetricY && q.Source.Contains("40:1") && err.Source.Contains("不是笔尖位置误差") && err.Source.Contains("arm2") && speed.Source.Contains("不是实测速度") && w.Plane.Source.Contains("不是实测笔尖位置"), "every chart states where its data comes from, and what it is not");
+            Check(err.SymmetricY && q.Source.Contains("40:1") && err.Source.Contains("不是笔尖位置误差") && err.Source.Contains("arm2") && speed.Source.Contains("粗略估计") && w.Plane.Source.Contains("不是实测笔尖位置"), "every chart states where its data comes from, and what it is not");
             Check(w.Plane.Paths.Count == 3 && w.Plane.Paths[0].Name == "规划轨迹（模型）" && w.Plane.Paths.Any(p => p.Name == "混合反馈估算"), "plane: plan, command and hybrid paths");
             Check(w.SummaryText_.Contains("arm2 误差：RMSE") && err.Notes.Any(n => n.StartsWith("arm2 误差")) && err.Lines.Any(l => l.Label.StartsWith("q2 RMSE")) && w.SummaryText_.Contains("分段 arm2 RMSE"), "arm2's error statistics are in the summary, the chart note and as ±RMSE lines");
             Check(q.Series.First(x => x.Name == "q2 编码器").Color != q.Series.First(x => x.Name == "编码器").Color && q.Series.First(x => x.Name == "q2 编码器").Color != q.Series.First(x => x.Name == "q2 命令").Color, "arm2's measured curve has a colour of its own, not arm1's encoder colour");
@@ -112,7 +112,7 @@ internal sealed partial class ExperimentWindow
 
             // Two recordings laid over each other.
             w.SelectForSelfTest(0, 1);
-            Check(w.ShownRuns == 2 && q.Series.Count == 12 && err.Series.Count == 5 && speed.Series.Count == 4 && q.Series[0].Name.StartsWith("A ") && q.Series[7].Name.StartsWith("B "), "comparison doubles the series and tags them A and B");
+            Check(w.ShownRuns == 2 && q.Series.Count == 12 && err.Series.Count == 5 && speed.Series.Count == 8 && q.Series[0].Name.StartsWith("A ") && q.Series[7].Name.StartsWith("B "), "comparison doubles the series and tags them A and B");
             Check(w.SummaryText_.Contains("B 相对 A") && w.Plane.Paths.Count == 6 && err.Notes.Count == 4, "comparison summary and notes");
             Check(w.Range.Max >= 10 && w.Plane.Arms.Count == 4, "both arms at the cursor");
             // Language switch rewrites everything without losing the selection.

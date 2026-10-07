@@ -66,6 +66,7 @@ public static partial class ExperimentArchiveTests
             var data = ExperimentArchive.Load(run);
             Check(data.Plan.Length == plan.Nodes.Length && data.Feedback.Length > 50 && data.SkippedRows == 0, "plan and feedback loaded");
             var a = RunAnalysis.Create(run, data);
+            Check(a.V1Measured.Length == a.T.Length && a.V2Measured.Length == a.T.Length && a.Axes.Length == 4 && a.V1Measured.Max(Math.Abs) is var m1 && m1 > 0.5 * a.Axes[0].Peak && m1 < 1.15 * a.Axes[0].Peak && a.V2Measured.Max(Math.Abs) is var m2 && m2 > 0.5 * a.Axes[1].Peak && m2 < 1.15 * a.Axes[1].Peak, $"the encoder slope must peak near the plan's peak speed: {a.V1Measured.Max(Math.Abs)} vs {a.Axes[0].Peak}, {a.V2Measured.Max(Math.Abs)} vs {a.Axes[1].Peak}");
             Check(a.Rmse2 is { } r2 && run.Rmse2 is { } s2 && Math.Abs(r2 - s2) < 1e-3 && a.Peak2 is { } k2 && run.Peak2 is { } sk2 && Math.Abs(k2 - sk2) < 1e-3, $"arm2 statistics from the samples must equal the recorder's summary: {a.Rmse2} vs {run.Rmse2}");
             Check(csvRows[0].Contains("q2_rmse_deg,q2_peak_deg") && csvRows[2].Split(',')[Array.IndexOf(csvRows[0].Split(','), "q2_rmse_deg")] != "", "the report carries arm2's statistics");
             Check(a.Aligned && Math.Abs(a.AlignmentOffsetMs - 8200) <= 10 && a.AlignmentResidualDeg < 0.02, $"the plan must be aligned to the device clock within 10 ms: {a.AlignmentOffsetMs} residual {a.AlignmentResidualDeg}");
