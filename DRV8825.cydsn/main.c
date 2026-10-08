@@ -34,7 +34,7 @@
 /* Hardware offload switches (docs/HARDWARE_OFFLOAD_PLAN.md).  A switch is 1 only while the matching component is in
  * TopDesign; 0 keeps the software path, which the offline fixture also builds. */
 #ifndef HW_SSI
-#define HW_SSI                      (0u) /* AS5045 read-out by the UDB SPI Master "Ssi" instead of bit-banging */
+#define HW_SSI                      (1u) /* AS5045 read-out by the UDB SPI Master "Ssi" instead of bit-banging */
 #endif
 #ifndef HW_STEP
 #define HW_STEP                     (0u) /* STEP pulses from Control_Regs "StepArm1Req"/"StepArm2Req" + UDB PWMs, no busy-wait */
