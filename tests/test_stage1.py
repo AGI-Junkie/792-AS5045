@@ -71,6 +71,7 @@ typedef int8_t int8; typedef int16_t int16; typedef int32_t int32; typedef int64
 static uint64_t simClock, simClockBase, simClockWraps;
 static void (*simTickIsr)(void);
 static void (*simBeforeTrajCheck)(void), (*simBeforeSlotCheck)(void);
+static void (*simAfterCriticalExit)(void);
 static int simInts=1, simTickPending;
 static unsigned simWdtStarted, simWdtFeeds;
 static int simIlo1K;
@@ -87,7 +88,8 @@ static void sim_tick_sync(void) {
     sim_evt_service();
 }
 static uint8 mock_critical_enter(void){uint8 old=(uint8)simInts;sim_tick_sync();simInts=0;return old;}
-static void mock_critical_exit(uint8 old){simInts=old;sim_tick_sync();}
+static void mock_critical_exit(uint8 old){simInts=old;sim_tick_sync();
+    if(simInts && simAfterCriticalExit){void (*hook)(void)=simAfterCriticalExit;simAfterCriticalExit=0;hook();}}
 static int simPins[128], simStep1, simStep2, simBadEncoder, simBadReads;
 static int simFault, simLimit, simHome1Mode, simHome2Mode, simStall, simPolarity=1, simStiction;
 static int simHome1At=400, simHome2At=120;
@@ -107,7 +109,10 @@ static char simLog[1048576]; static unsigned simLogN;
  * busy-waits on it for ~115 us, so a read costs 0.25 us there and the frame lasts as long as the real one. */
 /* Inject target-library formatting cost; this is a scheduling stress model, not a measured printf profile. */
 static unsigned simFormatCostUs;
+static unsigned simFormatCalls;
+static int simRequireFormatInts;
 static int mock_snprintf(char *dst,size_t size,const char *fmt,...) {
+    if(simRequireFormatInts)assert(simInts);simFormatCalls++;
     int n; va_list ap; va_start(ap,fmt);n=vsnprintf(dst,size,fmt,ap);va_end(ap);
     simClock+=(uint64_t)simFormatCostUs*SIM_MHZ;sim_tick_sync();return n;
 }
@@ -1573,9 +1578,46 @@ static void fuzz_test(uint32 seed) {
     { unsigned i; for(i=0; i<16u && fuzzReason[i][0]; i++) printf("FUZZSTOP %u %s\n",fuzzReasonN[i],fuzzReason[i]); }
 }
 static int32 lsb_to_out_deg100(int32 lsb) { return (int32)(((int64)lsb * 36000) / ((int64)ENCODER_CPR * GEAR_RATIO)); }
+static void snapshot_interrupt(void) {
+    assert(simInts); /* Inject an event immediately after the snapshot unlocks. */
+    jog_step(&g_arm1,1);jog_step(&g_arm2,1);
+    g_traj.lagMaxCy=301u*SU_CY_PER_US;g_traj.slipCy=402u*SU_CY_PER_US;
+#if HW_EVT
+    g_evtMaxCy=999u*SU_CY_PER_US;g_evtBusyCy=1888u*SU_CY_PER_US;g_evtEvents=777u;
+#endif
+}
 int main(int argc,char **argv) {
     const char *t=argv[1]; unsigned i, p1, p2;
     assert(argc==2);
+    if(!strcmp(t,"snapshot_telem") || !strcmp(t,"snapshot_stats")) {
+        char expected[160];int32 u1,u2;
+        setup();txq_flush_blocking();simLogN=0;simLog[0]=0;simRequireFormatInts=1;
+        u1=g_arm1.usteps;u2=g_arm2.usteps;
+        if(!strcmp(t,"snapshot_telem")) {
+            snprintf(expected,sizeof(expected),"p1=%ld p2=%ld e1=%ld err=%ld ",
+                (long)(g_ptp.origin[0]-u1),(long)(g_ptp.origin[1]-u2),
+                (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),(long)(cmd_lsb()-g_enc.pos));
+            simAfterCriticalExit=snapshot_interrupt;telem_line();
+            assert(!simAfterCriticalExit && g_arm1.usteps==u1+1 && g_arm2.usteps==u2+1);
+            txq_flush_blocking();assert(strstr(simLog,expected));
+#if ARM2_ENCODER_FEEDBACK
+            assert(strstr(simLog,"e2=0 err2=0 ") && g_enc2.cmdLsbX100!=0);
+#endif
+        } else {
+            g_traj.lagMaxCy=100u*SU_CY_PER_US;g_traj.slipCy=200u*SU_CY_PER_US;
+            g_statusNext=9u;simAfterCriticalExit=snapshot_interrupt;stage_status_line();
+            assert(!simAfterCriticalExit);txq_flush_blocking();
+            assert(strstr(simLog,"traj_lag_max_us=100 traj_slip_us=200"));
+#if HW_EVT
+            g_jogMs=100u;g_evtMaxCy=10u*SU_CY_PER_US;g_evtBusyCy=100u*SU_CY_PER_US;g_evtEvents=20u;
+            g_evtRunMs=g_jogMs-10u;g_statusNext=13u;
+            simAfterCriticalExit=snapshot_interrupt;stage_status_line();
+            assert(!simAfterCriticalExit);txq_flush_blocking();
+            assert(strstr(simLog,"evt_isr_max_us=10 evt_isr_busy_permille=10 evt_events=20"));
+#endif
+        }
+        puts(t);return 0;
+    }
     if(!strcmp(t,"traj_isr_done") || !strcmp(t,"traj_isr_slot")) {
         setup();g_ptp.reference=1u;g_ptp.active=1u;g_ptp.sinceMs=g_jogMs;
         g_traj.state=TRAJ_RUNNING;g_traj.count=1u;g_traj.index=0u;
@@ -2530,6 +2572,7 @@ cases += ['startup_stiction','home_low_speed_tracking','home_following_stall','j
 cases += ['boot_tx_backlog','rejected_byte_status','operator_stop_reenable','operator_stop_after_protection','operator_stop_after_fault']
 cases += ['limits_'+n for n in ['configure','retry','invalid','busy','enabled']]
 cases += ['telem_rate','telem_rate_invalid','telem_stream','telem_skip','fault_snapshot']
+cases += ['snapshot_telem','snapshot_stats']
 cases += ['rates_config','rates_jog','rates_home']
 cases += ['home_from_drawing','home_from_arm2_range','home_long_stop']
 cases += ['home_search_stop','home_search_heartbeat','home_search_limit','home_search_fault','home_release_time_limit']

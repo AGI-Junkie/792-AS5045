@@ -85,12 +85,13 @@ typedef enum { TRAJ_EMPTY = 0, TRAJ_UPLOADING = 1, TRAJ_READY = 2, TRAJ_RUNNING 
 typedef struct { int16 q1, q2; uint16 ms; } traj_node_t;
 typedef struct {
     uint8 state;   /* traj_state_t; DONE keeps the nodes, so a fresh RUN repeats the plan */
-    uint16 count, expected, index;
+    uint16 count, expected;
+    volatile uint16 index;    /* event ISR advances it, foreground reports it */
     uint32 durationMs;
     uint32 elapsedCy, clock;  /* time spent in node `index`, and the SysTick count it was last advanced at */
     uint32 lastStep;          /* SysTick count of the last step pulse */
-    uint32 lagMaxCy;          /* worst lateness of a step behind its due time; the owner clears it (ENABLE) */
-    uint32 slipCy;            /* total plan-clock stretch of the current run (see TRAJ_LATE_SOFT_US); cleared by traj_start */
+    volatile uint32 lagMaxCy; /* ISR writes, foreground reports; cleared by ENABLE */
+    volatile uint32 slipCy;   /* ISR plan-clock stretch; cleared by traj_start */
     int32 velocity[2];
     traj_node_t nodes[TRAJ_CAPACITY];
 } traj_t;

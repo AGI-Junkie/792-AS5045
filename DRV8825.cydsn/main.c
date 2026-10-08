@@ -604,14 +604,14 @@ _Static_assert((MOVE_RATE_MAX_USTEP_S * ENC_MAX_GAP_MS / 1000u) * LSB_PER_USTEP_
                "multi-turn wrap becomes ambiguous: lower MOVE_RATE_MAX_USTEP_S or ENC_MAX_GAP_MS");
 typedef struct
 {
-    int32  pos;         /* accumulated motor-side position, encoder LSB     */
+    volatile int32 pos; /* foreground sample, also read by the event ISR */
     uint16 lastAngle;
     uint8  primed;
-    uint8  badStreak;
+    volatile uint8 badStreak;
     uint8  trackingLost;
     uint32 lastMs;
     int32 lastCmd;
-    int32 cmdUsteps, cmdLsbX100;
+    volatile int32 cmdUsteps, cmdLsbX100;
     int32 snapUsteps, snapLsbX100;   /* the command as it stood when the frame now being decoded was started */
     uint8 incDir, directionKnown;
     int32 softCenter, origin;
@@ -1309,7 +1309,7 @@ typedef struct
     uint32 pinStep;
     uint32 pinDir;
     uint8  stepIdleHigh;    /* 1: idle high / low pulse (stepper2 style)   */
-    uint8  hasEnc;          /* both axes: closed track on AS5045            */
+    volatile uint8 hasEnc; /* foreground validity, read by the event ISR */
     uint8  leftDirLevel;    /* open-loop axes: DIR level that means "left" */
     uint8  lastDirLevel;    /* 0xFF = unknown, forces a DIR write          */
     uint8  invert;          /* run-time direction inversion ('1' / '2')    */
@@ -1326,7 +1326,7 @@ typedef struct
     uint32 rampRemainder;   /* fractional rate increment, per 1 ms tick */
     uint32 periodCy;        /* BUS_CLK cycles between steps at `rate`      */
     uint32 tLastStep;
-    int32  usteps;          /* net microsteps since power-up, right = +    */
+    volatile int32 usteps; /* net microsteps; ISR writes during trajectories */
     int32  peakSlip;        /* worst slip of the current press, LSB        */
     uint8  derates;
     uint16 settleMs;        /* >0: just stopped, rotor still ringing       */
@@ -1346,7 +1346,7 @@ static uint8 dual_ready(void) {
     return g_arm1.hasEnc && g_enc.directionKnown && !g_enc.badStreak &&
         (!ARM2_ENCODER_FEEDBACK || (g_arm2.hasEnc && g_enc2.directionKnown && !g_enc2.badStreak));
 }
-static uint32 g_jogMs;          /* latest monotonic hardware time, not loop ticks */
+static volatile uint32 g_jogMs; /* foreground wall time, read by the event ISR */
 static uint32 g_loopMaxMs, g_tickMaxLagMs;
 static uint32 g_lastKeyMs;      /* last valid key byte                   */
 static uint8  g_keysSeen;
@@ -1403,13 +1403,15 @@ static uint32 motion_min(uint32 a, uint32 b) { return a < b ? a : b; }
 #include "traj.h"
 
 static struct {
-    uint8 active; /* 1 moving, 2 settling */
+    volatile uint8 active; /* 1 moving, 2 settling; event ISR publishes completion */
     uint8 reference;
     uint8 referenceSource; /* 1 switch homing, 2 operator-defined straight pose */
     int32 encoderOrigin; /* arm1 compatibility field */
     uint32 epoch;
     uint32 sequence;
-    uint32 sinceMs, settleMs, lastStep, periodUs;
+    uint32 sinceMs;
+    volatile uint32 settleMs;
+    uint32 lastStep, periodUs;
     int32 origin[2];
     dda_t seg; /* the segment being stepped: one point-to-point move, or one trajectory node */
     uint8 accepted[15];
@@ -1612,10 +1614,10 @@ static const char *stop_phase(void)
 }
 #if ARM2_ENCODER_FEEDBACK
 #define ENC2_LOG_FORMAT "e2=%ld err2=%ld "
-#define ENC2_LOG_ARGS (long)((g_enc2.pos-g_enc2.origin)*(g_enc2.incDir==ARM2_LEFT_DIR_LEVEL?1:-1)), (long)(g_enc2.cmdLsbX100/100-g_enc2.pos),
+#define ENC2_LOG_ARGS(command) (long)((g_enc2.pos-g_enc2.origin)*(g_enc2.incDir==ARM2_LEFT_DIR_LEVEL?1:-1)), (long)((command)/100-g_enc2.pos),
 #else
 #define ENC2_LOG_FORMAT ""
-#define ENC2_LOG_ARGS
+#define ENC2_LOG_ARGS(command)
 #endif
 
 /* RAM only: repeat evidence while stopped, even if the first TX attempt was dropped.
@@ -1637,7 +1639,7 @@ static void fault_snapshot(const char *reason, uint8 driverFault)
           (unsigned)(g_ptp.reference && dual_ready()),
           (long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
           (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),(long)(cmd_lsb()-g_enc.pos),
-        ENC2_LOG_ARGS
+        ENC2_LOG_ARGS(g_enc2.cmdLsbX100)
           (unsigned)((HARD_LIMIT_ACTIVE()?1u:0u)|(ARM1_HOME_ACTIVE()?2u:0u)|(ARM2_NPN_ACTIVE()?4u:0u)|(FAULT_ACTIVE()?8u:0u)),
           (unsigned long)(g_keysSeen ? (g_jogMs - g_lastKeyMs) : 0u),(unsigned long)g_keyMaxGapMs,
           (unsigned long)elapsedUs,(unsigned long)plannedUs,(unsigned long)(elapsedUs>plannedUs ? elapsedUs-plannedUs : 0u),
@@ -2281,8 +2283,9 @@ static void traj_service(void)
 #define TRAJ_FOREGROUND_MAX_MS      (40u)       /* no foreground pass for this long: the plan is stopped */
 static volatile uint8 g_evtRunning;             /* the timer owns the trajectory's pulses */
 static const char * volatile g_evtStop;         /* why the interrupt ended a run (static text) */
-static uint32 g_fgPassAt;                       /* SU_NOW() at the start of the latest foreground pass */
-static uint32 g_evtMaxCy, g_evtBusyCy, g_evtEvents, g_evtRunMs;
+static volatile uint32 g_fgPassAt;              /* foreground heartbeat read by the event ISR */
+static volatile uint32 g_evtMaxCy, g_evtBusyCy, g_evtEvents;
+static uint32 g_evtRunMs;
 
 static void evt_arm_cy(uint32 cy)
 {
@@ -2689,15 +2692,25 @@ static void motion_config_status(void)
  * e1 is motor encoder LSB relative to the reference; e2 measures the motor-2 elbow; q2=q1+elbow. */
 static void telem_line(void)
 {
+    int32 steps1, steps2, command1;
+#if ARM2_ENCODER_FEEDBACK
+    int32 command2;
+#endif
+    uint8 ints=CyEnterCriticalSection();
+    steps1=g_arm1.usteps;steps2=g_arm2.usteps;command1=g_enc.cmdLsbX100;
+#if ARM2_ENCODER_FEEDBACK
+    command2=g_enc2.cmdLsbX100;
+#endif
+    CyExitCriticalSection(ints);
     JLOGF("TELEM t=%lu epoch=%lu seq=%lu ref=%u source=%u p1=%ld p2=%ld e1=%ld err=%ld "
         ENC2_LOG_FORMAT
         "inputs=%u drops=%lu\r\n",
         (unsigned long)g_jogMs,(unsigned long)g_ptp.epoch,(unsigned long)g_ptp.sequence,
         (unsigned)(g_ptp.reference && dual_ready()),
-        (unsigned)g_ptp.referenceSource,(long)(g_ptp.origin[0]-g_arm1.usteps),(long)(g_ptp.origin[1]-g_arm2.usteps),
+        (unsigned)g_ptp.referenceSource,(long)(g_ptp.origin[0]-steps1),(long)(g_ptp.origin[1]-steps2),
         (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),
-        (long)(cmd_lsb()-g_enc.pos),
-        ENC2_LOG_ARGS
+        (long)(command1/100-g_enc.pos),
+        ENC2_LOG_ARGS(command2)
         (unsigned)((HARD_LIMIT_ACTIVE()?1u:0u)|(ARM1_HOME_ACTIVE()?2u:0u)|(ARM2_NPN_ACTIVE()?4u:0u)|(FAULT_ACTIVE()?8u:0u)),
         (unsigned long)g_ptpRxDropped);
 }
@@ -2758,10 +2771,16 @@ static void stage_status_line(void)
           (unsigned long)g_rxRejected, (unsigned long)g_ptpEpochRejected,
           (unsigned)g_rxLastBad[(g_rxLastBadIdx + 7u) % 8u]); break;
     case 9u:
+    {
+    uint32 lagCy, slipCy;
+    uint8 ints=CyEnterCriticalSection();
+    lagCy=g_traj.lagMaxCy;slipCy=g_traj.slipCy;
+    CyExitCriticalSection(ints);
     JLOGF("TIMING loop_max_ms=%lu tick_lag_max_ms=%lu clock=hardware wdt=256-384ms key_age_ms=%lu key_max_gap_ms=%lu status_max_us=%lu traj_lag_max_us=%lu traj_slip_us=%lu\r\n",
           (unsigned long)g_loopMaxMs,(unsigned long)g_tickMaxLagMs,
           (unsigned long)(g_keysSeen ? (g_jogMs - g_lastKeyMs) : 0u),(unsigned long)g_keyMaxGapMs,(unsigned long)(g_statusMaxCy/SU_CY_PER_US),
-          (unsigned long)(g_traj.lagMaxCy/SU_CY_PER_US),(unsigned long)(g_traj.slipCy/SU_CY_PER_US)); break;
+          (unsigned long)(lagCy/SU_CY_PER_US),(unsigned long)(slipCy/SU_CY_PER_US));
+    } break;
     case 10u:
     JLOGF("ENC_DIAG irq_max_us=%lu retries=%lu rejected=%lu gap_max_ms=%lu follow_peak_lsb=%lu\r\n",
           (unsigned long)(g_encIrqMaxCy/SU_CY_PER_US),(unsigned long)g_encRetries,
@@ -2775,15 +2794,19 @@ static void stage_status_line(void)
     case 13u:
     {
 #if (HW_EVT != 0u)
-        unsigned long isrMaxUs=g_evtMaxCy/SU_CY_PER_US, events=g_evtEvents;
-        unsigned long busyPermille=(g_jogMs>g_evtRunMs) ? (g_evtBusyCy/SU_CY_PER_US)/(g_jogMs-g_evtRunMs) : 0ul;   /* us per ms = permille */
+        uint32 maxCy, busyCy, events;
+        uint8 ints=CyEnterCriticalSection();
+        maxCy=g_evtMaxCy;busyCy=g_evtBusyCy;events=g_evtEvents;
+        CyExitCriticalSection(ints);
+        unsigned long isrMaxUs=maxCy/SU_CY_PER_US;
+        unsigned long busyPermille=(g_jogMs>g_evtRunMs) ? (busyCy/SU_CY_PER_US)/(g_jogMs-g_evtRunMs) : 0ul;   /* us per ms = permille */
 #else
         unsigned long isrMaxUs=0ul, events=0ul, busyPermille=0ul;
 #endif
         JLOGF("HWOFFLOAD bus_mhz=%u ssi=%u step=%u evt=%u dead=%u pinirq=%u txdma=%u evt_isr_max_us=%lu evt_isr_busy_permille=%lu evt_events=%lu\r\n",
               (unsigned)(BCLK__BUS_CLK__HZ/1000000u),(unsigned)HW_SSI,(unsigned)HW_STEP,(unsigned)HW_EVT,(unsigned)HW_DEAD,
               (unsigned)HW_PINIRQ,(unsigned)HW_TXDMA,
-              isrMaxUs,busyPermille,events);
+              isrMaxUs,busyPermille,(unsigned long)events);
     } break;
 #endif
     }
