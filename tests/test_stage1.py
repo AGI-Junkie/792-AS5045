@@ -2355,7 +2355,11 @@ int main(int argc,char **argv) {
         puts(t);return 0;
     }
     if(!strncmp(t,"clock_",6)) {
-        uint32 before=wall_ms();
+        uint32 before;
+        /* Register reads advance the mock clock: start exact-ms delta checks away from a floor boundary. */
+        if(!strcmp(t,"clock_wraps") || !strcmp(t,"clock_ms_wrap"))
+            simClock+=(SIM_MHZ*1000u)-(simClock-simClockBase)%(SIM_MHZ*1000u);
+        before=wall_ms();
         if(!strcmp(t,"clock_wraps")) {
             simClock+=3u*(SIM_MHZ*1000000u);assert(wall_ms()-before==3000u);
             before=wall_ms();simInts=0;
