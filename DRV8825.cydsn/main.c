@@ -2257,6 +2257,7 @@ static uint8 coordinated_step(const char *failure)
     dda_step(&g_ptp.seg,step);
     return pulse_axes(step,failure);
 }
+static void traj_service(void) __attribute__((unused)); /* HW_EVT firmware uses the ISR; offline executor tests also call this. */
 static void traj_service(void)
 {
     int8 step[2];
@@ -2374,9 +2375,10 @@ static void ptp_service(void)
     }
     if(g_traj.state==TRAJ_RUNNING) {
 #if (HW_EVT != 0u)
-        if(g_evtRunning) { return; }   /* the event timer steps the plan */
-#endif
+        return;   /* ISR owns the plan even after DONE/FAIL; never poll it again in the foreground. */
+#else
         traj_service(); return;
+#endif
     }
     if (g_ptp.seg.done>=g_ptp.seg.total) { g_ptp.active=2u; g_ptp.settleMs=g_jogMs; return; }
     if (SU_ELAPSED(g_ptp.lastStep)<g_ptp.periodUs*SU_CY_PER_US) { return; }
@@ -2881,6 +2883,9 @@ static uint8 jog_slot_free(uint32 us)
 
     if (g_ptp.active==1u) {
         uint32 period, since;
+#if (HW_EVT != 0u)
+        if(g_traj.state==TRAJ_RUNNING) { return 1u; } /* ISR pulses need no foreground slot; keep its memo private. */
+#endif
         if(g_traj.state==TRAJ_RUNNING) { traj_next_due(&g_traj,&g_ptp.seg,SU_NOW(),&since,&period); }
         else { period=g_ptp.periodUs*SU_CY_PER_US; since=SU_ELAPSED(g_ptp.lastStep); }
         if (since>=period || period-since<need) { return 0u; }

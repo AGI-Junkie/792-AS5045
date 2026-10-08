@@ -32,6 +32,14 @@ pin_defs = '\n'.join(f'#define {pin} {i}' for i, pin in enumerate(pins))
 # A 1 ms fixture iteration may cross the boundary and already emit the next step.
 source = replace_once(source, 'if(++t->index==t->count)',
                       'sim_check_traj_boundary(); if(++t->index==t->count)')
+# Deliver the final event at ordinary-memory boundaries the register mock cannot intercept.
+source = replace_once(source, '    if(g_traj.state==TRAJ_RUNNING) {\n#if (HW_EVT != 0u)',
+                      '    if(simBeforeTrajCheck) { void (*hook)(void)=simBeforeTrajCheck; simBeforeTrajCheck=0; hook(); }\n'
+                      '    if(g_traj.state==TRAJ_RUNNING) {\n#if (HW_EVT != 0u)')
+source = replace_once(source, '    if (g_ptp.active==1u) {\n        uint32 period, since;',
+                      '    if (g_ptp.active==1u) {\n'
+                      '        if(simBeforeSlotCheck) { void (*hook)(void)=simBeforeSlotCheck; simBeforeSlotCheck=0; hook(); }\n'
+                      '        uint32 period, since;')
 
 mock = r'''
 #include <stdint.h>
@@ -62,6 +70,7 @@ typedef int8_t int8; typedef int16_t int16; typedef int32_t int32; typedef int64
 #define CyGlobalIntEnable ((void)0)
 static uint64_t simClock, simClockBase, simClockWraps;
 static void (*simTickIsr)(void);
+static void (*simBeforeTrajCheck)(void), (*simBeforeSlotCheck)(void);
 static int simInts=1, simTickPending;
 static unsigned simWdtStarted, simWdtFeeds;
 static int simIlo1K;
@@ -1120,19 +1129,21 @@ static void host_rates_config(void) {
 /* The trace is taken in 24 MHz-equivalent cycles, so a different bus clock reproduces the pulse counts and the axis order
  * exactly but lands some pulses one foreground pass later: each clock has its own recorded hashes (48 MHz: 10-08).  The
  * hardware offload moves every pulse again (no busy-waits, the SPI Master, the event timer): a build with every switch
- * on has its own set as well.  Any other combination checks the pulse counts and the axis order only (SCHED_HASHED 0). */
+ * on has its own set as well. Removing foreground slot-clock reads for ISR-owned plans changes the timestamp hash;
+ * old/new pulse counts, axis/direction order and 21 us modeled worst lag match (2026-10-08 characterization).
+ * Any other combination checks the pulse counts and node endpoints only (SCHED_HASHED 0). */
 #define SCHED_ALL_HW (HW_SSI && HW_STEP && HW_EVT && HW_DEAD && HW_PINIRQ && HW_TXDMA)
 #define SCHED_NO_HW  (!HW_SSI && !HW_STEP && !HW_EVT && !HW_DEAD && !HW_PINIRQ && !HW_TXDMA)
 #if SIM_MHZ == 48 && SCHED_ALL_HW
 #define SCHED_HASHED 1
 #if ARM2_ENCODER_FEEDBACK
-#define SCHED_AH 0xca446ce5u
-#define SCHED_BH 0x6db0cb80u
-#define SCHED_CH 0x66f9bb75u
+#define SCHED_AH 0x19fc5fbdu
+#define SCHED_BH 0x9a91c048u
+#define SCHED_CH 0x5d4d6f5du
 #else
-#define SCHED_AH 0xa4aec715u
-#define SCHED_BH 0x3c70b458u
-#define SCHED_CH 0xb35393cdu
+#define SCHED_AH 0xbc5d385du
+#define SCHED_BH 0xb9afec00u
+#define SCHED_CH 0xdca866cdu
 #endif
 #elif SIM_MHZ == 48 && SCHED_NO_HW
 #define SCHED_HASHED 1
@@ -1565,6 +1576,34 @@ static int32 lsb_to_out_deg100(int32 lsb) { return (int32)(((int64)lsb * 36000) 
 int main(int argc,char **argv) {
     const char *t=argv[1]; unsigned i, p1, p2;
     assert(argc==2);
+    if(!strcmp(t,"traj_isr_done") || !strcmp(t,"traj_isr_slot")) {
+        setup();g_ptp.reference=1u;g_ptp.active=1u;g_ptp.sinceMs=g_jogMs;
+        g_traj.state=TRAJ_RUNNING;g_traj.count=1u;g_traj.index=0u;
+        g_traj.nodes[0].q1=g_traj.nodes[0].q2=0;g_traj.nodes[0].ms=20u;
+        g_ptp.origin[0]=g_arm1.usteps;g_ptp.origin[1]=g_arm2.usteps;
+        g_ptp.seg.target[0]=g_arm1.usteps;g_ptp.seg.target[1]=g_arm2.usteps;
+        g_ptp.seg.done=g_ptp.seg.total=0u;
+        g_traj.elapsedCy=20u*1000u*SU_CY_PER_US;g_traj.clock=SU_NOW();
+        p1=simPulse1;p2=simPulse2;
+#if HW_EVT
+        g_evtRunning=1u;g_fgPassAt=SU_NOW();
+        if(!strcmp(t,"traj_isr_slot")) {
+            simBeforeSlotCheck=evt_isr;
+            assert(jog_slot_free(50u));assert(!simBeforeSlotCheck);
+        } else {
+            simBeforeTrajCheck=evt_isr;ptp_service();assert(!simBeforeTrajCheck);
+        }
+        assert(!g_evtRunning && !g_evtStop);
+#else
+        assert(!jog_slot_free(50u)); /* software path still checks the due node */
+        ptp_service();             /* software path still executes it */
+#endif
+        assert(g_traj.index==g_traj.count && g_ptp.active==2u && simBoundaryChecks==1u);
+        assert(simPulse1==p1 && simPulse2==p2);
+        simClock+=(uint64_t)SIM_MHZ*(HOME_SETTLE_MS+1u)*1000u;jog_update_time();
+        ptp_service();assert(!g_ptp.active && g_traj.state==TRAJ_DONE && g_motionEnabled);
+        puts(t);return 0;
+    }
     if(!strcmp(t,"traj_status_cost")) {
         uint64_t start; unsigned requested=0;
         setup();g_enc2.directionKnown=1u;g_enc2.incDir=1u;
@@ -1572,6 +1611,9 @@ int main(int argc,char **argv) {
         g_traj.state=3u;g_traj.count=2u;g_traj.index=1u;
         g_traj.nodes[1].q1=-139;g_traj.nodes[1].q2=207;g_traj.nodes[1].ms=397; /* 785 steps = 1977/s, 79% of TRAJ_RATE_MAX (was 248 ms = 3165/s = 79% of the old 4000 cap) */
         g_ptp.active=1u;{int32 pos[2];pos[0]=g_arm1.usteps;pos[1]=g_arm2.usteps;g_traj.elapsedCy=0;g_traj.clock=g_traj.lastStep=SU_NOW();traj_segment(&g_traj,&g_ptp.seg,g_ptp.origin,pos);}
+#if HW_EVT
+        evt_start(); /* This fixture bypasses RUN; start the hardware owner explicitly. */
+#endif
         assert(g_ptp.seg.total==785u); CyILO_Start1K();CyWdtStart(CYWDT_128_TICKS,CYWDT_LPMODE_NOCHANGE);start=simClock;
         simFormatCostUs=2500u; /* 12 format calls in one burst cost about the observed 30 ms loop gap. */
         while(g_motionEnabled && g_traj.index<g_traj.count && simClock-start<600000u*SIM_MHZ) {
@@ -2525,6 +2567,7 @@ ptp_cases += ['traj_'+name for name in ['success','dwell','duplicate','capacity'
 ptp_cases += ['manual_'+name for name in ['success','duplicate','stop','old_epoch','disabled','moving','busy','upload','sensor','fault','encoder','timeout','stale','payload','crc']]
 ptp_cases += ['fuzz_%d' % n for n in range(1, 7)]   # the gate's share; long campaigns: --emit-c=DIR and run fuzz_<seed> in parallel
 ptp_cases += ['traj_evt_runs','traj_evt_stall','traj_evt_stop']
+ptp_cases += ['traj_isr_done','traj_isr_slot']
 ptp_cases += ['dual_manual_unknown','dual_ptp_follow','stop_latch','traj_slip','traj_status_cost','hot_arith','jog_arm2_limit','origin_retry','traj_schedule','pulse_blocked']
 if host_plan is not None: ptp_cases += ['traj_host_plan','traj_manual_plan','traj_host_plan_offset','traj_host_plan_rx_retry']
 if len(sys.argv)>1:
