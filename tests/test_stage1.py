@@ -287,8 +287,10 @@ static unsigned simPinIrqCount;
 static uint8 FAULT_ClearInterrupt(void){return 0;}
 static uint8 LIMIT2_ClearInterrupt(void){return 0;}
 static void StepKill_Write(uint8 v){simStepKill=v&1;}
-static void PinIsr_StartEx(void (*h)(void)){simPinHandler=h;}
-static void PinIsr_SetPriority(uint8 prio){simPinIrqPrio=prio;}
+static void FaultIsr_StartEx(void (*h)(void)){simPinHandler=h;}
+static void LimitIsr_StartEx(void (*h)(void)){simPinHandler=h;}
+static void FaultIsr_SetPriority(uint8 prio){simPinIrqPrio=prio;}
+static void LimitIsr_SetPriority(uint8 prio){simPinIrqPrio=prio;}
 static void sim_pin_service(void) {
     int edge=(simFault && !simPinPrevFault) || (simLimit && !simPinPrevLimit);
     if(simInts && !simPinInIsr) { simPinPrevFault=simFault; simPinPrevLimit=simLimit; }
@@ -338,6 +340,7 @@ static void StepArm1_Start(void){simStepStarted|=1u; simDeadKilled=0;}
 static void StepArm2_Start(void){simStepStarted|=2u; simDeadKilled=0;}
 static void StepArm1_Stop(void){simStepStarted&=~1u;}
 static void StepArm2_Stop(void){simStepStarted&=~2u;}
+static void StepRearm_Write(uint8 v){ if(v&1u) simDeadKilled=0; }   /* reset input of both PWMs: clears a latched kill */
 static void StepArm1Req_Write(uint8 v){ if(v&1u){simStepWrites1++; sim_pulse_arm1();} }
 static void StepArm2Req_Write(uint8 v){ if(v&1u){simStepWrites2++; sim_pulse_arm2();} }
 static void mock_set(int pin,int value) {
@@ -2523,11 +2526,11 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     tmp = Path(temp)
     if host_plan is not None: (tmp/'host-plan.bin').write_bytes(host_plan.read_bytes())
     if host_control is not None: (tmp/'host-control.bin').write_bytes(host_control.read_bytes())
-    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','PinIsr.h','CyDmac.h']:
+    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','FaultIsr.h','LimitIsr.h','StepRearm.h','CyDmac.h']:
         (tmp/name).write_text('',encoding='ascii')
     if emit_c is not None:
         emit_c.mkdir(parents=True, exist_ok=True)
-        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','PinIsr.h','CyDmac.h']: (emit_c/name).write_text('',encoding='ascii')
+        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','FaultIsr.h','LimitIsr.h','StepRearm.h','CyDmac.h']: (emit_c/name).write_text('',encoding='ascii')
         (emit_c/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
         print('wrote', emit_c/'check.c'); sys.exit(0)
     (tmp/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')

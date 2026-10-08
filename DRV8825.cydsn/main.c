@@ -79,11 +79,15 @@
 #include "AliveReq.h"
 #include "DeadTimer.h"
 #endif
+#if (HW_DEAD != 0u || HW_PINIRQ != 0u)
+#include "StepRearm.h"
+#endif
 #if (HW_PINIRQ != 0u)
 #include "FAULT.h"
 #include "LIMIT2.h"
 #include "StepKill.h"
-#include "PinIsr.h"
+#include "FaultIsr.h"
+#include "LimitIsr.h"
 #endif
 #if (HW_TXDMA != 0u)
 #include <CyDmac.h>
@@ -1538,6 +1542,7 @@ static void alive_kick(void) { AliveReq_Write(1u); }
 static void deadman_arm(void)   /* (re)start the PWMs, which clears a latched kill, and the timer */
 {
     StepArm1_Stop(); StepArm1_Start(); StepArm2_Stop(); StepArm2_Start();
+    StepRearm_Write(1u);   /* PulseMode Control_Reg on both PWMs' reset input: the Latched kill is cleared by a reset */
     DeadTimer_Start();
     (void)DeadTimer_ReadStatusRegister();
     alive_kick();
@@ -1561,12 +1566,17 @@ CY_ISR(pin_stop_isr)
     StepKill_Write(1u);
     g_pinStop = 1u;
 }
-static void pinirq_init(void)
+static void pinirq_init(void)   /* each pin's port has its own interrupt line, so each gets an isr component */
 {
-    PinIsr_StartEx(pin_stop_isr);
-    PinIsr_SetPriority(0u);
+    FaultIsr_StartEx(pin_stop_isr);
+    FaultIsr_SetPriority(0u);
+    LimitIsr_StartEx(pin_stop_isr);
+    LimitIsr_SetPriority(0u);
 }
-static void step_unkill(void) { g_pinStop = 0u; StepKill_Write(0u); }
+static void step_unkill(void)   /* StepKill back to 0, then reset the PWMs: their kill is Latched */
+{
+    g_pinStop = 0u; StepKill_Write(0u); StepRearm_Write(1u);
+}
 #else
 #define step_unkill()   ((void)0)
 #endif
