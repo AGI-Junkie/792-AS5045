@@ -118,7 +118,6 @@ try {
         "Firmware: FW_BUILD_ID=$(Def 'FW_BUILD_ID'), PROTO_VERSION=$(Def 'PROTO_VERSION'), firmware.hex sha256=$hexHash..., code $flashBytes of 262144 bytes, SRAM $sramBytes of 65536 bytes (cyelftool -S)",
         'Toolchain: Creator 4.4 ARM GCC 5.4 Debug firmware; .NET 10 Windows WPF Release host.',
         "Defaults in main.c: PTP_COMMISSIONED=$(Def 'PTP_COMMISSIONED'); boot joint ranges q1 $(Deg 'PTP_MIN1_CD')..$(Deg 'PTP_MAX1_CD'), q2 $(Deg 'PTP_MIN2_CD')..$(Deg 'PTP_MAX2_CD') degrees (software bounds, not measured mechanical limits); deadman $(Def 'JOG_DEADMAN_MS') ms.",
-        'HostUart: UDB UART 115200 8N1, RX P12[6], TX P12[7], 256-byte RX/TX interrupt buffers (checked by verify-creator-pins.ps1).',
         'Protocol, frame formats and state model: docs/PROTOCOL.md and docs/STATE_MODEL.md (in this folder).',
         (Get-Content (Join-Path $dest 'pin-checks.log') | Where-Object { $_ -like 'PASS:*' }),
         $contractLine,
