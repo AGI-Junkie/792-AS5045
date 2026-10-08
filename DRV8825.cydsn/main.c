@@ -46,7 +46,7 @@
 #define HW_PINIRQ                   (0u) /* nFAULT / global limit pin interrupts kill the STEP PWMs at once (needs HW_STEP) */
 #endif
 #ifndef HW_TXDMA
-#define HW_TXDMA                    (0u) /* debug-UART transmit by DMA from the text queue into the UART's TX FIFO */
+#define HW_TXDMA                    (1u) /* debug-UART transmit by DMA from the text queue into the UART's TX FIFO */
 #endif
 #ifndef HW_DEAD
 #define HW_DEAD                     (1u) /* hardware deadman: DeadTimer + AliveReq cut the STEP PWMs if the foreground stalls */
