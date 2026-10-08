@@ -168,6 +168,10 @@ static void HostUart_PutChar(uint8 b){
 #define CY_DMA_TD_INC_SRC_ADR 1u
 #define CY_DMA_STATUS_CHAIN_ACTIVE 1u
 #define CY_DMA_STATUS_TD_ACTIVE 2u
+#define CY_DMA_CH_BASIC_CFG_EN 1u
+static struct { volatile uint8 basic_cfg[4]; } simDmaChannels[2];
+#define CY_DMA_CH_STRUCT_PTR simDmaChannels
+#define simDmaEnabled simDmaChannels[1].basic_cfg[0]
 typedef int cystatus;
 static uint8 simUartTxFifoReg;
 #define HostUart_TXDATA_PTR ((volatile uint8 *)&simUartTxFifoReg)
@@ -175,26 +179,30 @@ static const void *simDmaPtrs[8]; static unsigned simDmaPtrN;
 static uint16 sim_dma_addr(const void *p){ if(simDmaPtrN>=8) simDmaPtrN=0; simDmaPtrs[simDmaPtrN]=p; return (uint16)simDmaPtrN++; }
 #define TXDMA_ADDR(p) sim_dma_addr((const void *)(p))
 static unsigned simDmaLen, simDmaLogged, simDmaTransfers, simDmaBytes, simDmaInit, simDmaByteCy; static const uint8 *simDmaSrc;
-static uint64_t simDmaStart; static int simDmaActive, simDmaEnabled;
+static uint64_t simDmaStart; static int simDmaActive, simDmaHoldDrq;
 static void sim_dma_progress(void){
     uint64_t n;
-    if(!simDmaActive) return;
+    if(!simDmaEnabled) return;
+    if(!simDmaActive) {
+        if(simDmaHoldDrq) return;
+        simDmaActive=1;simDmaStart=simClock;
+    }
     n=simDmaByteCy?(simClock-simDmaStart)/simDmaByteCy:simDmaLen;
     if(n>simDmaLen) n=simDmaLen;
     while(simDmaLogged<n){ mock_log(simDmaSrc[simDmaLogged++]); simDmaBytes++; }
-    if(simDmaLogged>=simDmaLen) simDmaActive=0;
+    if(simDmaLogged>=simDmaLen) {simDmaActive=0;simDmaEnabled=0;}
 }
 static uint8 TxDma_DmaInitialize(uint8 b,uint8 r,uint16 hs,uint16 hd){(void)b;(void)r;(void)hs;(void)hd;simDmaInit=1;return 1;}
 static uint8 CyDmaTdAllocate(void){return 3;}
-static cystatus CyDmaTdSetConfiguration(uint8 td,uint16 n,uint8 next,uint8 cfg){(void)td;(void)next;assert(cfg==CY_DMA_TD_INC_SRC_ADR && n>=1u && n<=4095u);simDmaLen=n;return 0;}
+static cystatus CyDmaTdSetConfiguration(uint8 td,uint16 n,uint8 next,uint8 cfg){(void)td;assert(next==CY_DMA_DISABLE_TD && cfg==CY_DMA_TD_INC_SRC_ADR && n>=1u && n<=4095u);simDmaLen=n;return 0;}
 static cystatus CyDmaTdSetAddress(uint8 td,uint16 src,uint16 dst){(void)td;(void)dst;simDmaSrc=(const uint8 *)simDmaPtrs[src];return 0;}
 static cystatus CyDmaChSetInitialTd(uint8 ch,uint8 td){(void)ch;(void)td;return 0;}
-static cystatus CyDmaChEnable(uint8 ch,uint8 keep){(void)ch;(void)keep;assert(simDmaInit && !simDmaActive);
-    simDmaActive=1;simDmaEnabled=1;simDmaStart=simClock;simDmaLogged=0;simDmaTransfers++;sim_dma_progress();return 0;}
+static cystatus CyDmaChEnable(uint8 ch,uint8 keep){(void)ch;(void)keep;assert(simDmaInit && !simDmaEnabled);
+    simDmaActive=0;simDmaEnabled=1;simDmaLogged=0;simDmaTransfers++;sim_dma_progress();return 0;}
 static cystatus CyDmaChDisable(uint8 ch){(void)ch;simDmaActive=0;simDmaEnabled=0;return 0;}
 static cystatus CyDmaChStatus(uint8 ch,uint8 *td,uint8 *state){(void)ch;*td=0;simClock+=simRegCost;
     sim_dma_progress();
-    *state=simDmaActive?CY_DMA_STATUS_TD_ACTIVE:0u;return 0;}
+    *state=simDmaActive?CY_DMA_STATUS_CHAIN_ACTIVE:0u;return 0;}
 static uint32 mock_frame(void) {
     uint32 angle, frame, bits, parity=0;
     if(simBadEncoder) return 0;
@@ -1711,7 +1719,23 @@ int main(int argc,char **argv) {
         char big[300]; unsigned n, sent=0u, k; uint16 tail0;
         hw_init(); assert(simDmaInit);
         simLogN=0; simLog[0]=0;
-        if(!strcmp(t,"txdma_order")) {
+        if(!strcmp(t,"txdma_wait_drq")) {
+            uint16 free0;
+            simDmaHoldDrq=1;simDmaByteCy=SIM_MHZ*87u;
+            JLOG("0123456789");tail0=g_txqTail;free0=txq_free();txq_send_one();
+            assert(simDmaEnabled && !simDmaActive && g_txDmaLen==10u);
+            for(k=0;k<3;k++) {
+                simClock+=SIM_MHZ*100u;txq_send_one();
+                assert(g_txqTail==tail0 && g_txDmaLen==10u && txq_free()==free0);
+                assert(simDmaTransfers==1u && !simLogN);
+            }
+            simDmaHoldDrq=0;txq_send_one();
+            assert(simDmaActive && simDmaEnabled && g_txqTail==tail0);
+            simClock+=SIM_MHZ*1000u;txq_send_one();
+            assert(!simDmaEnabled && !g_txDmaLen && !txq_pending());
+            assert(g_txqTail==(uint16)((tail0+10u)%TXQ_SIZE) && !strcmp(simLog,"0123456789"));
+            txq_send_one();assert(g_txqTail==(uint16)((tail0+10u)%TXQ_SIZE)); /* retire once */
+        } else if(!strcmp(t,"txdma_order")) {
             /* more text than the ring holds, in pieces, across the wrap: it arrives complete and in order */
             for(n=0;n<sizeof(big)-1;n++) big[n]=(char)('a'+(n%26)); big[sizeof(big)-1]=0;
             for(k=0;k<20;k++) {
@@ -2456,7 +2480,7 @@ int main(int argc,char **argv) {
 
 cases = ['dual_'+n for n in ['home_reverse','home_stall','wrap','loss','gap','parity','hold','derate','follow_stop','peer_bad','peer_bad_reverse','final','limit','enable_bad']]
 cases += ['ssi_nonblocking','ssi_snapshot','ssi_retry','ssi_timeout','ssi_takeover']
-cases += ['step_hw_request','step_hw_pins','dead_kill','txdma_order','txdma_busy','pin_irq_kill']
+cases += ['step_hw_request','step_hw_pins','dead_kill','txdma_order','txdma_busy','txdma_wait_drq','pin_irq_kill']
 cases += ['dual_snapshot_length','chain_frames','boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
          'missing_sensor','stuck_sensor','missing_npn','stalled_motor','reject_moving',
          'fault','limit','encoder_loss','jog_cancels','sensor_bounce']

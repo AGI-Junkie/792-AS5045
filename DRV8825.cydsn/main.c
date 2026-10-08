@@ -1198,7 +1198,9 @@ static void txq_send_one(void)
     {
         uint8 td, state;
         (void)CyDmaChStatus(g_txDmaCh, &td, &state);
-        if ((state & (CY_DMA_STATUS_CHAIN_ACTIVE | CY_DMA_STATUS_TD_ACTIVE)) != 0u) { return; }
+        /* Zero activity also means no first DRQ yet; DISABLE_TD clears EN only after completion. */
+        if ((CY_DMA_CH_STRUCT_PTR[g_txDmaCh].basic_cfg[0u] & CY_DMA_CH_BASIC_CFG_EN) != 0u ||
+            (state & (CY_DMA_STATUS_CHAIN_ACTIVE | CY_DMA_STATUS_TD_ACTIVE)) != 0u) { return; }
         g_txqTail = (uint16)((g_txqTail + g_txDmaLen) % TXQ_SIZE);
         g_txDmaLen = 0u;
     }
