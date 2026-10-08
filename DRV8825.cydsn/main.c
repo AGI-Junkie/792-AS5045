@@ -49,7 +49,7 @@
 #define HW_TXDMA                    (0u) /* debug-UART transmit by DMA from the text queue into the UART's TX FIFO */
 #endif
 #ifndef HW_DEAD
-#define HW_DEAD                     (0u) /* hardware deadman: DeadTimer + AliveReq cut the STEP PWMs if the foreground stalls */
+#define HW_DEAD                     (1u) /* hardware deadman: DeadTimer + AliveReq cut the STEP PWMs if the foreground stalls */
 #endif
 #if (HW_EVT != 0u || HW_DEAD != 0u || HW_PINIRQ != 0u) && (HW_STEP == 0u)
 #error "HW_EVT, HW_DEAD and HW_PINIRQ need HW_STEP: the interrupt must not busy-wait for pulses, the kills act on the STEP PWMs"
