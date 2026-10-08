@@ -40,7 +40,7 @@
 #define HW_STEP                     (1u) /* STEP pulses from Control_Regs "StepArm1Req"/"StepArm2Req" + UDB PWMs, no busy-wait */
 #endif
 #ifndef HW_EVT
-#define HW_EVT                      (0u) /* trajectory steps from the EvtTimer interrupt instead of the foreground poll */
+#define HW_EVT                      (1u) /* trajectory steps from the EvtTimer interrupt instead of the foreground poll */
 #endif
 #ifndef HW_PINIRQ
 #define HW_PINIRQ                   (0u) /* nFAULT / global limit pin interrupts kill the STEP PWMs at once (needs HW_STEP) */
