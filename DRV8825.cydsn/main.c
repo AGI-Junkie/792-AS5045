@@ -37,7 +37,7 @@
 #define HW_SSI                      (1u) /* AS5045 read-out by the UDB SPI Master "Ssi" instead of bit-banging */
 #endif
 #ifndef HW_STEP
-#define HW_STEP                     (0u) /* STEP pulses from Control_Regs "StepArm1Req"/"StepArm2Req" + UDB PWMs, no busy-wait */
+#define HW_STEP                     (1u) /* STEP pulses from Control_Regs "StepArm1Req"/"StepArm2Req" + UDB PWMs, no busy-wait */
 #endif
 #ifndef HW_EVT
 #define HW_EVT                      (0u) /* trajectory steps from the EvtTimer interrupt instead of the foreground poll */
