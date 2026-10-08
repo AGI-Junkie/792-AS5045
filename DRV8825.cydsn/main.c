@@ -43,7 +43,7 @@
 #define HW_EVT                      (1u) /* trajectory steps from the EvtTimer interrupt instead of the foreground poll */
 #endif
 #ifndef HW_PINIRQ
-#define HW_PINIRQ                   (0u) /* nFAULT / global limit pin interrupts kill the STEP PWMs at once (needs HW_STEP) */
+#define HW_PINIRQ                   (1u) /* nFAULT / global limit pin interrupts kill the STEP PWMs at once (needs HW_STEP) */
 #endif
 #ifndef HW_TXDMA
 #define HW_TXDMA                    (1u) /* debug-UART transmit by DMA from the text queue into the UART's TX FIFO */
