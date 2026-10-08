@@ -2730,7 +2730,7 @@ static void telem_service(void)
     g_telemSent++;
 }
 
-/* Format only one status line per foreground slice during motion. A queued UART
+/* Format only one status line per foreground slice, including idle. A queued UART
  * does not make the preceding snprintf burst nonblocking. Keep safety deadlines. */
 static uint8 g_statusNext;
 static uint32 g_statusAt, g_statusMaxCy, g_statusEpoch;
@@ -2828,7 +2828,7 @@ static void stage_status(void)
     }
     /* Stops publish the retained cause first, and supersede any partial running block. */
     if(!g_motionEnabled && g_lastStop[0]) JLOG(g_lastStop);
-    g_statusEpoch=g_ptp.epoch;g_statusNext=1u;while(g_statusNext)stage_status_line();
+    g_statusEpoch=g_ptp.epoch;g_statusNext=1u;
 }
 
 static void stage_enable(void)

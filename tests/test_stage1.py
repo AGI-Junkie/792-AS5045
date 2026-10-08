@@ -430,6 +430,11 @@ static void setup(void) {
     stage_enable();
     assert(g_motionEnabled && !simPulse1 && !simPulse2 && !g_homed1 && !g_homed2);
 }
+static void status_drain(void) { /* Test callers that need a completed idle status block. */
+    assert(!status_moving());
+    while(g_statusNext){stage_status_service();txq_flush_blocking();}
+    txq_flush_blocking();
+}
 static void sim_check_traj_boundary(void) {
     const traj_node_t *node=&g_traj.nodes[g_traj.index];
     assert(g_arm1.usteps==g_ptp.origin[0]-ptp_offset(0,node->q1));
@@ -567,7 +572,7 @@ static void telem_test(const char *t) {
         assert(g_telemHz==10);                                         /* the same sequence with another rate is stale */
         packetType=11;ptp_send(g_controlSequence+1u,epoch,0,0,0,5);packetType=1;
         assert(g_telemHz==0);                                          /* 0 switches the stream off */
-        simLogN=0;simLog[0]=0;stage_status();txq_flush_blocking();
+        simLogN=0;simLog[0]=0;stage_status();status_drain();
         assert(strstr(simLog," telem_hz=0 proto=") && strstr(simLog," traj_repeat=1") && strstr(simLog," fault_snapshot=1") && strstr(simLog,"TELEM_DIAG hz=0 sent=0"));
         return;
     }
@@ -675,7 +680,7 @@ static void rates_test(const char *t) {
     ptp_send(seq,epoch,200,500,0,0); /* exact retry after heartbeat */
     ptp_send(seq,epoch,300,500,0,0);assert(g_motionRate[0]==200);
     ptp_send(g_controlSequence+1u,epoch,150,300,1,0);packetType=1;
-    txq_flush_blocking();assert(strstr(simLog,"PTP_RATES epoch=") && strstr(simLog,"motion_rates=1"));
+    status_drain();assert(strstr(simLog,"PTP_RATES epoch=") && strstr(simLog,"motion_rates=1"));
     stage_enable(); assert(g_motionEnabled && g_motionRate[0]==200 && g_motionRate[1]==150);
     if(!strcmp(t,"rates_jog")) {
         g_arm2.want=1; jog_axis_tick(&g_arm2);before=g_arm2.rate;
@@ -731,7 +736,7 @@ static void limits_test(const char *t) {
         assert(!ptp_counts_in_range(0u,g_ptp.origin[0]-ptp_offset(0u,13500)));
         return;
     }
-    jog_handle_byte(JOG_CMD_STOP);short_send(0,0);txq_flush_blocking();
+    jog_handle_byte(JOG_CMD_STOP);short_send(0,0);status_drain();
     seq=g_controlSequence+1u;epoch=g_ptp.epoch;
     if(!strcmp(t,"limits_invalid")) {
         const int16 bounds[][2]={{-18001,13500},{-13500,18001},{100,200},{-200,-100},{1,1},{100,-100}};
@@ -919,7 +924,7 @@ static void ptp_test(const char *t) {
             (long)((g_enc.pos-g_ptp.encoderOrigin)*(g_encIncDir==ARM1_LEFT_DIR_LEVEL?1:-1)),(long)(cmd_lsb()-g_enc.pos));
         assert(strstr(simLog,expected));
         assert(g_ptp.origin[0]-g_arm1.usteps<0 && g_ptp.origin[1]-g_arm2.usteps>0);
-        jog_handle_byte(JOG_CMD_STOP);txq_flush_blocking();
+        jog_handle_byte(JOG_CMD_STOP);status_drain();
         assert(g_ptp.referenceSource==0u && strstr(simLog,"ref=0 source=0"));return;
     }
     if(!strcmp(t,"ptp_logged_retry")) {
@@ -1135,42 +1140,43 @@ static void host_rates_config(void) {
  * exactly but lands some pulses one foreground pass later: each clock has its own recorded hashes (48 MHz: 10-08).  The
  * hardware offload moves every pulse again (no busy-waits, the SPI Master, the event timer): a build with every switch
  * on has its own set as well. Removing foreground slot-clock reads for ISR-owned plans changes the timestamp hash;
- * old/new pulse counts, axis/direction order and 21 us modeled worst lag match (2026-10-08 characterization).
+ * Idle status slicing also changes clock phases. Both changes were characterized against the prior commit:
+ * pulse counts, node endpoints and axis/direction order match; hardware modeled worst lag stays 21 us.
  * Any other combination checks the pulse counts and node endpoints only (SCHED_HASHED 0). */
 #define SCHED_ALL_HW (HW_SSI && HW_STEP && HW_EVT && HW_DEAD && HW_PINIRQ && HW_TXDMA)
 #define SCHED_NO_HW  (!HW_SSI && !HW_STEP && !HW_EVT && !HW_DEAD && !HW_PINIRQ && !HW_TXDMA)
 #if SIM_MHZ == 48 && SCHED_ALL_HW
 #define SCHED_HASHED 1
 #if ARM2_ENCODER_FEEDBACK
-#define SCHED_AH 0x19fc5fbdu
-#define SCHED_BH 0x9a91c048u
-#define SCHED_CH 0x5d4d6f5du
+#define SCHED_AH 0xd98b4cddu
+#define SCHED_BH 0x9fe67478u
+#define SCHED_CH 0xba97d7fdu
 #else
-#define SCHED_AH 0xbc5d385du
-#define SCHED_BH 0xb9afec00u
-#define SCHED_CH 0xdca866cdu
+#define SCHED_AH 0x3f7d68bdu
+#define SCHED_BH 0xe88b3c78u
+#define SCHED_CH 0x33299ecdu
 #endif
 #elif SIM_MHZ == 48 && SCHED_NO_HW
 #define SCHED_HASHED 1
 #if ARM2_ENCODER_FEEDBACK
-#define SCHED_AH 0xbdc7f313u
-#define SCHED_BH 0x50f57facu
-#define SCHED_CH 0x1b50e5abu
+#define SCHED_AH 0xcdd517bfu
+#define SCHED_BH 0x6385ba80u
+#define SCHED_CH 0x4f57bf0bu
 #else
-#define SCHED_AH 0xd407c905u
-#define SCHED_BH 0xe469fbb6u
-#define SCHED_CH 0x77bd772bu
+#define SCHED_AH 0x435fb50du
+#define SCHED_BH 0x2d4f0882u
+#define SCHED_CH 0x15b5256fu
 #endif
 #elif SIM_MHZ == 24 && SCHED_NO_HW
 #define SCHED_HASHED 1
 #if ARM2_ENCODER_FEEDBACK /* the second encoder frame lengthens the foreground pass, which moves where each pulse lands */
-#define SCHED_AH 0x4e7b6b67u
-#define SCHED_BH 0xae4b8b3cu
-#define SCHED_CH 0x1b50e5abu
+#define SCHED_AH 0x95834fe7u
+#define SCHED_BH 0x6385ba80u
+#define SCHED_CH 0xfe1892c3u
 #else
-#define SCHED_AH 0x8ab0b9d5u
-#define SCHED_BH 0xe469fbb6u
-#define SCHED_CH 0x4ed142dbu
+#define SCHED_AH 0xa177853du
+#define SCHED_BH 0xe03428feu
+#define SCHED_CH 0x3f5f10ffu
 #endif
 #else
 #define SCHED_HASHED 0
@@ -1589,6 +1595,43 @@ static void snapshot_interrupt(void) {
 int main(int argc,char **argv) {
     const char *t=argv[1]; unsigned i, p1, p2;
     assert(argc==2);
+    if(!strncmp(t,"status_idle_",12)) {
+        static const char *prefix[]={"STATE fw=","CONTROL seq=","PTP_STATE ","MOTION_RATES ","PTP_CHECK ",
+            "TRAJ_STATE ","LINK ","PTP_RX ","TIMING ","ENC_DIAG ","TELEM_DIAG ","TELEM t="};
+        unsigned before,feeds;const char *at,*state;uint32 epoch;
+        setup();status_drain();app_start();g_telemHz=0u;
+        simLogN=0;simLog[0]=0;simFormatCalls=0u;simRequireFormatInts=1;
+        before=simFormatCalls;epoch=g_ptp.epoch;
+        if(!strcmp(t,"status_idle_stop")) {
+            g_statusNext=8u;g_statusEpoch=epoch;stage_stop("status slice regression",0u);
+            txq_flush_blocking();assert(strstr(simLog,"LAST_STOP ") && !strstr(simLog,"STATE fw="));
+        } else {
+            if(!strcmp(t,"status_idle_epoch")) {g_statusNext=8u;g_statusEpoch=epoch;ptp_invalidate();}
+            if(!strcmp(t,"status_idle_repeat")) {g_statusNext=8u;g_statusEpoch=epoch;}
+            stage_status();assert(simFormatCalls==before);
+        }
+        assert(g_statusNext==1u && g_statusEpoch==g_ptp.epoch);
+        simFormatCostUs=2500u;feeds=simWdtFeeds;
+        for(i=0;i<STATUS_LINES;i++) {
+            before=simFormatCalls;app_poll();
+            assert(simFormatCalls==before+1u);
+            assert(g_statusNext==(i+1u<STATUS_LINES ? i+2u : 0u));
+            txq_flush_blocking();
+        }
+        assert(simWdtFeeds==feeds+STATUS_LINES && wall_ms()<JOG_STATUS_MS);
+        at=simLog;
+        for(i=0;i<sizeof(prefix)/sizeof(prefix[0]);i++){at=strstr(at,prefix[i]);assert(at);at++;}
+        if(STATUS_LINES==13u)assert(strstr(at,"HWOFFLOAD "));
+#if !HW_EVT
+        if(STATUS_LINES==13u)assert(strstr(simLog,"evt_isr_max_us=0 evt_isr_busy_permille=0 evt_events=0"));
+#endif
+        state=strstr(simLog,"STATE fw=");
+        if(!strcmp(t,"status_idle_stop"))assert(strstr(simLog,"LAST_STOP ")<state);
+        if(!strcmp(t,"status_idle_epoch"))assert(g_ptp.epoch!=epoch);
+        at=strstr(simLog,"PTP_STATE ");at=strstr(at,"epoch=");
+        assert(at && strtoul(at+6,0,10)==g_ptp.epoch);
+        puts(t);return 0;
+    }
     if(!strcmp(t,"snapshot_telem") || !strcmp(t,"snapshot_stats")) {
         char expected[160];int32 u1,u2;
         setup();txq_flush_blocking();simLogN=0;simLog[0]=0;simRequireFormatInts=1;
@@ -1783,7 +1826,7 @@ int main(int argc,char **argv) {
         assert(app_boot()); setup(); assert(g_arm1.hasEnc && !g_arm2.hasEnc);
         assert(!g_enc2.directionKnown); packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;
         assert(g_ptp.reference && !simPulse1 && !simPulse2);
-        stage_status();txq_flush_blocking();assert(strstr(simLog,"arm2fb=0") && !strstr(simLog," e2="));
+        stage_status();status_drain();assert(strstr(simLog,"arm2fb=0") && !strstr(simLog," e2="));
         { uint32 epoch=g_ptp.epoch; ptp_send(2,epoch,0,100,200,0);
           for(i=0;i<20000 && g_ptp.active;i++)cycle(1);
           assert(g_motionEnabled && !g_ptp.active && simPulse2); }
@@ -2098,7 +2141,7 @@ int main(int argc,char **argv) {
     if(!strcmp(t,"link_capabilities")) {
         /* The LINK line is the only carrier of the host's compatibility contract (docs/PROTOCOL.md section 6). */
         char proto[24]; simLogN=0; simLog[0]=0;
-        stage_status(); txq_flush_blocking();
+        stage_status(); status_drain();
         sprintf(proto," proto=%u\r\n",(unsigned)PROTO_VERSION); /* with its end of line: the debug buffer must not cut the LINK line short */
         assert(strstr(simLog,"STATE fw=stage2-v11 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
         assert(strstr(simLog," short_hb=1") && strstr(simLog," joint_limits=1") && strstr(simLog," motion_rates=1") && strstr(simLog," rates_live=1") && strstr(simLog," q2_absolute=1"));
@@ -2137,14 +2180,14 @@ int main(int argc,char **argv) {
     if(!strcmp(t,"rejected_byte_status")) {
         uint32 rejected=g_rxRejected;
         jog_handle_byte(0x02);assert(g_rxRejected==++rejected);
-        stage_status();txq_flush_blocking();assert(strstr(simLog,"last_rejected_byte=0x02"));
+        stage_status();status_drain();assert(strstr(simLog,"last_rejected_byte=0x02"));
         g_uploadRxQuarantine=1u;jog_handle_byte(0x04);assert(g_rxRejected==++rejected);
-        stage_status();txq_flush_blocking();assert(strstr(simLog,"last_rejected_byte=0x04"));
+        stage_status();status_drain();assert(strstr(simLog,"last_rejected_byte=0x04"));
         g_uploadRxQuarantine=0u;jog_handle_byte(JOG_CMD_ENABLE);assert(g_rxRejected==++rejected);
-        stage_status();txq_flush_blocking();assert(strstr(simLog,"last_rejected_byte=0x63"));
+        stage_status();status_drain();assert(strstr(simLog,"last_rejected_byte=0x63"));
         packetType=6;ptp_send(g_controlSequence+1u,g_ptp.epoch-1u,0,0,0,0);packetType=1;
         assert(g_rxRejected==++rejected);
-        simLogN=0;simLog[0]=0;stage_status();txq_flush_blocking();
+        simLogN=0;simLog[0]=0;stage_status();status_drain();
         assert(strstr(simLog,"last_rejected_byte=0x63")); /* epoch rejection is not an unknown wire byte */
         puts(t);return 0;
     }
@@ -2573,6 +2616,7 @@ cases += ['boot_tx_backlog','rejected_byte_status','operator_stop_reenable','ope
 cases += ['limits_'+n for n in ['configure','retry','invalid','busy','enabled']]
 cases += ['telem_rate','telem_rate_invalid','telem_stream','telem_skip','fault_snapshot']
 cases += ['snapshot_telem','snapshot_stats']
+cases += ['status_idle_'+n for n in ['slice','stop','epoch','repeat']]
 cases += ['rates_config','rates_jog','rates_home']
 cases += ['home_from_drawing','home_from_arm2_range','home_long_stop']
 cases += ['home_search_stop','home_search_heartbeat','home_search_limit','home_search_fault','home_release_time_limit']
