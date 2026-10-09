@@ -212,7 +212,9 @@ public sealed partial class ControlWindow : Window
             e.Handled = true; SafeAction(Heartbeat);
         }
     }
-    private bool PointBusy => pendingControl is not null || pendingPoint != 0 || ptp is { Active: > 0 } || uploading is not null || executing || StoreBusy || pendingBoardSave is not null;
+    // A save held back for the speed synchronisation also locks editing: the plan and settings it will save must not change under it.
+    private bool PointBusyCore => pendingControl is not null || pendingPoint != 0 || ptp is { Active: > 0 } || uploading is not null || executing || StoreBusy || pendingBoardSave is not null;
+    private bool PointBusy => PointBusyCore || deferredBoardSave is not null;
     private bool CanPoint => LimitsReady && stage2 && compatible && enabled && homed && feedbackReady && !homing && !stopPending && !PointBusy &&
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Referenced: true, Epoch: > 0 } &&
         (DateTime.UtcNow - lastPtpAt).TotalSeconds < 2 && (!supportsTelemetry ||

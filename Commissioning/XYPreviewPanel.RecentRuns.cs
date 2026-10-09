@@ -298,6 +298,13 @@ public sealed partial class XYPreviewPanel
             star.SetBoard(4, true, false, [Free(0), Held(1, 0x11111111), null, null], ledger, null);
             if (star.recentRows.Any(r => (string)r.Star.Content == "★") || !star.boardNote.Text.Contains("别处存的图形")) Fail("设备上的计划与记录不符时不应标 ★，而应说明是别处存的");
             star.SetBoard(4, true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
+            // Telling the panel the same thing again changes nothing: the buttons the operator is about to use stay the same objects.
+            var keep = star.recentRows[0].Star; int rebuilds = star.BoardRebuilds;
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0xABCD1234), null, null], new List<LedgerEntry>(ledger), null);
+            if (!ReferenceEquals(keep, star.recentRows[0].Star) || star.BoardRebuilds != rebuilds) Fail("同样的板上状态不应重建按钮");
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, () => "x");
+            if (ReferenceEquals(keep, star.recentRows[0].Star) || star.BoardRebuilds != rebuilds + 1) Fail("板上状态变了就应重建");
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
             // A slot this computer has no record of (saved elsewhere, or the record is lost) still gets its own clear button, with the same confirmation.
             star.SetBoard(4, true, false, [Free(0), Held(1, 0x11111111), null, null], ledger, null);
             if (star.BoardClearButtons.Count != 1 || !((string)star.BoardClearButtons[0].Content).Contains("槽2")) Fail("别处存的槽应有清除按钮：" + star.BoardClearButtons.Count);

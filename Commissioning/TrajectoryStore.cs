@@ -24,7 +24,8 @@ public sealed record BoardSlot(int Slot, bool Valid, uint Seq, int Nodes, int Du
         if (!m.Groups[3].Success || !uint.TryParse(m.Groups[3].Value, out uint seq) || !int.TryParse(m.Groups[4].Value, out int nodes) ||
             !int.TryParse(m.Groups[5].Value, out int duration) || !int.TryParse(m.Groups[6].Value, out int q1) || !int.TryParse(m.Groups[7].Value, out int q2) ||
             !uint.TryParse(m.Groups[8].Value, System.Globalization.NumberStyles.HexNumber, null, out uint crc) ||
-            nodes is < 2 or > DeviceContract.TrajCapacity || duration <= 0 || Math.Abs(q1) > DeviceContract.JointLimitCdMax || Math.Abs(q2) > DeviceContract.JointLimitCdMax) return null;
+            nodes is < 2 or > DeviceContract.TrajCapacity || duration <= 0 ||
+            q1 is < -DeviceContract.JointLimitCdMax or > DeviceContract.JointLimitCdMax || q2 is < -DeviceContract.JointLimitCdMax or > DeviceContract.JointLimitCdMax) return null;   // not Math.Abs: it throws for int.MinValue
         return new BoardSlot(slot, true, seq, nodes, duration, q1, q2, crc);
     }
 }
@@ -132,7 +133,8 @@ public static class BoardLedger
         Check(BoardSlot.Parse("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=-5686 q2=5871 crc=BD3EB746") is { Valid: true, Seq: 3, Nodes: 485, DurationMs: 60480, Q1Cd: -5686, Q2Cd: 5871, Crc: 0xBD3EB746 }, "valid slot line");
         foreach (string bad in new[] { "TRAJ_SLOT slot=4 valid=0", "TRAJ_SLOT slot=0 valid=1", "TRAJ_SLOT slot=0 valid=0 seq=1", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=1 duration_ms=5 q1=0 q2=0 crc=00000000",
             "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=2049 duration_ms=5 q1=0 q2=0 crc=00000000", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=18001 q2=0 crc=00000000",
-            "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=0 q2=0 crc=bd3eb746", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=0 q1=0 q2=0 crc=BD3EB746" })
+            "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=0 q2=0 crc=bd3eb746", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=0 q1=0 q2=0 crc=BD3EB746",
+            "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=-2147483648 q2=0 crc=BD3EB746", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=0 q2=-2147483648 crc=BD3EB746" })
             Check(BoardSlot.Parse(bad) is null, "bad slot line accepted: " + bad);
         Check(StoreStatus.Parse("TRAJ_STORE state=saving slot=2 rows=8/12 seq=74 last=failed last_slot=0 row_max_us=7000") is { Busy: true, Slot: 2, RowsDone: 8, RowsTotal: 12, Seq: 74, Last: "failed", RowMaxUs: 7000 }, "status line");
         Check(StoreStatus.Parse("TRAJ_STORE state=idle slot=0 rows=0/0 seq=1 last=none last_slot=0 row_max_us=0") is { Busy: false }, "idle status line");

@@ -30,9 +30,16 @@ public sealed partial class XYPreviewPanel
     private readonly TextBlock boardNote = new() { TextWrapping = TextWrapping.Wrap, FontSize = 11, Foreground = WorkbenchTheme.Muted, Margin = new Thickness(10, 2, 10, 6) };
 
     // known: every slot has been reported on this link.  Until then no slot is assumed empty, and saving stays off.
+    internal int BoardRebuilds;                    // how often the board state really changed (the controls are rebuilt only then)
     public void SetBoard(int slotCount, bool known, bool busy, IReadOnlyList<BoardSlot?> slots, IReadOnlyList<LedgerEntry> ledger, Func<string>? message)
     {
-        boardSlotCount = Math.Clamp(slotCount, 0, DeviceContract.TrajStoreSlots); boardKnown = known; boardBusy = busy; boardSlots = slots.ToArray(); boardLedger = ledger.ToList(); boardMessage = message;
+        // The device repeats its LINK line every 500 ms: unchanged state must not tear down the buttons the operator is using
+        // (a confirmation menu opened from one of them would be lost).
+        slotCount = Math.Clamp(slotCount, 0, DeviceContract.TrajStoreSlots);
+        var newSlots = slots.ToArray(); var newLedger = ledger.ToList();
+        if (slotCount == boardSlotCount && known == boardKnown && busy == boardBusy && newSlots.SequenceEqual(boardSlots) && newLedger.SequenceEqual(boardLedger) && ReferenceEquals(message, boardMessage)) return;
+        BoardRebuilds++;
+        boardSlotCount = slotCount; boardKnown = known; boardBusy = busy; boardSlots = newSlots; boardLedger = newLedger; boardMessage = message;
         ShowRecentRuns();
         UpdateBoardNote();
         UpdateBoardClear();

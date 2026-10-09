@@ -23,7 +23,7 @@ public sealed partial class ControlWindow
     private readonly BoardSlot?[] boardSlots = new BoardSlot?[DeviceContract.TrajStoreSlots];
     private bool boardKnown;                                              // a COMPLETE inventory (every slot reported) has arrived on this link
     private int boardSeen;                                                // bit per slot reported by the query in flight
-    private (ExecutionTrajectory Plan, int Slot, DateTime Since)? deferredBoardSave;   // asked while the device was still confirming new speeds
+    private (ExecutionTrajectory Plan, int Slot, DateTime Since, string Settings)? deferredBoardSave;   // asked while the device was still confirming new speeds
     private StoreStatus? storeStatus;
     private StoreJob? storeJob;
     private StoreOp storeRequestOp;
@@ -33,7 +33,7 @@ public sealed partial class ControlWindow
     private DateTime lastBoardQueryAt;
     private List<LedgerEntry> boardLedger = [];
     private Func<string>? boardMessage;
-    private (ExecutionNode[] Nodes, int Slot)? pendingBoardSave;          // upload first, then save into the slot
+    private (ExecutionNode[] Nodes, int Slot, string Settings)? pendingBoardSave;          // upload first, then save into the slot
     private int? loadingSlot;                                             // a type 13 load is in flight for the plan in `uploading`
     private const double StoreAnswerSeconds = 1.0, StoreWorkSeconds = 12;
 
@@ -43,9 +43,10 @@ public sealed partial class ControlWindow
     private void ReadStoreCapability(string[] words)
     {
         string? slots = words.FirstOrDefault(w => w.StartsWith("traj_store=", StringComparison.Ordinal));
+        int before = storeSlotCount;
         storeSlotCount = slots is not null && int.TryParse(slots.AsSpan(11), out int n) && n is > 0 and <= DeviceContract.TrajStoreSlots ? n : 0;
         if (storeSlotCount == 0) { boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); }
-        PublishBoard();
+        if (storeSlotCount != before) PublishBoard();   // the LINK line comes every 500 ms; the panel is only told when this changes
     }
 
     private void ResetBoard()
@@ -164,18 +165,21 @@ public sealed partial class ControlWindow
     }
 
     // The plan the device holds is what gets saved.  A figure that is not held yet is uploaded first, then saved: one click.
-    private void RequestSaveToBoard(ExecutionTrajectory plan, int slot)
+    // `settings` is the description of the figure AT THE MOMENT it was asked for: a save held back or uploading first keeps it, so the
+    // ledger never labels this plan with settings typed meanwhile.
+    private void RequestSaveToBoard(ExecutionTrajectory plan, int slot, string? settings = null)
     {
+        settings ??= xyPreview.SettingsDescription;
         if (slot < 0 || slot >= storeSlotCount) return;
         if (!StoreAvailable || !boardKnown || storeJob is not null || pendingBoardSave is not null || PointBusy) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
-        if (uploaded is { } held && held.Nodes.SequenceEqual(plan.Nodes)) { deferredBoardSave = null; BeginBoardSave(plan.Nodes, slot); return; }
+        if (uploaded is { } held && held.Nodes.SequenceEqual(plan.Nodes)) { deferredBoardSave = null; BeginBoardSave(plan.Nodes, slot, settings); return; }
         // A figure with other speeds makes the panel re-send them first; the upload has to wait until the device confirmed them.
-        if (!LimitsReady) { deferredBoardSave = (plan, slot, DateTime.UtcNow); SetBoardMessage(() => Lang.T("board.waitSync", slot + 1)); return; }
+        if (!LimitsReady) { deferredBoardSave = (plan, slot, DateTime.UtcNow, settings); SetBoardMessage(() => Lang.T("board.waitSync", slot + 1)); return; }
         deferredBoardSave = null;
         // The marker comes AFTER the upload has started: it counts as busy, and RequestTrajectory refuses to start while busy.
         RequestTrajectory(plan, allowBoard: false);
         if (uploading is null) { SetBoardMessage(() => Lang.T("board.err.needStart")); return; }
-        pendingBoardSave = (plan.Nodes, slot);
+        pendingBoardSave = (plan.Nodes, slot, settings);
         SetBoardMessage(() => Lang.T("board.uploadThenSave", slot + 1));
     }
 
@@ -184,15 +188,14 @@ public sealed partial class ControlWindow
     {
         if (deferredBoardSave is not { } deferred) return;
         if ((now - deferred.Since).TotalSeconds > 15) { deferredBoardSave = null; SetBoardMessage(() => Lang.T("board.err.needStart")); return; }
-        if (!LimitsReady || PointBusy) return;
+        if (!LimitsReady || PointBusyCore) return;   // PointBusy itself includes this held save
         deferredBoardSave = null;
-        RequestSaveToBoard(deferred.Plan, deferred.Slot);
+        RequestSaveToBoard(deferred.Plan, deferred.Slot, deferred.Settings);
     }
 
-    private void BeginBoardSave(ExecutionNode[] nodes, int slot)
+    private void BeginBoardSave(ExecutionNode[] nodes, int slot, string settings)
     {
         uint crc = TrajectoryArchive.PlanCrc(nodes);
-        string settings = xyPreview.SettingsDescription;
         if (!StartStoreJob(StoreOp.Save, slot, (ok, message) =>
         {
             if (ok) { RememberBoard(slot, crc, settings); SetBoardMessage(() => Lang.T("board.saved", slot + 1)); }
@@ -258,7 +261,7 @@ public sealed partial class ControlWindow
     {
         if (pendingBoardSave is not { } pending || !pending.Nodes.SequenceEqual(plan.Nodes)) return;
         pendingBoardSave = null;
-        BeginBoardSave(plan.Nodes, pending.Slot);
+        BeginBoardSave(plan.Nodes, pending.Slot, pending.Settings);
     }
 
     // The archive's message handling, checked against the lines the firmware prints.
@@ -322,6 +325,10 @@ public sealed partial class ControlWindow
             Check(w.storeJob is not null, "a status for another command ended the job");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={seq} last=none last_slot=0 row_max_us=0");
             Check(w.storeJob is null && w.boardKnown && w.boardSlots[1] is { Valid: true, Crc: 0xBD3EB746 } && w.boardSlots[0] is { Valid: false }, "the query answer was not taken");
+            // The LINK line repeats every 500 ms: with nothing changed the panel's controls are not rebuilt.
+            int rebuilds = w.xyPreview.BoardRebuilds;
+            w.HandleLine(Link(" traj_store=4 telem_hz=0")); w.HandleLine(Link(" traj_store=4 telem_hz=0"));
+            Check(w.xyPreview.BoardRebuilds == rebuilds, "a repeated LINK line rebuilt the board controls");
             // Saving waits for the complete inventory, and for the device to confirm new speeds: a figure with other speeds makes the panel
             // re-send them, and the upload that follows is held back instead of being dropped.
             w.xyPreview.SelectShapeForSelfTest(3); w.xyPreview.LoadExampleForSelfTest();
@@ -329,6 +336,12 @@ public sealed partial class ControlWindow
             Check(!w.LimitsReady, "the fixture was expected to be waiting for the device's ranges");
             w.RequestSaveToBoard(shown, 0);
             Check(w.deferredBoardSave is { Slot: 0 } && w.uploading is null && w.pendingBoardSave is null && w.storeJob is null, "a save asked during speed synchronisation was not held back");
+            // While it waits, editing is locked (the plan and the settings it will save must not change), and it keeps the settings of the moment.
+            string heldSettings = w.deferredBoardSave!.Value.Settings;
+            Check(w.PointBusy && heldSettings.Contains("shape=3"), "a held-back save did not lock editing or capture its settings");
+            w.xyPreview.SelectShapeForSelfTest(2);
+            Check(w.deferredBoardSave!.Value.Settings == heldSettings, "the held settings changed with the panel");
+            w.xyPreview.SelectShapeForSelfTest(3);
             w.RetryDeferredBoardSave(DateTime.UtcNow.AddSeconds(2));
             Check(w.deferredBoardSave is not null, "the held save was dropped before its time");
             w.RetryDeferredBoardSave(DateTime.UtcNow.AddSeconds(16));
@@ -364,7 +377,7 @@ public sealed partial class ControlWindow
             Check(done && !ok && w.storeJob is { Op: StoreOp.Query }, "silence did not end the job (and read the board back)");
             w.FinishStoreJob(true, "");
             // Disconnecting forgets the board; a stop forgets a pending save.
-            w.pendingBoardSave = (nodes, 0);
+            w.pendingBoardSave = (nodes, 0, "shape=3");
             w.ResetBoard();
             w.HandleLine(Link(" traj_store=2 telem_hz=0"));
             Check(w.storeSlotCount == 2, "a smaller slot count was not read");
