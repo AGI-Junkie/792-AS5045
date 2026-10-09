@@ -52,7 +52,7 @@
 #define HW_DEAD                     (1u) /* hardware deadman: DeadTimer + AliveReq cut the STEP PWMs if the foreground stalls */
 #endif
 #ifndef HW_USB
-#define HW_USB                      (0u) /* USB CDC link on J6: the USBFS macro "UsbCdc" (docs/USB_CDC.md); 1 only while it is in TopDesign */
+#define HW_USB                      (1u) /* USB CDC link on J6: the USBFS macro "UsbCdc" (docs/USB_CDC.md); 1 only while it is in TopDesign */
 #endif
 #if (HW_USB != 0u) && (HW_TXDMA != 0u)
 #error "HW_USB does not drive HW_TXDMA yet: the DMA owns the UART transmit queue"
@@ -78,6 +78,7 @@
 #endif
 #if (HW_USB != 0u)
 #include "UsbCdc.h"
+#include "UsbCdc_cdc.h"
 #endif
 #if (HW_EVT != 0u)
 #include "EvtTimer.h"

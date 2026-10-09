@@ -1,0 +1,51 @@
+# USB CDC 链路（P5c）
+
+目标：上位机经芯片自带的 USB（J6，P15[6]/P15[7]）通信，不再只靠 KitProg 的 UART 桥。出处：`docs/HARDWARE_OFFLOAD_PLAN.md` P5c。
+
+## 状态
+
+| 部分 | 状态 |
+|---|---|
+| 固件链路层（`HW_USB`，默认 1） | 已做；仿真 5 个用例（`usb_tx` / `usb_fallback` / `usb_stall` / `usb_rx` / `usb_link`） |
+| TopDesign：`UsbCdc`（USBUART CDC 宏，USBFS v3.20） | 已放；引脚 Dm=P15[7]、Dp=P15[6] |
+| 时钟 | 已改；Creator 构建 0 错误 0 警告，时序 No Timing Violations |
+| 上位机：认出 USB 口、取消双发 | **没做** |
+| 上板验证 | **没做** |
+
+## 固件行为
+
+- “USB 链路已打开” = 已枚举（configured）且主机置了 DTR。
+- 已打开：发送队列经 CDC IN 端点发出，每包最多 64 字节；未打开：仍走 KitProg UART（和以前一样）。
+- 接收是合并的：USB 和 UART 的字节都进同一个解析器。
+- 主机停止读取（端点一直不就绪）时，队列写满后整条丢弃并计入 `tx_dropped`，`txq_flush_blocking` 100 ms 后放弃，和 UART 卡住时一样。
+- `LINK` 行新增 `link=usb|uart`，上位机据此知道当前走哪条链路。
+- `HW_USB` 与 `HW_TXDMA` 不能同时为 1（编译期报错）：TX DMA 仍然关着，且尚未修复。
+
+## 时钟改动（`DRV8825.cydwr`）
+
+| 项 | 之前 | 现在 |
+|---|---|---|
+| IMO | 3 MHz ±1% | 24 MHz，开倍频器，USB 锁定时 ±0.25% |
+| PLL | 输入 IMO 3 MHz | 输入 IMO 24 MHz，输出仍是 48 MHz |
+| USB_CLK | 关 | 开，IMOx2 = 48 MHz |
+| ILO | 1 kHz | 1 kHz 与 100 kHz 同时使能，Route 选 100 kHz |
+| 总线 / 主时钟 | 48 MHz | 48 MHz（不变） |
+| `HostUart_IntClock` | 923.077 kHz（÷52） | 不变 |
+
+ILO Route 改为 100 kHz 是 USBFS 的硬性要求（Creator 报 `fit.M0031`）。看门狗用的是 ILO 1 kHz 输出，只要求它保持使能（`CyWdtStart` 说明），所以看门狗周期按设计不变；这一点没有上板验证。
+
+## 风险（上板前要知道）
+
+1. **USB 没连、IMO 没被锁定时精度只有 ±4%**（数据手册，非 USB 模式）。总线、步进脉冲、µs 计时、UART 波特率都会跟着偏。USB 连着且在传 SOF 时是 ±0.25%。KitProg UART 在没有 USB 锁定时可能失配；这是计划里写过的取舍。
+2. 只用 KitProg 线（不插 J6）时，固件的计时精度比以前差。闭环编码器会兜住位置，但时间相关的限值（步频、deadman 的毫秒数）会按比例偏。
+3. J6 单线供电（VBUS 经 F1/D2 并入 VTARG）是从原理图文本推断的，没逐线核对。
+4. 烧录和调试仍然走 J10（KitProg）。
+
+## 上板验证步骤
+
+1. 在 Creator 里构建并烧录（J10）。
+2. 再插 J6：Windows 应出现一个新的 COM 口（“USB 串行设备”）。
+3. 用串口工具以任意波特率打开新 COM 口并置 DTR，发 `s`：应收到完整的 STATE/LINK 行，`LINK` 里 `link=usb`，`proto=4`。
+4. 关闭该 COM 口：下一次 `s` 走 KitProg 的 COM 口，`link=uart`。
+5. 拔掉 J6、只留 J10：行为应和以前一致；记录此时 `--uart-stress` 的结果。
+6. 观察看门狗：固件不应反复复位（反复出现开机信息即为复位）。
