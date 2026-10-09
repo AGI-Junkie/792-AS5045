@@ -54,7 +54,9 @@ foreach ($block in $blocks) {
     if ($byName.ContainsKey($name)) { $issues.Add("Duplicate Verilog instance: $name") }
     $byName[$name] = $block
 }
-if ($blocks.Count -ne 25) { $issues.Add("Expected 25 Pins instances; found $($blocks.Count)") }
+# 25 functional pins + Dm/Dp, the USB data pins owned by the UsbCdc macro.
+if ($blocks.Count -ne 27) { $issues.Add("Expected 27 Pins instances; found $($blocks.Count)") }
+foreach ($usbPin in @('Dm', 'Dp')) { if (-not $byName.ContainsKey($usbPin)) { $issues.Add("Missing USB pin instance: $usbPin") } }
 $defaultCount = @($byName.Keys | Where-Object { $_ -cmatch '^Pin_[0-9]+$' }).Count
 if ($NamedInstances -and $defaultCount) { $issues.Add("Functional names incomplete: $defaultCount default Pin_* names remain") }
 

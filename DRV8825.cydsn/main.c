@@ -147,7 +147,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r2500-slip-mref2-ssififo-upstat1"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -191,8 +191,8 @@
 /* Numbers the host has to agree on.  Commissioning/DeviceContract.cs holds the same values and
  * build-release.ps1 compares the two, so change them together or the release build fails. */
 #define CFG_RATE_MIN                 (20)     /* configurable jog/home/PTP rate range, microsteps/s    */
-#define CFG_RATE_MAX_AXIS1           (4000)
-#define CFG_RATE_MAX_AXIS2           (4000)
+#define CFG_RATE_MAX_AXIS1           (5000)
+#define CFG_RATE_MAX_AXIS2           (5000)
 #define CFG_ACCEL_MIN                (100)    /* configurable acceleration range, microsteps/s^2       */
 #define CFG_ACCEL_MAX_AXIS1          (20000)
 #define CFG_ACCEL_MAX_AXIS2          (12000)
@@ -230,7 +230,7 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
     PTP_MINE_CD < -CFG_JOINT_CD_MAX || PTP_MAXE_CD > CFG_JOINT_CD_MAX)
 #error "PTP requires an elbow bound within +/-180 deg containing straight zero"
 #endif
-#define PTP_RATE_MAX                 (2500u)
+#define PTP_RATE_MAX                 (5000u)
 #define PTP_ACCEL                    (3000u)
 #define PTP_FRAME_BYTES              (17u)
 #define PTP_FRAME_START              (0xD1u)
@@ -1462,12 +1462,12 @@ static uint32 motion_min(uint32 a, uint32 b) { return a < b ? a : b; }
 /* Whole-path preload: no movement until every numbered node is accepted.  The plan's data and rules are in traj.h; the
  * numbers it is built on stay here, where the release gate reads them against DeviceContract.cs. */
 #define TRAJ_CAPACITY 2048u
-#define TRAJ_RATE_MAX 2500u
+#define TRAJ_RATE_MAX 5000u
 #define TRAJ_ACCEL_MAX 3000u
 /* Never pulse a trajectory faster than this, even when catching up.  Deliberately NOT tied to TRAJ_RATE_MAX: the plan stays
- * under 2500 steps/s, but a loop that fell a little behind must still be able to close the gap (250 us is the spacing the
+ * under TRAJ_RATE_MAX, but a loop that fell a little behind must still be able to close the gap (250 us is the spacing the
  * hardware-tested builds used). */
-#define TRAJ_BURST_RATE_MAX 4000u
+#define TRAJ_BURST_RATE_MAX 5000u
 #define TRAJ_STEP_MIN_US (1000000u / TRAJ_BURST_RATE_MAX)
 /* Ride the limit instead of stopping: a step more than TRAJ_LATE_SOFT_US behind its due time means the loop cannot keep this
  * plan's pace right now, so the plan clock is held back by the excess (the segment simply takes longer; every segment still

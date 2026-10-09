@@ -68,7 +68,7 @@ static inline __attribute__((always_inline)) void dda_step(dda_t *d, int8 step[2
 
 /* When step k of a segment is due: floor(k * duration / total) cycles.  With q = duration / total and
  * r = duration % total that is k*q + k*r/total, which stays in 32 bits while total < 65536 (a node is at most 500 ms
- * at under 4000 steps/s), so the hot loop needs no 64-bit divide.  The last answer is kept because one pass of the main
+ * at the firmware rate caps), so the hot loop needs no 64-bit divide.  The last answer is kept because one pass of the main
  * loop asks for the same step from the trajectory service, the encoder slot check and the TX slot check. */
 static uint32 traj_due_cy(uint32 k, uint32 duration, uint32 total)
 {
