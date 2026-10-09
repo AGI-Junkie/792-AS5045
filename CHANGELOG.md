@@ -2,6 +2,16 @@
 
 最新在前。每条写“改了什么、验证到哪一步”；“未烧录”指固件镜像没有下载到板子上。
 
+## 2026-10-09：板上轨迹存档（Flash，4 槽）+ 最近运行里的 ★ 表示“已存在板子上”（未烧录、未上实机）
+
+设计、布局、断电安全、命令、上位机用法见 [docs/TRAJ_STORE.md](docs/TRAJ_STORE.md)。分支 `jog-derate`。
+
+- **固件**：`trajstore.h`（布局、CRC-32、A/B 块、逐行保存状态机）+ `main.c`（type 12 查询/保存/清空、type 13 加载、`store_service` 每个前台循环写一行、`axes_idle()` 在保存期间为假）。Flash 存档区 `0x20000–0x39FFF` 由新的 `cm3gcc_trajstore.ld` 保留（工程的 Custom Linker Script 已指向它）；没用这个脚本链接时 `traj_store=0`，所有存档操作被拒绝。LINK 行新增 `traj_store=<槽数>`，`FW_BUILD_ID` 加后缀 `-store4`，proto 不变。
+- **上位机**：`TrajectoryStore.cs`（槽/状态行解析、CRC-32、节点流、本机记录 `board-slots.json`）、`ControlWindow.Store.cs`（命令队列按字节重发、保存/清除/加载、上传后自动保存）、`XYPreviewPanel.Board.cs`（★/☆ 与菜单、槽位提示行、“从板上加载”按钮文字）。**最近运行的 ★ 从“本地收藏”改成“已存在板子上”**，旧的 `favorite-runs.json` 不再使用。
+- **发布闸门**：`build-release.ps1` 把新文件纳入源码哈希，核对 `TrajStoreSlots`/`TS_SLOTS`，并检查 map 里 `__trajstore_start` 在 `0x00020000`（没用存档脚本链接就报错）。
+- **验证**：`tests/test_stage1.py` 新增 `store_*` 10 例（假 Flash，每个写操作处断电/写错误，两种配置），全量闸门最后一次完整跑完是 622 例全过（那时还没加“未用存档脚本链接则拒绝”的保护）；之后按要求没再跑全量，只跑了全部 `store_*`、`link_capabilities` 和降速相关用例，均通过；上位机 `--self-test`、`--language-self-test`、`--upload-language-test`、`--log-level-self-test` 通过。固件用 Creator 命令行在草稿目录构建通过（Flash 52168 B，无警告），map/ELF/HEX 已核对。
+- **没做/要上板确认**：写一行的实际阻塞时间（看 `row_max_us`）、保存期间的心跳/USB、断电后恢复、重新烧录会清空存档（HEX 把整片 Flash 写满）。
+
 ## 2026-10-08：下位机硬件卸载（BUS_CLK 48 MHz；SSI、步进脉冲、事件定时器、deadman、串口 DMA、引脚中断；开关默认关；未烧录，TopDesign 组件未放）
 
 计划与依据见 [docs/HARDWARE_OFFLOAD_PLAN.md](docs/HARDWARE_OFFLOAD_PLAN.md)，要在 Creator 里放的组件见 [docs/TOPDESIGN_RECIPE.md](docs/TOPDESIGN_RECIPE.md)。分支 `hw-offload`，基于 main 6610a30，**没有上板**。

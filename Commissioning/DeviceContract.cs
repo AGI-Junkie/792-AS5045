@@ -37,6 +37,9 @@ public static class DeviceContract
     public const int TrajNodeMaxMs = 500;           // TRAJ_NODE_MAX_MS
     public const int TrajTotalMaxMs = 600000;       // TRAJ_TOTAL_MAX_MS
 
+    // Flash archive of finished trajectories (control type 12, load type 13; docs/TRAJ_STORE.md).
+    public const int TrajStoreSlots = 4;            // TS_SLOTS
+
     // Streamed position telemetry (control type 11): 0 = only the 500 ms status block, otherwise this many TELEM lines a second.
     public const int TelemRateMin = 5;              // TELEM_HZ_MIN
     public const int TelemRateMax = 20;             // TELEM_HZ_MAX

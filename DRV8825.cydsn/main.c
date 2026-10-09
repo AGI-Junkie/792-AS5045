@@ -66,6 +66,7 @@
 #include <cydevice_trm.h>
 #include <cypins.h>
 #include <CyLib.h>
+#include <CyFlash.h>
 #include "HostUart.h"
 #if (HW_SSI != 0u)
 #include "Ssi.h"
@@ -147,7 +148,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -266,7 +267,10 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
 #define SLIP_WARN_LSB               (31)     /* 1.5 full steps = 2.70 deg    */
 #define SLIP_FAIL_LSB               (328)    /* 4 electrical cycles = 28.8   */
 #define PULLOUT_LSB                 (41)     /* 2 full steps, for reporting  */
-#define SLIP_DERATE_MAX             (3u)     /* speed cap can drop 8x        */
+#define SLIP_DERATE_FLOOR_SHIFT     (3u)     /* speed cap can drop 8x        */
+#define SLIP_DERATE_HOLD_MS         (300u)   /* min gap between two cuts     */
+#define SLIP_CALM_LSB               (15)     /* slip this low = cap may rise */
+#define SLIP_RECOVER_MS             (1000u)  /* calm this long -> raise cap  */
 
 /* AS5045 output delay. MODE low/open = slow mode, 2.61 kHz / 384 us.
  * At 6000 ustep/s that delay alone looks like 6 LSB of slip, so it is
@@ -1393,7 +1397,7 @@ typedef struct
     uint8  latched;         /* stopped by slip: ignore keys until released */
     uint8  limitHit;        /* soft limit message already printed          */
     uint32 rate;            /* current ustep/s                             */
-    uint32 rateCap;         /* cap for this press, halved on slip warnings */
+    uint32 rateCap;         /* cap for this press, cut on slip warnings, raised when calm */
     uint32 rateMax;
     uint32 rateStart;
     uint32 accel;           /* ustep/s^2                                   */
@@ -1404,7 +1408,10 @@ typedef struct
     volatile int32 usteps; /* net microsteps; ISR writes during trajectories */
     int32  peakSlip;        /* worst slip of the current press, LSB        */
     uint8  derates;
-    uint16 settleMs;        /* >0: just stopped, rotor still ringing       */
+    int32  slipNow;         /* latest slip, LSB (not the peak)             */
+    uint16 derateHoldMs;    /* >0: a cut just happened, no second one yet  */
+    uint16 calmMs;          /* ms of slip < SLIP_CALM_LSB while capped     */
+    uint16 settleMs;       /* >0: just stopped, rotor still ringing       */
     uint8  holding;         /* closed-loop hold at holdTarget        */
     int32  holdTarget;
     uint32 holdCooldownMs;
@@ -1476,6 +1483,8 @@ static uint32 motion_min(uint32 a, uint32 b) { return a < b ? a : b; }
 #define TRAJ_LATE_SOFT_US 1000u
 #define TRAJ_SLIP_MAX_MS 5000u
 #include "traj.h"
+static const uint8 *ts_flash(uint32 offset) { return (const uint8 *)(CYDEV_FLASH_BASE + offset); }
+#include "trajstore.h"
 
 static struct {
     volatile uint8 active; /* 1 moving, 2 settling; event ISR publishes completion */
@@ -1518,6 +1527,21 @@ static uint8 g_uploadRxQuarantine;
 static uint32 g_keyMaxGapMs;
 
 static traj_t g_traj;
+
+/* Flash archive (trajstore.h).  The write hook is the only code that programs flash: it refuses anything outside the
+ * archive region, so a bad slot number or offset can never reach the program. */
+static ts_job_t g_store;
+static uint8  g_storeAccepted[15];
+static uint32 g_storeSeq;                         /* control sequence of the latest accepted type 12 command */
+static struct { uint8 last, slot; uint32 rowMaxCy; } g_storeResult;   /* last: 0 none, 1 saved, 2 erased, 3 failed, 4 aborted */
+static uint8 ts_write_row(uint32 offset, const uint8 *row)
+{
+    cystatus status;
+    if (!TS_LINKED() || offset < TS_REGION_OFFSET || offset + TS_ROW_BYTES > TS_REGION_OFFSET + TS_REGION_BYTES || (offset % TS_ROW_BYTES) != 0u) { return 0u; }
+    status = CyWriteRowData((uint8)(offset / CY_FLASH_SIZEOF_ARRAY), (uint16)((offset % CY_FLASH_SIZEOF_ARRAY) / CY_FLASH_SIZEOF_ROW), row);
+    CyFlushCache();   /* the instruction/data cache may still hold the old row */
+    return (uint8)(status == CYRET_SUCCESS && memcmp(ts_flash(offset), row, TS_ROW_BYTES) == 0);
+}
 
 typedef enum { HOME_IDLE, HOME_RELEASE, HOME_BACKOFF, HOME_FAST,
                HOME_SLOW, HOME_SETTLE, HOME_STRAIGHT, HOME_STRAIGHT_SETTLE } home_phase_t;
@@ -1585,7 +1609,7 @@ static uint8 host_input_idle(void)
 static uint8 axes_idle(void)
 {
     return !g_arm1.moving && !g_arm2.moving && !g_arm1.want && !g_arm2.want &&
-           !g_arm1.settleMs && !g_arm2.settleMs;
+           !g_arm1.settleMs && !g_arm2.settleMs && !g_store.busy;   /* a flash save keeps the stage still */
 }
 static uint8 motion_inputs_clear(void)
 {
@@ -2109,6 +2133,115 @@ static void control_accept(const uint8 *p)
     else { jog_home_all(); }
 }
 
+static uint8 joint_range_ok(int32 q1, int32 q2)
+{
+    return q1>=g_jointMinCd[0] && q1<=g_jointMaxCd[0] && q2>=g_jointMinCd[1] && q2<=g_jointMaxCd[1] &&
+           q2-q1>=g_jointMinCd[JOINT_ELBOW] && q2-q1<=g_jointMaxCd[JOINT_ELBOW];
+}
+
+/* ---- flash archive: type 12 (query / save / erase a slot) and the load behind type 13 ------------------------------ */
+static void store_status(void)
+{
+    static const char *const last[] = { "none", "saved", "erased", "failed", "aborted" };
+    JLOGF("TRAJ_STORE state=%s slot=%u rows=%u/%u seq=%lu last=%s last_slot=%u row_max_us=%lu\r\n",
+          !g_store.busy ? "idle" : g_store.kind==TS_JOB_SAVE ? "saving" : "erasing", (unsigned)g_store.slot,
+          (unsigned)(g_store.kind==TS_JOB_SAVE && g_store.row>0u ? g_store.row-1u : 0u), (unsigned)g_store.rows,
+          (unsigned long)g_storeSeq, last[g_storeResult.last], (unsigned)g_storeResult.slot,
+          (unsigned long)(g_storeResult.rowMaxCy/SU_CY_PER_US));
+}
+static void store_slot_line(uint8 slot)
+{
+    ts_info_t in;
+    ts_active(slot,&in);
+    if(!in.valid) { JLOGF("TRAJ_SLOT slot=%u valid=0\r\n",(unsigned)slot); return; }
+    JLOGF("TRAJ_SLOT slot=%u valid=1 seq=%lu nodes=%u duration_ms=%lu q1=%d q2=%d crc=%08lX\r\n",
+          (unsigned)slot,(unsigned long)in.seq,(unsigned)in.count,(unsigned long)in.durationMs,(int)in.q1,(int)in.q2,
+          (unsigned long)in.dataCrc);
+}
+static void store_end(uint8 result)
+{
+    g_storeResult.last=result; g_storeResult.slot=g_store.slot; g_storeResult.rowMaxCy=g_store.rowMaxCy;
+    g_store.busy=0u; store_status();
+}
+/* One flash row per foreground pass.  The plan being saved is g_traj itself, so anything that changes it (a stop, an
+ * enable, a new upload) ends the save, and the block under construction stays invalid. */
+static void store_service(void)
+{
+    ts_step_t r;
+    if(!g_store.busy) { return; }
+    if(g_store.kind==TS_JOB_SAVE && (!traj_runnable(&g_traj) || g_traj.count!=g_store.count || g_traj.durationMs!=g_store.durationMs)) {
+        JLOG("TRAJ_STORE aborted: the plan changed\r\n"); store_end(4u); return;
+    }
+    r=ts_step(&g_store);
+    if(r==TS_STEP_FAIL) { JLOGF("TRAJ_STORE failed: flash write/verify at row %lu\r\n",(unsigned long)g_store.rowsWritten); store_end(3u); }
+    else if(r==TS_STEP_DONE) { store_end(g_store.kind==TS_JOB_SAVE ? 1u : 2u); }
+    else if(g_store.kind==TS_JOB_SAVE && g_store.phase==1u && (g_store.row&7u)==0u) { store_status(); }
+}
+static void store_accept(const uint8 *p)
+{
+    uint32 seq=ptp_u32(p+1);
+    uint16 slot=ptp_u16(p+9), op=ptp_u16(p+11);
+    uint8 retry;
+    if(ptp_u32(p+5)!=g_ptp.epoch) {
+        g_rxRejected++; g_ptpEpochRejected++; ptp_announce_epoch();
+        JLOG("TRAJ_STORE refused: stale epoch\r\n"); return;
+    }
+    if(!TS_LINKED()) { g_rxRejected++; JLOG("TRAJ_STORE refused: archive region not reserved (link with cm3gcc_trajstore.ld)\r\n"); return; }
+    retry=(uint8)(memcmp(g_storeAccepted,p,15u)==0);   /* heartbeats keep advancing the sequence, so a retry is judged by its bytes */
+    if(!retry && (!seq || seq<=g_controlSequence)) { g_rxRejected++; JLOG("TRAJ_STORE refused: stale sequence\r\n"); return; }
+    if(ptp_u16(p+13) || op<1u || op>3u || (slot>=TS_SLOTS && !(op==1u && slot==0xFFFFu))) {
+        g_rxRejected++; JLOG("TRAJ_STORE refused: arguments\r\n"); return;
+    }
+    if(!retry) {
+        if(g_home.phase!=HOME_IDLE || g_ptp.active || g_traj.state==TRAJ_RUNNING || !axes_idle()) {
+            JLOG("TRAJ_STORE refused: stage not idle\r\n"); return;
+        }
+        if(op==2u && !traj_runnable(&g_traj)) { JLOG("TRAJ_STORE refused: no complete plan in RAM\r\n"); return; }
+        if(op!=1u && CySetTemp()!=CYRET_SUCCESS) { JLOG("TRAJ_STORE refused: flash temperature setup\r\n"); return; }
+        g_controlSequence=seq; g_storeSeq=seq; memcpy(g_storeAccepted,p,15u);
+        if(op==2u) { ts_job_save(&g_store,(uint8)slot,g_traj.nodes,g_traj.count,g_traj.durationMs); }
+        else if(op==3u) { ts_job_erase(&g_store,(uint8)slot); }
+    }
+    if(op==1u) {
+        uint8 s;
+        for(s=0u;s<TS_SLOTS;s++) { if(slot==0xFFFFu || slot==s) { store_slot_line(s); } }
+    }
+    store_status();
+}
+/* Fill g_traj from a slot through the same checks an upload gets, against the CURRENT joint ranges and speeds, so a
+ * plan saved under other settings is refused instead of run.  A good CRC proves the bytes are intact, nothing more. */
+static uint8 store_load(uint16 slot)
+{
+    ts_info_t in;
+    const uint8 *nodes;
+    traj_limits_t lim;
+    uint16 i;
+    uint8 ok=1u;
+    if(slot>=TS_SLOTS || !TS_LINKED()) { JLOG("PTP refused: archive slot\r\n"); return 0u; }
+    ts_active((uint8)slot,&in);
+    if(!in.valid) { JLOG("PTP refused: archive slot empty or damaged\r\n"); return 0u; }
+    if(g_arm1.usteps!=g_ptp.origin[0]-ptp_offset(0u,in.q1) || g_arm2.usteps!=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,in.q1,in.q2))) {
+        JLOG("PTP refused: move to trajectory start first\r\n"); return 0u;
+    }
+    for(i=0u;i<2u;i++) {
+        lim.rate[i]=motion_min(TRAJ_RATE_MAX,g_motionRate[i]);
+        lim.accel[i]=motion_min(TRAJ_ACCEL_MAX,g_motionAccel[i]);
+    }
+    nodes=ts_flash(ts_block_offset((uint8)slot,in.which))+TS_ROW_BYTES;
+    traj_begin(&g_traj,in.q1,in.q2,in.count);
+    ok=(uint8)(joint_range_ok(in.q1,in.q2) && (int16)ts_get16(nodes)==in.q1 && (int16)ts_get16(nodes+2)==in.q2 && ts_get16(nodes+4)==0u);
+    for(i=1u;ok && i<in.count;i++) {
+        const uint8 *n=nodes+(uint32)i*TS_NODE_BYTES;
+        int16 q1=(int16)ts_get16(n), q2=(int16)ts_get16(n+2);
+        ok=(uint8)(joint_range_ok(q1,q2) && traj_push(&g_traj,&lim,1u,q1,q2,ts_get16(n+4))==TRAJ_PUSH_OK);
+    }
+    if(!ok || g_traj.state!=TRAJ_READY || g_traj.durationMs!=in.durationMs) {
+        traj_discard(); JLOG("PTP refused: archived plan does not fit the current limits\r\n"); return 0u;
+    }
+    JLOGF("TRAJ_LOAD slot=%u seq=%lu nodes=%u duration_ms=%lu\r\n",(unsigned)slot,(unsigned long)in.seq,(unsigned)in.count,(unsigned long)in.durationMs);
+    return 1u;
+}
+
 static uint8 traj_accept(const uint8 *p)
 {
     uint16 value=ptp_u16(p+13);
@@ -2131,6 +2264,10 @@ static uint8 traj_accept(const uint8 *p)
         case TRAJ_PUSH_RATE: JLOG("PTP refused: trajectory rate/velocity change\r\n"); return 0u;
         default: break;
         }
+    } else if(p[0]==13u) {
+        /* LOAD: q1 = slot, q2 = 0, value = 0; the plan comes from flash instead of from numbered node packets. */
+        if(q[1]!=0 || value!=0u) { JLOG("PTP refused: archive load arguments\r\n"); return 0u; }
+        return store_load(ptp_u16(p+9));
     } else {
         /* TRAJ_DONE = the held plan already ran once; the nodes are intact, so a fresh RUN (new sequence) repeats it */
         if(p[0]!=4u || q[0]!=0 || q[1]!=0 || value!=0u || !traj_runnable(&g_traj) ||
@@ -2158,8 +2295,9 @@ static void ptp_accept(void)
     if (ptp_crc(p,15u) != ptp_u16(p+15)) { g_ptpRxDropped++; g_ptpRxCrc++; JLOG("PTP RX dropped: CRC\r\n"); return; }
     if (p[0]==9u || p[0]==10u) { joint_limits_accept(p); return; }
     if (p[0]==11u) { telem_rate_accept(p); return; }
+    if (p[0]==12u) { store_accept(p); return; }
     if (p[0]>=6u && p[0]<=8u) { control_accept(p); return; }
-    if (p[0] < 1u || p[0] > 5u) { JLOG("PTP refused: version\r\n"); return; }
+    if (p[0] < 1u || (p[0] > 5u && p[0] != 13u)) { JLOG("PTP refused: version\r\n"); return; }
     if (!PTP_COMMISSIONED) { JLOG("PTP refused: commissioning lock\r\n"); return; }
     if(p[0]==5u && g_ptp.reference && seq==g_ptp.sequence && memcmp(g_ptp.accepted,p,15u)==0) {
         stage_status(); return; /* retry confirms the same reference, never re-zero */
@@ -2191,8 +2329,8 @@ static void ptp_accept(void)
         JLOG("MANUAL REF OK: operator declares current pose q1=q2=0 straight; no motion; NOT sensor homed\r\n");
         stage_status(); return;
     }
-    if (q1 < g_jointMinCd[0] || q1 > g_jointMaxCd[0] || q2 < g_jointMinCd[1] || q2 > g_jointMaxCd[1] ||
-        q2-q1 < g_jointMinCd[JOINT_ELBOW] || q2-q1 > g_jointMaxCd[JOINT_ELBOW] || (p[0]==1u && (rate < (uint32)CFG_RATE_MIN || rate > PTP_RATE_MAX)) ||
+    /* LOAD (13) carries a slot, not angles; its nodes are range-checked one by one in store_load(). */
+    if ((p[0]!=13u && (!joint_range_ok(q1,q2) || (p[0]==1u && (rate < (uint32)CFG_RATE_MIN || rate > PTP_RATE_MAX)))) ||
         !ptp_counts_in_range(0u,g_arm1.usteps) || !ptp_counts_in_range(1u,g_arm2.usteps)) {
         JLOG("PTP refused: joint range/rate\r\n"); return;
     }
@@ -2838,8 +2976,8 @@ static void stage_status_line(void)
     case 6u:
     traj_status(); break;
     case 7u:
-    JLOGF("LINK uart=hw baud=115200 link=%s rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=%u traj_repeat=1 fault_snapshot=1 telem_hz=%u proto=%u\r\n",
-          (g_usbUp != 0u) ? "usb" : "uart", (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)ARM2_ENCODER_FEEDBACK, (unsigned)g_telemHz, (unsigned)PROTO_VERSION); break;
+    JLOGF("LINK uart=hw baud=115200 link=%s rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=%u traj_repeat=1 fault_snapshot=1 traj_store=%u telem_hz=%u proto=%u\r\n",
+          (g_usbUp != 0u) ? "usb" : "uart", (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)ARM2_ENCODER_FEEDBACK, (unsigned)(TS_LINKED() ? TS_SLOTS : 0u), (unsigned)g_telemHz, (unsigned)PROTO_VERSION); break;
     case 8u:
     JLOGF("PTP_RX short_ok=%lu drop_crc=%lu drop_short=%lu drop_timeout=%lu rejected=%lu epoch_rejected=%lu last_rejected_byte=0x%02X\r\n",
           (unsigned long)g_shortRxOk, (unsigned long)g_ptpRxCrc, (unsigned long)g_ptpRxShort, (unsigned long)g_ptpRxTimeout,
@@ -2973,6 +3111,9 @@ static void jog_axis_init(jog_axis_t *a, const char *name, uint32 pinStep,
     a->usteps       = 0;
     a->peakSlip     = 0;
     a->derates      = 0u;
+    a->slipNow      = 0;
+    a->derateHoldMs = 0u;
+    a->calmMs       = 0u;
     a->settleMs     = 0u;
     a->holding      = 0u;
     a->holdTarget   = 0;
@@ -3116,6 +3257,9 @@ static void jog_axis_tick(jog_axis_t *a)
             a->rampRemainder=0u;
             a->peakSlip = 0;
             a->derates  = 0u;
+            a->slipNow  = 0;
+            a->derateHoldMs = 0u;
+            a->calmMs   = 0u;
             a->holding  = 0u;
             a->statusMs = 0u;
             if (a->hasEnc != 0u)
@@ -3131,6 +3275,20 @@ static void jog_axis_tick(jog_axis_t *a)
     }
     else if (want == a->moving)
     {
+        if (a->derateHoldMs != 0u) { a->derateHoldMs--; }
+        if (a->rateCap < a->rateMax)
+        {
+            /* Lag is dynamic: it shrinks once the cap holds the speed down.
+             * After a calm second try a bit more (ponytail: this saws around
+             * the real limit; a slower-rising cap if that ever bothers). */
+            a->calmMs = (a->slipNow < SLIP_CALM_LSB) ? (uint16)(a->calmMs + 1u) : 0u;
+            if (a->calmMs >= SLIP_RECOVER_MS)
+            {
+                a->calmMs  = 0u;
+                a->rateCap += a->rateCap >> 3;
+                if (a->rateCap > a->rateMax) { a->rateCap = a->rateMax; }
+            }
+        }
         a->rampRemainder+=a->accel;
         a->rate += a->rampRemainder / (1000000u / JOG_TICK_US);
         a->rampRemainder %= (1000000u / JOG_TICK_US);
@@ -3181,7 +3339,7 @@ static void jog_axis_tick(jog_axis_t *a)
         a->settleMs--;
         if (a->settleMs == 0u) { jog_axis_settled(a); }
     }
-    else if ((a->hasEnc != 0u) && (a->holding != 0u))
+    else if ((a->hasEnc != 0u) && (a->holding != 0u) && !g_store.busy)   /* a flash job keeps the stage still: no corrections meanwhile */
     {
         /* Closed-loop hold: nudge the rotor back one microstep at a time.
          * A huge error invalidates the position and stops the whole stage. */
@@ -3224,20 +3382,32 @@ static void jog_slip_check(jog_axis_t *a)
 
     periodUs = a->periodCy / SU_CY_PER_US;
     slip = abs_i32(slip_axis(e,jog_enc_sign(a, a->moving), periodUs));
+    a->slipNow = slip;
     if (slip > a->peakSlip) { a->peakSlip = slip; }
 
     if (slip >= SLIP_FAIL_LSB)
     {
         stage_stop("jog encoder following error", 0u);
     }
-    else if ((slip >= SLIP_WARN_LSB) && (a->derates < SLIP_DERATE_MAX))
+    else if ((slip >= SLIP_WARN_LSB) && (a->derateHoldMs == 0u))
     {
-        a->rateCap >>= 1;
-        if (a->rateCap < a->rateStart) { a->rateCap = a->rateStart; }
-        if (a->rate > a->rateCap)      { a->rate = a->rateCap; }
-        a->derates++;
-        JLOGF("%s SLIP WARN: %ld lsb, cap -> %lu ustep/s\r\n",
-              a->name, (long)slip, (unsigned long)a->rateCap);
+        /* One cut of 25% from the speed that caused it, then wait: the lag
+         * needs a few hundred ms to shrink, three cuts in a row would take
+         * the cap to 1/8 on a single transient. */
+        uint32 floorCap = a->rateMax >> SLIP_DERATE_FLOOR_SHIFT;
+        uint32 cap = (a->rate - (a->rate >> 2));
+        if (cap < floorCap)       { cap = floorCap; }
+        if (cap < a->rateStart)   { cap = a->rateStart; }
+        a->derateHoldMs = SLIP_DERATE_HOLD_MS;
+        a->calmMs = 0u;
+        if (cap < a->rateCap)
+        {
+            a->rateCap = cap;
+            if (a->rate > a->rateCap) { a->rate = a->rateCap; }
+            a->derates++;
+            JLOGF("%s SLIP WARN: %ld lsb, cap -> %lu ustep/s\r\n",
+                  a->name, (long)slip, (unsigned long)a->rateCap);
+        }
     }
 }
 
@@ -3275,7 +3445,7 @@ static void jog_apply_keys(uint8 mask)
         g_jogKeysIdle = (mask == 0u) ? 1u : 0u;
         if ((g_home.phase != HOME_IDLE) && (mask != 0u))
         { stage_stop("jog key pressed during HOME", 0u); }
-        if ((g_home.phase != HOME_IDLE) || g_ptp.active || (g_motionEnabled == 0u) || (g_homeNeedKeyRelease != 0u))
+        if ((g_home.phase != HOME_IDLE) || g_ptp.active || g_store.busy || (g_motionEnabled == 0u) || (g_homeNeedKeyRelease != 0u))
         {
             if (mask == 0u) { g_homeNeedKeyRelease = 0u; }
             g_arm1.want = 0;
@@ -3612,6 +3782,8 @@ static void app_poll(void)
     service_encoder_sampling();
 
     stage_status_service();
+
+    store_service();   /* a flash save/erase: one row per pass, only while the stage is still */
 
 #if (HW_TXDMA != 0u)
     if (txq_pending() != 0u) { txq_send_one(); }       /* the DMA needs no gap between steps */

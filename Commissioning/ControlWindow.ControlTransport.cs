@@ -263,10 +263,21 @@ public sealed partial class ControlWindow
                 // instead of 17.75 ms.  No control sequence is consumed, so command
                 // ordering is unaffected.
                 packet = PtpProtocol.EncodeShortHeartbeat((byte)keys);
-            } else if (heartbeat || (epochReady && pendingControlType != 0 && (motionAllowed || pendingControlType is 9 or 10 or 11))) {
+            } else if (heartbeat || (epochReady && pendingControlType != 0 && (motionAllowed || pendingControlType is 9 or 10 or 11 or 12))) {
                 bool limits = !heartbeat && pendingControlType is 9 or 10;
                 bool telemRate = !heartbeat && pendingControlType == 11;   // output only: taken whether or not motion is allowed
-                if (limits && limitPacket.Length > 0) packet = limitPacket;
+                bool store = !heartbeat && pendingControlType == 12;       // the flash archive: the device itself insists on a still stage
+                if (store) {
+                    // A retry repeats the identical bytes, which the device answers without redoing anything.
+                    if (storeResend && storePacket.Length > 0) packet = storePacket;
+                    else {
+                        if (controlSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("err.seqExhaustedCtrl"));
+                        packet = storePacket = PtpProtocol.EncodeStore(++controlSequence, controlEpoch, storeRequestSlot, storeRequestOp);
+                        if (storeJob is { } job) job.Sequence = controlSequence;
+                    }
+                    storeResend = false;
+                }
+                else if (limits && limitPacket.Length > 0) packet = limitPacket;
                 else {
                     if (controlSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("err.seqExhaustedCtrl"));
                     packet = PtpProtocol.EncodePacket(heartbeat ? (byte)6 : pendingControlType, ++controlSequence,
