@@ -35,13 +35,14 @@ public sealed partial class ControlWindow
                 Check(w.Title == Lang.T("app.title") && Equals(w.langToggle.Content, Lang.T("lang.toggle")), "chrome stale");
                 Check(string.Equals(w.Language.IetfLanguageTag, english ? "en-NZ" : "zh-CN", StringComparison.OrdinalIgnoreCase), "WPF accessibility language stale");
             }
-            foreach (int shape in Enumerable.Range(0, 4)) {
+            foreach (int shape in new[] { 0, 1, 2, 3, (int)DrawingShape.Freehand + 1 }) {
                 p.SelectShapeForSelfTest(shape); p.LoadExampleForSelfTest();
                 p.CheckLanguagePreservesPreview(() => Toggle(true));
                 Check(p.ResultForSelfTest.Contains(shape == 0 ? "Target" : "Trajectory"), "plan details stale");
                 p.CheckLanguagePreservesPreview(() => Toggle(false));
             }
             // Existing error messages and invalid edits must survive the switch without applying the edits.
+            p.SelectShapeForSelfTest(3); p.LoadExampleForSelfTest();
             p.CheckLanguageInvalidEdit(() => Toggle(true), () => Toggle(false));
             p.SelectShapeForSelfTest(3); p.LoadExampleForSelfTest();
             const uint epoch = 4;

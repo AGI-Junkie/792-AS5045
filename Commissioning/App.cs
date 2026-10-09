@@ -17,14 +17,15 @@ public sealed class App : Application
     [STAThread]
     public static int Main(string[] args)
     {
-        if (args.Contains("--self-test") || args.Contains("--language-self-test") || args.Contains("--upload-language-test") || args.Contains("--log-level-self-test"))
+        if (args.Contains("--self-test") || args.Contains("--language-self-test") || args.Contains("--upload-language-test") || args.Contains("--log-level-self-test") || args.Contains("--freehand-self-test"))
         {
             try
             {
                 Lang.PersistChanges = false;
                 int snapshot = Array.IndexOf(args, "--snapshot");
                 string? path = snapshot >= 0 && snapshot + 1 < args.Length ? args[snapshot + 1] : null;
-                if (args.Contains("--log-level-self-test")) ControlWindow.LoggingSelfTest();
+                if (args.Contains("--freehand-self-test")) { Lang.Set(false, false); FreehandTrajectory.SelfTest(); XYPreviewPanel.FreehandSelfTest(path); }
+                else if (args.Contains("--log-level-self-test")) ControlWindow.LoggingSelfTest();
                 else if (args.Contains("--upload-language-test")) ControlWindow.UploadLanguageTest();
                 else if (args.Contains("--language-self-test")) { Lang.SelfTest(); ControlWindow.LanguageSelfTest(path); }
                 else ControlWindow.SelfTest(path);
@@ -190,6 +191,7 @@ public sealed partial class ControlWindow : Window
     private static bool IsTextInteraction(ModifierKeys modifiers, bool textFocused) => modifiers != ModifierKeys.None || textFocused;
     private void OnKeyDown(object sender, KeyEventArgs e)
     {
+        if (e.Key == Key.Escape && xyPreview.CancelFreehandOnEscape()) { e.Handled = true; return; }
         if (e.Key is Key.Space or Key.Escape) { Stop(); e.Handled = true; return; }
         // Ctrl+C/Ctrl+A and navigation inside the log are native text operations.
         if (IsTextInteraction(Keyboard.Modifiers, IsEditingControls)) return;

@@ -49,29 +49,31 @@ public sealed partial class XYPreviewPanel : UserControl
     // the extra shape fields (c, rotation, scale, custom contour).
     private const int LegacyFieldCount = 15, ElbowFieldCount = 17, CustomFieldIndex = 20;
     private TextBox[] ParameterFields => [l1,l2,x,y,a,b,min1,max1,min2,max2,feed,v1,v2,acc1,acc2,elbowMin,elbowMax,c,rotation,scale,custom];
-    private sealed record SavedParameters(int Schema, int Shape, int Branch, string[] Fields, int Direction = 0);
-    private string SaveParameters() => JsonSerializer.Serialize(new SavedParameters(1,shape.SelectedIndex,branch.SelectedIndex,ParameterFields.Select(f=>f.Text).ToArray(),direction.SelectedIndex),new JsonSerializerOptions { WriteIndented=true });
+    private sealed record SavedParameters(int Schema, int Shape, int Branch, string[] Fields, int Direction = 0, FreehandPoint[]? Freehand = null);
+    private string SaveParameters() => JsonSerializer.Serialize(new SavedParameters(1,shape.SelectedIndex,branch.SelectedIndex,ParameterFields.Select(f=>f.Text).ToArray(),direction.SelectedIndex,freehandPoints.ToArray()),new JsonSerializerOptions { WriteIndented=true });
     private void RestoreParameters(string json)
     {
         var p=JsonSerializer.Deserialize<SavedParameters>(json);
         if(p is null || p.Schema!=1 || p.Shape < 0 || p.Shape >= shape.Items.Count || p.Branch is <0 or >1 || p.Direction is <0 or >1 || p.Fields is null ||
             p.Fields.Length!=LegacyFieldCount && p.Fields.Length!=ElbowFieldCount && p.Fields.Length!=ParameterFields.Length ||
             p.Fields.Select((v,i)=>v is null || v.Length>(i==CustomFieldIndex?4096:32)).Any(bad=>bad)) throw Lang.Error("fault.paramFormat");
+        if (p.Freehand is { } points) FreehandTrajectory.Validate(points);
         updating=true;
         try { shape.SelectedIndex=p.Shape; branch.SelectedIndex=p.Branch; direction.SelectedIndex=p.Direction;
             // A field the file does not have keeps its default: the elbow range, c and the custom contour empty, rotation 0, scale 1.
             for(int i=0;i<ParameterFields.Length;i++) ParameterFields[i].Text=i<p.Fields.Length?p.Fields[i]:ParameterFields[i]==rotation?"0":ParameterFields[i]==scale?"1":"";
-            ClampRateFields(); }
+            RestoreFreehand(p.Freehand); freehandMode = p.Shape == FreehandIndex; ClampRateFields(); }
         finally { updating=false; ShapeFields(); Refresh(); NotifyLimitsChanged(); }
     }
     private static string ParametersPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "parameters.json");
     public event Action? ParametersSaved;
     private void SaveCurrentParameters(string path)
     {
+        if (RecordingFreehand) return;
         Refresh();
         try {
             _=Model; _=PreviewLimits(); _=MotionProfile.From(RequestedRates);
-            _=Number(x); _=Number(y);
+            if (shape.SelectedIndex != FreehandIndex) { _=Number(x); _=Number(y); }
             if(shape.SelectedIndex>0) _=ShapeOptionsFromFields(); 
             WriteParameters(path);
             ParametersSaved?.Invoke();
@@ -79,6 +81,7 @@ public sealed partial class XYPreviewPanel : UserControl
     }
     private void WriteParameters(string path)
     {
+        FreehandTrajectory.Validate(freehandPoints);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path + ".tmp", SaveParameters(), new UTF8Encoding(false));
         File.Move(path + ".tmp", path, true);
@@ -95,7 +98,7 @@ public sealed partial class XYPreviewPanel : UserControl
     {
         if (!File.Exists(path)) return;
         try {
-            if (new FileInfo(path).Length > 32768) throw Lang.Error("fault.paramTooBig");
+            if (new FileInfo(path).Length > 512 * 1024) throw Lang.Error("fault.paramTooBig");
             RestoreParameters(File.ReadAllText(path));
             RememberSaved();
         } catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException) { operationError=() => Lang.T("fault.paramRestore")+ex.Message; UpdatePointButton(); }
@@ -115,14 +118,17 @@ public sealed partial class XYPreviewPanel : UserControl
     public FrameworkElement ParameterContent { get; private set; } = null!;
     public void SetEditingAllowed(bool allowed)
     {
+        editingAllowed = allowed;
+        if (!allowed) CancelFreehandStroke();
         foreach(var c in editControls) c.IsEnabled = allowed;
         if (allowed) { export.IsEnabled = play.IsEnabled = rewind.IsEnabled = cursor.IsEnabled = timing is not null; }
         else PausePlayback();
+        UpdateFreehandTools();
     }
     // a and b mean radius, end point or size depending on the shape, so a value typed for one shape is meaningless for
     // another (a circle's radius 5 became a line ending at X=5). Each shape keeps its own a/b; a shape never visited
     // starts from a small example next to the start point that fits the default joint range.
-    private readonly string[][] shapeDims = Enumerable.Range(0, 11).Select(_ => new[] { "", "", "" }).ToArray();
+    private readonly string[][] shapeDims = Enumerable.Range(0, Enum.GetValues<DrawingShape>().Length + 1).Select(_ => new[] { "", "", "" }).ToArray();
     private int shownShape = 3;
     private static string Mm(double value) => Math.Round(value, 2).ToString("0.##", CultureInfo.InvariantCulture);
     private string[] ExampleDims(int index)
@@ -148,6 +154,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private ShapeOptions ShapeOptionsFromFields()
     {
         int index = shape.SelectedIndex; var uses = ShapeUses(index);
+        if (index == FreehandIndex) return new ShapeOptions { FreehandPoints = freehandPoints.ToArray() };
         _ = Number(x); _ = Number(y);
         if (uses.A) _ = Number(a);
         if (uses.B) _ = Number(b);
@@ -165,12 +172,14 @@ public sealed partial class XYPreviewPanel : UserControl
     }
     private void LoadExample()
     {
+        CancelFreehandStroke();
         updating = true;
         try {
             branch.SelectedIndex=0; x.Text="340"; y.Text="0";
             var dims = ExampleDims(shape.SelectedIndex); a.Text=dims[0]; b.Text=dims[1]; c.Text=dims[2];
             rotation.Text="0"; scale.Text="1"; direction.SelectedIndex=0;
             if (shape.SelectedIndex == 10) custom.Text = ExampleContour;
+            if (shape.SelectedIndex == FreehandIndex) LoadFreehandExample();
         } finally { updating=false; ShapeFields(); Refresh(); NotifyLimitsChanged(); }
     }
     private readonly TextBox l1 = Field("180"), l2 = Field("176.38"), x = Field("340"), y = Field("0");
@@ -257,7 +266,7 @@ public sealed partial class XYPreviewPanel : UserControl
     }
     public XYPreviewPanel()
     {
-        foreach (var key in Enumerable.Range(0, 11).Select(i => "xy.shape" + i))
+        foreach (var key in Enumerable.Range(0, Enum.GetValues<DrawingShape>().Length + 1).Select(i => "xy.shape" + i))
             shape.Items.Add(Lang.Bind(new ComboBoxItem(), ContentControl.ContentProperty, key));
         foreach (var key in new[] { "xy.dirCcw", "xy.dirCw" })
             direction.Items.Add(Lang.Bind(new ComboBoxItem(), ContentControl.ContentProperty, key));
@@ -295,12 +304,13 @@ public sealed partial class XYPreviewPanel : UserControl
         var geometry = Group("section.geometry"); geometry.Children.Add(BuildLamps(ShapeGroup, false));
         geometry.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.shape"), shape));
         geometry.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.branch"), branch));
-        geometry.Children.Add(WorkbenchTheme.Row(xLabel, x)); geometry.Children.Add(WorkbenchTheme.Row(yLabel, y));
+        geometry.Children.Add(xRow = WorkbenchTheme.Row(xLabel, x)); geometry.Children.Add(yRow = WorkbenchTheme.Row(yLabel, y));
         geometry.Children.Add(aRow = WorkbenchTheme.Row(aLabel, a)); geometry.Children.Add(bRow = WorkbenchTheme.Row(bLabel, b));
         geometry.Children.Add(cRow = WorkbenchTheme.Row(cLabel, c));
         customLabel.Margin = new Thickness(10,4,10,0); customLabel.Foreground = WorkbenchTheme.Muted; customLabel.TextWrapping = TextWrapping.Wrap;
         geometry.Children.Add(customRow = WorkbenchTheme.Edge(new StackPanel { Children = { customLabel, custom } }, Brushes.White, new Thickness(0,0,0,1)));
         var transform = Group("section.transform"); transform.Children.Add(BuildLamps(ShapeGroup, false));
+        transformSection = (FrameworkElement)controls.Children[controls.Children.Count - 1];
         transform.Children.Add(Prop("xy.rotation", rotation, "°")); transform.Children.Add(Prop("xy.scale", scale, "×"));
         transform.Children.Add(WorkbenchTheme.Row(WorkbenchTheme.LocalLabel("xy.direction"), direction));
         var dimensions = Group("section.dimensions"); dimensions.Children.Add(BuildLamps(SizeGroup, false));
@@ -358,7 +368,7 @@ public sealed partial class XYPreviewPanel : UserControl
         direction.SelectionChanged += (_, _) => ParametersChanged();
         foreach (var help in rangeHelp) editControls.Add(help);
         branch.SelectionChanged += (_, _) => ParametersChanged();
-        shape.SelectionChanged += (_, _) => { SwitchShape(); ShapeFields(); ParametersChanged(); };
+        shape.SelectionChanged += (_, _) => { CancelFreehandStroke(); freehandMode = shape.SelectedIndex == FreehandIndex; SwitchShape(); ShapeFields(); ParametersChanged(); UpdateFreehandTools(); };
         cursor.ValueChanged += (_, _) => { if (!advancing) { PausePlayback(); offlineSim=true; } DrawSample(); };
         canvas.SizeChanged += (_, _) => RedrawViewport();
         play.Click += (_, _) => TogglePlayback(); rewind.Click += (_, _) => { PausePlayback(); offlineSim=true; cursor.Value = 0; RedrawViewport(); };
@@ -461,6 +471,8 @@ public sealed partial class XYPreviewPanel : UserControl
         bRow.Visibility = b.Visibility = bLabel.Visibility = lb == "" ? Visibility.Collapsed : Visibility.Visible;
         cRow.Visibility = c.Visibility = cLabel.Visibility = lc == "" ? Visibility.Collapsed : Visibility.Visible;
         customRow.Visibility = s == 10 ? Visibility.Visible : Visibility.Collapsed;
+        xRow.Visibility = yRow.Visibility = transformSection.Visibility = s == FreehandIndex ? Visibility.Collapsed : Visibility.Visible;
+        UpdateFreehandTools();
         customLabel.Text = Lang.T("xy.customHelp");
         System.Windows.Automation.AutomationProperties.SetName(custom, Lang.T("xy.customName"));
         System.Windows.Automation.AutomationProperties.SetName(x,xLabel.Text); System.Windows.Automation.AutomationProperties.SetName(y,yLabel.Text);
@@ -494,7 +506,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private JointLimits PreviewLimits() => Limits() ?? DefaultTrialRange;
     private void Refresh()
     {
-        if (updating) return;
+        if (updating || RecordingFreehand) return;
         parametersDirty = false;
         offlineSim = false;
         cameraReady = false; autoFit = true; operationError=null;
@@ -507,7 +519,7 @@ public sealed partial class XYPreviewPanel : UserControl
         {
             var model = new PlanarArm(Number(l1), Number(l2));
             _ = MotionProfile.From(RequestedRates);
-            double tx = Number(x), ty = Number(y);
+            double tx = shape.SelectedIndex == FreehandIndex ? 0 : Number(x), ty = shape.SelectedIndex == FreehandIndex ? 0 : Number(y);
             JointLimits? limits = PreviewLimits(); planningLimits = limits;
             if (shape.SelectedIndex > 0)
             {
@@ -546,6 +558,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private void ParametersChanged()
     {
         if (updating) return;
+        CancelFreehandStroke();
         parametersDirty = true;
         cameraReady = false; autoFit = true;
         RefreshOverlayLimits(); RefreshRangeHelp();
@@ -843,7 +856,7 @@ public sealed partial class XYPreviewPanel : UserControl
         double Width(DrawingTrajectory t) => t.Samples.Max(s => s.Target.X) - t.Samples.Min(s => s.Target.X);
         // Each shape shows the fields it reads and hides the rest.
         foreach (var (index, usesA, usesB, usesC, usesText) in new[] { (0,false,false,false,false), (1,true,true,false,false), (2,true,true,false,false), (3,true,false,false,false),
-            (4,true,true,false,false), (5,true,true,true,false), (6,true,true,true,false), (7,true,true,true,false), (8,true,true,false,false), (9,true,true,true,false), (10,false,false,false,true) })
+            (4,true,true,false,false), (5,true,true,true,false), (6,true,true,true,false), (7,true,true,true,false), (8,true,true,false,false), (9,true,true,true,false), (10,false,false,false,true), (11,false,false,false,false) })
         {
             Show(index);
             if ((panel.aRow.Visibility == Visibility.Visible) != usesA || (panel.bRow.Visibility == Visibility.Visible) != usesB ||
@@ -895,7 +908,7 @@ public sealed partial class XYPreviewPanel : UserControl
             panel.RestoreParameters(JsonSerializer.Serialize(new { Schema = 1, Shape = 3, Branch = 0, Fields = fields }));
             if (panel.rotation.Text != "0" || panel.scale.Text != "1" || panel.direction.SelectedIndex != 0 || panel.custom.Text != "") Fail($"{count} 个字段的旧文件应以默认变换恢复");
         }
-        foreach (string bad in new[] { JsonSerializer.Serialize(new { Schema = 1, Shape = 11, Branch = 0, Fields = panel.ParameterFields.Select(f => f.Text).ToArray() }),
+        foreach (string bad in new[] { JsonSerializer.Serialize(new { Schema = 1, Shape = panel.shape.Items.Count, Branch = 0, Fields = panel.ParameterFields.Select(f => f.Text).ToArray() }),
             JsonSerializer.Serialize(new { Schema = 1, Shape = 3, Branch = 0, Fields = panel.ParameterFields.Select(f => f.Text).ToArray(), Direction = 2 }),
             JsonSerializer.Serialize(new { Schema = 1, Shape = 3, Branch = 0, Fields = panel.ParameterFields.Select((f, i) => i == 0 ? new string('9', 33) : f.Text).ToArray() }),
             JsonSerializer.Serialize(new { Schema = 1, Shape = 10, Branch = 0, Fields = panel.ParameterFields.Select((f, i) => i == CustomFieldIndex ? new string('1', 4097) : f.Text).ToArray() }) })
@@ -937,6 +950,7 @@ public sealed partial class XYPreviewPanel : UserControl
         ShapeFieldsSelfTest();
         RecentRunsSelfTest();
         ShapeDefaultsSelfTest();
+        FreehandSelfTest(snapshotPath);
         var panel = new XYPreviewPanel();
         panel.ViewportSelfTest();
         ArmMotionPreviewSelfTest();
@@ -1148,7 +1162,7 @@ public sealed partial class XYPreviewPanel : UserControl
             // Render every supported shape through the same controls and planner.
             panel.SetStartFeedback(null);
             panel.SetPointMoveState(false,null,"离线预览；未连接设备。",true);
-            string[] shapeNames={"point","line","rectangle","circle","ellipse","arc","rounded-rectangle","figure8","polygon","spiral","custom"};
+            string[] shapeNames={"point","line","rectangle","circle","ellipse","arc","rounded-rectangle","figure8","polygon","spiral","custom","freehand"};
             for(int selected=0;selected<shapeNames.Length;selected++) {
                 panel.shape.SelectedIndex=selected;
                 if(selected<=3) {
