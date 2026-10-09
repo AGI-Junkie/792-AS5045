@@ -71,12 +71,15 @@ internal static class FreehandTrajectory
             Validate(original);
             var raw = new List<Point>();
             foreach (var p in original) if (raw.Count == 0 || (p.Point - raw[^1]).Length > 1e-9) raw.Add(p.Point);
+            if (raw.Count < 2 || raw.Zip(raw.Skip(1)).Sum(s => (s.Second - s.First).Length) < 1) throw;   // too short to repair: keep Create's own message
             var reference = Simplify(raw).Select(i => raw[i]).ToList();
             foreach (var (passes, margin) in RepairLevels)
             {
                 var candidate = Reshape(raw, model, limits, branch, passes, margin);
                 if (candidate is null) continue;
-                double shift = candidate.Max(p => reference.Zip(reference.Skip(1)).Min(s => Distance(p.Point, s.First, s.Second)));
+                // Both ways: the plan must stay near the draft, and every draft vertex (a retraced excursion included) near the plan.
+                double Away(IEnumerable<Point> from, List<Point> to) => from.Max(p => to.Zip(to.Skip(1)).Min(s => Distance(p, s.First, s.Second)));
+                double shift = Math.Max(Away(candidate.Select(p => p.Point), reference), Away(reference, candidate.Select(p => p.Point).ToList()));
                 if (shift > RepairShift) continue;
                 try { Verify(candidate); return (candidate, shift); } catch (ArgumentException) { }
             }
@@ -331,6 +334,8 @@ internal static class FreehandTrajectory
         var legalised = new ExecutionTrajectory(new TimedTrajectory(DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, 0, range,
             new ShapeOptions { FreehandPoints = repaired.Points }), rates), range);
         ExecutionTrajectory.Validate(legalised.Nodes, range);
+        foreach (var bad in new[] { Array.Empty<FreehandPoint>(), [new(330, 0)], [new(330, 0), new(330, 0)], [new(330, 0), new(380, 0), new(330, 0)] })   // short drafts keep Create's error; a retraced excursion cannot hide its shift
+            try { Repair(bad, model, range, 0, rates); Check(false, "repair accepted " + bad.Length + " points"); } catch (ArgumentException) { }
         try { Repair([new(330, 0), new(50, 0), new(-50, 0)], model, range, 0, rates); Check(false, "repair crossed the unreachable hole"); }   // no re-routing
         catch (ArgumentException) { }
         try {
