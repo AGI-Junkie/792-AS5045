@@ -51,6 +51,9 @@ public sealed partial class XYPreviewPanel
         panel.RestoreParameters(JsonSerializer.Serialize(savedRecord with { Freehand = FreehandTrajectory.RefinementExample }));
         Check(panel.execution is not null && panel.trajectory!.Stops.Length == 2, "automatic corner refinement: " + panel.result.Text);
         Check(panel.freehandPoints.SequenceEqual(FreehandTrajectory.RefinementExample), "refinement rewrote the saved draft");
+        var overshoot = Enumerable.Range(0, 81).Select(i => new FreehandPoint(330 + i * 0.4, 3 * Math.Sin(i * 0.2))).ToArray();
+        panel.RestoreParameters(JsonSerializer.Serialize(savedRecord with { Freehand = overshoot }));
+        Check(panel.execution is not null && panel.freehandPoints.SequenceEqual(overshoot) && panel.result.Text.Contains(Lang.T("fh.repaired", 1.0).TrimStart()[..4]), "automatic repair: " + panel.result.Text);
         panel.RestoreParameters(saved);
         var large = savedRecord with { Freehand = Enumerable.Range(0, 5000).Select(i => new FreehandPoint(330 + i / 1000.0, 0)).ToArray() };
         string largeJson = JsonSerializer.Serialize(large);

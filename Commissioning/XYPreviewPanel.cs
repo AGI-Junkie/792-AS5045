@@ -525,6 +525,11 @@ public sealed partial class XYPreviewPanel : UserControl
             {
                 JointLimits? bounds = limits;
                 var uses = ShapeUses(shape.SelectedIndex); var extras = ShapeOptionsFromFields();
+                double repaired = 0;   // freehand only: how far the plan had to leave the draft to become legal
+                if (shape.SelectedIndex == FreehandIndex) {
+                    var fixedDraft = FreehandTrajectory.Repair(extras.FreehandPoints, model, bounds, Math.Max(0, branch.SelectedIndex), RequestedRates);
+                    extras = extras with { FreehandPoints = fixedDraft.Points }; repaired = fixedDraft.Shift;
+                }
                 trajectory = DrawingTrajectory.Create(model, (DrawingShape)(shape.SelectedIndex - 1), tx, ty,
                     uses.A ? Number(a) : 0, uses.B ? Number(b) : 0, Math.Max(0, branch.SelectedIndex), bounds, extras);
                 timing = new TimedTrajectory(trajectory, RequestedRates);
@@ -536,7 +541,7 @@ public sealed partial class XYPreviewPanel : UserControl
                     trajectory.Samples.Min(s => s.Pose.Q1), trajectory.Samples.Max(s => s.Pose.Q1),
                     trajectory.Samples.Min(s => s.Pose.Q2), trajectory.Samples.Max(s => s.Pose.Q2),
                     trajectory.Samples.Min(s => JointLimits.Elbow(s.Pose)), trajectory.Samples.Max(s => JointLimits.Elbow(s.Pose))) +
-                    (trajectory.NearSingularity ? Lang.T("plan.nearSing") : ""));
+                    (trajectory.NearSingularity ? Lang.T("plan.nearSing") : "") + (repaired > 0 ? Lang.T("fh.repaired", repaired) : ""));
                 cursor.Maximum = timing.Duration; cursor.Value = 0; offlineSim = false;   // resetting the cursor is not scrubbing
                 export.IsEnabled = cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = true; DrawSample();
                 return;

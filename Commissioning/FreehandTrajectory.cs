@@ -49,6 +49,92 @@ internal static class FreehandTrajectory
         throw Lang.Error("err.freehandFit", 1);
     }
 
+    // Passes of a [1 2 1] smoothing filter and the margin (mm; half of it in degrees) kept from every reach/joint bound, mildest first.
+    private static readonly (int Passes, double Margin)[] RepairLevels = [(2, 1), (8, 2), (32, 4), (128, 6)];
+    internal const double RepairShift = 12;
+
+    // The draft as drawn when the whole plan checks. Otherwise a smoothed copy with its out-of-reach points pulled into the
+    // reachable region, the mildest one that checks. Shift: how far (mm) the plan strays from the draft; 0 when untouched.
+    // ponytail: a stroke that crosses an unreachable hole is not re-routed, only pulled to the edge, so it still fails.
+    internal static (FreehandPoint[] Points, double Shift) Repair(IReadOnlyList<FreehandPoint> draft, PlanarArm model, JointLimits? limits, int branch, PlanningRates rates)
+    {
+        void Verify(FreehandPoint[] points)
+        {
+            var path = DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, branch, limits, new ShapeOptions { FreehandPoints = points });
+            var timing = new TimedTrajectory(path, rates);
+            if (limits is { } range) _ = new ExecutionTrajectory(timing, range);
+        }
+        var original = draft.ToArray();
+        try { Verify(original); return (original, 0); }
+        catch (ArgumentException)
+        {
+            Validate(original);
+            var raw = new List<Point>();
+            foreach (var p in original) if (raw.Count == 0 || (p.Point - raw[^1]).Length > 1e-9) raw.Add(p.Point);
+            var reference = Simplify(raw).Select(i => raw[i]).ToList();
+            foreach (var (passes, margin) in RepairLevels)
+            {
+                var candidate = Reshape(raw, model, limits, branch, passes, margin);
+                if (candidate is null) continue;
+                double shift = candidate.Max(p => reference.Zip(reference.Skip(1)).Min(s => Distance(p.Point, s.First, s.Second)));
+                if (shift > RepairShift) continue;
+                try { Verify(candidate); return (candidate, shift); } catch (ArgumentException) { }
+            }
+            throw;
+        }
+    }
+
+    private static FreehandPoint[]? Reshape(List<Point> raw, PlanarArm model, JointLimits? limits, int branch, int passes, double margin)
+    {
+        double total = raw.Zip(raw.Skip(1)).Sum(s => (s.Second - s.First).Length);
+        int n = Math.Max(1, (int)Math.Ceiling(total / Math.Max(1, total / 4000)));
+        var line = new Point[n + 1]; line[0] = raw[0]; line[n] = raw[^1];
+        double done = 0;
+        for (int k = 1, seg = 0; k < n; k++)
+        {
+            double target = total * k / n;
+            while (seg < raw.Count - 2 && done + (raw[seg + 1] - raw[seg]).Length < target) { done += (raw[seg + 1] - raw[seg]).Length; seg++; }
+            double length = (raw[seg + 1] - raw[seg]).Length;
+            line[k] = raw[seg] + (raw[seg + 1] - raw[seg]) * Math.Clamp(length == 0 ? 0 : (target - done) / length, 0, 1);
+        }
+        for (int pass = 0; pass < passes; pass++)
+        {
+            var next = (Point[])line.Clone();
+            for (int i = 1; i < n; i++) next[i] = new Point((line[i - 1].X + 2 * line[i].X + line[i + 1].X) / 4, (line[i - 1].Y + 2 * line[i].Y + line[i + 1].Y) / 4);
+            line = next;
+        }
+        double inner = model.InnerRadius + margin, outer = model.OuterRadius - margin, degrees = margin / 2;
+        JointLimits? inside = limits is { } l ? new(l.Min1 + degrees, l.Max1 - degrees, l.Min2 + degrees, l.Max2 - degrees, l.ElbowMin + degrees, l.ElbowMax - degrees) : null;
+        bool Feasible(Point p)
+        {
+            double radius = ((Vector)p).Length;
+            if (radius < inner || radius > outer) return false;
+            var poses = model.Inverse(p.X, p.Y);
+            return inside is not { } range || range.Contains(poses[Math.Min(branch, poses.Length - 1)]);
+        }
+        for (int i = 0; i <= n; i++)
+        {
+            if (Feasible(line[i])) continue;
+            // Nearest reachable point: grow a ring around it, take the ring point closest to the previous one, then walk it back to the edge.
+            Point? hit = null;
+            for (double d = 0.5; d <= RepairShift && hit is null; d += 0.5)
+            {
+                double gap = double.MaxValue;
+                for (int k = 0; k < 64; k++)
+                {
+                    var c = new Point(line[i].X + d * Math.Cos(Math.PI * k / 32), line[i].Y + d * Math.Sin(Math.PI * k / 32));
+                    double away = i == 0 ? 0 : (c - line[i - 1]).Length;
+                    if (away < gap && Feasible(c)) { gap = away; hit = c; }
+                }
+            }
+            if (hit is not { } edge) return null;
+            Point low = line[i];
+            for (int k = 0; k < 8; k++) { var mid = low + (edge - low) * 0.5; if (Feasible(mid)) edge = mid; else low = mid; }
+            line[i] = edge;
+        }
+        return line.Select(p => new FreehandPoint(p.X, p.Y)).ToArray();
+    }
+
     private static List<int> Simplify(IReadOnlyList<Point> points)
     {
         var keep = new SortedSet<int> { 0, points.Count - 1 };
@@ -233,6 +319,20 @@ internal static class FreehandTrajectory
                 new ShapeOptions { FreehandPoints = [new(50, 0), new(-50, 0)] });
             throw new InvalidOperationException("Freehand accepted an unreachable interior");
         } catch (ArgumentException) { }
+        // Repair: a legal draft is untouched; one overshooting the reach (356.38 mm) or jittery is made legal within RepairShift.
+        var rates = new PlanningRates(10, 5, 3, 10, 6);
+        var legal = Repair(raw.Select(p => new FreehandPoint(320 + p.X, p.Y)).ToArray(), model, range, 0, rates);
+        Check(legal.Shift == 0, "repair touched a legal draft");
+        var overshoot = Enumerable.Range(0, 81).Select(i => new FreehandPoint(330 + i * 0.4, 3 * Math.Sin(i * 0.2))).ToArray();
+        try { DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, 0, range, new ShapeOptions { FreehandPoints = overshoot }); Check(false, "overshoot was legal"); }
+        catch (ArgumentException) { }
+        var repaired = Repair(overshoot, model, range, 0, rates);
+        Check(repaired.Shift > 0 && repaired.Shift <= RepairShift && repaired.Points.All(p => ((Vector)p.Point).Length < model.OuterRadius), "repair left the reach");
+        var legalised = new ExecutionTrajectory(new TimedTrajectory(DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, 0, range,
+            new ShapeOptions { FreehandPoints = repaired.Points }), rates), range);
+        ExecutionTrajectory.Validate(legalised.Nodes, range);
+        try { Repair([new(330, 0), new(50, 0), new(-50, 0)], model, range, 0, rates); Check(false, "repair crossed the unreachable hole"); }   // no re-routing
+        catch (ArgumentException) { }
         try {
             ExecutionTrajectory.Validate(new ExecutionNode[DeviceContract.TrajCapacity + 1], range);
             throw new InvalidOperationException("Freehand capacity gate missing");
