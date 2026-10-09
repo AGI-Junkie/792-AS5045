@@ -753,7 +753,7 @@ static uint8 enc_flight_poll(uint8 *ok)
     uint32 raw1=0u, raw2=0u;
     if(!g_encFlight) { return 0u; }
     if(ssi_done()) { ssi_take(&raw1,&raw2); }
-    else if(SU_ELAPSED(g_encFlightAt) >= SSI_TIMEOUT_US*SU_CY_PER_US) { ssi_abort(); }   /* a dead frame reads as 0 */
+    else if(SU_ELAPSED(g_encFlightAt) >= SSI_TIMEOUT_US*SU_CY_PER_US) { g_ssiTimeouts++; ssi_abort(); }   /* a dead frame reads as 0 */
     else { return 0u; }
     if(!enc_decode_pair(raw1,raw2,&a,&b) && (uint8)(g_encTry+1u)<ENCODER_READ_RETRIES) { g_encTry++; enc_flight_start(1u); return 0u; }
     g_encFlight=0u;
@@ -3342,8 +3342,12 @@ static void jog_handle_byte(uint8 b)
              * until it says OK, then power-cycle to enter closed loop. */
             as5045_t s;
             uint8 code;
+            uint32 timeoutsBefore = g_ssiTimeouts;
             as5045_read(&s);
             code = classify(&s);
+            /* raw=0 is either DO held low or a frame that never completed: report which, and the pin as it is right now */
+            JLOGF("ENCODER ssi_timeouts=%lu this_read_timed_out=%u do_pin=%u\r\n",
+                  (unsigned long)g_ssiTimeouts, (unsigned)(g_ssiTimeouts != timeoutsBefore), (unsigned)(CyPins_ReadPin(PIN_DO) != 0u));
             JLOGF("ENCODER %s raw=0x%05lX angle=%u OCF=%u COF=%u LIN=%u INC=%u DEC=%u PAR=%u(%s)%s\r\n",
                   state_name(code), (unsigned long)s.raw, (unsigned)s.angle,
                   (unsigned)s.ocf, (unsigned)s.cof, (unsigned)s.lin,

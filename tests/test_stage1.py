@@ -2205,6 +2205,12 @@ int main(int argc,char **argv) {
             for(k=0;k<40 && !enc_flight_poll(&ok);k++) simClock+=SIM_MHZ*200u;
             assert(k<40 && !ok && !g_encFlight && g_enc.badStreak==1u);
             simSsiDead=0u; assert(enc_sample() && !g_enc.badStreak);   /* and the interface works again afterwards */
+        } else if(!strcmp(t,"ssi_diag")) {
+            /* E: raw=0 from a frame that never finished reads this_read_timed_out=1; a healthy read says 0 */
+            simSsiDead=1u; simLogN=0; simLog[0]=0; jog_handle_byte('e'); txq_flush_blocking();
+            assert(strstr(simLog,"ssi_timeouts=1 this_read_timed_out=1 ") && strstr(simLog,"ENCODER DO stuck LOW raw=0x00000"));
+            simSsiDead=0u; simLogN=0; simLog[0]=0; g_jogMs+=JOG_CMD_REPEAT_MS+1u; jog_handle_byte('e'); txq_flush_blocking();
+            assert(strstr(simLog,"ssi_timeouts=1 this_read_timed_out=0 ") && strstr(simLog,"do_pin="));
         } else if(!strcmp(t,"ssi_takeover")) {
             /* a synchronous read, or a re-anchored command, drops a frame that is still on the wire */
             g_encTry=0u; enc_flight_start(0u); assert(g_encFlight);
@@ -2832,7 +2838,7 @@ int main(int argc,char **argv) {
 '''
 
 cases = ['dual_'+n for n in ['home_reverse','home_stall','wrap','loss','gap','parity','hold','derate','follow_stop','peer_bad','peer_bad_reverse','final','limit','enable_bad']]
-cases += ['ssi_fifo','ssi_nonblocking','ssi_snapshot','ssi_retry','ssi_timeout','ssi_takeover']
+cases += ['ssi_fifo','ssi_nonblocking','ssi_snapshot','ssi_retry','ssi_timeout','ssi_diag','ssi_takeover']
 cases += ['usb_tx','usb_fallback','usb_stall','usb_rx','usb_link']
 cases += ['step_hw_request','step_hw_pins','dead_kill','txdma_order','txdma_busy','txdma_wait_drq','pin_irq_kill']
 cases += ['dual_snapshot_length','chain_frames','boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',

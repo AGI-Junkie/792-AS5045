@@ -17,6 +17,7 @@
 #define HW_SSI_H
 
 #define SSI_TIMEOUT_US              (1000u)  /* a frame is 160 us (hardware) / 230 us (software) at most */
+static uint32 g_ssiTimeouts;                 /* frames given up on; a dead frame reads as 0, same as DO held low (the E command tells them apart) */
 
 #if (HW_SSI == 0u)
 
@@ -127,7 +128,7 @@ static void as5045_read_clocks(uint32 *first, uint32 *second, uint8 clocks)
 #if (HW_SSI != 0u)
     while (ssi_done() == 0u)
     {
-        if (SU_ELAPSED(g_ssiAt) >= SSI_TIMEOUT_US * SU_CY_PER_US) { ssi_abort(); *first = 0u; *second = 0u; return; }
+        if (SU_ELAPSED(g_ssiAt) >= SSI_TIMEOUT_US * SU_CY_PER_US) { g_ssiTimeouts++; ssi_abort(); *first = 0u; *second = 0u; return; }
     }
 #endif
     ssi_take(first, second);
