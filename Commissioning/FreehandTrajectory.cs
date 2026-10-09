@@ -12,6 +12,8 @@ internal static class FreehandTrajectory
     internal const int MaxPoints = 5000;
     internal const double CaptureSpacing = 0.25, Tolerance = 1;
     private const double SimplifyTolerance = 0.25, CurveTolerance = Tolerance - SimplifyTolerance;
+    internal static FreehandPoint[] Example => Enumerable.Range(0, 41)
+        .Select(i => new FreehandPoint(330 + i * 0.25, 2 * Math.Sin(i * Math.PI / 20))).ToArray();
 
     internal static void Validate(IReadOnlyList<FreehandPoint> points)
     {

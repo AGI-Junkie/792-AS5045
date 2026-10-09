@@ -1,6 +1,7 @@
 using System.IO;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
@@ -25,6 +26,10 @@ public sealed partial class XYPreviewPanel
         panel.CompleteFreehandStroke(panel.ToScreen(end));
         Check((panel.freehandPoints[^1].Point - end).Length < 1e-8 && panel.freehandStrokes.Count == 1, "terminal point lost");
         panel.RedrawViewport();
+        Check(panel.BeginFreehandStroke(panel.ToScreen(end)), "record before capture loss");
+        panel.AddFreehandPoint(panel.ToScreen(new Point(336, 0)));
+        panel.canvas.RaiseEvent(new MouseEventArgs(Mouse.PrimaryDevice, Environment.TickCount) { RoutedEvent = Mouse.LostMouseCaptureEvent });
+        Check(!panel.RecordingFreehand && panel.freehandPoints.Count == 3, "lost capture did not discard the unfinished stroke");
         Check(!panel.BeginFreehandStroke(panel.ToScreen(new Point(310, 0))) && panel.freehandPoints.Count == 3, "far continuation accepted");
         Check(panel.BeginFreehandStroke(panel.ToScreen(new Point(334.1, 0))), "near continuation rejected");
         Check((panel.freehandPoints[^1].Point - end).Length < 1e-8, "continuation must snap, not append a connector");
@@ -48,6 +53,10 @@ public sealed partial class XYPreviewPanel
         string largeJson = JsonSerializer.Serialize(large);
         panel.RestoreParameters(largeJson);
         Check(panel.freehandPoints.Count == 5000 && panel.execution is not null, "maximum draft restore");
+        Check(panel.BeginFreehandStroke(panel.ToScreen(panel.freehandPoints[^1].Point)), "record at point limit");
+        panel.AddFreehandPoint(panel.ToScreen(new Point(336, 0)));
+        Check(!panel.RecordingFreehand && panel.freehandPoints.Count == 5000 && panel.execution is null, "point-limit cancellation");
+        panel.Refresh();
         string testRoot = Path.Combine(Path.GetTempPath(), "freehand-save-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(testRoot);
         try {

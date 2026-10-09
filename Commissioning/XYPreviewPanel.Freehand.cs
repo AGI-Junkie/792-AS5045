@@ -138,8 +138,7 @@ public sealed partial class XYPreviewPanel
         UpdateFreehandTools();
     }
 
-    private void LoadFreehandExample() => RestoreFreehand(Enumerable.Range(0, 41)
-        .Select(i => new FreehandPoint(330 + i * 0.25, 2 * Math.Sin(i * Math.PI / 20))).ToArray());
+    private void LoadFreehandExample() => RestoreFreehand(FreehandTrajectory.Example);
 
     private void DrawFreehand()
     {
