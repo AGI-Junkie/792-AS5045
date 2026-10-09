@@ -5,6 +5,8 @@ namespace TwoLinkCommissioning;
 public sealed partial class ControlWindow
 {
     private bool framedControl;
+    private string linkWarned = "";
+    private bool usbLink;      // the open port is the firmware's own USB CDC device (UsbLink)
     private uint controlSequence, controlEpoch;
     private uint reportedEpoch;
     private bool waitingStopEpoch;
@@ -126,8 +128,12 @@ public sealed partial class ControlWindow
 
     private ushort LeasedKeys() => LeaseAgeMs() > KeyStaleMs ? (ushort)0 : (ushort)Volatile.Read(ref leaseKeys);
 
-    private static void WriteControlFrame(Action<byte[], int, int> write, byte[] packet)
+    private static void WriteControlFrame(Action<byte[], int, int> write, byte[] packet, bool single = false)
     {
+        // USB CDC is checksummed and retried by the bus and has no bridge to drop bytes: the whole frame in one write,
+        // one copy.  The firmware accepts that unchanged (adjacent frame bytes are never equal, so its duplicate rule
+        // does not touch them).
+        if (single) { write(packet, 0, packet.Length); return; }
         // KitProg bench A/B: bursts caused framing errors; single paced copies
         // still lost bytes. Existing firmware deduplication accepts two copies.
         // One frame per writer step, never interleaved with another frame.
@@ -273,7 +279,7 @@ public sealed partial class ControlWindow
             } else return false;
         }
         long sendStarted = Stopwatch.GetTimestamp();
-        WriteControlFrame(write, packet);
+        WriteControlFrame(write, packet, usbLink);
         sessionFrames++;
         if (heartbeat) {
             lock (wireSync) {

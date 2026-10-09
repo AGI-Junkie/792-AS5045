@@ -9,7 +9,7 @@
 | 固件链路层（`HW_USB`，默认 1） | 已做；仿真 5 个用例（`usb_tx` / `usb_fallback` / `usb_stall` / `usb_rx` / `usb_link`） |
 | TopDesign：`UsbCdc`（USBUART CDC 宏，USBFS v3.20） | 已放；引脚 Dm=P15[7]、Dp=P15[6] |
 | 时钟 | 已改；Creator 构建 0 错误 0 警告，时序 No Timing Violations |
-| 上位机：认出 USB 口、取消双发 | **没做** |
+| 上位机：认出 USB 口、置 DTR、取消双发和字节间隔（`UsbLink.cs`） | 已做；自检 `USB link`（`--self-test`）通过 |
 | 上板验证 | **没做** |
 
 ## 固件行为

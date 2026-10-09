@@ -235,7 +235,9 @@ public sealed partial class ControlWindow : Window
             string path = Path.Combine(directory, $"stage1-{DateTime.Now:yyyyMMdd-HHmmss-fff}.log");
             recording = new StreamWriter(path, false, new UTF8Encoding(false)) { AutoFlush = true };
             Lang.Text(logPath, () => Lang.T("state.logSaved") + path);
-            serial = new SerialPort(port, 115200, Parity.None, 8, StopBits.One) { WriteTimeout = 100, ReadTimeout = 10, DtrEnable = false, RtsEnable = false };
+            // The firmware answers on USB only while the host holds DTR; the KitProg bridge keeps the old DTR-off setting.
+            usbLink = UsbLink.IsFirmwareCdc(port);
+            serial = new SerialPort(port, 115200, Parity.None, 8, StopBits.One) { WriteTimeout = 100, ReadTimeout = 10, DtrEnable = usbLink, RtsEnable = false };
             serial.DataReceived += (_, _) => WakeSerialPump();
             serial.Open(); openedAt = DateTime.UtcNow; lastStateAt = DateTime.MinValue;
             lastHeartbeatSent = 0;
@@ -250,7 +252,7 @@ public sealed partial class ControlWindow : Window
             Lang.Text(state, () => Lang.T("state.connected"));
             connect.Content = Lang.T("btn.disconnect"); ports.IsEnabled = false; timer.Start(); heartbeatTimer.Start();
             StartWireWriter();
-            Append("HOST connected " + port);
+            Append("HOST connected " + port + (usbLink ? " (USB CDC: one copy per byte, one write per frame)" : " (UART)"));
             Append("HOST UI " + Title + "; executable=" + Environment.ProcessPath);
         }
         catch (Exception ex) { Disconnect(() => Lang.T("state.connectFail") + ex.Message); }
@@ -361,7 +363,7 @@ public sealed partial class ControlWindow : Window
             heartbeatTimer.Interval = TimeSpan.FromMilliseconds(framedControl ? 8 : 40);
             bool fastLink = framedControl || line.StartsWith("STATE fw=stage2-v6 ");
             if (hardwareUart != fastLink)
-                Append(framedControl ? $"HOST transport: v7 hardware UART 115200; one dedicated writer thread owns the wire, 2 copies/byte, >={ControlByteGapMs.ToString(System.Globalization.CultureInfo.InvariantCulture)} ms spacing" :
+                Append(framedControl ? $"HOST transport: v7 hardware UART 115200; one dedicated writer thread owns the wire, " + (usbLink ? "1 copy/byte (USB CDC)" : $"2 copies/byte, >={ControlByteGapMs.ToString(System.Globalization.CultureInfo.InvariantCulture)} ms spacing") :
                     fastLink ? "HOST transport: hardware UART 115200; paced chunks <=8 bytes/40ms, CRC/ACK/retry retained" :
                     "HOST transport: legacy UART; paced triplicate writes");
             hardwareUart = fastLink;
@@ -447,6 +449,10 @@ public sealed partial class ControlWindow : Window
             // in the log, because "which heartbeat is running" decides the margin.
             lastFirmwareBuild = line.Split(' ').FirstOrDefault(w => w.StartsWith("fw=", StringComparison.Ordinal))?[3..] ?? "unknown";
             RefreshFirmwareStatus();
+            string answeredOn = line.Split(' ').FirstOrDefault(w => w.StartsWith("link=", StringComparison.Ordinal))?[5..] ?? "uart";
+            string linkWarning = usbLink && answeredOn != "usb" ? "HOST link: the USB CDC port is open but the firmware answers on the UART (DTR not seen)"
+                : !usbLink && answeredOn == "usb" ? "HOST link: the firmware answers on USB but this port is not its USB CDC device" : "";
+            if (linkWarning != linkWarned) { linkWarned = linkWarning; if (linkWarning.Length > 0) Append(linkWarning, LogLevel.Warning); }
             bool compact = line.Contains("short_hb=1");
             if (compact != supportsShortHeartbeat)
                 Append(compact ? "HOST heartbeat: compact 6 wire bytes per beat, 20 ms idle target"
@@ -830,7 +836,7 @@ public sealed partial class ControlWindow : Window
         var heartbeatReport = new StringBuilder();
         try
         {
-            heartbeatReport.Append(BackgroundMotionSelfTest()).Append(HeartbeatSchedulingSelfTest()).Append(ExperimentFinishHeartbeatSelfTest())
+            heartbeatReport.Append(BackgroundMotionSelfTest()).Append(HeartbeatSchedulingSelfTest()).Append(ExperimentFinishHeartbeatSelfTest()).Append(UsbLinkSelfTest())
                 .Append(WithLeaseRetry(ReferenceIdleReplaySelfTest)).Append(WithLeaseRetry(PreviewInteractionReplaySelfTest))
                 .Append(WithLeaseRetry(UploadReplaySelfTest))
                 .Append(WithLeaseRetry(() => ReferenceReplaySelfTest(false, true))).Append(WithLeaseRetry(() => ReferenceReplaySelfTest(true, true)));
