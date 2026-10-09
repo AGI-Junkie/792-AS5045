@@ -14,7 +14,7 @@ namespace TwoLinkCommissioning;
 // patterns and reports how the firmware's own error counters moved.  It refuses to run while the firmware says enabled=1.
 public static class UartStress
 {
-    public enum Pattern { Production, BurstSingle, BurstDouble, PacedSingle1ms, PacedDouble025ms, PacedDouble1ms, CompactProduction }
+    public enum Pattern { Production, BurstSingle, BurstDouble, PacedSingle1ms, PacedDouble025ms, PacedDouble1ms, CompactProduction, PacedDouble05ms }
 
     public sealed record Counters(long Overflow, long Error, long Dropped, long ShortOk, long DropCrc, long DropShort, long DropTimeout, long Rejected, long EpochRejected)
     {
@@ -49,7 +49,8 @@ public static class UartStress
             Pattern.PacedSingle1ms => (1, 1.0),
             Pattern.PacedDouble025ms => (2, 0.25),
             Pattern.PacedDouble1ms => (2, 1.0),
-            _ => (2, 0.5),   // Production and CompactProduction: what the workbench does
+            Pattern.PacedDouble05ms => (2, 0.5),
+            _ => (2, ControlWindow.ControlByteGapMs), // Production and CompactProduction follow the workbench.
         };
         for (int i = 0; i < frame.Length * copies; i++)
         {
@@ -116,12 +117,12 @@ public static class UartStress
                 {
                     byte[] frame = pattern == Pattern.CompactProduction ? PtpProtocol.EncodeShortHeartbeat(0)
                         : PtpProtocol.EncodePacket(6, seq++, epoch, new JointPose(0, 0), 0);
-                    SendFrame(pattern, frame, (b, o, n) => port.Write(b, o, n), ms =>
+                    SendFrame(pattern, frame, (b, o, n) => { port.Write(b, o, n); bytes += n; }, ms =>
                     {
                         long t0 = Stopwatch.GetTimestamp();
                         while (Stopwatch.GetElapsedTime(t0).TotalMilliseconds < ms) Thread.SpinWait(20);
                     });
-                    frames++; bytes += frame.Length;
+                    frames++;
                     Thread.Sleep(40); Drain();
                     if (enabled) { Say("firmware became enabled; aborting"); return 1; }
                 }
@@ -144,19 +145,24 @@ public static class UartStress
         Check(t == new Counters(1, 129, 5, 7, 2, 3, 4, 5, 6), "counters parsed wrongly");
         Check(t.Delta(Counters.Empty).StartsWith("rx_error+129 rx_overflow+1 drop_crc+2 drop_short+3 drop_timeout+4"), "delta text changed");
         var frame = new byte[] { 0xd1, 0x81, 0xa1, 0xd3 };
-        (int writes, int bytes, int gaps, List<double> gapMs) Run(Pattern p)
+        (int writes, int bytes, int gaps, List<double> gapMs) Run(Pattern p, byte[] packet)
         {
             int w = 0, b = 0, g = 0; var ms = new List<double>();
-            SendFrame(p, frame, (data, offset, n) => { w++; b += n; }, m => { g++; ms.Add(m); });
+            SendFrame(p, packet, (data, offset, n) => { w++; b += n; }, m => { g++; ms.Add(m); });
             return (w, b, g, ms);
         }
-        var prod = Run(Pattern.Production);
-        Check(prod.writes == 8 && prod.bytes == 8 && prod.gaps == 7 && prod.gapMs.All(m => m == 0.5), "production pattern is not two paced copies at 0.5 ms");
-        var burst = Run(Pattern.BurstSingle);
+        var heartbeat = PtpProtocol.EncodePacket(6, 1, 1, new JointPose(0, 0), 0);
+        var prod = Run(Pattern.Production, heartbeat);
+        Check(prod.writes == 72 && prod.bytes == 72 && prod.gaps == 71 && prod.gapMs.All(m => m == ControlWindow.ControlByteGapMs), "production heartbeat must use the workbench's gap and count both copies");
+        var compact = Run(Pattern.CompactProduction, PtpProtocol.EncodeShortHeartbeat(0));
+        Check(compact.writes == 12 && compact.bytes == 12 && compact.gaps == 11 && compact.gapMs.All(m => m == ControlWindow.ControlByteGapMs), "compact heartbeat must use the workbench's gap and count both copies");
+        var baseline = Run(Pattern.PacedDouble05ms, heartbeat);
+        Check(baseline.writes == 72 && baseline.bytes == 72 && baseline.gaps == 71 && baseline.gapMs.All(m => m == 0.5), "historical 0.5 ms baseline changed");
+        var burst = Run(Pattern.BurstSingle, frame);
         Check(burst.writes == 1 && burst.bytes == 4 && burst.gaps == 0, "burst-single must be one write");
-        var burst2 = Run(Pattern.BurstDouble);
+        var burst2 = Run(Pattern.BurstDouble, frame);
         Check(burst2.writes == 1 && burst2.bytes == 8 && burst2.gaps == 0, "burst-double must be one write of doubled bytes");
-        var single = Run(Pattern.PacedSingle1ms);
+        var single = Run(Pattern.PacedSingle1ms, frame);
         Check(single.writes == 4 && single.bytes == 4 && single.gaps == 3 && single.gapMs.All(m => m == 1.0), "paced-single is one copy at 1 ms");
         var doubled = new List<byte>();
         SendFrame(Pattern.BurstDouble, frame, (data, offset, n) => doubled.AddRange(data.Skip(offset).Take(n)), _ => { });

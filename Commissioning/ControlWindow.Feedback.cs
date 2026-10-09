@@ -84,7 +84,8 @@ public sealed partial class ControlWindow
     {
         var recorder = experiment; experiment = null; experimentCompleting = null;
         if (recorder is null) return;
-        recorder.Finish(outcome); RecordExperimentOutcome(outcome, recorder); xyPreview.RefreshRecentRuns();
+        recorder.Finish(outcome); RecordExperimentOutcome(outcome, recorder);
+        _ = xyPreview.RefreshRecentRunsAsync(); // Archive IO must not block the dispatcher heartbeat lease.
         Lang.Text(experimentResult, () => Lang.T("exp.finished", outcome=="complete"?Lang.T("exp.complete"):Lang.T("exp.aborted"), recorder.Samples) +
             (recorder.MotionSamples>0?Lang.T("exp.rmse", recorder.Rmse) + (recorder.MotionSamples2>0 ? Lang.T("exp.rmse2", recorder.RmseElbow) : "") + "\n":Lang.T("exp.noMotion")) +
             Lang.T("exp.savedNote"));

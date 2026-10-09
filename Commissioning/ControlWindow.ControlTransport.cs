@@ -22,6 +22,7 @@ public sealed partial class ControlWindow
     // still stops the heartbeat and the firmware still stops the machine.
     private const double ShortHeartbeatIdleMs = 20;  // idle after a compact (6-byte) heartbeat
     private const double LongHeartbeatIdleMs = 40;   // idle after a legacy 36-byte heartbeat
+    internal const double ControlByteGapMs = 0.25;   // shortcut: keep both copies until sustained burst uploads are verified on KitProg.
     private const double KeyStaleMs = 100;           // stop honouring held keys this long after the UI stops
     private const double LeaseStopMs = 200;          // stop heartbeating this long after the UI stops
     private const double SlowHeartbeatLogMs = 100;   // report a gap before it becomes a stop
@@ -111,10 +112,8 @@ public sealed partial class ControlWindow
     // the firmware deadman window (LeaseStopMs), so an ordinary long dispatcher job
     // cannot by itself become a false stop; a truly hung UI still stops the machine,
     // at most LeaseStopMs + one frame + the 250 ms firmware deadline after the hang.
-    // The idle target has to stay proportional to what a beat costs on the wire.  A
-    // 36-byte frame spends 35.5 ms of paced writes, so asking for a 20 ms idle would
-    // keep the writer busy ~65% of the time and let it fight the UI for the CPU; the
-    // compact frame costs 5.5 ms and can afford the tighter beat.
+    // Leave idle time for the UI lease: full beats cost 17.75 ms of paced writes;
+    // compact beats cost 2.75 ms and can afford the tighter target.
     private double HeartbeatIdleTarget() => supportsShortHeartbeat ? ShortHeartbeatIdleMs : LongHeartbeatIdleMs;
 
     private long LeaseAgeMs()
@@ -136,7 +135,7 @@ public sealed partial class ControlWindow
             write(packet, i / 2, 1);
             if (i + 1 < packet.Length * 2) {
                 long sent = Stopwatch.GetTimestamp();
-                while (Stopwatch.GetElapsedTime(sent).TotalMilliseconds < 0.5) Thread.SpinWait(20);
+                while (Stopwatch.GetElapsedTime(sent).TotalMilliseconds < ControlByteGapMs) Thread.SpinWait(20);
             }
         }
     }
@@ -254,8 +253,8 @@ public sealed partial class ControlWindow
             }
             heartbeat = controlDataSent || lastControlHeartbeat == 0 || Stopwatch.GetElapsedTime(lastControlHeartbeat, now).TotalMilliseconds >= HeartbeatIdleTarget();
             if (heartbeat && supportsShortHeartbeat && epochReady) {
-                // Six wire bytes instead of 36: one beat costs 5.5 ms of paced writes
-                // instead of 35.5 ms.  No control sequence is consumed, so command
+                // Six wire bytes instead of 36: one beat costs 2.75 ms of paced writes
+                // instead of 17.75 ms.  No control sequence is consumed, so command
                 // ordering is unaffected.
                 packet = PtpProtocol.EncodeShortHeartbeat((byte)keys);
             } else if (heartbeat || (epochReady && pendingControlType != 0 && (motionAllowed || pendingControlType is 9 or 10 or 11))) {
@@ -388,7 +387,7 @@ public sealed partial class ControlWindow
         {
             long now = Stopwatch.GetTimestamp();
             if (count != 1 || offset != wireBytes / 2 ||
-                (wireBytes != 0 && Stopwatch.GetElapsedTime(previousByte, now).TotalMilliseconds < 0.5))
+                (wireBytes != 0 && Stopwatch.GetElapsedTime(previousByte, now).TotalMilliseconds < ControlByteGapMs))
                 throw new InvalidOperationException("v7 byte pacing or frame order violated");
             previousByte = now;
             var chunk = data.AsSpan(offset, count).ToArray();

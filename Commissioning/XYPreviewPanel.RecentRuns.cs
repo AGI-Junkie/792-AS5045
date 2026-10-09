@@ -24,6 +24,7 @@ public sealed partial class XYPreviewPanel
     private static string RunsRoot => RunsRootOverride ?? ControlWindow.ExperimentRoot;
     private static string FavoritesPath => FavoritesPathOverride ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "favorite-runs.json");
     private List<ExperimentRun> recentRuns = [];
+    private int recentRefreshVersion;
     private HashSet<string> favorites = [];
     private readonly List<(Button Star, Button Load)> recentRows = [];
     private readonly StackPanel recentList = new();
@@ -77,12 +78,32 @@ public sealed partial class XYPreviewPanel
     // ponytail: reads every recording's metadata (archive list is capped at 500); keep an index file if that gets slow.
     internal void RefreshRecentRuns()
     {
+        recentRefreshVersion++;
         try { favorites = File.Exists(FavoritesPath) && new FileInfo(FavoritesPath).Length < 65_536 ? JsonSerializer.Deserialize<HashSet<string>>(File.ReadAllText(FavoritesPath)) ?? [] : []; }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { favorites = []; }
         // A point move to a shape's start is not a drawing of its own; a single-point run is.
-        recentRuns = ExperimentArchive.List(RunsRoot).Runs.Where(r => r.Kind != "point" || r.Settings?.Shape == 0).ToList();
+        recentRuns = ReadRecentRuns(RunsRoot);
         ShowRecentRuns();
         Lang.Text(recentNote, () => recentRuns.Count == 0 ? Lang.T("recent.empty", RecentCount) : Lang.T("recent.hint"));
+    }
+
+    private static List<ExperimentRun> ReadRecentRuns(string root) =>
+        ExperimentArchive.List(root).Runs.Where(r => r.Kind != "point" || r.Settings?.Shape == 0).ToList();
+
+    internal async Task RefreshRecentRunsAsync()
+    {
+        int version = ++recentRefreshVersion;
+        string root = RunsRoot;
+        try {
+            var runs = await Task.Run(() => ReadRecentRuns(root));
+            if (version != recentRefreshVersion) return;
+            recentRuns = runs;
+            ShowRecentRuns();
+            Lang.Text(recentNote, () => recentRuns.Count == 0 ? Lang.T("recent.empty", RecentCount) : Lang.T("recent.hint"));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) {
+            System.Diagnostics.Trace.TraceError("Recent experiment refresh: " + ex);
+        }
     }
 
     private string RunSummary(ExperimentRun run)

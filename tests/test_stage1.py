@@ -1593,9 +1593,136 @@ static void snapshot_interrupt(void) {
     g_evtMaxCy=999u*SU_CY_PER_US;g_evtBusyCy=1888u*SU_CY_PER_US;g_evtEvents=777u;
 #endif
 }
+static void status_upload_test(const char *t) {
+    static const char *essential[]={"STATE fw=","CONTROL seq=","PTP_STATE ","TRAJ_STATE ","TELEM t="};
+    static const char *diagnostic[]={"MOTION_RATES ","PTP_CHECK ","LINK ","PTP_RX ","TIMING ","ENC_DIAG ","TELEM_DIAG "};
+    unsigned i,idleBytes,uploadBytes,queued,after,firstLine,crc,p1,p2;const char *at,*ack;
+    setup();g_enc2.directionKnown=1u;g_enc2.incDir=1u;
+    traj_send(5,1u,0,0,0);assert(g_ptp.reference && g_homed1 && g_homed2);status_drain();
+    simLogN=0;simLog[0]=0;stage_status();status_drain();idleBytes=simLogN;
+    for(i=0;i<sizeof(diagnostic)/sizeof(diagnostic[0]);i++)assert(strstr(simLog,diagnostic[i]));
+    p1=simPulse1;p2=simPulse2;
+    traj_send(2,2u,0,0,!strcmp(t,"status_upload_stream")?176u:4u);assert(g_traj.state==TRAJ_UPLOADING && g_traj.count==1u);
+    simLogN=0;simLog[0]=0;
+    if(!strcmp(t,"status_upload_volume")) {
+        stage_status();status_drain();uploadBytes=simLogN;
+        printf("STATUS_UPLOAD idle_bytes=%u upload_bytes=%u wire_ms=%.2f/%.2f\n",idleBytes,uploadBytes,
+               idleBytes*1000.0/11520.0,uploadBytes*1000.0/11520.0);fflush(stdout);
+        assert(uploadBytes*2u<idleBytes);
+        at=simLog;
+        for(i=0;i<sizeof(essential)/sizeof(essential[0]);i++){at=strstr(at,essential[i]);assert(at);at++;}
+        for(i=0;i<sizeof(diagnostic)/sizeof(diagnostic[0]);i++)assert(!strstr(simLog,diagnostic[i]));
+        assert(!strstr(simLog,"HWOFFLOAD ") && !g_txqDropped);
+    } else if(!strcmp(t,"status_upload_backlog")) {
+        /* An accepted node has queued its receipt; periodic work must not enlarge that backlog. */
+        packetType=3u;ptp_send(3u,g_ptp.epoch,0,0,100u,0);packetType=1u;
+        assert(g_traj.count==2u && g_ptp.sequence==3u && txq_pending());
+        queued=TXQ_SIZE-1u-txq_free();stage_status();
+        for(i=0;i<STATUS_LINES+2u;i++)stage_status_service();
+        after=TXQ_SIZE-1u-txq_free();
+        printf("STATUS_UPLOAD ack_queued_bytes=%u after_status_bytes=%u\n",queued,after);fflush(stdout);
+        assert(after==queued && g_statusNext==1u);
+        txq_flush_blocking();assert(strstr(simLog,"TRAJ_STATE state=1 count=2 total=4 index=0 seq=3 ")==simLog);
+        status_drain();
+        /* If a status line entered first, ACK latency is bounded by that one complete line. */
+        simLogN=0;simLog[0]=0;stage_status();stage_status_service();
+        firstLine=TXQ_SIZE-1u-txq_free();assert(firstLine && firstLine<200u);
+        for(i=0;i<STATUS_LINES+2u;i++)stage_status_service();
+        queued=TXQ_SIZE-1u-txq_free();
+        packetType=3u;ptp_send(4u,g_ptp.epoch,0,0,100u,0);packetType=1u;
+        assert(g_traj.count==3u && g_ptp.sequence==4u);
+        after=TXQ_SIZE-1u-txq_free();
+        for(i=0;i<STATUS_LINES+2u;i++)stage_status_service();
+        assert(TXQ_SIZE-1u-txq_free()==after && queued==firstLine);
+        txq_flush_blocking();ack=strstr(simLog,"TRAJ_STATE state=1 count=3 total=4 index=0 seq=4 ");
+        assert(strstr(simLog,"STATE fw=")==simLog && ack && (unsigned)(ack-simLog)==firstLine);
+        printf("STATUS_UPLOAD ahead_of_ack_bytes=%u wire_ms=%.2f\n",firstLine,firstLine*1000.0/11520.0);
+        status_drain();assert(!g_txqDropped);
+    } else if(!strcmp(t,"status_upload_partial")) {
+        stage_status();stage_status_service();txq_flush_blocking();assert(g_statusNext==2u);
+        stage_status();assert(g_statusNext==2u); /* Periodic requests cannot restart the unfinished block. */
+        packetType=2u;ptp_send(2u,g_ptp.epoch,0,0,4u,0);packetType=1u;
+        assert(g_traj.count==1u && g_ptp.sequence==2u && g_statusNext==2u);
+        txq_flush_blocking();assert(strstr(simLog,"PTP duplicate seq=2; not restarted"));
+        status_drain();
+        /* The lost original ACK is recovered by periodic TRAJ_STATE without committing the retry twice. */
+        at=simLog;
+        for(i=0;i<sizeof(essential)/sizeof(essential[0]);i++){at=strstr(at,essential[i]);assert(at);at++;}
+        assert(strstr(simLog,"TRAJ_STATE state=1 count=1 total=4 index=0 seq=2 ") && !g_txqDropped);
+    } else if(!strcmp(t,"status_upload_stream")) {
+        static const char *fresh[]={"STATE fw=","PTP_STATE ","TRAJ_STATE ","TELEM t="};
+        unsigned last[4]={0},gap[4]={0},seen[4]={0},scan=0,peak=0,j,budget,elapsed;
+        uint32 started;char *end,*line;
+        jog_update_time();started=g_jogMs;g_telemHz=10u;g_telemLastMs=g_jogMs;
+        /* Same parser/ACK and periodic services, with a conservative 11-byte/ms TX drain budget (115200 8N1). */
+        for(i=0;i<8750u;i++) {
+            simClock+=(uint64_t)SIM_MHZ*1000u;jog_update_time();elapsed=g_jogMs-started;
+            if(i%40u==0u)sim_keys(0);
+            if(i%50u==0u && i<8700u){packetType=3u;ptp_send(3u+i/50u,g_ptp.epoch,0,0,100u,0);packetType=1u;}
+            if(i%500u==0u)stage_status();
+            telem_service();stage_status_service();
+            queued=TXQ_SIZE-1u-txq_free();if(queued>peak)peak=queued;
+            for(budget=0;budget<11u && txq_pending();budget++)txq_send_one();
+            while((end=strchr(simLog+scan,'\n'))!=NULL) {
+                line=simLog+scan;
+                for(j=0;j<4u;j++)if(!strncmp(line,fresh[j],strlen(fresh[j]))) {
+                    if(elapsed-last[j]>gap[j])gap[j]=elapsed-last[j];last[j]=elapsed;seen[j]++;
+                }
+                scan=(unsigned)(end-simLog)+1u;
+            }
+        }
+        assert(g_motionEnabled && g_traj.state==TRAJ_UPLOADING && g_traj.count==175u && g_ptp.sequence==176u);
+        for(j=0;j<4u;j++){if(elapsed-last[j]>gap[j])gap[j]=elapsed-last[j];assert(seen[j]>=10u && gap[j]<750u);}
+        assert(gap[3]<250u && g_telemSent>=80u && !g_txqDropped);
+        printf("STATUS_UPLOAD stream_nodes=175 state_gap_ms=%u ptp_gap_ms=%u traj_gap_ms=%u telem_gap_ms=%u peak_queue_bytes=%u\n",
+               gap[0],gap[1],gap[2],gap[3],peak);
+        txq_flush_blocking();status_drain();
+        for(i=0;i<sizeof(diagnostic)/sizeof(diagnostic[0]);i++)assert(!strstr(simLog,diagnostic[i]));
+        traj_send(3u,177u,0,0,100u);assert(g_traj.state==TRAJ_READY && g_traj.count==176u);
+    } else if(!strcmp(t,"status_upload_restore")) {
+        for(i=3u;i<=5u;i++)traj_send(3u,i,0,0,100u);
+        assert(g_traj.state==TRAJ_READY && g_traj.count==4u);
+        simLogN=0;simLog[0]=0;stage_status();status_drain();
+        for(i=0;i<sizeof(diagnostic)/sizeof(diagnostic[0]);i++)assert(strstr(simLog,diagnostic[i]));
+        traj_send(4u,6u,0,0,0);assert(g_traj.state==TRAJ_RUNNING && g_ptp.active);
+        simLogN=0;simLog[0]=0;stage_status();
+        for(i=0;i<100u && g_statusNext;i++)cycle(1);
+        assert(g_traj.state==TRAJ_RUNNING && !g_statusNext);
+        for(i=0;i<sizeof(diagnostic)/sizeof(diagnostic[0]);i++)assert(strstr(simLog,diagnostic[i]));
+        for(i=0;i<5000u && g_ptp.active;i++)cycle(1);
+        assert(g_traj.state==TRAJ_DONE && g_motionEnabled);
+        simLogN=0;simLog[0]=0;stage_status();status_drain();
+        for(i=0;i<sizeof(diagnostic)/sizeof(diagnostic[0]);i++)assert(strstr(simLog,diagnostic[i]));
+    } else {
+        /* CRC and ordering rejection remain on the actual parser/accept path during reduced status. */
+        crc=g_ptpRxCrc;
+        packetType=3u;ptp_send(3u,g_ptp.epoch,0,0,100u,1);packetType=1u;
+        assert(g_ptpRxCrc==crc+1u && g_traj.count==1u && g_ptp.sequence==2u);
+        txq_flush_blocking();assert(strstr(simLog,"PTP RX dropped: CRC"));
+        packetType=3u;ptp_send(4u,g_ptp.epoch,0,0,100u,0);packetType=1u;
+        assert(g_traj.count==1u && g_ptp.sequence==2u);
+        txq_flush_blocking();assert(strstr(simLog,"PTP refused: trajectory order/time"));
+        simLogN=0;simLog[0]=0;
+        packetType=3u;ptp_send(3u,g_ptp.epoch,0,0,100u,0);packetType=1u;
+        assert(g_traj.count==2u && txq_pending());stage_status();
+        if(!strcmp(t,"status_upload_fault")){simFault=1;assert(jog_safety_blocked());assert(g_jogFaulted);}
+        else {assert(!strcmp(t,"status_upload_stop"));jog_handle_byte(JOG_CMD_STOP);}
+        assert(!g_motionEnabled && !g_traj.state && !g_ptp.reference);
+        txq_flush_blocking(); /* No periodic status service is needed to publish the fault/STOP. */
+        ack=strstr(simLog,"TRAJ_STATE state=1 count=2 ");at=strstr(simLog,"FAULT_SNAPSHOT ");
+        assert(ack && at && ack<at && strstr(simLog,"STOP: ") && strstr(at,"phase=traj_upload"));
+        assert(!strstr(simLog,"LINK "));
+        status_drain();
+        assert(strstr(simLog,"LAST_STOP ") && strstr(simLog,"STATE fw=stage2-v11 enabled=0"));
+        for(i=0;i<sizeof(diagnostic)/sizeof(diagnostic[0]);i++)assert(strstr(simLog,diagnostic[i]));
+        assert(!g_txqDropped);
+    }
+    assert(simPulse1==p1 && simPulse2==p2);
+}
 int main(int argc,char **argv) {
     const char *t=argv[1]; unsigned i, p1, p2;
     assert(argc==2);
+    if(!strncmp(t,"status_upload_",14)){status_upload_test(t);puts(t);return 0;}
     if(!strncmp(t,"status_idle_",12)) {
         static const char *prefix[]={"STATE fw=","CONTROL seq=","PTP_STATE ","MOTION_RATES ","PTP_CHECK ",
             "TRAJ_STATE ","LINK ","PTP_RX ","TIMING ","ENC_DIAG ","TELEM_DIAG ","TELEM t="};
@@ -2673,6 +2800,7 @@ ptp_cases += ['manual_'+name for name in ['success','duplicate','stop','old_epoc
 ptp_cases += ['fuzz_%d' % n for n in range(1, 7)]   # the gate's share; long campaigns: --emit-c=DIR and run fuzz_<seed> in parallel
 ptp_cases += ['traj_evt_runs','traj_evt_stall','traj_evt_stop']
 ptp_cases += ['traj_isr_done','traj_isr_slot']
+ptp_cases += ['status_upload_'+n for n in ['volume','backlog','partial','stream','restore','stop','fault']]
 ptp_cases += ['dual_manual_unknown','dual_ptp_follow','stop_latch','traj_slip','traj_status_cost','hot_arith','jog_arm2_limit','origin_retry','traj_schedule','pulse_blocked']
 if host_plan is not None: ptp_cases += ['traj_host_plan','traj_manual_plan','traj_host_plan_offset','traj_host_plan_rx_retry']
 if len(sys.argv)>1:
@@ -2722,6 +2850,7 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
         result=subprocess.run([str(tmp/'check.exe'),case],cwd=tmp,capture_output=True,text=True,errors='replace',timeout=(120 if case.startswith('fuzz_') else 20))
         assert result.returncode==0, f'{case}: {result.stdout}\n{result.stderr}'
         fuzz_total('simulated-unlock',result.stdout)
+        if case.startswith('status_upload_'): print(result.stdout, end='')
         print('PASS simulated-unlock',case)
     # Exercise the deliberately optional, absent arm2 encoder in the delivery profile.
     # Third profile: arm2 feedback off (the macro default is now 1), no other overrides.
@@ -2733,6 +2862,7 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
         result=subprocess.run([str(tmp/'check.exe'),case],cwd=tmp,capture_output=True,text=True,errors='replace',timeout=(120 if case.startswith('fuzz_') else 20))
         assert result.returncode==0, f'delivery {case}: {result.stdout}\n{result.stderr}'
         fuzz_total('delivery-default',result.stdout)
+        if case.startswith('status_upload_'): print(result.stdout, end='')
         print('PASS delivery-default',case)
     # The base cases again with arm2 feedback off, as delivered.  dual_* describe the two-encoder behaviour (they cannot
     # pass without it); everything else, including the arm2_* and control_* cases, must hold in both configurations.

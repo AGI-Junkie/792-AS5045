@@ -361,7 +361,7 @@ public sealed partial class ControlWindow : Window
             heartbeatTimer.Interval = TimeSpan.FromMilliseconds(framedControl ? 8 : 40);
             bool fastLink = framedControl || line.StartsWith("STATE fw=stage2-v6 ");
             if (hardwareUart != fastLink)
-                Append(framedControl ? "HOST transport: v7 hardware UART 115200; one dedicated writer thread owns the wire, 2 copies/byte, >=0.5 ms spacing" :
+                Append(framedControl ? $"HOST transport: v7 hardware UART 115200; one dedicated writer thread owns the wire, 2 copies/byte, >={ControlByteGapMs.ToString(System.Globalization.CultureInfo.InvariantCulture)} ms spacing" :
                     fastLink ? "HOST transport: hardware UART 115200; paced chunks <=8 bytes/40ms, CRC/ACK/retry retained" :
                     "HOST transport: legacy UART; paced triplicate writes");
             hardwareUart = fastLink;
@@ -830,7 +830,7 @@ public sealed partial class ControlWindow : Window
         var heartbeatReport = new StringBuilder();
         try
         {
-            heartbeatReport.Append(BackgroundMotionSelfTest()).Append(HeartbeatSchedulingSelfTest())
+            heartbeatReport.Append(BackgroundMotionSelfTest()).Append(HeartbeatSchedulingSelfTest()).Append(ExperimentFinishHeartbeatSelfTest())
                 .Append(WithLeaseRetry(ReferenceIdleReplaySelfTest)).Append(WithLeaseRetry(PreviewInteractionReplaySelfTest))
                 .Append(WithLeaseRetry(UploadReplaySelfTest))
                 .Append(WithLeaseRetry(() => ReferenceReplaySelfTest(false, true))).Append(WithLeaseRetry(() => ReferenceReplaySelfTest(true, true)));

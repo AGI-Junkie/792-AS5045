@@ -137,7 +137,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r2500-slip-mref2-ssififo"
+#define FW_BUILD_ID                 "stage2-v11-r2500-slip-mref2-ssififo-upstat1"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -2821,12 +2821,19 @@ static void stage_status_line(void)
 static void stage_status_service(void)
 {
     if(!g_statusNext) return;
+    if(g_traj.state==TRAJ_UPLOADING) {
+        /* Keep fresh host state and ACK recovery without piling diagnostics ahead of the next receipt. */
+        if(txq_pending()) return;
+        if(g_statusNext==4u || g_statusNext==5u) g_statusNext=6u;
+        else if(g_statusNext>=7u && g_statusNext<12u) g_statusNext=12u;
+        else if(g_statusNext>12u) { g_statusNext=0u; return; }
+    }
     if(status_moving() && (SU_ELAPSED(g_statusAt)<5000u*SU_CY_PER_US || !jog_slot_free(50u))) return;
     g_statusAt=SU_NOW();stage_status_line();
 }
 static void stage_status(void)
 {
-    if(status_moving()) {
+    if(status_moving() || g_traj.state==TRAJ_UPLOADING) {
         /* A new reference epoch must restart at STATE/PTP_STATE, even in a partial block. */
         if(!g_statusNext || g_statusEpoch!=g_ptp.epoch)g_statusNext=1u;
         g_statusEpoch=g_ptp.epoch;return;
