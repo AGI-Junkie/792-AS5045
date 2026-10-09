@@ -10,7 +10,7 @@
 | TopDesign：`UsbCdc`（USBUART CDC 宏，USBFS v3.20） | 已放；引脚 Dm=P15[7]、Dp=P15[6] |
 | 时钟 | 已改；Creator 构建 0 错误 0 警告，时序 No Timing Violations |
 | 上位机：认出 USB 口、置 DTR、取消双发和字节间隔（`UsbLink.cs`） | 已做；自检 `USB link`（`--self-test`）通过 |
-| 上板验证 | 部分：插着 J6 时 `link=usb`、能使能、无复位无停机、`key_max_gap_ms=53`（KitProg 时 66–134）；拔掉 J6 回退 UART 的修复（总线活动判定）**待上板确认** |
+| 上板验证 | 已验证：插着 J6 时 `link=usb`、能使能、无复位无停机、`key_max_gap_ms=53`（KitProg 时 66–134）；拔掉 J6 后上位机连 COM8，`link=uart`、`ENABLE OK`、无停机。未单独记录：拔掉后再插回 J6 自动切回 USB |
 
 ## 固件行为
 
@@ -50,3 +50,8 @@ ILO Route 改为 100 kHz 是 USBFS 的硬性要求（Creator 报 `fit.M0031`）�
 4. 关闭该 COM 口：下一次 `s` 走 KitProg 的 COM 口，`link=uart`。
 5. 拔掉 J6、只留 J10：行为应和以前一致；记录此时 `--uart-stress` 的结果。
 6. 观察看门狗：固件不应反复复位（反复出现开机信息即为复位）。
+
+## 排查备忘
+
+- 连 COM8 报 `Access to the path 'COM8' is denied`：别的程序（PuTTY 等串口终端）占着这个口，先关掉它。
+- 拔掉 J6 后 Windows 的端口列表里还会残留旧的 COM10，选它会报 `Could not find file`，是注册表里的历史记录，不影响功能。
