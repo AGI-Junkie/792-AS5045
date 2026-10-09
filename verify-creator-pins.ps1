@@ -150,7 +150,9 @@ if ($hasUart) {
     }
     $header = Get-Content -LiteralPath (Join-Path $ProjectPath 'Generated_Source\PSoC5\HostUart.h') -Raw
     $uartSettings = @{ RX_INTERRUPT_ENABLED = '1'; RX_BUFFER_SIZE = '256'; TX_INTERRUPT_ENABLED = '1'; TX_BUFFER_SIZE = '256' }
-    if ($hw.HW_TXDMA) { $uartSettings.TX_INTERRUPT_ENABLED = '0'; $uartSettings.TX_BUFFER_SIZE = '4' }
+    $fifoTx = $hw.HW_TXDMA -or ($header -match '#define\s+HostUart_TX_INTERRUPT_ENABLED\s+\(0u\)' -and
+                              $header -match '#define\s+HostUart_TX_BUFFER_SIZE\s+\(4u\)')
+    if ($fifoTx) { $uartSettings.TX_INTERRUPT_ENABLED = '0'; $uartSettings.TX_BUFFER_SIZE = '4' }
     foreach ($setting in $uartSettings.Keys) {
         $value = $uartSettings[$setting]
         if ($header -notmatch ('#define\s+HostUart_' + $setting + '\s+\(' + $value + 'u\)')) { $issues.Add("UART configuration mismatch: $setting") }
@@ -193,7 +195,7 @@ if (-not $defaultCount) {
     Write-Output "PASS: $defaultCount legacy Pin_* names verified; use -NamedInstances to require functional names."
 }
 if ($hasUart) {
-    $txMode = if ($hw.HW_TXDMA) { 'TX FIFO 4 bytes with DMA' } else { 'TX interrupt buffer 256 bytes' }
+    $txMode = if ($hw.HW_TXDMA) { 'TX FIFO 4 bytes with DMA' } elseif ($fifoTx) { 'TX FIFO 4 bytes with CPU' } else { 'TX interrupt buffer 256 bytes' }
     Write-Output "PASS: HostUart 115200, RX P12[6] interrupt buffer 256 bytes, TX P12[7] $txMode."
 }
 Write-Output 'Input HW checkbox visibility requires Creator inspection; it is absent from generated Verilog.'

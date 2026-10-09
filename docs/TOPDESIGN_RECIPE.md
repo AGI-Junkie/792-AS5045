@@ -28,6 +28,8 @@
 | `ClkMs` | 1 kHz | 阶段 5 |
 
 ## 4. 阶段 2：编码器 SSI（开关 `HW_SSI`）
+
+**2026-10-09 驱动修复：** RX Buffer Size 为 4 时，`Ssi_GetRxBufferSize()` 仅报告空/非空（0/1），不能用它等待 2 或 4 个接收字。`hw_ssi.h` 现逐字取出 FIFO 数据并累计完成数；保留下面的硬件配置。此前错误的完成判断导致超时输出零值、使能被拒绝。复现和验证见 [SSI_DIAGNOSIS.md](SSI_DIAGNOSIS.md)。
 **要做的事**：用 SPI Master 接管 AS5045 的三根线，原来的三个引脚组件 `CLK`、`CSN`、`AS5045_DO` 保留（引脚位置 P12[0]、P12[1]、P1[3] 不变），只改成由硬件驱动。
 
 1. 放 **SPI Master**（Digital → Communications → SPI → SPI Master，v2.50），实例名 `Ssi`，Configure：
@@ -84,6 +86,9 @@
 5. 构建，通过后把 `HW_DEAD` 改成 `(1u)`，再构建。提交。
 
 ## 8. 阶段 6：串口发送改 DMA（开关 `HW_TXDMA`）
+
+**2026-10-09 台架更新：当前默认保留 `HW_TXDMA=0`。** DMA 开启版经 KitProg 收到的状态文本隔字丢失，无法完成串口握手；只关闭 UART TX DMA 的对照版已收到完整 `STATE` / `LINK` / `HWOFFLOAD`，其余五项卸载仍开启。保留本节的 UART 4 字节 TX FIFO 和 DMA 组件，由现有 CPU 发送路径填 FIFO；DMA 不接管 GPIO，关闭它不需要撤掉组件。完成 FIFO/DRQ 与桥接时序的实机验证后才能重新开启；下面第 3 步的开启操作目前暂停。证据见 [UART_DIAGNOSIS.md](UART_DIAGNOSIS.md)。
+
 1. 打开已有的 `HostUart`（UART v2.50）的 Configure：
    - TX Buffer Size 改成 **4**（RX Buffer Size 保持 256，RX 中断保持）。
    - Interrupt On 里取消 TX 的其他项，只勾 **TX - On FIFO Not Full**。

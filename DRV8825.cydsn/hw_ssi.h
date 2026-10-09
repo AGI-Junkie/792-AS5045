@@ -64,13 +64,13 @@ static void ssi_abort(void)                          { }
  * The AS5045 changes DO on CLK rising edges and the master samples on the falling edge that follows, so stream bit 0
  * is DO right after CSn falls (a 1), bits 1..18 are board 1's 18 bits (D11 first), bit 19 is a dummy and bits 20..37
  * are board 2's: exactly the software read's bit i = j - 1.  Four words give 40 clocks (38 are needed) and fill the
- * 4-deep TX FIFO; two words (20 clocks) are enough for board 1 alone.  The receive FIFO holds the frame, so a frame
- * is complete when it holds as many words as were sent.  Mode and bit alignment are to be confirmed on the bench. */
+ * 4-deep TX FIFO; two words (20 clocks) are enough for board 1 alone.  Drain received words as they arrive and
+ * complete when all queued words are collected.  Mode and bit alignment are to be confirmed on the bench. */
 #define SSI_WORD_BITS               (10u)
 #define SSI_WORD_MASK               (0x03FFu)
 #define SSI_WORDS_MAX               (4u)
 
-static uint8  g_ssiWords;
+static uint8  g_ssiWords, g_ssiRead;
 static uint16 g_ssiRx[SSI_WORDS_MAX];
 static uint32 g_ssiAt;                 /* SU_NOW() when the frame was queued */
 
@@ -78,13 +78,17 @@ static void ssi_begin(uint8 clocks)
 {
     uint8 i;
     g_ssiWords = (clocks > 19u) ? 4u : 2u;
+    g_ssiRead = 0u;
     g_ssiAt = SU_NOW();
     Ssi_ClearRxBuffer();
     for (i = 0u; i < g_ssiWords; i++) { Ssi_WriteTxData(SSI_WORD_MASK); }  /* MOSI is not connected */
 }
 static uint8 ssi_done(void)
 {
-    return (g_ssiWords == 0u || (uint8)Ssi_GetRxBufferSize() >= g_ssiWords) ? 1u : 0u;
+    /* With the hardware FIFO, GetRxBufferSize reports only 0/1, not the number of words. */
+    while (g_ssiRead < g_ssiWords && Ssi_GetRxBufferSize() != 0u)
+    { g_ssiRx[g_ssiRead++] = (uint16)(Ssi_ReadRxData() & SSI_WORD_MASK); }
+    return (g_ssiRead >= g_ssiWords) ? 1u : 0u;
 }
 static uint32 ssi_stream(uint8 from, uint8 count)    /* `count` stream bits starting at bit `from`, first bit is the MSB */
 {
@@ -99,8 +103,6 @@ static uint32 ssi_stream(uint8 from, uint8 count)    /* `count` stream bits star
 }
 static void ssi_take(uint32 *first, uint32 *second)
 {
-    uint8 i;
-    for (i = 0u; i < g_ssiWords; i++) { g_ssiRx[i] = (uint16)(Ssi_ReadRxData() & SSI_WORD_MASK); }
     *first  = ssi_stream(1u, 18u) & FRAME_MASK;
     *second = (g_ssiWords > 2u) ? (ssi_stream(20u, 18u) & FRAME_MASK) : 0u;
     g_ssiWords = 0u;

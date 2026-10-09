@@ -49,6 +49,8 @@ def main():
     source = ROOT / "DRV8825.cydsn"
     originals = {name: (source / name).read_text() for name in FILES}
     assert "#define HW_TXDMA" in originals["main.c"]
+    # Exercise DMA gates even when production temporarily uses CPU UART output.
+    originals["main.c"] = replace(originals["main.c"], r"(#define\s+HW_TXDMA\s+)\([01]u\)", r"\g<1>(1u)")
     v = originals["codegentemp/DRV8825.v"]
     # Each corruption must fail for its intended reason, not just any error.
     mutations = [
@@ -86,6 +88,14 @@ def main():
             target.write_text(content)
         check(project)
         check(project, ("-NamedInstances", "-HardwareUart"))
+        (project / "main.c").write_text(replace(originals["main.c"], r"(#define\s+HW_TXDMA\s+)\(1u\)", r"\g<1>(0u)"))
+        check(project, ("-NamedInstances", "-HardwareUart"))
+        print("PASS: CPU UART with 4-byte FIFO")
+        (project / FILES[3]).write_text(replace(originals[FILES[3]], r"(#define\s+HostUart_TX_BUFFER_SIZE\s+\()4u", r"\g<1>256u"))
+        check(project, expected_error="TX_INTERRUPT_ENABLED")
+        print("PASS: CPU UART software buffer without TX interrupt rejected")
+        (project / FILES[3]).write_text(originals[FILES[3]])
+        (project / "main.c").write_text(originals["main.c"])
         for label, name, mutate, error in mutations:
             (project / name).write_text(mutate(originals[name]))
             check(project, expected_error=error)

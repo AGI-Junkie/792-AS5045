@@ -274,7 +274,8 @@ static void Ssi_WriteTxData(uint16 w){
     assert(simSsiQueued<4); /* the TX FIFO is four words deep */
     simSsiQueued++;
 }
-static unsigned Ssi_GetRxBufferSize(void){return sim_ssi_complete()-simSsiRead;}
+/* Creator's hardware FIFO API reports only empty/nonempty, never the word count. */
+static unsigned Ssi_GetRxBufferSize(void){return sim_ssi_complete()>simSsiRead?1u:0u;}
 static uint16 Ssi_ReadRxData(void){
     uint16 w=0; unsigned j;
     assert(simSsiRead<sim_ssi_complete());
@@ -1958,7 +1959,20 @@ int main(int argc,char **argv) {
 #if HW_SSI
         uint8 ok=0u; uint64_t t0; unsigned k; unsigned retries;
         setup(); simClock+=SIM_MHZ*2000u; g_enc.primed=1u;
-        if(!strcmp(t,"ssi_nonblocking")) {
+        if(!strcmp(t,"ssi_fifo")) {
+            uint32 first, second, expected;
+            /* Accumulate each word while in flight; repeated polls must not consume it twice. */
+            expected=mock_frame(); ssi_begin(38u);
+            for(k=1u;k<=4u;k++) {
+                simClock+=SIM_MHZ*44u;
+                assert(ssi_done()==(k==4u) && simSsiRead==k);
+                assert(ssi_done()==(k==4u) && simSsiRead==k);
+            }
+            ssi_take(&first,&second); assert(first==expected && second==simSsiFrame2 && ssi_done());
+            /* The one-encoder frame has two words, with no stale words from the chain. */
+            ssi_begin(18u); simClock+=SIM_MHZ*90u; assert(ssi_done() && simSsiRead==2u);
+            ssi_take(&first,&second); assert(first==expected && second==0u);
+        } else if(!strcmp(t,"ssi_nonblocking")) {
             /* queueing a frame is a few register writes and masks nothing; the answer is there once 160 us have passed */
             t0=simClock; g_encTry=0u; enc_flight_start(0u);
             assert(simClock-t0<(uint64_t)SIM_MHZ*20u && simInts && g_encFlight);
@@ -2610,7 +2624,7 @@ int main(int argc,char **argv) {
 '''
 
 cases = ['dual_'+n for n in ['home_reverse','home_stall','wrap','loss','gap','parity','hold','derate','follow_stop','peer_bad','peer_bad_reverse','final','limit','enable_bad']]
-cases += ['ssi_nonblocking','ssi_snapshot','ssi_retry','ssi_timeout','ssi_takeover']
+cases += ['ssi_fifo','ssi_nonblocking','ssi_snapshot','ssi_retry','ssi_timeout','ssi_takeover']
 cases += ['step_hw_request','step_hw_pins','dead_kill','txdma_order','txdma_busy','txdma_wait_drq','pin_irq_kill']
 cases += ['dual_snapshot_length','chain_frames','boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
          'missing_sensor','stuck_sensor','missing_npn','stalled_motor','reject_moving',

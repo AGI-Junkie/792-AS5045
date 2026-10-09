@@ -46,7 +46,7 @@
 #define HW_PINIRQ                   (1u) /* nFAULT / global limit pin interrupts kill the STEP PWMs at once (needs HW_STEP) */
 #endif
 #ifndef HW_TXDMA
-#define HW_TXDMA                    (1u) /* debug-UART transmit by DMA from the text queue into the UART's TX FIFO */
+#define HW_TXDMA                    (0u) /* shortcut: CPU TX avoids observed byte loss; re-enable DMA after FIFO/DRQ hardware validation */
 #endif
 #ifndef HW_DEAD
 #define HW_DEAD                     (1u) /* hardware deadman: DeadTimer + AliveReq cut the STEP PWMs if the foreground stalls */
@@ -137,7 +137,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r2500-slip-mref2"
+#define FW_BUILD_ID                 "stage2-v11-r2500-slip-mref2-ssififo"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
