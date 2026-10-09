@@ -22,7 +22,7 @@ public sealed partial class XYPreviewPanel
     private bool boxMode;
     private readonly DispatcherTimer viewportRedrawTimer = new(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(33) };
     private bool HasTrajectoryDetail => trajectory is not null && canvas.ActualWidth>560 && canvas.ActualHeight>280;
-    private Rect Plot => new(48, 16, Math.Max(1, canvas.ActualWidth - 68 - (HasTrajectoryDetail?210:0)), Math.Max(1, canvas.ActualHeight - 98));
+    private Rect Plot => freehandPlot ?? new Rect(48, 16, Math.Max(1, canvas.ActualWidth - 68 - (HasTrajectoryDetail?210:0)), Math.Max(1, canvas.ActualHeight - 98));
     private bool FollowCommand => !offlineSim && liveLayer.IsChecked==true && startFeedback is {Referenced:true};
     private Point ToScreen(Point p) => new(Plot.Left + Plot.Width / 2 + (p.X-cameraCenter.X)*pixelsPerMm,
         Plot.Top + Plot.Height / 2 - (p.Y-cameraCenter.Y)*pixelsPerMm);
@@ -38,7 +38,8 @@ public sealed partial class XYPreviewPanel
         }
         Action("−", "vp.zoomOut", () => ZoomAt(ToScreen(cameraCenter), 1/1.3));
         Action("＋", "vp.zoomIn", () => ZoomAt(ToScreen(cameraCenter), 1.3));
-        boxTool.Click += (_,_) => { boxMode = !boxMode; UpdateBoxTool(); }; bar.Children.Add(boxTool);
+        boxTool.Click += (_,_) => { if (RecordingFreehand) return; freehandMode = false; boxMode = !boxMode; UpdateBoxTool(); UpdateFreehandTools(); }; bar.Children.Add(boxTool);
+        BuildFreehandTools(bar);
         unreachableLayer.ToolTip = Lang.T("vp.unreachable.tip");
         unreachableLayer.Checked += (_,_) => { overlayUnreachable = true; RedrawViewport(); };
         unreachableLayer.Unchecked += (_,_) => { overlayUnreachable = false; RedrawViewport(); };
@@ -53,9 +54,9 @@ public sealed partial class XYPreviewPanel
         boxTool.Background = boxMode ? WorkbenchTheme.Brush("#EDF8F8") : Brushes.White;
         boxTool.Foreground = boxMode ? WorkbenchTheme.Teal : WorkbenchTheme.Ink;
         boxTool.BorderBrush = boxMode ? WorkbenchTheme.Teal : WorkbenchTheme.Line;
-        canvas.Cursor = boxMode ? Cursors.Cross : Cursors.Hand;
+        canvas.Cursor = boxMode || freehandMode ? Cursors.Cross : Cursors.Hand;
     }
-    private string PointerHint => overlayLimits is null || !overlayUnreachable ? Lang.T("vp.hint") : Lang.T("vp.hintRed");
+    private string PointerHint => freehandMode ? Lang.T("fh.hint") : overlayLimits is null || !overlayUnreachable ? Lang.T("vp.hint") : Lang.T("vp.hintRed");
     private string PointerReach(Point world)
     {
         if(overlayLimits is null || !overlayUnreachable) return "";
@@ -75,6 +76,7 @@ public sealed partial class XYPreviewPanel
         boxTool.Content = boxMode ? Lang.T("btn.boxActive") : Lang.T("btn.box");
         boxTool.ToolTip = Lang.T("vp.box.tip");
         System.Windows.Automation.AutomationProperties.SetName(canvas, Lang.T("vp.canvasName"));
+        RefreshFreehandLanguage();
         pointerInfo.Text = PointerHint;
     }
     // Preview ranges are user editable; firmware restrictions remain separate execution gates.
@@ -93,11 +95,19 @@ public sealed partial class XYPreviewPanel
     private void InitializeViewport()
     {
         viewportRedrawTimer.Tick += (_,_) => RedrawViewport();
-        Unloaded += (_,_) => viewportRedrawTimer.Stop();
+        Unloaded += (_,_) => { CancelFreehandStroke(); viewportRedrawTimer.Stop(); };
+        canvas.Focusable = true;
+        canvas.PreviewKeyDown += (_, e) => { if (e.Key == Key.Escape && RecordingFreehand) { CancelFreehandStroke(); e.Handled = true; } };
         canvas.Cursor = Cursors.Hand;
         System.Windows.Automation.AutomationProperties.SetName(canvas,Lang.T("vp.canvasName"));
-        canvas.MouseWheel += (_,e) => { if(cameraReady && !dragging) ZoomAt(e.GetPosition(canvas),Math.Pow(1.2,e.Delta/120.0)); e.Handled=true; };
+        canvas.MouseWheel += (_,e) => { if(cameraReady && !dragging && !RecordingFreehand) ZoomAt(e.GetPosition(canvas),Math.Pow(1.2,e.Delta/120.0)); e.Handled=true; };
         canvas.MouseDown += (_,e) => {
+            if (RecordingFreehand) { e.Handled = true; return; }
+            if (freehandMode && e.ChangedButton == MouseButton.Left) {
+                canvas.Focus();
+                if (BeginFreehandStroke(e.GetPosition(canvas)) && !canvas.CaptureMouse()) CancelFreehandStroke();
+                e.Handled = true; return;
+            }
             if(!cameraReady || !Plot.Contains(e.GetPosition(canvas)) || e.ChangedButton is not (MouseButton.Left or MouseButton.Middle)) return;
             if(e.ChangedButton==MouseButton.Left && e.ClickCount==2) { FitView(false); e.Handled=true; return; }   // back to the whole-arm view
             dragFrom=dragTo=e.GetPosition(canvas); dragCenter=cameraCenter;
@@ -105,6 +115,7 @@ public sealed partial class XYPreviewPanel
         };
         canvas.MouseMove += (_,e) => {
             var p=e.GetPosition(canvas);
+            if (RecordingFreehand) { AddFreehandPoint(p); e.Handled = true; }
             if(dragging) {
                 dragTo=new Point(Math.Clamp(p.X,Plot.Left,Plot.Right),Math.Clamp(p.Y,Plot.Top,Plot.Bottom));
                 if(!boxDrag) PanFrom(dragCenter,p-dragFrom);
@@ -113,22 +124,24 @@ public sealed partial class XYPreviewPanel
             if(cameraReady) { var world=ToWorld(p); pointerInfo.Text=Lang.T("vp.mouse", world.X, world.Y)+PointerReach(world); }
         };
         canvas.MouseUp += (_,e) => {
+            if (RecordingFreehand && e.ChangedButton == MouseButton.Left) { CompleteFreehandStroke(e.GetPosition(canvas)); e.Handled = true; return; }
             if(!dragging) return;
             if(boxDrag) FitSelection(new Rect(dragFrom,dragTo));
             dragging=false; canvas.ReleaseMouseCapture(); boxMode=false; UpdateBoxTool(); RedrawViewport(); e.Handled=true;
         };
-        canvas.LostMouseCapture += (_,_) => { dragging=false; boxMode=false; UpdateBoxTool(); RedrawViewport(); };
+        canvas.LostMouseCapture += (_,_) => { CancelFreehandStroke(); dragging=false; boxMode=false; UpdateBoxTool(); RedrawViewport(); };
         canvas.MouseLeave += (_,_) => { if(!dragging) pointerInfo.Text=PointerHint; };
-        canvas.SizeChanged += (_,_) => { if(autoFit) cameraReady=false; };
+        canvas.SizeChanged += (_,_) => { CancelFreehandStroke(); if(autoFit) cameraReady=false; };
     }
     internal void FitView(bool detail)
     {
+        if (RecordingFreehand) return;
         detailView=detail; cameraReady=false; autoFit=true;
         boxMode=false; UpdateBoxTool(); RedrawViewport();
     }
     private void ZoomAt(Point anchor, double factor)
     {
-        if(!cameraReady || !double.IsFinite(factor) || factor<=0) return;
+        if(RecordingFreehand || !cameraReady || !double.IsFinite(factor) || factor<=0) return;
         var before=ToWorld(anchor);
         pixelsPerMm=Math.Clamp(pixelsPerMm*factor,0.05,4000);
         cameraCenter+=before-ToWorld(anchor); autoFit=false; RequestViewportRedraw();
@@ -326,6 +339,7 @@ public sealed partial class XYPreviewPanel
         var scaleStart=new Point(Plot.Left+12,Plot.Bottom-18);
         Line(canvas,scaleStart,scaleStart+new Vector(scaleLength,0),WorkbenchTheme.Ink,2);
         Label(canvas,$"{step:0.###} mm",scaleStart+new Vector(0,-18));
+        DrawFreehand();
         if(dragging && boxDrag) {
             var r=new Rect(dragFrom,dragTo); var selection=new Rectangle {Width=r.Width,Height=r.Height,Stroke=WorkbenchTheme.Blue,Fill=WorkbenchTheme.Brush("#22245BE8"),IsHitTestVisible=false};
             Canvas.SetLeft(selection,r.Left); Canvas.SetTop(selection,r.Top); canvas.Children.Add(selection);

@@ -5,7 +5,7 @@ using System.Windows;
 namespace TwoLinkCommissioning;
 
 // The first three are the original shapes (their saved indices must not move); the rest were added later.
-public enum DrawingShape { Line, Rectangle, Circle, Ellipse, Arc, RoundedRectangle, Figure8, Polygon, Spiral, Custom }
+public enum DrawingShape { Line, Rectangle, Circle, Ellipse, Arc, RoundedRectangle, Figure8, Polygon, Spiral, Custom, Freehand }
 public readonly record struct DrawingSample(double Distance, Point Target, JointPose Pose);
 
 // What a, b mean depends on the shape; this carries the rest.  Every shape is drawn around its anchor (x, y), then
@@ -20,6 +20,7 @@ public sealed record ShapeOptions
     public double Scale { get; init; } = 1;
     public bool Clockwise { get; init; }           // open shapes: reversed stroke order (arc and spiral: sweep clockwise)
     public string Text { get; init; } = "";
+    public IReadOnlyList<FreehandPoint> FreehandPoints { get; init; } = [];
 }
 
 // One stroke between two dwell points: P(s) with its first and second derivative in s, 0 <= s <= 1.
@@ -28,9 +29,10 @@ public sealed class PathPiece
 {
     private readonly Func<double, PathPoint> at;
     public double Length { get; }
-    public PathPiece(Func<double, PathPoint> at, double? length = null)
+    internal double[]? Checks { get; }
+    public PathPiece(Func<double, PathPoint> at, double? length = null, double[]? checks = null)
     {
-        this.at = at;
+        this.at = at; Checks = checks;
         if (length is { } known) { Length = known; return; }
         // Simpson over |P'(s)|; the pieces are smooth or piecewise straight, so 512 steps is far finer than the 1 mm sampling.
         double sum = 0; const int steps = 512;
@@ -121,6 +123,8 @@ public sealed class DrawingTrajectory
         double Positive(double value, string key) => value >= 0.001 ? value : throw Lang.Error(key);
         switch (shape)
         {
+            case DrawingShape.Freehand:
+                curved = [FreehandTrajectory.Create(options.FreehandPoints)]; break;
             case DrawingShape.Line:
             {
                 Point end = identity ? new Point(a, b) : anchor + Turn(new Vector(a - x, b - y));
@@ -228,6 +232,8 @@ public sealed class DrawingTrajectory
             {
                 double fastest = 0;
                 for (int k = 0; k <= 256; k++) fastest = Math.Max(fastest, piece.At(k / 256.0).D1.Length);
+                if (piece.Checks is { } probes)
+                    foreach (double s in probes) fastest = Math.Max(fastest, piece.At(s).D1.Length);
                 int count = Math.Max(2, (int)Math.Ceiling(fastest * 1.02));
                 if (points.Count + count > 5000) throw Lang.Error("err.tooManyPoints");
                 for (int i = 1; i <= count; i++) points.Add(piece.At((double)i / count).P);
@@ -319,6 +325,13 @@ public sealed class DrawingTrajectory
             for (int piece = 0; piece < curved.Length; piece++)
             {
                 int first = stops[piece], last = stops[piece + 1];
+                if (curved[piece].Checks is { } probes)
+                    foreach (double s in probes) {
+                        Point target = curved[piece].At(s).P;
+                        double radius = ((Vector)target).Length;
+                        CheckRadius(radius, radius);
+                        CheckPoint(target, (int)Math.Round(first + (last - first) * s));
+                    }
                 for (int j = first; j < last; j++)
                     foreach (double q in new[] { 0.25, 0.5, 0.75 })
                     {
@@ -596,5 +609,6 @@ public sealed class DrawingTrajectory
         Reject(() => Create(model, DrawingShape.Ellipse, 250, 0, 0, 15, 0), "zero semi-axis");
         Reject(() => Create(model, DrawingShape.Ellipse, 250, 0, 300, 15, 0), "ellipse leaving the reach");
         CustomPath.SelfTest();
+        FreehandTrajectory.SelfTest();
     }
 }
