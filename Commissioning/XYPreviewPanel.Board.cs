@@ -57,7 +57,7 @@ public sealed partial class XYPreviewPanel
     private (ExecutionTrajectory? Plan, IReadOnlyList<BoardSlot?> Slots, BoardSlot? Found) boardLookup;
     private BoardSlot? PlanOnBoard()
     {
-        if (!boardSupported || execution is null) return null;
+        if (!boardSupported || !boardKnown || execution is null) return null;   // a half-read inventory is not used to decide "already on the board"
         if (!ReferenceEquals(boardLookup.Plan, execution) || !ReferenceEquals(boardLookup.Slots, boardSlots))
             boardLookup = (execution, boardSlots, TrajectoryArchive.SlotFor(boardSlots, execution.Nodes));
         return boardLookup.Found;

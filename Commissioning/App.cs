@@ -546,7 +546,7 @@ public sealed partial class ControlWindow : Window
             StartExperiment("trajectory",pointSequence+1,plan.Nodes);
             uploading = plan; uploaded = null; uploadedRan = false; trajectoryRanOnce = false; uploadNext = 0; trajectoryEpoch = ptp.Epoch; uploadStartedAt = DateTime.UtcNow;
             xyPreview.PausePlayback();
-            if (allowBoard && StoreAvailable && TrajectoryArchive.SlotFor(boardSlots, plan.Nodes) is { } stored)
+            if (allowBoard && StoreAvailable && boardKnown && TrajectoryArchive.SlotFor(boardSlots, plan.Nodes) is { } stored)
             {
                 loadingSlot = stored.Slot;
                 Append($"HOST trajectory load from board slot {stored.Slot} nodes={plan.Nodes.Length} duration={plan.Duration:F3}s; no automatic approach");

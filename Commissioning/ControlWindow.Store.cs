@@ -84,10 +84,12 @@ public sealed partial class ControlWindow
         job.Done?.Invoke(ok, message);
         // A change on the board is read back, so the picture shown is the device's and not what was hoped for.  A FAILED save or erase
         // is read back too: it may have changed flash before it failed (erase clears block A before block B), or have finished with its
-        // final status lost.  Until the answer is complete the inventory is not trusted.
+        // final status lost.  From the moment a save or erase ends, until the answer is complete, the old slot contents are not trusted:
+        // nothing is saved, cleared or loaded from them (a stale entry could pick the wrong plan), and if the read-back is lost the
+        // periodic synchronisation asks again.
         if (job.Op != StoreOp.Query)
         {
-            if (!ok) { boardKnown = false; boardSeen = 0; }
+            boardKnown = false; boardSeen = 0;
             StartStoreJob(StoreOp.Query, -1, null);
         }
         PublishBoard();
@@ -345,7 +347,7 @@ public sealed partial class ControlWindow
             Check(w.storeJob is { Acked: true } && !done, "the receipt did not mark the job acknowledged");
             w.PollStoreJob(DateTime.UtcNow.AddSeconds(5)); Check(w.storeJob is not null, "a saving device was given up on after five seconds");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=1/1 seq={saveSeq} last=saved last_slot=0 row_max_us=4000");
-            Check(done && ok && w.storeJob is { Op: StoreOp.Query }, "the end of the save was not taken and read back");
+            Check(done && ok && w.storeJob is { Op: StoreOp.Query } && !w.boardKnown, "the end of the save was not taken and read back with the inventory distrusted meanwhile");
             // A failed save, a refusal, silence: each ends the job as failed; a refusal needs no waiting.
             w.FinishStoreJob(true, "");
             done = false; Check(w.StartStoreJob(StoreOp.Save, 2, (success, _) => { done = true; ok = success; }), "save 2 queued"); Next(12); uint failSeq = w.storeJob!.Sequence;
@@ -412,7 +414,10 @@ public sealed partial class ControlWindow
             Check(w.uploaded == plan && w.pendingBoardSave is null && w.storeJob is { Op: StoreOp.Save, Slot: 0 } && w.pendingControlType == 12, "the save did not follow the upload");
             w.storeJob!.Sequence = 40;   // the writer thread is not running in this fixture
             w.TestLine("TRAJ_STORE state=idle slot=0 rows=1/1 seq=40 last=saved last_slot=0 row_max_us=4000");
-            Check(BoardLedger.Load().Any(e => e.Slot == 0 && e.Crc == TrajectoryArchive.PlanCrc(plan.Nodes)) && w.storeJob is { Op: StoreOp.Query }, "the save was not recorded and read back");
+            Check(BoardLedger.Load().Any(e => e.Slot == 0 && e.Crc == TrajectoryArchive.PlanCrc(plan.Nodes)) && w.storeJob is { Op: StoreOp.Query } && !w.boardKnown, "the save was not recorded and read back");
+            // Until the read-back arrives the old slot contents are not used: no load from a stale entry, no stars, no saves.
+            w.TestLine("TRAJ_SLOT slot=0 valid=1 seq=9 nodes=" + plan.Nodes.Length + " duration_ms=" + plan.Nodes.Sum(n => (int)n.Milliseconds) + " q1=0 q2=0 crc=" + TrajectoryArchive.PlanCrc(plan.Nodes).ToString("X8"));
+            Check(!w.boardKnown && (string)p.UploadButton.Content == "上传图形", "a half-read inventory was trusted: " + p.UploadButton.Content);
             // The read-back: the device reports the plan in slot 0, and the screen then offers to load it.
             int ms = plan.Nodes.Sum(n => (int)n.Milliseconds);
             w.TestLine($"TRAJ_SLOT slot=0 valid=1 seq=1 nodes={plan.Nodes.Length} duration_ms={ms} q1={(int)Math.Round(start.Q1 * 100)} q2={(int)Math.Round(start.Q2 * 100)} crc={TrajectoryArchive.PlanCrc(plan.Nodes):X8}");
