@@ -67,6 +67,7 @@ typedef int8_t int8; typedef int16_t int16; typedef int32_t int32; typedef int64
 #define CY_PINS_PC_DATAOUT 1
 #define CY_PINS_DM_DIG_HIZ 0
 #define CY_PINS_DM_RES_UP 0
+#define CY_PINS_DM_RES_DWN 0
 #define CyGlobalIntEnable ((void)0)
 static uint64_t simClock, simClockBase, simClockWraps;
 static void (*simTickIsr)(void);
@@ -402,6 +403,7 @@ static void mock_set(int pin,int value) {
 #define CY_GET_REG32(p) mock_reg(p)
 #define CY_SET_REG32(p,v) mock_reg_set(p,v)
 #define CY_SET_REG8(p,v) mock_set((p),((v)&1))
+#define CY_GET_REG8(p) ((uint8)(simPins[(p)]&1))
 #define CyPins_ReadPin(p) mock_read(p)
 #define CyPins_SetPin(p) mock_set((p),1)
 #define CyPins_ClearPin(p) mock_set((p),0)
@@ -2209,8 +2211,8 @@ int main(int argc,char **argv) {
             /* E: raw=0 from a frame that never finished reads this_read_timed_out=1; a healthy read says 0 */
             simSsiDead=1u; simLogN=0; simLog[0]=0; jog_handle_byte('e'); txq_flush_blocking();
             assert(strstr(simLog,"ssi_timeouts=1 this_read_timed_out=1 ") && strstr(simLog,"ENCODER DO stuck LOW raw=0x00000"));
-            simSsiDead=0u; simLogN=0; simLog[0]=0; g_jogMs+=JOG_CMD_REPEAT_MS+1u; jog_handle_byte('e'); txq_flush_blocking();
-            assert(strstr(simLog,"ssi_timeouts=1 this_read_timed_out=0 ") && strstr(simLog,"do_pin="));
+            simSsiDead=0u; simLogN=0; simLog[0]=0; g_jogMs+=JOG_CMD_REPEAT_MS+1u; g_motionEnabled=0u; jog_handle_byte('e'); txq_flush_blocking();
+            assert(strstr(simLog,"ssi_timeouts=1 this_read_timed_out=0 ") && strstr(simLog,"do_pin=") && strstr(simLog,"DO probe, CSn high: pullup_reads="));
         } else if(!strcmp(t,"ssi_takeover")) {
             /* a synchronous read, or a re-anchored command, drops a frame that is still on the wire */
             g_encTry=0u; enc_flight_start(0u); assert(g_encFlight);

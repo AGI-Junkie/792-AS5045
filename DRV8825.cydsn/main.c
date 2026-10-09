@@ -340,6 +340,7 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
 #define PIN_CSN                     CYREG_PRT12_PC1  /* P12[1] -> AS5045 CSn */
 #define PIN_CLK                     CYREG_PRT12_PC0  /* P12[0] -> AS5045 CLK */
 #define PIN_DO                      CYREG_PRT1_PC3   /* P1[3]  <- AS5045 DO  */
+#define DO_DM_MASK                  (0x0Eu)          /* drive-mode bits of the pin configuration register */
 
 /* DRV2 / stepper2 carrier map verified on 2026-07-19. */
 #define PIN_DIR2                    CYREG_PRT12_PC4
@@ -3354,6 +3355,19 @@ static void jog_handle_byte(uint8 b)
                   (unsigned)s.mag_inc, (unsigned)s.mag_dec, (unsigned)s.par,
                   (s.par_ok != 0u) ? "ok" : "BAD",
                   (g_arm1.hasEnc != 0u) ? " [angle feedback]" : " [motion blocked; C rechecks]");
+            if (g_motionEnabled == 0u)
+            {
+                /* With CSn high the AS5045 releases DO, so the line floats: a pull-up must read 1 and a pull-down 0.
+                 * 0/0 = held low (short, or something drives it), 1/1 = held high.  The drive mode is restored. */
+                uint8 saved = CY_GET_REG8(PIN_DO), up, down;
+                CY_SET_REG8(PIN_DO, (uint8)((saved & ~DO_DM_MASK) | CY_PINS_DM_RES_UP));  delay_us(50u);
+                up = (CyPins_ReadPin(PIN_DO) != 0u) ? 1u : 0u;
+                CY_SET_REG8(PIN_DO, (uint8)((saved & ~DO_DM_MASK) | CY_PINS_DM_RES_DWN)); delay_us(50u);
+                down = (CyPins_ReadPin(PIN_DO) != 0u) ? 1u : 0u;
+                CY_SET_REG8(PIN_DO, saved);
+                JLOGF("ENCODER DO probe, CSn high: pullup_reads=%u pulldown_reads=%u (released line: 1/0; 0/0 held low; 1/1 held high)\r\n",
+                      (unsigned)up, (unsigned)down);
+            }
             break;
         }
         case 'f':
