@@ -51,6 +51,12 @@
 #ifndef HW_DEAD
 #define HW_DEAD                     (1u) /* hardware deadman: DeadTimer + AliveReq cut the STEP PWMs if the foreground stalls */
 #endif
+#ifndef HW_USB
+#define HW_USB                      (0u) /* USB CDC link on J6: the USBFS macro "UsbCdc" (docs/USB_CDC.md); 1 only while it is in TopDesign */
+#endif
+#if (HW_USB != 0u) && (HW_TXDMA != 0u)
+#error "HW_USB does not drive HW_TXDMA yet: the DMA owns the UART transmit queue"
+#endif
 #if (HW_EVT != 0u || HW_DEAD != 0u || HW_PINIRQ != 0u) && (HW_STEP == 0u)
 #error "HW_EVT, HW_DEAD and HW_PINIRQ need HW_STEP: the interrupt must not busy-wait for pulses, the kills act on the STEP PWMs"
 #endif
@@ -69,6 +75,9 @@
 #include "StepArm2Req.h"
 #include "StepArm1.h"
 #include "StepArm2.h"
+#endif
+#if (HW_USB != 0u)
+#include "UsbCdc.h"
 #endif
 #if (HW_EVT != 0u)
 #include "EvtTimer.h"
@@ -1075,6 +1084,9 @@ static void hw_init(void)
 #if (USE_DEBUG_UART != 0u)
     /* Creator owns the UART pin routing; never overwrite its PC registers. */
     HostUart_Start();
+#if (HW_USB != 0u)
+    UsbCdc_Start(0u, UsbCdc_5V_OPERATION);   /* VDDD is 5 V; enumerates when J6 is plugged in */
+#endif
 #if (HW_TXDMA != 0u)
     txdma_init();
 #endif
@@ -1154,6 +1166,29 @@ static uint16 g_txqHead;
 static uint16 g_txqTail;
 static uint16 g_txqDropped;
 
+#if (HW_USB != 0u)
+/* USB CDC on J6 (docs/USB_CDC.md).  The link is "up" while the host has the port open (configured + DTR): then the
+ * text queue goes out through the CDC IN endpoint (up to 64 bytes per packet) and the bytes come from the OUT endpoint;
+ * otherwise everything stays on the KitProg UART.  Receive is merged: bytes from either link reach the parser.
+ * Polled from the foreground (the component's own ISR does the enumeration), never blocks. */
+#define USB_PACKET                  (64u)
+static uint8 g_usbRx[USB_PACKET];
+static uint8 g_usbRxN, g_usbRxI;     /* bytes in g_usbRx / next one to hand out */
+static uint8 g_usbUp;
+static void usb_poll(void)
+{
+    if (UsbCdc_IsConfigurationChanged() != 0u && UsbCdc_GetConfiguration() != 0u) { UsbCdc_CDC_Init(); }
+    g_usbUp = (UsbCdc_GetConfiguration() != 0u && (UsbCdc_GetLineControl() & UsbCdc_LINE_CONTROL_DTR) != 0u) ? 1u : 0u;
+    if (g_usbUp != 0u && g_usbRxI >= g_usbRxN && UsbCdc_DataIsReady() != 0u)
+    {
+        g_usbRxN = (uint8)UsbCdc_GetAll(g_usbRx);
+        g_usbRxI = 0u;
+    }
+}
+#else
+#define g_usbUp                     (0u)
+#endif
+
 static void txq_puts(const char *s)
 {
     /* Drop a whole message, never a partial ACK that can corrupt the next line. */
@@ -1221,6 +1256,22 @@ static void txq_send_one(void)
 #else
 static void txq_send_one(void)
 {
+#if (HW_USB != 0u)
+    usb_poll();
+    if (g_usbUp != 0u)
+    {
+        /* One packet per call; PutData copies into the endpoint, so the queue space is free at once.  A host that
+         * stops reading leaves CDCIsReady() low: the queue fills, whole messages are dropped and counted as usual. */
+        if (g_txqHead != g_txqTail && UsbCdc_CDCIsReady() != 0u)
+        {
+            uint16 len = (g_txqHead > g_txqTail) ? (uint16)(g_txqHead - g_txqTail) : (uint16)(TXQ_SIZE - g_txqTail);
+            if (len > USB_PACKET) { len = USB_PACKET; }
+            UsbCdc_PutData((const uint8 *)&g_txq[g_txqTail], len);
+            g_txqTail = (uint16)((g_txqTail + len) % TXQ_SIZE);
+        }
+        return;
+    }
+#endif
     if (g_txqHead != g_txqTail && HostUart_GetTxBufferSize() < HostUart_TX_BUFFER_SIZE - 1u)
     {
         HostUart_PutChar((uint8)g_txq[g_txqTail]);
@@ -1255,7 +1306,12 @@ static int16 uart_rx_service(void)
     uint16 received = 0u;
     uint8 overflow, errors = 0u;
     int16 result = -1;
-    uint8 ints = CyEnterCriticalSection();
+    uint8 ints;
+#if (HW_USB != 0u)
+    usb_poll();
+    if (g_usbRxI < g_usbRxN) { return (int16)g_usbRx[g_usbRxI++]; }
+#endif
+    ints = CyEnterCriticalSection();
     overflow = HostUart_rxBufferOverflow;
     if (HostUart_GetRxBufferSize() != 0u || HostUart_errorStatus != 0u || overflow != 0u)
     {
@@ -1285,7 +1341,12 @@ static int16 uart_rx_service(void)
 
 static void uart_discard_rx(void)
 {
-    uint8 ints = CyEnterCriticalSection();
+    uint8 ints;
+#if (HW_USB != 0u)
+    g_usbRxI = g_usbRxN;
+    if (UsbCdc_GetConfiguration() != 0u && UsbCdc_DataIsReady() != 0u) { (void)UsbCdc_GetAll(g_usbRx); }
+#endif
+    ints = CyEnterCriticalSection();
     HostUart_ClearRxBuffer();
     HostUart_errorStatus = 0u;
     CyExitCriticalSection(ints);
@@ -2767,8 +2828,8 @@ static void stage_status_line(void)
     case 6u:
     traj_status(); break;
     case 7u:
-    JLOGF("LINK uart=hw baud=115200 rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=%u traj_repeat=1 fault_snapshot=1 telem_hz=%u proto=%u\r\n",
-          (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)ARM2_ENCODER_FEEDBACK, (unsigned)g_telemHz, (unsigned)PROTO_VERSION); break;
+    JLOGF("LINK uart=hw baud=115200 link=%s rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=%u traj_repeat=1 fault_snapshot=1 telem_hz=%u proto=%u\r\n",
+          (g_usbUp != 0u) ? "usb" : "uart", (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)ARM2_ENCODER_FEEDBACK, (unsigned)g_telemHz, (unsigned)PROTO_VERSION); break;
     case 8u:
     JLOGF("PTP_RX short_ok=%lu drop_crc=%lu drop_short=%lu drop_timeout=%lu rejected=%lu epoch_rejected=%lu last_rejected_byte=0x%02X\r\n",
           (unsigned long)g_shortRxOk, (unsigned long)g_ptpRxCrc, (unsigned long)g_ptpRxShort, (unsigned long)g_ptpRxTimeout,
@@ -3527,6 +3588,11 @@ static void app_poll(void)
 
 #if (HW_TXDMA != 0u)
     if (txq_pending() != 0u) { txq_send_one(); }       /* the DMA needs no gap between steps */
+#elif (HW_USB != 0u)
+    if ((txq_pending() != 0u) && ((g_usbUp != 0u) || (jog_slot_free(JOG_TX_BYTE_US) != 0u)))
+    {
+        txq_send_one();                                /* a USB packet is a few register writes, no gap needed */
+    }
 #else
     if ((txq_pending() != 0u) && (jog_slot_free(JOG_TX_BYTE_US) != 0u))
     {

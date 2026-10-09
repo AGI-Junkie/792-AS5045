@@ -171,6 +171,26 @@ static void HostUart_PutChar(uint8 b){
     while(simClock<simUartTxBusyUntil){simClock+=SIM_MHZ;sim_tick_sync();}
     mock_log(b);
 }
+/* USB CDC "UsbCdc" (USBFS macro): configured + DTR = the port is open.  Packets of at most 64 bytes, like the endpoint. */
+#define UsbCdc_5V_OPERATION 1u
+#define UsbCdc_LINE_CONTROL_DTR 1u
+static uint8 simUsbCfg, simUsbCfgChanged, simUsbDtr, simUsbStarted, simUsbInit, simUsbReady=1;
+static uint8 simUsbRx[512]; static unsigned simUsbRxN, simUsbRxI;
+static char simUsbSent[4096]; static unsigned simUsbSentN, simUsbPackets, simUsbMaxPacket;
+static void UsbCdc_Start(uint8 device, uint8 mode){(void)device;(void)mode;simUsbStarted=1;}
+static uint8 UsbCdc_GetConfiguration(void){return simUsbCfg;}
+static uint8 UsbCdc_IsConfigurationChanged(void){uint8 c=simUsbCfgChanged;simUsbCfgChanged=0;return c;}
+static uint8 UsbCdc_CDC_Init(void){simUsbInit++;return 0;}
+static uint16 UsbCdc_GetLineControl(void){return simUsbDtr;}
+static uint8 UsbCdc_DataIsReady(void){return simUsbRxI<simUsbRxN;}
+static uint16 UsbCdc_GetAll(uint8 *p){unsigned n=simUsbRxN-simUsbRxI;if(n>64u)n=64u;memcpy(p,simUsbRx+simUsbRxI,n);simUsbRxI+=n;return (uint16)n;}
+static uint8 UsbCdc_CDCIsReady(void){return simUsbReady;}
+static void UsbCdc_PutData(const uint8 *p, uint16 n){
+    assert(simUsbReady && n>0 && n<=64u && simUsbSentN+n<sizeof(simUsbSent));
+    memcpy(simUsbSent+simUsbSentN,p,n);simUsbSentN+=n;simUsbPackets++;if(n>simUsbMaxPacket)simUsbMaxPacket=n;
+}
+static void sim_usb_reset(void){simUsbCfg=simUsbCfgChanged=simUsbDtr=0;simUsbReady=1;simUsbRxN=simUsbRxI=0;simUsbSentN=simUsbPackets=simUsbMaxPacket=0;simUsbInit=0;}
+static void sim_usb_push(const void *p, unsigned n){memcpy(simUsbRx+simUsbRxN,p,n);simUsbRxN+=n;}
 /* DMA channel "TxDma": text queue -> UART TX FIFO.  The channel moves one byte per simDmaByteCy cycles (0 = the UART
  * keeps up instantly, like the PutChar model above) and the bytes appear in the log as they are moved, so a stuck wire
  * (a huge simDmaByteCy) sends nothing and a disabled channel stops where it was. */
@@ -2082,6 +2102,67 @@ int main(int argc,char **argv) {
 #endif
         puts(t);return 0;
     }
+    if(!strncmp(t,"usb_",4)) {
+        char text[200]; unsigned k, n;
+        setup(); txq_flush_blocking();
+        for(k=0;k<199u;k++) text[k]=(char)('a'+k%26);
+        text[199]=0;
+        simLogN=0; simLog[0]=0;
+#if HW_USB
+        assert(simUsbStarted);
+        sim_usb_reset(); simLogN=0; simLog[0]=0;
+        if(!strcmp(t,"usb_tx")) {
+            /* port open: the text queue leaves in packets of at most 64 bytes, in order, and the UART stays silent */
+            simUsbCfg=1; simUsbCfgChanged=1; simUsbDtr=1;
+            JLOG(text); txq_send_one();
+            assert(g_usbUp && simUsbInit==1 && simUsbPackets==1 && simUsbSentN==64u);
+            while(txq_pending()) txq_send_one();
+            assert(simUsbSentN==199u && !memcmp(simUsbSent,text,199u) && simUsbPackets==4u && simUsbMaxPacket==64u);
+            assert(simLogN==0 && g_txqDropped==0);
+        } else if(!strcmp(t,"usb_fallback")) {
+            /* port closed: UART.  Port opens mid-queue: the rest goes out by USB, nothing lost or repeated, then back to UART. */
+            JLOG(text);
+            for(k=0;k<10;k++) txq_send_one();
+            n=simLogN; assert(n>0 && n<=10u && simUsbPackets==0);
+            simUsbCfg=1; simUsbCfgChanged=1; simUsbDtr=1;
+            while(txq_pending()) txq_send_one();
+            assert(g_usbUp && n+simUsbSentN==199u && !memcmp(simLog,text,n) && !memcmp(simUsbSent,text+n,simUsbSentN));
+            simUsbDtr=0; simLogN=0; simLog[0]=0; JLOG("x\r\n"); txq_flush_blocking();
+            assert(!g_usbUp && simLogN==3u && !strcmp(simLog,"x\r\n"));
+            /* configured but DTR low (nobody opened the port) is not "up" either */
+            simUsbDtr=0; usb_poll(); assert(!g_usbUp);
+        } else if(!strcmp(t,"usb_stall")) {
+            /* the host stopped reading (CDCIsReady stays low): nothing is sent or lost silently, the flush gives up like a stuck UART */
+            uint32 before;
+            simUsbCfg=1; simUsbCfgChanged=1; simUsbDtr=1; simUsbReady=0;
+            JLOG(text); txq_send_one(); assert(simUsbPackets==0 && txq_pending());
+            before=wall_ms(); txq_flush_blocking();
+            assert(!txq_pending() && wall_ms()-before>=100u && wall_ms()-before<110u && g_txqDropped==1u && simUsbPackets==0 && simLogN==0);
+            simUsbReady=1; JLOG("ok\r\n"); txq_flush_blocking();
+            assert(simUsbSentN==4u && !memcmp(simUsbSent,"ok\r\n",4));
+        } else if(!strcmp(t,"usb_rx")) {
+            /* USB bytes come out in order across 64-byte packets, then the UART's; a discard drops what is pending on both */
+            uint8 data[150]; int16 b;
+            for(k=0;k<150u;k++) data[k]=(uint8)(0x40u+k%32u);
+            simUsbCfg=1; simUsbCfgChanged=1; simUsbDtr=1; sim_usb_push(data,150u);
+            for(k=0;k<150u;k++) { b=uart_rx_service(); assert(b==(int16)data[k]); }
+            assert(uart_rx_service()==-1 && simUsbInit==1);
+            sim_uart_push(0x5A); assert(uart_rx_service()==0x5A && uart_rx_service()==-1);
+            sim_usb_push(data,100u); sim_uart_push(0x5B); assert(uart_rx_service()==(int16)data[0]);
+            uart_discard_rx(); assert(uart_rx_service()==-1 && simUsbRxI==simUsbRxN);
+        } else if(!strcmp(t,"usb_link")) {
+            stage_status(); status_drain(); assert(strstr(simLog," link=uart ") && !strstr(simLog," link=usb "));
+            simUsbCfg=1; simUsbCfgChanged=1; simUsbDtr=1; simLogN=0; simLog[0]=0; simUsbSentN=0;
+            stage_status(); status_drain(); usb_poll();
+            simUsbSent[simUsbSentN]=0; assert(strstr(simUsbSent," link=usb ") && !strstr(simUsbSent," link=uart "));
+        } else assert(0);
+#else
+        /* no USB build: the link is the UART and says so */
+        assert(g_usbUp==0u);
+        stage_status(); status_drain(); assert(strstr(simLog," link=uart ") && !strstr(simLog," link=usb "));
+#endif
+        puts(t);return 0;
+    }
     if(!strncmp(t,"ssi_",4)) {
 #if HW_SSI
         uint8 ok=0u; uint64_t t0; unsigned k; unsigned retries;
@@ -2752,6 +2833,7 @@ int main(int argc,char **argv) {
 
 cases = ['dual_'+n for n in ['home_reverse','home_stall','wrap','loss','gap','parity','hold','derate','follow_stop','peer_bad','peer_bad_reverse','final','limit','enable_bad']]
 cases += ['ssi_fifo','ssi_nonblocking','ssi_snapshot','ssi_retry','ssi_timeout','ssi_takeover']
+cases += ['usb_tx','usb_fallback','usb_stall','usb_rx','usb_link']
 cases += ['step_hw_request','step_hw_pins','dead_kill','txdma_order','txdma_busy','txdma_wait_drq','pin_irq_kill']
 cases += ['dual_snapshot_length','chain_frames','boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
          'missing_sensor','stuck_sensor','missing_npn','stalled_motor','reject_moving',
@@ -2826,11 +2908,11 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     tmp = Path(temp)
     if host_plan is not None: (tmp/'host-plan.bin').write_bytes(host_plan.read_bytes())
     if host_control is not None: (tmp/'host-control.bin').write_bytes(host_control.read_bytes())
-    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','FaultIsr.h','LimitIsr.h','StepRearm.h','CyDmac.h']:
+    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','FaultIsr.h','LimitIsr.h','StepRearm.h','CyDmac.h','UsbCdc.h']:
         (tmp/name).write_text('',encoding='ascii')
     if emit_c is not None:
         emit_c.mkdir(parents=True, exist_ok=True)
-        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','FaultIsr.h','LimitIsr.h','StepRearm.h','CyDmac.h']: (emit_c/name).write_text('',encoding='ascii')
+        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','FaultIsr.h','LimitIsr.h','StepRearm.h','CyDmac.h','UsbCdc.h']: (emit_c/name).write_text('',encoding='ascii')
         (emit_c/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
         print('wrote', emit_c/'check.c'); sys.exit(0)
     (tmp/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
