@@ -10,7 +10,7 @@
 | TopDesign：`UsbCdc`（USBUART CDC 宏，USBFS v3.20） | 已放；引脚 Dm=P15[7]、Dp=P15[6] |
 | 时钟 | 已改；Creator 构建 0 错误 0 警告，时序 No Timing Violations |
 | 上位机：认出 USB 口、置 DTR、取消双发和字节间隔（`UsbLink.cs`） | 已做；自检 `USB link`（`--self-test`）通过 |
-| 上板验证 | 已验证：插着 J6 时 `link=usb`、能使能、无复位无停机、`key_max_gap_ms=53`（KitProg 时 66–134）；拔掉 J6 后上位机连 COM8，`link=uart`、`ENABLE OK`、无停机。未单独记录：拔掉后再插回 J6 自动切回 USB |
+| 上板验证 | **全部通过**：插着 J6 时 `link=usb`、能使能、无复位无停机、`key_max_gap_ms=53`（KitProg 时 66–134）；拔掉 J6 后回退 UART（`link=uart`、`ENABLE OK`、无停机）；用 USB 跑完整轨迹无复位无停机；拔掉再插回 J6 自动切回 USB；只接 J6 一根线可供电使用 |
 
 ## 固件行为
 
@@ -39,7 +39,7 @@ ILO Route 改为 100 kHz 是 USBFS 的硬性要求（Creator 报 `fit.M0031`）�
 
 1. **USB 没连、IMO 没被锁定时精度只有 ±4%**（数据手册，非 USB 模式）。总线、步进脉冲、µs 计时、UART 波特率都会跟着偏。USB 连着且在传 SOF 时是 ±0.25%。KitProg UART 在没有 USB 锁定时可能失配；这是计划里写过的取舍。
 2. 只用 KitProg 线（不插 J6）时，固件的计时精度比以前差。闭环编码器会兜住位置，但时间相关的限值（步频、deadman 的毫秒数）会按比例偏。
-3. J6 单线供电（VBUS 经 F1/D2 并入 VTARG）是从原理图文本推断的，没逐线核对。
+3. J6 单线供电（VBUS 经 F1/D2 并入 VTARG）：已在板上验证可用。
 4. 烧录和调试仍然走 J10（KitProg）。
 
 ## 上板验证步骤
