@@ -175,13 +175,14 @@ static void HostUart_PutChar(uint8 b){
 /* USB CDC "UsbCdc" (USBFS macro): configured + DTR = the port is open.  Packets of at most 64 bytes, like the endpoint. */
 #define UsbCdc_5V_OPERATION 1u
 #define UsbCdc_LINE_CONTROL_DTR 1u
-static uint8 simUsbCfg, simUsbCfgChanged, simUsbDtr, simUsbStarted, simUsbInit, simUsbReady=1;
+static uint8 simUsbCfg, simUsbCfgChanged, simUsbDtr, simUsbStarted, simUsbInit, simUsbReady=1, simUsbActive=1;
 static uint8 simUsbRx[512]; static unsigned simUsbRxN, simUsbRxI;
 static char simUsbSent[4096]; static unsigned simUsbSentN, simUsbPackets, simUsbMaxPacket;
 static void UsbCdc_Start(uint8 device, uint8 mode){(void)device;(void)mode;simUsbStarted=1;}
 static uint8 UsbCdc_GetConfiguration(void){return simUsbCfg;}
 static uint8 UsbCdc_IsConfigurationChanged(void){uint8 c=simUsbCfgChanged;simUsbCfgChanged=0;return c;}
 static uint8 UsbCdc_CDC_Init(void){simUsbInit++;return 0;}
+static uint8 UsbCdc_CheckActivity(void){return simUsbActive;}
 static uint16 UsbCdc_GetLineControl(void){return simUsbDtr;}
 static uint8 UsbCdc_DataIsReady(void){return simUsbRxI<simUsbRxN;}
 static uint16 UsbCdc_GetAll(uint8 *p){unsigned n=simUsbRxN-simUsbRxI;if(n>64u)n=64u;memcpy(p,simUsbRx+simUsbRxI,n);simUsbRxI+=n;return (uint16)n;}
@@ -190,7 +191,7 @@ static void UsbCdc_PutData(const uint8 *p, uint16 n){
     assert(simUsbReady && n>0 && n<=64u && simUsbSentN+n<sizeof(simUsbSent));
     memcpy(simUsbSent+simUsbSentN,p,n);simUsbSentN+=n;simUsbPackets++;if(n>simUsbMaxPacket)simUsbMaxPacket=n;
 }
-static void sim_usb_reset(void){simUsbCfg=simUsbCfgChanged=simUsbDtr=0;simUsbReady=1;simUsbRxN=simUsbRxI=0;simUsbSentN=simUsbPackets=simUsbMaxPacket=0;simUsbInit=0;}
+static void sim_usb_reset(void){simUsbCfg=simUsbCfgChanged=simUsbDtr=0;simUsbReady=1;simUsbActive=1;simUsbRxN=simUsbRxI=0;simUsbSentN=simUsbPackets=simUsbMaxPacket=0;simUsbInit=0;}
 static void sim_usb_push(const void *p, unsigned n){memcpy(simUsbRx+simUsbRxN,p,n);simUsbRxN+=n;}
 /* DMA channel "TxDma": text queue -> UART TX FIFO.  The channel moves one byte per simDmaByteCy cycles (0 = the UART
  * keeps up instantly, like the PutChar model above) and the bytes appear in the log as they are moved, so a stuck wire
@@ -2142,6 +2143,19 @@ int main(int argc,char **argv) {
             assert(!txq_pending() && wall_ms()-before>=100u && wall_ms()-before<110u && g_txqDropped==1u && simUsbPackets==0 && simLogN==0);
             simUsbReady=1; JLOG("ok\r\n"); txq_flush_blocking();
             assert(simUsbSentN==4u && !memcmp(simUsbSent,"ok\r\n",4));
+        } else if(!strcmp(t,"usb_detach")) {
+            /* cable pulled with the port still "open": configured and DTR stay set, but SOFs stop.  The text must go back
+             * to the UART at once, and to USB again when the bus comes back. */
+            simUsbCfg=1; simUsbCfgChanged=1; simUsbDtr=1;
+            JLOG("up\r\n"); txq_flush_blocking();
+            assert(g_usbUp && simUsbSentN==4u && simLogN==0);
+            simUsbActive=0; simClock+=(uint64_t)SIM_MHZ*1000u*(USB_ACTIVITY_TIMEOUT_MS+20u); usb_poll();
+            assert(!g_usbUp);
+            JLOG("uart\r\n"); txq_flush_blocking();
+            assert(simLogN==6u && !strcmp(simLog,"uart\r\n") && simUsbSentN==4u);
+            simUsbActive=1; usb_poll(); assert(g_usbUp);
+            JLOG("back\r\n"); txq_flush_blocking();
+            assert(simUsbSentN==10u && !memcmp(simUsbSent+4,"back\r\n",6));
         } else if(!strcmp(t,"usb_rx")) {
             /* USB bytes come out in order across 64-byte packets, then the UART's; a discard drops what is pending on both */
             uint8 data[150]; int16 b;
@@ -2841,7 +2855,7 @@ int main(int argc,char **argv) {
 
 cases = ['dual_'+n for n in ['home_reverse','home_stall','wrap','loss','gap','parity','hold','derate','follow_stop','peer_bad','peer_bad_reverse','final','limit','enable_bad']]
 cases += ['ssi_fifo','ssi_nonblocking','ssi_snapshot','ssi_retry','ssi_timeout','ssi_diag','ssi_takeover']
-cases += ['usb_tx','usb_fallback','usb_stall','usb_rx','usb_link']
+cases += ['usb_tx','usb_fallback','usb_stall','usb_detach','usb_rx','usb_link']
 cases += ['step_hw_request','step_hw_pins','dead_kill','txdma_order','txdma_busy','txdma_wait_drq','pin_irq_kill']
 cases += ['dual_snapshot_length','chain_frames','boot','boot_bad','boot_limit','success','reverse_polarity','home_active_at_start',
          'missing_sensor','stuck_sensor','missing_npn','stalled_motor','reject_moving',

@@ -10,11 +10,12 @@
 | TopDesign：`UsbCdc`（USBUART CDC 宏，USBFS v3.20） | 已放；引脚 Dm=P15[7]、Dp=P15[6] |
 | 时钟 | 已改；Creator 构建 0 错误 0 警告，时序 No Timing Violations |
 | 上位机：认出 USB 口、置 DTR、取消双发和字节间隔（`UsbLink.cs`） | 已做；自检 `USB link`（`--self-test`）通过 |
-| 上板验证 | **没做** |
+| 上板验证 | 部分：插着 J6 时 `link=usb`、能使能、无复位无停机、`key_max_gap_ms=53`（KitProg 时 66–134）；拔掉 J6 回退 UART 的修复（总线活动判定）**待上板确认** |
 
 ## 固件行为
 
-- “USB 链路已打开” = 已枚举（configured）且主机置了 DTR。
+- “USB 链路已打开” = 已枚举（configured）、主机置了 DTR，**并且 100 ms 内看到过总线活动**（`UsbCdc_CheckActivity()`，主机连着时每毫秒一个 SOF）。
+  没有最后一条时，拔掉 J6 后“已枚举”和 DTR 都不会清除（没开 VBUS 监测），固件会一直把输出塞给没人读的端点，KitProg 的 UART 就是哑的（上板时 COM8 连不上、`tx_dropped` 飙到上千就是这个原因）。
 - 已打开：发送队列经 CDC IN 端点发出，每包最多 64 字节；未打开：仍走 KitProg UART（和以前一样）。
 - 接收是合并的：USB 和 UART 的字节都进同一个解析器。
 - 主机停止读取（端点一直不就绪）时，队列写满后整条丢弃并计入 `tx_dropped`，`txq_flush_blocking` 100 ms 后放弃，和 UART 卡住时一样。

@@ -1177,10 +1177,18 @@ static uint16 g_txqDropped;
 static uint8 g_usbRx[USB_PACKET];
 static uint8 g_usbRxN, g_usbRxI;     /* bytes in g_usbRx / next one to hand out */
 static uint8 g_usbUp;
+/* Unplugging J6 changes neither "configured" nor DTR (VBUS is not monitored), so the link is also required to show bus
+ * activity: a connected host sends SOF every millisecond.  No activity for this long = cable out (or host suspended):
+ * the text goes back to the UART instead of into an endpoint nobody reads. */
+#define USB_ACTIVITY_TIMEOUT_MS     (100u)
+static uint32 g_usbActiveMs;
+static uint8 g_usbSeen;
 static void usb_poll(void)
 {
+    if (UsbCdc_CheckActivity() != 0u) { g_usbActiveMs = wall_ms(); g_usbSeen = 1u; }
     if (UsbCdc_IsConfigurationChanged() != 0u && UsbCdc_GetConfiguration() != 0u) { UsbCdc_CDC_Init(); }
-    g_usbUp = (UsbCdc_GetConfiguration() != 0u && (UsbCdc_GetLineControl() & UsbCdc_LINE_CONTROL_DTR) != 0u) ? 1u : 0u;
+    g_usbUp = (UsbCdc_GetConfiguration() != 0u && (UsbCdc_GetLineControl() & UsbCdc_LINE_CONTROL_DTR) != 0u &&
+               g_usbSeen != 0u && (wall_ms() - g_usbActiveMs) < USB_ACTIVITY_TIMEOUT_MS) ? 1u : 0u;
     if (g_usbUp != 0u && g_usbRxI >= g_usbRxN && UsbCdc_DataIsReady() != 0u)
     {
         g_usbRxN = (uint8)UsbCdc_GetAll(g_usbRx);
