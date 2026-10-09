@@ -59,15 +59,25 @@ public sealed class TimedTrajectory
     internal double PieceDuration(int piece, double ramp, int probes)
     {
         double duration = 0.02;
-        for (int i = 0; i <= probes; i++)
+        void Probe(double z)
         {
-            var state = EvaluatePiece(piece, i / (double)probes, 1, ramp);
+            var state = EvaluatePiece(piece, z, 1, ramp);
             duration = Math.Max(duration, state.Speed / Rates.Feed);
             duration = Math.Max(duration, Math.Abs(state.Velocity.Q1) / Rates.V1);
             duration = Math.Max(duration, Math.Abs(state.Velocity.Q2 - state.Velocity.Q1) / Rates.V2);
             duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q1) / Rates.A1));
             duration = Math.Max(duration, Math.Sqrt(Math.Abs(state.Acceleration.Q2 - state.Acceleration.Q1) / Rates.A2));
         }
+        for (int i = 0; i <= probes; i++) Probe(i / (double)probes);
+        if (Path.Pieces[piece].Checks is { } checks)
+            foreach (double u in checks) {
+                double low = 0, high = 1;
+                for (int k = 0; k < 40; k++) {
+                    double z = (low + high) / 2;
+                    if (Progress(z, ramp).U < u) low = z; else high = z;
+                }
+                Probe((low + high) / 2);
+            }
         return duration;
     }
 

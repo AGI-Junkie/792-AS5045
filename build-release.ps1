@@ -91,7 +91,7 @@ try {
     Write-Host 'Testing actual firmware C with mocked GPIO and host-generated paths...'
     python tests/test_stage1.py "--host-plan=$dest\preview.execution.bin" "--host-control=$dest\preview.control.bin" *> (Join-Path $dest 'firmware-tests.log')
     if ($LASTEXITCODE -ne 0) { throw "Firmware checks failed; see $dest\firmware-tests.log" }
-    foreach ($shape in @('line','rectangle')) {
+    foreach ($shape in @('line','rectangle','freehand')) {
         python tests/test_stage1.py traj_host_plan traj_manual_plan "--host-plan=$dest\$shape.execution.bin" *> (Join-Path $dest "$shape-tests.log")
         if ($LASTEXITCODE -ne 0) { throw "$shape execution checks failed." }
     }

@@ -17,14 +17,15 @@ public sealed class App : Application
     [STAThread]
     public static int Main(string[] args)
     {
-        if (args.Contains("--self-test") || args.Contains("--language-self-test") || args.Contains("--upload-language-test") || args.Contains("--log-level-self-test"))
+        if (args.Contains("--self-test") || args.Contains("--language-self-test") || args.Contains("--upload-language-test") || args.Contains("--log-level-self-test") || args.Contains("--freehand-self-test"))
         {
             try
             {
                 Lang.PersistChanges = false;
                 int snapshot = Array.IndexOf(args, "--snapshot");
                 string? path = snapshot >= 0 && snapshot + 1 < args.Length ? args[snapshot + 1] : null;
-                if (args.Contains("--log-level-self-test")) ControlWindow.LoggingSelfTest();
+                if (args.Contains("--freehand-self-test")) { Lang.Set(false, false); FreehandTrajectory.SelfTest(); XYPreviewPanel.FreehandSelfTest(path); }
+                else if (args.Contains("--log-level-self-test")) ControlWindow.LoggingSelfTest();
                 else if (args.Contains("--upload-language-test")) ControlWindow.UploadLanguageTest();
                 else if (args.Contains("--language-self-test")) { Lang.SelfTest(); ControlWindow.LanguageSelfTest(path); }
                 else ControlWindow.SelfTest(path);
@@ -191,6 +192,7 @@ public sealed partial class ControlWindow : Window
     private static bool IsTextInteraction(ModifierKeys modifiers, bool textFocused) => modifiers != ModifierKeys.None || textFocused;
     private void OnKeyDown(object sender, KeyEventArgs e)
     {
+        if (e.Key == Key.Escape && xyPreview.CancelFreehandOnEscape()) { e.Handled = true; return; }
         if (e.Key is Key.Space or Key.Escape) { Stop(); e.Handled = true; return; }
         // Ctrl+C/Ctrl+A and navigation inside the log are native text operations.
         if (IsTextInteraction(Keyboard.Modifiers, IsEditingControls)) return;
@@ -1077,8 +1079,9 @@ public sealed partial class ControlWindow : Window
             using var binary = new BinaryWriter(File.Create(Path.ChangeExtension(snapshotPath, ".execution.bin")));
             binary.Write((ushort)execution.Nodes.Length);
             foreach (var n in execution.Nodes) { binary.Write((short)Math.Round(n.Pose.Q1 * 100)); binary.Write((short)Math.Round(n.Pose.Q2 * 100)); binary.Write(n.Milliseconds); }
-            foreach(var kind in new[]{DrawingShape.Line,DrawingShape.Rectangle}) {
-                var extraPath=DrawingTrajectory.Create(new PlanarArm(180,176.38),kind,338,-4,kind==DrawingShape.Line?344:6,kind==DrawingShape.Line?4:8,0,null);
+            foreach(var kind in new[]{DrawingShape.Line,DrawingShape.Rectangle,DrawingShape.Freehand}) {
+                var options = kind == DrawingShape.Freehand ? new ShapeOptions { FreehandPoints = FreehandTrajectory.RefinementExample } : null;
+                var extraPath=DrawingTrajectory.Create(new PlanarArm(180,176.38),kind,338,-4,kind==DrawingShape.Line?344:6,kind==DrawingShape.Line?4:8,0,null,options);
                 var extraPlan=new ExecutionTrajectory(new TimedTrajectory(extraPath,new PlanningRates(20,5,3,10,6)),new JointLimits(-30,30,-60,60));
                 using var extra=new BinaryWriter(File.Create(Path.Combine(Path.GetDirectoryName(snapshotPath)!,kind.ToString().ToLowerInvariant()+".execution.bin")));
                 extra.Write((ushort)extraPlan.Nodes.Length);

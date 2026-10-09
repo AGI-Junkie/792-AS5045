@@ -198,7 +198,7 @@ internal sealed partial class ExperimentWindow : Window
     }
 
     // ---- list ------------------------------------------------------------------------------------------------------
-    private string ShapeName(ExperimentRun run) => run.Settings is { } s && s.Shape >= 0 && s.Shape <= 10 ? Lang.T("xy.shape" + s.Shape) : "—";
+    private string ShapeName(ExperimentRun run) => run.Settings is { } s && s.Shape >= 0 && s.Shape <= Enum.GetValues<DrawingShape>().Length ? Lang.T("xy.shape" + s.Shape) : "—";
     private static string KindKey(ExperimentRun run) => run.Kind switch { "point" => "exp.kind.point", "fault" => "exp.kind.fault", _ => "exp.kind.trajectory" };
     private Row MakeRow(ExperimentRun run)
     {

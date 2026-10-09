@@ -105,7 +105,7 @@ public sealed partial class XYPreviewPanel
     private string RunSummary(ExperimentRun run)
     {
         var s = run.Settings;
-        string shapeName = s is { Shape: >= 0 and <= 10 } ? Lang.T("xy.shape" + s.Shape) : "—";
+        string shapeName = s is { Shape: >= 0 } && s.Shape < shape.Items.Count ? Lang.T("xy.shape" + s.Shape) : "—";
         string status = run.Complete ? "✓ " + Lang.T("exp.status.complete") : "✗ " + (run.Outcome == "interrupted" ? Lang.T("exp.status.interrupted") : Lang.T("exp.status.other", run.Outcome));
         return $"{run.StartedUtc.ToLocalTime():MM-dd HH:mm}  {shapeName}  v{s?.V1:0.#}/{s?.V2:0.#}  {status}" + (run.Rmse is { } rmse ? $"  RMSE {rmse:0.000}°" : "");
     }
@@ -183,13 +183,13 @@ public sealed partial class XYPreviewPanel
 
     // ---- where each group of parameters stands ----------------------------------------------------------------------
     // Positions in the snapshot: the 21 text fields in ParameterFields order, then shape, branch, direction.
-    private static readonly int[] ShapeGroup = [2, 3, 4, 5, 17, 18, 19, 20, 21, 22, 23], SizeGroup = [0, 1], RangeGroup = [6, 7, 8, 9, 15, 16], SpeedGroup = [11, 12, 13, 14];
+    private static readonly int[] ShapeGroup = [2, 3, 4, 5, 17, 18, 19, 20, 21, 22, 23, 24], SizeGroup = [0, 1], RangeGroup = [6, 7, 8, 9, 15, 16], SpeedGroup = [11, 12, 13, 14];
     private string[]? savedFields;                       // what was last written to, or read from, the parameter file
     private bool rangeConfirmed = true, speedConfirmed = true;
     private bool planHeld;                               // the plan on the device is the one on screen
     private readonly List<(int[] Group, bool HasDevice, TextBlock[] Lamps)> lampRows = [];
 
-    private string[] SnapshotFields() => ParameterFields.Select(f => f.Text).Concat([shape.SelectedIndex.ToString(), branch.SelectedIndex.ToString(), direction.SelectedIndex.ToString()]).ToArray();
+    private string[] SnapshotFields() => ParameterFields.Select(f => f.Text).Concat([shape.SelectedIndex.ToString(), branch.SelectedIndex.ToString(), direction.SelectedIndex.ToString(), JsonSerializer.Serialize(freehandPoints)]).ToArray();
     private void RememberSaved() { savedFields = SnapshotFields(); UpdateLamps(); }
 
     // The device's own report of the joint ranges and of the speeds, each against what is typed here.
