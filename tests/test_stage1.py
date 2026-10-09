@@ -2299,7 +2299,17 @@ int main(int argc,char **argv) {
             simStall2=1;
             for(i=0;i<(!strcmp(t,"dual_derate")?20u:150u);i++)jog_step(&g_arm2,1);
             simClock+=(SIM_MHZ*1000u);service_encoder();
-            if(!strcmp(t,"dual_derate")) {assert(g_motionEnabled && g_arm2.derates==1 && g_arm2.rateCap==300 && !g_arm1.derates);}
+            if(!strcmp(t,"dual_derate")) {
+                uint32 cut;
+                assert(g_motionEnabled && g_arm2.derates==1 && g_arm2.rateCap==450 && !g_arm1.derates);
+                /* one cut, not three, however many encoder samples still see the lag */
+                for(i=0;i<5;i++){simClock+=(SIM_MHZ*1000u);service_encoder();}
+                assert(g_arm2.derates==1 && g_arm2.rateCap==450);
+                /* calm for a second: the cap climbs again, never past rateMax */
+                cut=g_arm2.rateCap;g_arm2.want=1;g_arm2.slipNow=0;
+                for(i=0;i<SLIP_RECOVER_MS+5u;i++)jog_axis_tick(&g_arm2);
+                assert(g_arm2.rateCap>cut && g_arm2.rateCap<=g_arm2.rateMax);
+            }
             else {assert(!g_motionEnabled && !g_ptp.reference);}
         } else if(!strcmp(t,"dual_peer_bad") || !strcmp(t,"dual_peer_bad_reverse")) {
             jog_axis_t *healthy=!strcmp(t,"dual_peer_bad") ? &g_arm1 : &g_arm2;

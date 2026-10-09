@@ -266,7 +266,10 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
 #define SLIP_WARN_LSB               (31)     /* 1.5 full steps = 2.70 deg    */
 #define SLIP_FAIL_LSB               (328)    /* 4 electrical cycles = 28.8   */
 #define PULLOUT_LSB                 (41)     /* 2 full steps, for reporting  */
-#define SLIP_DERATE_MAX             (3u)     /* speed cap can drop 8x        */
+#define SLIP_DERATE_FLOOR_SHIFT     (3u)     /* speed cap can drop 8x        */
+#define SLIP_DERATE_HOLD_MS         (300u)   /* min gap between two cuts     */
+#define SLIP_CALM_LSB               (15)     /* slip this low = cap may rise */
+#define SLIP_RECOVER_MS             (1000u)  /* calm this long -> raise cap  */
 
 /* AS5045 output delay. MODE low/open = slow mode, 2.61 kHz / 384 us.
  * At 6000 ustep/s that delay alone looks like 6 LSB of slip, so it is
@@ -1393,7 +1396,7 @@ typedef struct
     uint8  latched;         /* stopped by slip: ignore keys until released */
     uint8  limitHit;        /* soft limit message already printed          */
     uint32 rate;            /* current ustep/s                             */
-    uint32 rateCap;         /* cap for this press, halved on slip warnings */
+    uint32 rateCap;         /* cap for this press, cut on slip warnings, raised when calm */
     uint32 rateMax;
     uint32 rateStart;
     uint32 accel;           /* ustep/s^2                                   */
@@ -1404,7 +1407,10 @@ typedef struct
     volatile int32 usteps; /* net microsteps; ISR writes during trajectories */
     int32  peakSlip;        /* worst slip of the current press, LSB        */
     uint8  derates;
-    uint16 settleMs;        /* >0: just stopped, rotor still ringing       */
+    int32  slipNow;         /* latest slip, LSB (not the peak)             */
+    uint16 derateHoldMs;    /* >0: a cut just happened, no second one yet  */
+    uint16 calmMs;          /* ms of slip < SLIP_CALM_LSB while capped     */
+    uint16 settleMs;       /* >0: just stopped, rotor still ringing       */
     uint8  holding;         /* closed-loop hold at holdTarget        */
     int32  holdTarget;
     uint32 holdCooldownMs;
@@ -2973,6 +2979,9 @@ static void jog_axis_init(jog_axis_t *a, const char *name, uint32 pinStep,
     a->usteps       = 0;
     a->peakSlip     = 0;
     a->derates      = 0u;
+    a->slipNow      = 0;
+    a->derateHoldMs = 0u;
+    a->calmMs       = 0u;
     a->settleMs     = 0u;
     a->holding      = 0u;
     a->holdTarget   = 0;
@@ -3116,6 +3125,9 @@ static void jog_axis_tick(jog_axis_t *a)
             a->rampRemainder=0u;
             a->peakSlip = 0;
             a->derates  = 0u;
+            a->slipNow  = 0;
+            a->derateHoldMs = 0u;
+            a->calmMs   = 0u;
             a->holding  = 0u;
             a->statusMs = 0u;
             if (a->hasEnc != 0u)
@@ -3131,6 +3143,20 @@ static void jog_axis_tick(jog_axis_t *a)
     }
     else if (want == a->moving)
     {
+        if (a->derateHoldMs != 0u) { a->derateHoldMs--; }
+        if (a->rateCap < a->rateMax)
+        {
+            /* Lag is dynamic: it shrinks once the cap holds the speed down.
+             * After a calm second try a bit more (ponytail: this saws around
+             * the real limit; a slower-rising cap if that ever bothers). */
+            a->calmMs = (a->slipNow < SLIP_CALM_LSB) ? (uint16)(a->calmMs + 1u) : 0u;
+            if (a->calmMs >= SLIP_RECOVER_MS)
+            {
+                a->calmMs  = 0u;
+                a->rateCap += a->rateCap >> 3;
+                if (a->rateCap > a->rateMax) { a->rateCap = a->rateMax; }
+            }
+        }
         a->rampRemainder+=a->accel;
         a->rate += a->rampRemainder / (1000000u / JOG_TICK_US);
         a->rampRemainder %= (1000000u / JOG_TICK_US);
@@ -3224,20 +3250,32 @@ static void jog_slip_check(jog_axis_t *a)
 
     periodUs = a->periodCy / SU_CY_PER_US;
     slip = abs_i32(slip_axis(e,jog_enc_sign(a, a->moving), periodUs));
+    a->slipNow = slip;
     if (slip > a->peakSlip) { a->peakSlip = slip; }
 
     if (slip >= SLIP_FAIL_LSB)
     {
         stage_stop("jog encoder following error", 0u);
     }
-    else if ((slip >= SLIP_WARN_LSB) && (a->derates < SLIP_DERATE_MAX))
+    else if ((slip >= SLIP_WARN_LSB) && (a->derateHoldMs == 0u))
     {
-        a->rateCap >>= 1;
-        if (a->rateCap < a->rateStart) { a->rateCap = a->rateStart; }
-        if (a->rate > a->rateCap)      { a->rate = a->rateCap; }
-        a->derates++;
-        JLOGF("%s SLIP WARN: %ld lsb, cap -> %lu ustep/s\r\n",
-              a->name, (long)slip, (unsigned long)a->rateCap);
+        /* One cut of 25% from the speed that caused it, then wait: the lag
+         * needs a few hundred ms to shrink, three cuts in a row would take
+         * the cap to 1/8 on a single transient. */
+        uint32 floorCap = a->rateMax >> SLIP_DERATE_FLOOR_SHIFT;
+        uint32 cap = (a->rate - (a->rate >> 2));
+        if (cap < floorCap)       { cap = floorCap; }
+        if (cap < a->rateStart)   { cap = a->rateStart; }
+        a->derateHoldMs = SLIP_DERATE_HOLD_MS;
+        a->calmMs = 0u;
+        if (cap < a->rateCap)
+        {
+            a->rateCap = cap;
+            if (a->rate > a->rateCap) { a->rate = a->rateCap; }
+            a->derates++;
+            JLOGF("%s SLIP WARN: %ld lsb, cap -> %lu ustep/s\r\n",
+                  a->name, (long)slip, (unsigned long)a->rateCap);
+        }
     }
 }
 
