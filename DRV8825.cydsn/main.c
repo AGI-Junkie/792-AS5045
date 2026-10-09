@@ -504,6 +504,9 @@ typedef struct
 } as5045_t;
 
 static uint32 g_encIrqMaxCy, g_encRetries, g_encRejected, g_encMaxGapMs, g_followPeakLsb;
+static uint32 g_encRejRaw, g_encRejGapMs;    /* the frame behind the last jump rejection, for ENC_DIAG */
+static uint16 g_encRejPrev;
+static int32  g_encRejCmdLsb;
 /* The serial read-out (bit-banged or UDB SPI Master, see hw_ssi.h) gives as5045_read_clocks() and the
  * ssi_begin()/ssi_done()/ssi_take() trio. */
 #include "hw_ssi.h"
@@ -661,6 +664,7 @@ static uint8 enc_update(enc_t *e, const as5045_t *sample, uint8 valid)
            abs_i32(delta)>commandedLsb+ENC_JUMP_MARGIN_LSB ||
            position>INT32_MAX/100 || position<INT32_MIN/100) {
             e->trackingLost=1u; e->badStreak=ENC_BAD_LIMIT; g_encRejected++;
+            g_encRejRaw=sample->raw; g_encRejPrev=e->lastAngle; g_encRejCmdLsb=(int32)commandedLsb; g_encRejGapMs=gap;
             return 0u;
         }
         e->pos = (int32)position;
@@ -2782,9 +2786,10 @@ static void stage_status_line(void)
           (unsigned long)(lagCy/SU_CY_PER_US),(unsigned long)(slipCy/SU_CY_PER_US));
     } break;
     case 10u:
-    JLOGF("ENC_DIAG irq_max_us=%lu retries=%lu rejected=%lu gap_max_ms=%lu follow_peak_lsb=%lu\r\n",
+    JLOGF("ENC_DIAG irq_max_us=%lu retries=%lu rejected=%lu gap_max_ms=%lu follow_peak_lsb=%lu rej_raw=0x%05lX rej_prev=%u rej_cmd_lsb=%ld rej_gap_ms=%lu\r\n",
           (unsigned long)(g_encIrqMaxCy/SU_CY_PER_US),(unsigned long)g_encRetries,
-          (unsigned long)g_encRejected,(unsigned long)g_encMaxGapMs,(unsigned long)g_followPeakLsb); break;
+          (unsigned long)g_encRejected,(unsigned long)g_encMaxGapMs,(unsigned long)g_followPeakLsb,
+          (unsigned long)g_encRejRaw,(unsigned)g_encRejPrev,(long)g_encRejCmdLsb,(unsigned long)g_encRejGapMs); break;
     case 11u:
     JLOGF("TELEM_DIAG hz=%u sent=%lu skipped=%lu max_us=%lu\r\n",
           (unsigned)g_telemHz,(unsigned long)g_telemSent,(unsigned long)g_telemSkipped,(unsigned long)(g_telemMaxCy/SU_CY_PER_US)); break;

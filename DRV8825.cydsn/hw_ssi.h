@@ -76,12 +76,16 @@ static uint32 g_ssiAt;                 /* SU_NOW() when the frame was queued */
 
 static void ssi_begin(uint8 clocks)
 {
-    uint8 i;
+    uint8 i, ints;
     g_ssiWords = (clocks > 19u) ? 4u : 2u;
     g_ssiRead = 0u;
     g_ssiAt = SU_NOW();
     Ssi_ClearRxBuffer();
+    /* One atomic queue: an interrupt between two writes longer than one word (40 us) would empty the TX FIFO, the
+     * master would raise CSn and the AS5045 would restart its frame in the middle of ours. */
+    ints = CyEnterCriticalSection();
     for (i = 0u; i < g_ssiWords; i++) { Ssi_WriteTxData(SSI_WORD_MASK); }  /* MOSI is not connected */
+    CyExitCriticalSection(ints);
 }
 static uint8 ssi_done(void)
 {
