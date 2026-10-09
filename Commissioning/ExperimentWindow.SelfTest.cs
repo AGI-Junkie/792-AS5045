@@ -153,7 +153,10 @@ internal sealed partial class ExperimentWindow
             string figure = Path.Combine(temp, "figure.png");
             w.RenderImage(figure);
             var decoder = BitmapDecoder.Create(new Uri(figure), BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
-            Check(decoder.Frames[0].PixelWidth > w.Plane.ActualWidth + 300 && decoder.Frames[0].PixelHeight >= 700, "the exported figure holds the charts and the plane");
+            // Sized against the window as it actually came up: a small screen (a CI runner) clamps a 1320x860 window, and the figure shrinks with it.
+            int figureWidth = decoder.Frames[0].PixelWidth, figureHeight = decoder.Frames[0].PixelHeight;
+            Check(figureWidth > w.Plane.ActualWidth + 0.25 * w.ActualWidth && figureHeight >= 0.75 * w.ActualHeight,
+                $"the exported figure holds the charts and the plane (figure {figureWidth}x{figureHeight}, plane {w.Plane.ActualWidth:0}, window {w.ActualWidth:0}x{w.ActualHeight:0})");
             w.Hide();
             Check(w.ColumnHeaders.Length == 13 && w.ExportImageText == "导出图片 PNG", "the export button is labelled");
             // A stop with nothing recording is saved under "faults": listed, readable, and its pre-stop telemetry and log are replayable.
