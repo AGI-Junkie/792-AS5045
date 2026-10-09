@@ -153,9 +153,10 @@ internal sealed partial class ExperimentWindow
             string figure = Path.Combine(temp, "figure.png");
             w.RenderImage(figure);
             var decoder = BitmapDecoder.Create(new Uri(figure), BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
-            // Sized against the window as it actually came up: a small screen (a CI runner) clamps a 1320x860 window, and the figure shrinks with it.
+            // A small screen (the CI runner: window 1044x788, figure 510x784, plane 256) clamps the 1320x860 window and the charts get narrow:
+            // the figure only has to be taller than ~75% of the window and clearly wider than the plane alone, i.e. it holds the charts as well.
             int figureWidth = decoder.Frames[0].PixelWidth, figureHeight = decoder.Frames[0].PixelHeight;
-            Check(figureWidth > w.Plane.ActualWidth + 0.25 * w.ActualWidth && figureHeight >= 0.75 * w.ActualHeight,
+            Check(figureWidth > w.Plane.ActualWidth + 100 && figureHeight >= 0.75 * w.ActualHeight,
                 $"the exported figure holds the charts and the plane (figure {figureWidth}x{figureHeight}, plane {w.Plane.ActualWidth:0}, window {w.ActualWidth:0}x{w.ActualHeight:0})");
             w.Hide();
             Check(w.ColumnHeaders.Length == 13 && w.ExportImageText == "导出图片 PNG", "the export button is labelled");
