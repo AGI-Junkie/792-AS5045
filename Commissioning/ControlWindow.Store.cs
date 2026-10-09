@@ -7,11 +7,11 @@ namespace TwoLinkCommissioning;
 // type 12 (one at a time, retried byte for byte like the other control requests); loading is type 13 on the PTP sequence.
 public sealed partial class ControlWindow
 {
-    private sealed class StoreJob(StoreOp op, int slot, Action<bool, string>? done)
+    private sealed class StoreJob(StoreOp op, int slot, Action<bool, Func<string>>? done)
     {
         public StoreOp Op { get; } = op;
         public int Slot { get; } = slot;
-        public Action<bool, string>? Done { get; } = done;
+        public Action<bool, Func<string>>? Done { get; } = done;   // (ok, why): the reason stays a function, translated when it is shown
         public DateTime RequestedAt { get; set; } = DateTime.UtcNow;
         public DateTime LastSeenAt { get; set; } = DateTime.UtcNow;
         public int Attempts { get; set; } = 1;
@@ -61,7 +61,7 @@ public sealed partial class ControlWindow
         boardSlots, boardLedger, boardMessage);
     private void SetBoardMessage(Func<string>? message) { boardMessage = message; PublishBoard(); }
 
-    private bool StartStoreJob(StoreOp op, int slot, Action<bool, string>? done)
+    private bool StartStoreJob(StoreOp op, int slot, Action<bool, Func<string>>? done)
     {
         if (!StoreAvailable || storeJob is not null) return false;
         lock (wireSync)
@@ -76,13 +76,14 @@ public sealed partial class ControlWindow
         return true;
     }
 
-    private void FinishStoreJob(bool ok, string message)
+    private void FinishStoreJob(bool ok, Func<string>? why = null)
     {
+        why ??= () => "";
         if (storeJob is not { } job) return;
         storeJob = null;
         lock (wireSync) { if (pendingControlType == 12) pendingControlType = 0; }
         Append($"HOST archive {job.Op} slot={(job.Slot < 0 ? "all" : job.Slot.ToString())} {(ok ? "done" : "failed")}", ok ? null : LogLevel.Warning);   // the raw log stays raw; the reason goes to the panel
-        job.Done?.Invoke(ok, message);
+        job.Done?.Invoke(ok, why);
         // A change on the board is read back, so the picture shown is the device's and not what was hoped for.  A FAILED save or erase
         // is read back too: it may have changed flash before it failed (erase clears block A before block B), or have finished with its
         // final status lost.  From the moment a save or erase ends, until the answer is complete, the old slot contents are not trusted:
@@ -95,6 +96,21 @@ public sealed partial class ControlWindow
         }
         PublishBoard();
     }
+
+    // The device's reason, kept as a function: the message is translated when it is shown, so it follows a language switch and never
+    // carries a protocol word (failed, aborted, an English refusal text) into the Chinese interface.
+    private static Func<string> StoreDeviceReason(string last) =>
+        () => Lang.T("board.err.device", Lang.T(last == "aborted" ? "board.status.aborted" : "board.status.failed"));
+    private static Func<string> StoreRefusalReason(string refusal) => () => Lang.T("board.err.refused", refusal switch
+    {
+        _ when refusal.StartsWith("stage not idle", StringComparison.Ordinal) => Lang.T("board.refused.notIdle"),
+        _ when refusal.StartsWith("no complete plan", StringComparison.Ordinal) => Lang.T("board.refused.noPlan"),
+        _ when refusal.StartsWith("arguments", StringComparison.Ordinal) => Lang.T("board.refused.arguments"),
+        _ when refusal.StartsWith("stale", StringComparison.Ordinal) => Lang.T("board.refused.stale"),
+        _ when refusal.StartsWith("flash temperature", StringComparison.Ordinal) => Lang.T("board.refused.temperature"),
+        _ when refusal.StartsWith("archive region not reserved", StringComparison.Ordinal) => Lang.T("board.refused.unlinked"),
+        _ => Lang.T("board.refused.other", refusal),
+    });
 
     // Reads the archive once the link is up and the machine is still, and again after the device lost the answer.
     private void SynchronizeBoard(DateTime now)
@@ -112,7 +128,7 @@ public sealed partial class ControlWindow
         double quiet = (now - job.LastSeenAt).TotalSeconds;
         if (!job.Acked)
         {
-            if ((now - job.RequestedAt).TotalSeconds > 8 || (job.Attempts >= 3 && quiet >= StoreAnswerSeconds * 3)) { FinishStoreJob(false, Lang.T("board.err.noAnswer")); return; }
+            if ((now - job.RequestedAt).TotalSeconds > 8 || (job.Attempts >= 3 && quiet >= StoreAnswerSeconds * 3)) { FinishStoreJob(false, () => Lang.T("board.err.noAnswer")); return; }
             if (job.Sequence != 0 && job.Attempts < 3 && quiet >= StoreAnswerSeconds * job.Attempts)
             {
                 lock (wireSync) { if (pendingControlType != 0) return; storeResend = true; pendingControlType = 12; }
@@ -120,7 +136,7 @@ public sealed partial class ControlWindow
                 Append($"HOST archive retry attempt={job.Attempts}/3; identical packet", LogLevel.Warning);
             }
         }
-        else if (quiet > (job.Op == StoreOp.Query ? 3 : StoreWorkSeconds)) FinishStoreJob(false, Lang.T("board.err.stalled"));
+        else if (quiet > (job.Op == StoreOp.Query ? 3 : StoreWorkSeconds)) FinishStoreJob(false, () => Lang.T("board.err.stalled"));
     }
 
     private void ObserveStoreLine(string line)
@@ -150,10 +166,10 @@ public sealed partial class ControlWindow
                 StoreOp.Save => status.Last == "saved" && status.LastSlot == job.Slot,
                 _ => status.Last == "erased" && status.LastSlot == job.Slot,
             };
-            FinishStoreJob(ok, ok ? "" : Lang.T("board.err.device", status.Last));
+            FinishStoreJob(ok, ok ? null : StoreDeviceReason(status.Last));
         }
         else if (line.StartsWith("TRAJ_STORE refused:", StringComparison.Ordinal) && !job.Acked)
-            FinishStoreJob(false, Lang.T("board.err.refused", line[19..].Trim()));
+            FinishStoreJob(false, StoreRefusalReason(line[19..].Trim()));
     }
 
     // ---- what the panel asks for ----------------------------------------------------------------------------------------
@@ -196,10 +212,10 @@ public sealed partial class ControlWindow
     private void BeginBoardSave(ExecutionNode[] nodes, int slot, string settings)
     {
         uint crc = TrajectoryArchive.PlanCrc(nodes);
-        if (!StartStoreJob(StoreOp.Save, slot, (ok, message) =>
+        if (!StartStoreJob(StoreOp.Save, slot, (ok, why) =>
         {
             if (ok) { RememberBoard(slot, crc, settings); SetBoardMessage(() => Lang.T("board.saved", slot + 1)); }
-            else SetBoardMessage(() => Lang.T("board.saveFailed", slot + 1, message));
+            else SetBoardMessage(() => Lang.T("board.saveFailed", slot + 1, why()));
         })) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
         SetBoardMessage(() => Lang.T("board.saving", slot + 1));
     }
@@ -215,10 +231,10 @@ public sealed partial class ControlWindow
     {
         if (slot < 0 || slot >= storeSlotCount) return;
         if (!StoreAvailable || storeJob is not null || PointBusy) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
-        if (StartStoreJob(StoreOp.Erase, slot, (ok, message) =>
+        if (StartStoreJob(StoreOp.Erase, slot, (ok, why) =>
         {
             if (ok) { RememberBoard(slot, 0, null); SetBoardMessage(() => Lang.T("board.erased", slot + 1)); }
-            else SetBoardMessage(() => Lang.T("board.eraseFailed", slot + 1, message));
+            else SetBoardMessage(() => Lang.T("board.eraseFailed", slot + 1, why()));
         })) SetBoardMessage(() => Lang.T("board.erasing", slot + 1));
     }
 
@@ -362,20 +378,33 @@ public sealed partial class ControlWindow
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=1/1 seq={saveSeq} last=saved last_slot=0 row_max_us=4000");
             Check(done && ok && w.storeJob is { Op: StoreOp.Query } && !w.boardKnown, "the end of the save was not taken and read back with the inventory distrusted meanwhile");
             // A failed save, a refusal, silence: each ends the job as failed; a refusal needs no waiting.
-            w.FinishStoreJob(true, "");
+            w.FinishStoreJob(true);
             done = false; Check(w.StartStoreJob(StoreOp.Save, 2, (success, _) => { done = true; ok = success; }), "save 2 queued"); Next(12); uint failSeq = w.storeJob!.Sequence;
             w.HandleLine($"TRAJ_STORE state=idle slot=2 rows=3/12 seq={failSeq} last=failed last_slot=2 row_max_us=0");
             Check(done && !ok, "a failed save was reported as done");
             Check(w.storeJob is { Op: StoreOp.Query } && !w.boardKnown, "a failed save did not trigger a read-back and distrust of the inventory");
-            w.FinishStoreJob(true, "");
+            w.FinishStoreJob(true);
             done = false; Check(w.StartStoreJob(StoreOp.Erase, 1, (success, _) => { done = true; ok = success; }), "erase queued");
             w.HandleLine("TRAJ_STORE refused: stage not idle");
             Check(done && !ok && w.storeJob is { Op: StoreOp.Query }, "a refusal did not end the job (and read the board back)");
-            w.FinishStoreJob(true, "");
+            w.FinishStoreJob(true);
+            // The reason shown to the operator is translated when shown, in both languages, and never carries the device's English text.
+            bool english = Lang.IsEn;
+            try
+            {
+                Check(w.StartStoreJob(StoreOp.Erase, 1, (success, why) => w.SetBoardMessage(() => Lang.T("board.eraseFailed", 2, why()))), "erase for the message check");
+                w.HandleLine("TRAJ_STORE refused: stage not idle");
+                Lang.Set(false, false);
+                Check(w.boardMessage is { } zh && zh().Contains("不在静止") && !zh().Contains("stage not idle"), "refusal not shown in Chinese: " + w.boardMessage?.Invoke());
+                Lang.Set(true, false);
+                Check(w.boardMessage is { } en && en().Contains("not idle") && !en().Contains("不在静止"), "refusal did not follow the language switch: " + w.boardMessage?.Invoke());
+            }
+            finally { Lang.Set(english, false); }
+            w.FinishStoreJob(true);
             done = false; Check(w.StartStoreJob(StoreOp.Erase, 1, (success, _) => { done = true; ok = success; }), "erase queued again"); Next(12);
             for (int later = 30; later < 40 && !done; later++) w.PollStoreJob(DateTime.UtcNow.AddSeconds(later));   // stops at the first poll that gives up
             Check(done && !ok && w.storeJob is { Op: StoreOp.Query }, "silence did not end the job (and read the board back)");
-            w.FinishStoreJob(true, "");
+            w.FinishStoreJob(true);
             // Disconnecting forgets the board; a stop forgets a pending save.
             w.pendingBoardSave = (nodes, 0, "shape=3");
             w.ResetBoard();
