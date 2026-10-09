@@ -17,7 +17,7 @@ extra_defs = ''.join('#define %s %s\n' % tuple(a[9:].split('=', 1)) for a in sys
 sys.argv = [a for a in sys.argv if not a.startswith(('--host-plan=', '--host-control=', '--emit-c=', '--sim-mhz=', '--define='))]
 source = (root / 'DRV8825.cydsn/main.c').read_text(encoding='utf-8')
 # main.c includes traj.h; the simulation compiles one file, so put the header's text where the include is.
-for header in ['traj.h', 'hw_ssi.h']:
+for header in ['traj.h', 'trajstore.h', 'hw_ssi.h']:
     source = source.replace(f'#include "{header}"', (root / 'DRV8825.cydsn' / header).read_text(encoding='utf-8'), 1)
     assert f'#include "{header}"' not in source
 
@@ -209,6 +209,31 @@ static struct { volatile uint8 basic_cfg[4]; } simDmaChannels[2];
 #define CY_DMA_CH_STRUCT_PTR simDmaChannels
 #define simDmaEnabled simDmaChannels[1].basic_cfg[0]
 typedef int cystatus;
+/* flash archive mock: the whole 256 KB flash as an array, with a write counter and two fault injections */
+static uint8 simFlash[262144];
+static unsigned simFlashWrites;
+static int simFlashCut=-1, simFlashCutTorn, simFlashFail=-1;   /* power lost at / write error on the n-th write since reset */
+static int simPowerLost, simStoreLinked=1;
+#define TS_LINKED() simStoreLinked
+#define CYDEV_FLASH_BASE ((uintptr_t)simFlash)
+#define CY_FLASH_SIZEOF_ARRAY 65536u
+#define CY_FLASH_SIZEOF_ROW 256u
+#define CYRET_SUCCESS 0
+static cystatus CySetTemp(void){return CYRET_SUCCESS;}
+static void CyFlushCache(void){}
+static cystatus CyWriteRowData(uint8 array,uint16 row,const uint8 *data) {
+    uint8 *dst=simFlash+(uint32)array*CY_FLASH_SIZEOF_ARRAY+(uint32)row*CY_FLASH_SIZEOF_ROW;
+    unsigned n=simFlashWrites++;
+    assert((uint32)array*CY_FLASH_SIZEOF_ARRAY+(uint32)row*CY_FLASH_SIZEOF_ROW>=0x20000u);   /* never the program */
+    if(simPowerLost)return CYRET_SUCCESS;                      /* nothing reaches flash after the power went away */
+    if(simFlashFail>=0 && n==(unsigned)simFlashFail)return 1;
+    if(simFlashCut>=0 && n==(unsigned)simFlashCut) {
+        if(simFlashCutTorn){memcpy(dst,data,128);memset(dst+128,0xA5,128);}   /* half new, half garbage */
+        simPowerLost=1;return CYRET_SUCCESS;
+    }
+    memcpy(dst,data,CY_FLASH_SIZEOF_ROW);
+    return CYRET_SUCCESS;
+}
 static uint8 simUartTxFifoReg;
 #define HostUart_TXDATA_PTR ((volatile uint8 *)&simUartTxFifoReg)
 static const void *simDmaPtrs[8]; static unsigned simDmaPtrN;
@@ -1742,6 +1767,221 @@ static void status_upload_test(const char *t) {
     }
     assert(simPulse1==p1 && simPulse2==p2);
 }
+/* ---- flash archive (trajstore.h, type 12 query/save/erase, type 13 load) ---- */
+static uint32 ref_crc32(const uint8 *d,uint32 n) { /* bitwise IEEE CRC-32, independent of the firmware's table version */
+    uint32 crc=0xFFFFFFFFu,i;int b;
+    for(i=0;i<n;i++){crc^=d[i];for(b=0;b<8;b++)crc=(crc&1u)?(crc>>1)^0xEDB88320u:crc>>1;}
+    return ~crc;
+}
+static void sim_flash_reset(void){memset(simFlash,0xFF,sizeof(simFlash));simFlashWrites=0;simFlashCut=simFlashFail=-1;simFlashCutTorn=0;simPowerLost=0;memset(&g_store,0,sizeof(g_store));}
+/* A legal plan straight into g_traj through the same traj_push() an upload uses: a triangular speed profile, 100 ms nodes.
+ * variant 0 moves both joints together (elbow stays 0), variant 1 moves them apart, so the two are distinguishable. */
+static void store_make_plan(unsigned n,int variant) {
+    traj_limits_t lim;unsigned k;int32 q1=0,q2=0;int d;
+    for(k=0;k<2;k++){g_motionRate[k]=3000;g_motionAccel[k]=3000;lim.rate[k]=3000;lim.accel[k]=3000;}
+    traj_discard();
+    traj_begin(&g_traj,0,0,(uint16)n);
+    for(k=1;k<n;k++){
+        d=(int)(k<n-k?k:n-k);if(d>(n>1000u?1:3))d=n>1000u?1:3;
+        q1+=d;q2+=variant?-(d>1?1:0):d;
+        assert(traj_push(&g_traj,&lim,1u,(int16)q1,(int16)q2,100u)==TRAJ_PUSH_OK);
+    }
+    assert(g_traj.state==TRAJ_READY && g_traj.count==n);
+}
+static uint32 store_plan_crc(void){uint32 k,total=(uint32)g_traj.count*TS_NODE_BYTES,crc=0;for(k=0;k<total;k++){uint8 b=ts_stream_byte(g_traj.nodes,k);crc=ts_crc32(crc,&b,1u);}return crc;}
+static void store_send(uint8 type,uint32 seq,uint16 slot,uint16 op,uint16 value){
+    uint8 saved=packetType;packetType=type;ptp_send(seq,g_ptp.epoch,(int16)slot,(int16)op,value,0);packetType=saved;
+}
+static void store_run(void){unsigned i;for(i=0;i<400 && g_store.busy;i++){cycle(1);store_service();}assert(!g_store.busy);}
+static void store_save(uint16 slot){store_send(12,g_controlSequence+1u,slot,2,0);assert(g_store.busy);store_run();}
+static void store_reference(void){
+    g_enc2.directionKnown=1u;g_enc2.incDir=simPolarity2>0?1u:0u;
+    packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;
+    if(!g_ptp.reference){txq_flush_blocking();fprintf(stderr,"%s",simLog);}
+    assert(g_ptp.reference);
+}
+static void store_test(const char *t) {
+    ts_info_t in;static traj_node_t keep[TRAJ_CAPACITY];unsigned i,cut,torn;uint32 seq,crcA,crcB;uint8 *blk;
+    assert(ref_crc32((const uint8*)"123456789",9)==0xCBF43926u && ts_crc32(0,(const uint8*)"123456789",9)==0xCBF43926u);
+    sim_flash_reset();
+    store_reference();
+    if(!strcmp(t,"store_roundtrip")||!strcmp(t,"store_capacity")) {
+        unsigned n=!strcmp(t,"store_capacity")?TRAJ_CAPACITY:485u;
+        simLogN=0;simLog[0]=0;
+        store_send(12,g_controlSequence+1u,0xFFFFu,1,0);txq_flush_blocking();   /* empty archive: four invalid slots */
+        assert(strstr(simLog,"TRAJ_SLOT slot=0 valid=0") && strstr(simLog,"TRAJ_SLOT slot=3 valid=0") && strstr(simLog,"TRAJ_STORE state=idle") && simFlashWrites==0);
+        store_make_plan(n,0);memcpy(keep,g_traj.nodes,sizeof(traj_node_t)*n);
+        store_save(2);
+        assert(simFlashWrites==2u+(n*6u+255u)/256u && g_storeResult.last==1 && g_storeResult.slot==2);
+        ts_active(2,&in);
+        assert(in.valid && in.count==n && in.seq==1u && in.q1==0 && in.q2==0 && in.durationMs==g_traj.durationMs);
+        assert(in.dataCrc==store_plan_crc() && in.dataCrc==ref_crc32(ts_flash(ts_block_offset(2,in.which))+TS_ROW_BYTES,n*6u));
+        ts_active(1,&in);assert(!in.valid);
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,2,1,0);txq_flush_blocking();
+        assert(strstr(simLog,"TRAJ_SLOT slot=2 valid=1 seq=1 nodes=") && strstr(simLog,"TRAJ_STORE state=idle") && strstr(simLog,"last=saved"));
+        /* power cycle: RAM plan gone, load it back over the wire and check every node */
+        traj_discard();assert(!g_traj.state);
+        seq=g_ptp.sequence+1u;
+        store_send(13,seq,2,0,0);
+        assert(g_traj.state==TRAJ_READY && g_traj.count==n && g_ptp.sequence==seq && !memcmp(keep,g_traj.nodes,sizeof(traj_node_t)*n));
+        /* and it runs through the usual RUN */
+        store_send(4,seq+1u,0,0,0);
+        assert(g_ptp.active && g_traj.state==TRAJ_RUNNING);
+        return;
+    }
+    if(!strcmp(t,"store_ab")) {
+        store_make_plan(485,0);crcA=store_plan_crc();store_save(0);
+        ts_active(0,&in);assert(in.valid && in.seq==1u && in.which==0u && in.dataCrc==crcA);
+        store_make_plan(485,1);crcB=store_plan_crc();assert(crcA!=crcB);store_save(0);
+        ts_active(0,&in);assert(in.valid && in.seq==2u && in.which==1u && in.dataCrc==crcB);
+        assert(ts_check_block(ts_flash(ts_block_offset(0,0)),0,&in) && in.dataCrc==crcA);   /* the old block is still intact */
+        store_make_plan(485,0);store_save(0);
+        ts_active(0,&in);assert(in.valid && in.seq==3u && in.which==0u && in.dataCrc==crcA);
+        ts_active(1,&in);assert(!in.valid);                                                    /* other slots untouched */
+        return;
+    }
+    if(!strcmp(t,"store_power_loss")) {
+        /* Power lost (or a row torn in half) at every single flash write of a save over a good plan: the slot must come back
+         * as the old plan, whole, or as the new plan, whole -- never anything else. */
+        store_make_plan(485,0);crcA=store_plan_crc();
+        for(torn=0;torn<2;torn++) for(cut=0;cut<=14u;cut++) {
+            sim_flash_reset();store_make_plan(485,0);store_save(0);
+            store_make_plan(485,1);crcB=store_plan_crc();
+            simFlashWrites=0;simFlashCut=(int)cut;simFlashCutTorn=(int)torn;
+            store_send(12,g_controlSequence+1u,0,2,0);store_run();
+            ts_active(0,&in);   /* "reboot": nothing but flash survives */
+            assert(in.valid);
+            /* 14 writes in all, the header is the last.  Until it lands the old plan stands; if its first 128 bytes landed the new
+             * header is complete (every field and the CRC sit in them) and the plan it commits was verified row by row. */
+            if(cut<=12u) assert(in.dataCrc==crcA && in.seq==1u && g_storeResult.last==3);
+            else if(cut==13u) assert(g_storeResult.last==3 && ((in.dataCrc==crcA && in.seq==1u) || (torn && in.dataCrc==crcB && in.seq==2u)));
+            else         assert(in.dataCrc==crcB && in.seq==2u && g_storeResult.last==1);
+        }
+        return;
+    }
+    if(!strcmp(t,"store_write_error")) {
+        store_make_plan(485,0);crcA=store_plan_crc();store_save(0);
+        store_make_plan(485,1);
+        for(cut=0;cut<=13u;cut++) {
+            simFlashWrites=0;simFlashFail=(int)cut;
+            store_send(12,g_controlSequence+1u,0,2,0);store_run();
+            ts_active(0,&in);assert(in.valid && in.dataCrc==crcA && g_storeResult.last==3);
+            assert(g_store.busy==0 && axes_idle());
+        }
+        return;
+    }
+    if(!strcmp(t,"store_corrupt")) {
+        store_make_plan(485,0);crcA=store_plan_crc();store_save(1);
+        store_make_plan(485,1);crcB=store_plan_crc();store_save(1);
+        ts_active(1,&in);assert(in.valid && in.dataCrc==crcB);
+        blk=simFlash+ts_block_offset(1,in.which);
+        blk[TS_ROW_BYTES+100]^=0x10;                                   /* one flipped data bit */
+        ts_active(1,&in);assert(in.valid && in.dataCrc==crcA);        /* falls back to the older, intact block */
+        blk[TS_ROW_BYTES+100]^=0x10;ts_active(1,&in);assert(in.dataCrc==crcB);
+        blk[0]^=1;ts_active(1,&in);assert(in.dataCrc==crcA);          /* magic */
+        blk[0]^=1;blk[12]^=1;ts_active(1,&in);assert(in.dataCrc==crcA);   /* seq: header CRC no longer matches */
+        blk[12]^=1;ts_active(1,&in);assert(in.dataCrc==crcB);
+        /* a block copied into another slot is not that slot's plan; a plan under another joint convention is nobody's */
+        memcpy(simFlash+ts_block_offset(3,0),blk,TS_BLOCK_BYTES);ts_active(3,&in);assert(!in.valid);
+        memcpy(simFlash+ts_block_offset(3,0),blk,TS_BLOCK_BYTES);ts_put16(simFlash+ts_block_offset(3,0)+8,3);
+        ts_put32(simFlash+ts_block_offset(3,0)+28,ts_crc32(0,simFlash+ts_block_offset(3,0),28));ts_active(3,&in);assert(in.valid);
+        ts_put16(simFlash+ts_block_offset(3,0)+6,TS_CONTRACT+1u);
+        ts_put32(simFlash+ts_block_offset(3,0)+28,ts_crc32(0,simFlash+ts_block_offset(3,0),28));ts_active(3,&in);assert(!in.valid);
+        /* both blocks damaged: empty, and loading says so without touching the RAM plan */
+        simFlash[ts_block_offset(1,0)+TS_ROW_BYTES+7]^=1;simFlash[ts_block_offset(1,1)+TS_ROW_BYTES+7]^=1;
+        ts_active(1,&in);assert(!in.valid);
+        store_make_plan(485,0);simLogN=0;simLog[0]=0;
+        store_send(13,g_ptp.sequence+1u,1,0,0);txq_flush_blocking();
+        assert(strstr(simLog,"archive slot empty or damaged") && g_traj.state==TRAJ_READY && g_traj.count==485);
+        return;
+    }
+    if(!strcmp(t,"store_load_checks")) {
+        store_make_plan(485,0);store_save(0);
+        /* narrower joint range than the plan needs: refused, and no half plan is left behind */
+        g_jointMaxCd[0]=100;simLogN=0;simLog[0]=0;
+        traj_discard();store_send(13,g_ptp.sequence+1u,0,0,0);txq_flush_blocking();
+        assert(strstr(simLog,"does not fit the current limits") && g_traj.state==TRAJ_EMPTY && g_traj.count==0);
+        g_jointMaxCd[0]=PTP_MAX1_CD;
+        /* a lower configured speed than the plan was made for */
+        g_motionRate[0]=g_motionRate[1]=5;simLogN=0;simLog[0]=0;
+        store_send(13,g_ptp.sequence+1u,0,0,0);txq_flush_blocking();
+        assert(strstr(simLog,"does not fit the current limits") && g_traj.state==TRAJ_EMPTY);
+        g_motionRate[0]=g_motionRate[1]=3000;
+        /* not at the plan's start pose: refused before anything is changed */
+        store_make_plan(485,1);g_arm1.usteps+=5;simLogN=0;simLog[0]=0;
+        store_send(13,g_ptp.sequence+1u,0,0,0);txq_flush_blocking();
+        assert(strstr(simLog,"move to trajectory start first") && g_traj.state==TRAJ_READY);
+        g_arm1.usteps-=5;
+        /* bad slot / arguments */
+        simLogN=0;simLog[0]=0;
+        store_send(13,g_ptp.sequence+1u,TS_SLOTS,0,0);store_send(13,g_ptp.sequence+1u,0,1,0);store_send(13,g_ptp.sequence+1u,0,0,1);txq_flush_blocking();
+        assert(strstr(simLog,"archive slot") && strstr(simLog,"archive load arguments"));
+        store_send(13,g_ptp.sequence+1u,0,0,0);assert(g_traj.state==TRAJ_READY && g_traj.count==485);   /* the good load still works */
+        return;
+    }
+    if(!strcmp(t,"store_commands")) {
+        uint32 sq;
+        store_make_plan(485,0);
+        /* refused without starting anything: stale epoch, stale sequence, bad slot/op/value */
+        sq=g_controlSequence;
+        packetType=12;
+        ptp_send(sq+1u,g_ptp.epoch-1u,0,2,0,0);ptp_send(sq,g_ptp.epoch,0,2,0,0);ptp_send(0,g_ptp.epoch,0,2,0,0);
+        ptp_send(sq+1u,g_ptp.epoch,TS_SLOTS,2,0,0);ptp_send(sq+1u,g_ptp.epoch,0,0,0,0);ptp_send(sq+1u,g_ptp.epoch,0,4,0,0);
+        ptp_send(sq+1u,g_ptp.epoch,0,2,1,0);ptp_send(sq+1u,g_ptp.epoch,-1,2,0,0);   /* all-slots is for queries only */
+        packetType=1;
+        assert(!g_store.busy && g_controlSequence==sq && simFlashWrites==0);
+        /* an exact retry of a save only repeats the receipt */
+        store_send(12,sq+1u,1,2,0);assert(g_store.busy && g_storeSeq==sq+1u);
+        for(i=0;i<3;i++){cycle(1);store_service();}
+        {unsigned w=simFlashWrites;simLogN=0;simLog[0]=0;store_send(12,sq+1u,1,2,0);txq_flush_blocking();
+         assert(strstr(simLog,"TRAJ_STORE state=saving") && g_store.busy && simFlashWrites==w);}
+        /* while it runs the stage is still: a second command, a point move and the jog keys are all refused */
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,2,2,0);txq_flush_blocking();
+        assert(strstr(simLog,"stage not idle") && g_storeSeq==sq+1u && g_store.slot==1);
+        assert(!axes_idle());
+        packetType=1;ptp_send(g_ptp.sequence+1u,g_ptp.epoch,100,100,600,0);assert(!g_ptp.active);
+        store_run();assert(g_storeResult.last==1 && axes_idle());
+        /* erase */
+        ts_active(1,&in);assert(in.valid);
+        store_send(12,g_controlSequence+1u,1,3,0);assert(g_store.busy);store_run();
+        ts_active(1,&in);assert(!in.valid && g_storeResult.last==2);
+        return;
+    }
+    if(!strcmp(t,"store_abort")) {
+        store_make_plan(485,0);crcA=store_plan_crc();store_save(0);
+        store_make_plan(485,1);
+        store_send(12,g_controlSequence+1u,0,2,0);assert(g_store.busy);
+        for(i=0;i<5;i++){cycle(1);store_service();}assert(g_store.busy);
+        stage_stop("fixture stop",0u);                                    /* any stop discards the plan the save is reading */
+        cycle(1);store_service();
+        assert(!g_store.busy && g_storeResult.last==4);
+        ts_active(0,&in);assert(in.valid && in.dataCrc==crcA && in.seq==1u);   /* the old plan is untouched, the new one never committed */
+        /* saving needs a complete plan */
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,0,2,0);txq_flush_blocking();
+        assert(!g_store.busy);
+        return;
+    }
+    if(!strcmp(t,"store_unlinked")) {
+        /* an image linked with the stock script (no reserved region): every archive operation is refused and nothing is written */
+        uint8 row[TS_ROW_BYTES];memset(row,0,sizeof(row));
+        store_make_plan(485,0);store_save(0);ts_active(0,&in);assert(in.valid);
+        simStoreLinked=0;simLogN=0;simLog[0]=0;simFlashWrites=0;
+        store_send(12,g_controlSequence+1u,0,2,0);store_send(12,g_controlSequence+1u,0,3,0);store_send(12,g_controlSequence+1u,0xFFFFu,1,0);
+        store_send(13,g_ptp.sequence+1u,0,0,0);txq_flush_blocking();
+        assert(!g_store.busy && simFlashWrites==0 && strstr(simLog,"archive region not reserved") && !strstr(simLog,"TRAJ_SLOT") && !ts_write_row(TS_REGION_OFFSET,row));
+        simLogN=0;simLog[0]=0;stage_status();status_drain();
+        assert(strstr(simLog," traj_store=0 telem_hz="));
+        return;
+    }
+    if(!strcmp(t,"store_write_guard")) {
+        uint8 row[TS_ROW_BYTES];memset(row,0,sizeof(row));
+        assert(!ts_write_row(0,row) && !ts_write_row(0x10000u,row) && !ts_write_row(TS_REGION_OFFSET-TS_ROW_BYTES,row));
+        assert(!ts_write_row(TS_REGION_OFFSET+TS_REGION_BYTES,row) && !ts_write_row(TS_REGION_OFFSET+1u,row) && simFlashWrites==0);
+        assert(ts_write_row(TS_REGION_OFFSET,row) && ts_write_row(TS_REGION_OFFSET+TS_REGION_BYTES-TS_ROW_BYTES,row) && simFlashWrites==2);
+        return;
+    }
+    assert(0);
+}
 int main(int argc,char **argv) {
     const char *t=argv[1]; unsigned i, p1, p2;
     assert(argc==2);
@@ -2399,13 +2639,14 @@ int main(int argc,char **argv) {
         sprintf(proto," proto=%u\r\n",(unsigned)PROTO_VERSION); /* with its end of line: the debug buffer must not cut the LINK line short */
         assert(strstr(simLog,"STATE fw=stage2-v11 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
         assert(strstr(simLog," short_hb=1") && strstr(simLog," joint_limits=1") && strstr(simLog," motion_rates=1") && strstr(simLog," rates_live=1") && strstr(simLog," q2_absolute=1"));
-        assert(strstr(simLog," traj_repeat=1") && strstr(simLog," fault_snapshot=1") && strstr(simLog," telem_hz=0 proto="));
+        assert(strstr(simLog," traj_repeat=1") && strstr(simLog," fault_snapshot=1") && strstr(simLog," traj_store=4 telem_hz=0 proto="));
         puts(t);return 0;
     }
     if(!strncmp(t,"limits_",7)){limits_test(t);puts(t);return 0;}
     if(!strncmp(t,"telem_",6)){telem_test(t);puts(t);return 0;}
     if(!strcmp(t,"fault_snapshot")){fault_snapshot_test();puts(t);return 0;}
     if(!strncmp(t,"rates_",6)){rates_test(t);puts(t);return 0;}
+    if(!strncmp(t,"store_",6)){store_test(t);puts(t);return 0;}
     if(!strncmp(t,"operator_stop_",14)) {
         uint32 epoch=g_ptp.epoch;
         if(!strcmp(t,"operator_stop_after_protection")) {
@@ -2904,6 +3145,7 @@ ptp_cases += ['ptp_zero','ptp_axis1','ptp_axis2']
 ptp_cases += ['ptp_power_stable','ptp_fast_stall']
 ptp_cases += ['limits_ptp','limits_jog','limits_elbow','limits_elbow_traj','limits_elbow_jog']
 ptp_cases += ['rates_ptp','rates_traj','rates_live']
+ptp_cases += ['store_'+n for n in ['roundtrip','capacity','ab','power_loss','write_error','corrupt','load_checks','commands','abort','unlinked','write_guard']]
 ptp_cases += ['ptp_final_'+name for name in ['positive','negative','boundary','over_limit','following','counts']]
 ptp_cases += ['ptp_logged_retry']
 ptp_cases += ['traj_rx_'+name for name in ['retry','ready_retry','repeated','stop','timeout','overrun','overflow','break','parity','mixed','heartbeat','holding','fault','encoder','motion']]
@@ -2940,11 +3182,11 @@ with tempfile.TemporaryDirectory(prefix='arm-stage1-') as temp:
     tmp = Path(temp)
     if host_plan is not None: (tmp/'host-plan.bin').write_bytes(host_plan.read_bytes())
     if host_control is not None: (tmp/'host-control.bin').write_bytes(host_control.read_bytes())
-    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','FaultIsr.h','LimitIsr.h','StepRearm.h','CyDmac.h','UsbCdc.h','UsbCdc_cdc.h']:
+    for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','CyFlash.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','FaultIsr.h','LimitIsr.h','StepRearm.h','CyDmac.h','UsbCdc.h','UsbCdc_cdc.h']:
         (tmp/name).write_text('',encoding='ascii')
     if emit_c is not None:
         emit_c.mkdir(parents=True, exist_ok=True)
-        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','FaultIsr.h','LimitIsr.h','StepRearm.h','CyDmac.h','UsbCdc.h','UsbCdc_cdc.h']: (emit_c/name).write_text('',encoding='ascii')
+        for name in ['cytypes.h','cyfitter.h','cydevice_trm.h','cypins.h','CyLib.h','CyFlash.h','HostUart.h','Ssi.h','StepArm1Req.h','StepArm2Req.h','StepArm1.h','StepArm2.h','EvtTimer.h','EvtRestart.h','EvtIsr.h','AliveReq.h','DeadTimer.h','TxDma_dma.h','FAULT.h','LIMIT2.h','StepKill.h','FaultIsr.h','LimitIsr.h','StepRearm.h','CyDmac.h','UsbCdc.h','UsbCdc_cdc.h']: (emit_c/name).write_text('',encoding='ascii')
         (emit_c/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
         print('wrote', emit_c/'check.c'); sys.exit(0)
     (tmp/'check.c').write_text(pin_defs+f'\n#define SIM_MHZ {sim_mhz}u\n'+extra_defs+mock+'\n#define main firmware_main\n'+source+'\n#undef main\n'+harness,encoding='utf-8')
