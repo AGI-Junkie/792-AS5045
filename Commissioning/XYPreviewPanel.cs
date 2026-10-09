@@ -154,7 +154,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private ShapeOptions ShapeOptionsFromFields()
     {
         int index = shape.SelectedIndex; var uses = ShapeUses(index);
-        if (index == FreehandIndex) return new ShapeOptions { FreehandPoints = freehandPoints.ToArray() };
+        if (index == FreehandIndex) return new ShapeOptions { FreehandPoints = freehandPoints.ToArray(), FreehandFitLevel = FreehandFitLevel };
         _ = Number(x); _ = Number(y);
         if (uses.A) _ = Number(a);
         if (uses.B) _ = Number(b);
@@ -209,6 +209,9 @@ public sealed partial class XYPreviewPanel : UserControl
     private readonly Button movePoint = new() { Content = Lang.T("btn.movePoint"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
     private readonly TextBlock moveState = new() { Text = Lang.T("move.default"), Margin = new Thickness(4), TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock actionSummary = new() { FontWeight=FontWeights.SemiBold, MaxWidth=390, TextTrimming=TextTrimming.CharacterEllipsis, VerticalAlignment=VerticalAlignment.Center };
+    private readonly TextBlock actionDetails = new() { MaxWidth = 600, TextWrapping = TextWrapping.Wrap };
+    private JointRangeFailure? rangeFailure;
+    private Expander checksSection = null!;
     private readonly Border actionStatus = new() { CornerRadius=new CornerRadius(6), Padding=new Thickness(10,8,10,8), Margin=new Thickness(8,4,4,4), VerticalAlignment=VerticalAlignment.Center };
     private readonly ProgressBar actionProgress = new() { Height=4, Minimum=0, Maximum=100, Foreground=WorkbenchTheme.Teal, Background=WorkbenchTheme.Line, Margin=new Thickness(4,6,4,0), Visibility=Visibility.Collapsed };
     private string? deviceStatusMessage;
@@ -331,6 +334,8 @@ public sealed partial class XYPreviewPanel : UserControl
         feed.ToolTip = Lang.T("xy.feed.tip");
         speeds.Children.Add(Prop("xy.feed", feed, "mm/s", "xy.feed.name"));
         var checks = Group("section.checks", expanded: false);
+        checksSection = (Expander)controls.Children[controls.Children.Count - 1];
+        Lang.Bind(result, System.Windows.Automation.AutomationProperties.NameProperty, "diag.detailsName");
         checks.Children.Add(executionInfo); checks.Children.Add(moveState); checks.Children.Add(result); checks.Children.Add(notice);
         var preview = new Button { Content = Lang.T("btn.preview"), MinWidth = 120, Background = Brushes.White, Foreground = WorkbenchTheme.Blue, BorderBrush = WorkbenchTheme.Blue }; preview.Click += (_,_) => Refresh();
         previewButton = preview;
@@ -355,6 +360,8 @@ public sealed partial class XYPreviewPanel : UserControl
         var actions = new StackPanel { Margin = new Thickness(6,2,6,4) }; var actionBar = WorkbenchTheme.Edge(actions, edge: new Thickness(0,1,0,0)); Grid.SetRow(actionBar,2); shell.Children.Add(actionBar);
         var motion = new WrapPanel(); motion.Children.Add(movePoint); motion.Children.Add(upload); motion.Children.Add(run);
         actionStatus.Child=actionSummary; motion.Children.Add(actionStatus); actions.Children.Add(motion); actions.Children.Add(actionProgress);
+        actionSummary.ToolTip = new ToolTip { Content = actionDetails };
+        ToolTipService.SetShowDuration(actionSummary, 60000);
         executionInfo.FontSize=12; executionInfo.Padding=new Thickness(0);
         foreach(var b in new[] { movePoint, upload, run }) { WorkbenchTheme.Primary(b); ToolTipService.SetShowOnDisabled(b, true); }
         movePoint.Click += (_,_) => { if(movePoint.IsEnabled && pointTarget is {} p) PointMoveRequested?.Invoke(PtpProtocol.Quantize(p)); };
@@ -508,7 +515,7 @@ public sealed partial class XYPreviewPanel : UserControl
         if (updating || RecordingFreehand) return;
         parametersDirty = false;
         offlineSim = false;
-        cameraReady = false; autoFit = true; operationError=null;
+        cameraReady = false; autoFit = true; operationError=null; rangeFailure = null;
         RefreshOverlayLimits(); RefreshRangeHelp();
         pointTarget = null; movePoint.IsEnabled = false; execution = null; upload.IsEnabled = false; Lang.Text(executionInfo, () => "");
         PausePlayback(); trajectory = null; timing = null;
@@ -526,7 +533,7 @@ public sealed partial class XYPreviewPanel : UserControl
                 var uses = ShapeUses(shape.SelectedIndex); var extras = ShapeOptionsFromFields();
                 double repaired = 0;   // freehand only: how far the plan had to leave the draft to become legal
                 if (shape.SelectedIndex == FreehandIndex) {
-                    var fixedDraft = FreehandTrajectory.Repair(extras.FreehandPoints, model, bounds, Math.Max(0, branch.SelectedIndex), RequestedRates);
+                    var fixedDraft = FreehandTrajectory.Repair(extras.FreehandPoints, model, bounds, Math.Max(0, branch.SelectedIndex), RequestedRates, extras.FreehandFitLevel);
                     extras = extras with { FreehandPoints = fixedDraft.Points }; repaired = fixedDraft.Shift;
                 }
                 trajectory = DrawingTrajectory.Create(model, (DrawingShape)(shape.SelectedIndex - 1), tx, ty,
@@ -557,7 +564,7 @@ public sealed partial class XYPreviewPanel : UserControl
             Draw(model, selected, tx, ty, limits is null || limits.Value.Contains(selected), Reachability(model).IsReachable(model.Forward(selected).Tip));
             ShowPoseInfo(model, selected);
         }
-        catch (ArgumentException ex) { InvalidPlan(() => ex.Message); }
+        catch (ArgumentException ex) { InvalidPlan(() => ex.Message, (ex as Lang.ValidationException)?.RangeFailure); checksSection.IsExpanded = true; }
     }
     private void ParametersChanged()
     {
@@ -570,8 +577,9 @@ public sealed partial class XYPreviewPanel : UserControl
         InvalidPlan(() => Lang.T("err.needPreview"));
         NotifyLimitsChanged();
     }
-    private void InvalidPlan(Func<string> reason)
+    private void InvalidPlan(Func<string> reason, JointRangeFailure? failure = null)
     {
+        rangeFailure = failure;
         PausePlayback(); trajectory = null; timing = null;
         export.IsEnabled = cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = false;
         canvas.Children.Clear(); sampleInfo.Clear(); result.Foreground = Brushes.Firebrick; Lang.Text(result, reason); Lang.Text(notice, () => "");
@@ -671,6 +679,9 @@ public sealed partial class XYPreviewPanel : UserControl
         else if(!trajectorySupported) { text=Lang.T("act.noTraj"); severity=1; }
         else { text=Lang.T("act.needPen"); severity=1; }
         SetText(actionSummary,text);
+        SetText(actionDetails,text);
+        if (System.Windows.Automation.AutomationProperties.GetHelpText(actionSummary) != text)
+            System.Windows.Automation.AutomationProperties.SetHelpText(actionSummary, text);
         actionSummary.Foreground=StatusInk[severity];
         actionStatus.Background=StatusFill[severity];
         SetTip(actionStatus,text+"\n"+moveState.Text+Lang.T("act.details"));
@@ -711,7 +722,7 @@ public sealed partial class XYPreviewPanel : UserControl
             sampleInfo.ToolTip=FollowCommand?Lang.T("vp.sampleTooltipDevice"):
                 Lang.T("vp.sampleTooltipOffline", sample.Distance, sample.Speed);
         }
-        catch (ArgumentException ex) { InvalidPlan(() => ex.Message); }
+        catch (ArgumentException ex) { InvalidPlan(() => ex.Message, (ex as Lang.ValidationException)?.RangeFailure); checksSection.IsExpanded = true; }
     }
     private void Export()
     {
