@@ -75,6 +75,7 @@ public sealed partial class ControlWindow
         string? hz = words.FirstOrDefault(w => w.StartsWith("telem_hz=", StringComparison.Ordinal));
         supportsTelemRate = hz is not null;
         reportedTelemHz = hz is not null && int.TryParse(hz.AsSpan(9), out int value) ? value : -1;
+        ReadStoreCapability(words);
     }
 
     private void ResetDiagnostics()
@@ -83,6 +84,7 @@ public sealed partial class ControlWindow
         reportedTelemHz = -1; telemAttempts = 0; telemRequestedAt = default; lastTelemDiag = "";
         recentTelemetry.Clear(); lastFault = null;
         lastLatchedStop = null;
+        ResetBoard();
     }
 
     // Asks the device for the chosen stream rate once the link is up, and again if it ever reports another one.

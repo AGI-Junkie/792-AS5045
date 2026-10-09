@@ -239,7 +239,6 @@ public sealed partial class XYPreviewPanel : UserControl
         RefreshRecentLanguage();
         play.Content = playbackTimer.IsEnabled ? Lang.T("btn.playPause") : Lang.T("btn.play");
         rewind.Content = Lang.T("btn.rewind");
-        upload.Content = Lang.T("btn.upload");
         run.Content = Lang.T("btn.run");
         movePoint.Content = shape.SelectedIndex == 0 ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
         feed.ToolTip = Lang.T("xy.feed.tip");
@@ -600,6 +599,7 @@ public sealed partial class XYPreviewPanel : UserControl
         bool atStart = execution is not null && startFeedback is { Referenced: true, Inputs: 0 } &&
             startFeedback.Steps1 == ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose) && startFeedback.Steps2 == ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose);
         upload.IsEnabled = pointMoveAllowed && limitsMatch && trajectorySupported && execution is not null && atStart;
+        UpdateUploadCaption();
         // 执行图形 starts what the device holds, so it needs that exact plan to still be the one on screen.
         bool held = uploadedPlan is { } sent && execution is { } shown && sent.Nodes.SequenceEqual(shown.Nodes);
         planHeld = held; UpdateLamps();
@@ -617,7 +617,7 @@ public sealed partial class XYPreviewPanel : UserControl
         if (execution is null && shape.SelectedIndex > 0) move += "\n" + (executionInfo.Text.Length > 0 ? executionInfo.Text : Lang.T("move.needCheck"));
         SetText(moveState, move);
         UpdateActionStatus();
-        SetTip(upload, move + Lang.T("move.uploadTip"));
+        SetTip(upload, move + Lang.T(planOnBoard is null ? "move.uploadTip" : "board.loadTip"));
         SetTip(run, move);
         SetTip(movePoint, move);
     }

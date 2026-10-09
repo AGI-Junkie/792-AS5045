@@ -142,6 +142,7 @@ public sealed partial class ControlWindow : Window
         xyPreview.PointMoveRequested += RequestPoint;
         xyPreview.TrajectoryRequested += RequestTrajectory;
         xyPreview.ExecuteRequested += RequestExecute;
+        HookBoardPanel();
         xyPreview.LimitsChanged += OnLimitsChanged;
         PreviewKeyDown += OnKeyDown; PreviewKeyUp += OnKeyUp;
         Deactivated += (_, _) => {
@@ -208,7 +209,7 @@ public sealed partial class ControlWindow : Window
             e.Handled = true; SafeAction(Heartbeat);
         }
     }
-    private bool PointBusy => pendingControl is not null || pendingPoint != 0 || ptp is { Active: > 0 } || uploading is not null || executing;
+    private bool PointBusy => pendingControl is not null || pendingPoint != 0 || ptp is { Active: > 0 } || uploading is not null || executing || StoreBusy || pendingBoardSave is not null;
     private bool CanPoint => LimitsReady && stage2 && compatible && enabled && homed && feedbackReady && !homing && !stopPending && !PointBusy &&
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Referenced: true, Epoch: > 0 } &&
         (DateTime.UtcNow - lastPtpAt).TotalSeconds < 2 && (!supportsTelemetry ||
@@ -332,6 +333,7 @@ public sealed partial class ControlWindow : Window
             if (serial is not { IsOpen: true }) throw new IOException(Lang.T("fault.ioClosed"));
             PumpSerial();
             RetryPendingPoint(DateTime.UtcNow);
+            PollStoreJob(DateTime.UtcNow);
             CheckControlTimeout(DateTime.UtcNow);
             CheckTelemetryTimeout(DateTime.UtcNow);
             if ((uploading is not null || executing) && ((DateTime.UtcNow - lastPtpAt).TotalSeconds > 2 ||
@@ -440,6 +442,7 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("FAULT_SNAPSHOT ")) { HandleFaultSnapshot(line); }
         else if (line.StartsWith("LAST_STOP ")) { HandleLatchedStop(line); }
         else if (line.StartsWith("PTP_LIMITS ") || line.StartsWith("PTP_RATES ")) { HandleLimitsAck(line); UpdateControls(); }
+        else if (line.StartsWith("TRAJ_SLOT ") || line.StartsWith("TRAJ_STORE ")) ObserveStoreLine(line);
         else if (line.StartsWith("TRAJ_STATE ")) HandleTrajectoryState(line);
         else if (line.StartsWith("TELEM ")) HandleTelemetry(line);
         else if (line.StartsWith("LINK ")) {
@@ -472,6 +475,7 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("PTP done ")) {
             if (experimentPhase == "point") experimentCompleting = "complete";
         }
+        else if (loadingSlot is not null && uploading is not null && line.StartsWith("PTP refused:")) FallBackToUpload(line);
         else if (line.StartsWith("PTP refused:")) {
             // A queued packet may be refused after STOP invalidates its reference.
             // Keep the stop cause unless this refusal belongs to a pending request.
@@ -526,7 +530,9 @@ public sealed partial class ControlWindow : Window
             (ptp is { Active: 2 } ? Lang.T("state.pointSettle") : ptp is { Active: 1 } ? Lang.T("state.pointMove") : Lang.T("state.pointWait")) +
             Lang.T("state.pointNote") : regularStateText());
     }
-    private void RequestTrajectory(ExecutionTrajectory plan)
+    private void RequestTrajectory(ExecutionTrajectory plan) => RequestTrajectory(plan, allowBoard: true);
+    // allowBoard: a plan the board already stores is loaded from its slot (seconds) instead of uploaded node by node (a minute).
+    private void RequestTrajectory(ExecutionTrajectory plan, bool allowBoard)
     {
         if (!CanPoint || !supportsTrajectory || ptp is null) return;
         SafeAction(() => {
@@ -536,6 +542,13 @@ public sealed partial class ControlWindow : Window
             StartExperiment("trajectory",pointSequence+1,plan.Nodes);
             uploading = plan; uploaded = null; uploadedRan = false; trajectoryRanOnce = false; uploadNext = 0; trajectoryEpoch = ptp.Epoch; uploadStartedAt = DateTime.UtcNow;
             xyPreview.PausePlayback();
+            if (allowBoard && StoreAvailable && TrajectoryArchive.SlotFor(boardSlots, plan.Nodes) is { } stored)
+            {
+                loadingSlot = stored.Slot;
+                Append($"HOST trajectory load from board slot {stored.Slot} nodes={plan.Nodes.Length} duration={plan.Duration:F3}s; no automatic approach");
+                SendLoadPacket();
+                return;
+            }
             Append($"HOST trajectory upload start nodes={plan.Nodes.Length} duration={plan.Duration:F3}s; no automatic approach");
             SendNextTrajectoryPacket();
         });
@@ -572,6 +585,7 @@ public sealed partial class ControlWindow : Window
             return;
         }
         uint mode = values[0], count = values[1], total = values[2], seq = values[4], epoch = values[5];
+        if (CompleteBoardLoad(seq, epoch, mode, count, total)) return;
         if (uploading is { } plan && seq == pendingPoint && epoch == trajectoryEpoch)
         {
             bool run = uploadNext == plan.Nodes.Length;
@@ -585,6 +599,7 @@ public sealed partial class ControlWindow : Window
                 // Fully loaded: the device holds the plan and does not move until the operator asks for RUN.
                 uploading = null; uploaded = plan; uploadedRan = false;
                 Append("HOST trajectory upload complete; waiting for the operator to start it (no automatic run)");
+                ContinueBoardSave(plan);
             }
             else SendNextTrajectoryPacket();
         }
@@ -668,6 +683,7 @@ public sealed partial class ControlWindow : Window
         pendingPoint = 0; ptp = null;
         manualReferencePending = false;
         uploading = uploaded = runPlan = null; executing = false;
+        pendingBoardSave = null; loadingSlot = null;
         keyboardMask = mouseMask = 0;
         pendingControl = null; telemetry = null; limitsReportSince = default; enableAfterReport = false;
         if (serial is not null) {
@@ -681,7 +697,7 @@ public sealed partial class ControlWindow : Window
     }
     private void UpdateControls(bool synchronize = true)
     {
-        if (synchronize) { SynchronizeJointLimits(DateTime.UtcNow); SynchronizeTelemetryRate(DateTime.UtcNow); }
+        if (synchronize) { SynchronizeJointLimits(DateTime.UtcNow); SynchronizeTelemetryRate(DateTime.UtcNow); SynchronizeBoard(DateTime.UtcNow); }
         Volatile.Write(ref limitsMotionAllowed, LimitsReady ? 1 : 0);
         if (synchronize && manualReferenceConfirmedEpoch!=0 && (!enabled || homing || ptp is not { Referenced:true } || ptp.Epoch!=manualReferenceConfirmedEpoch))
             InvalidateManualReferenceFeedback();
@@ -828,6 +844,7 @@ public sealed partial class ControlWindow : Window
         FlickerSelfTest();
         LoggingSelfTest();
         DiagnosticsSelfTest();
+        StoreSelfTest();
         WorkflowSelfTest();
         StopRecoverySelfTest();
         ShapeFlowSelfTest();
@@ -850,6 +867,7 @@ public sealed partial class ControlWindow : Window
         DrawingTrajectory.SelfTest();
         TimedTrajectory.SelfTest();
         PtpProtocol.SelfTest();
+        BoardLedger.SelfTest();
         UartStress.SelfTest();
         ControlTransportSelfTest(snapshotPath);
         ShortHeartbeatSelfTest();

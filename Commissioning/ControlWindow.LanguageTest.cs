@@ -84,6 +84,11 @@ public sealed partial class ControlWindow
                 Check(Lang.T("vp.mouse", 1.25, 2.5).Contains("1.25"), "UI numbers disagree with dot-decimal input");
                 ExecutionTrajectory.SelfTest();
             } finally { CultureInfo.CurrentCulture = culture; }
+            // The board archive's note and messages follow the language, and show up in the snapshots below.
+            p.SetBoard(true, false, [new BoardSlot(0, true, 1, 69, 16584, 0, 0, 1), null, null, null], [], () => Lang.T("board.saved", 1));
+            Toggle(false); Check(p.BoardNoteText.Contains("板上存档") && p.BoardNoteText.Contains("别处存的图形") && p.BoardNoteText.Contains("已存到板上槽1"), "board note not Chinese");
+            Toggle(true); Check(p.BoardNoteText.Contains("Stored on the board") && p.BoardNoteText.Contains("saved elsewhere") && p.BoardNoteText.Contains("Saved to board slot 1"), "board note not English");
+            Toggle(false); Check(p.BoardNoteText.Contains("板上存档"), "board note stale after switching back");
             if (snapshotPath is not null) {
                 string directory = Path.GetDirectoryName(Path.GetFullPath(snapshotPath))!;
                 Directory.CreateDirectory(directory);

@@ -83,16 +83,34 @@ public static class PtpProtocol
         pose = Quantize(pose);
         if (type == 9 && (value > 2 || pose.Q1 >= pose.Q2 || pose.Q1 > 0 || pose.Q2 < 0))   // axis 2 is the elbow
             throw Lang.Error("err.limitContainsZero");
+        return EncodeRaw(type, sequence, epoch, checked((short)Math.Round(pose.Q1 * 100)), checked((short)Math.Round(pose.Q2 * 100)), value);
+    }
+    // The 17-byte frame and its wire coding, for fields that are not angles (the archive commands carry a slot and an operation).
+    private static byte[] EncodeRaw(byte type, uint sequence, uint epoch, short first, short second, ushort value)
+    {
         byte[] packet = new byte[17]; packet[0] = type;
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(1), sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(5), epoch);
-        BinaryPrimitives.WriteInt16LittleEndian(packet.AsSpan(9), checked((short)Math.Round(pose.Q1 * 100)));
-        BinaryPrimitives.WriteInt16LittleEndian(packet.AsSpan(11), checked((short)Math.Round(pose.Q2 * 100)));
+        BinaryPrimitives.WriteInt16LittleEndian(packet.AsSpan(9), first);
+        BinaryPrimitives.WriteInt16LittleEndian(packet.AsSpan(11), second);
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(13), value);
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(15), Crc(packet.AsSpan(0, 15)));
         var wire = new List<byte> { 0xd1 };
         foreach (byte b in packet) { wire.Add((byte)(0x81 | ((b & 15) << 1))); wire.Add((byte)(0xa1 | ((b >> 4) << 1))); }
         wire.Add(0xd3); return wire.ToArray();
+    }
+    // Type 12 (control sequence): slot 0..3 (-1 = every slot, queries only) and what to do with it.
+    public static byte[] EncodeStore(uint sequence, uint epoch, int slot, StoreOp op)
+    {
+        if (sequence == 0 || epoch == 0 || op is not (StoreOp.Query or StoreOp.Save or StoreOp.Erase) ||
+            slot < (op == StoreOp.Query ? -1 : 0) || slot >= DeviceContract.TrajStoreSlots) throw Lang.Error("err.storePacket");
+        return EncodeRaw(12, sequence, epoch, (short)slot, (short)op, 0);
+    }
+    // Type 13 (PTP sequence): fill the device's RAM plan from a slot; the device refuses it unless the arms stand at the plan's start.
+    public static byte[] EncodeLoad(uint sequence, uint epoch, int slot)
+    {
+        if (sequence == 0 || epoch == 0 || slot is < 0 or >= DeviceContract.TrajStoreSlots) throw Lang.Error("err.storePacket");
+        return EncodeRaw(13, sequence, epoch, (short)slot, 0, 0);
     }
     public static void SelfTest()
     {

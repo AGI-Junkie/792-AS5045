@@ -31,12 +31,12 @@ function Restore-CreatorProject {
 }
 Push-Location -LiteralPath $repo
 try {
-    $sources = @('DRV8825.cydsn\main.c','DRV8825.cydsn\traj.h','DRV8825.cydsn\hw_ssi.h','DRV8825.cydsn\DRV8825.cyprj','DRV8825.cydsn\DRV8825.cydwr','DRV8825.cydsn\TopDesign\TopDesign.cysch','Commissioning\Commissioning.csproj','tests\test_stage1.py','build-release.ps1','verify-creator-pins.ps1','RELEASE_VERSION','README.md','CHANGELOG.md','docs\PROTOCOL.md','docs\ARM2_FEEDBACK.md','docs\STOP_DIAG.md','docs\STATE_MODEL.md','docs\UART_DIAGNOSIS.md','docs\history\RUN_REVIEW_20260929.md','tools\check-log.py')
+    $sources = @('DRV8825.cydsn\main.c','DRV8825.cydsn\traj.h','DRV8825.cydsn\trajstore.h','DRV8825.cydsn\cm3gcc_trajstore.ld','docs\TRAJ_STORE.md','DRV8825.cydsn\hw_ssi.h','DRV8825.cydsn\DRV8825.cyprj','DRV8825.cydsn\DRV8825.cydwr','DRV8825.cydsn\TopDesign\TopDesign.cysch','Commissioning\Commissioning.csproj','tests\test_stage1.py','build-release.ps1','verify-creator-pins.ps1','RELEASE_VERSION','README.md','CHANGELOG.md','docs\PROTOCOL.md','docs\ARM2_FEEDBACK.md','docs\STOP_DIAG.md','docs\STATE_MODEL.md','docs\UART_DIAGNOSIS.md','docs\history\RUN_REVIEW_20260929.md','tools\check-log.py')
     $sources += Get-ChildItem -LiteralPath Commissioning -Filter '*.cs' | ForEach-Object { 'Commissioning\' + $_.Name }
     $sourceHashes = @{}
     foreach ($source in $sources) { $sourceHashes[$source] = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash }
     # Numbers are read from main.c itself (macro value, trailing 'u' dropped) for the contract check and the report.
-    $mainText = Get-Content -LiteralPath 'DRV8825.cydsn\main.c' -Raw
+    $mainText = (Get-Content -LiteralPath 'DRV8825.cydsn\main.c' -Raw) + (Get-Content -LiteralPath 'DRV8825.cydsn\trajstore.h' -Raw)   # TS_SLOTS lives in trajstore.h
     function Def([string]$name) {
         ([regex]::Match($mainText, '(?m)^#define\s+' + [regex]::Escape($name) + '\s+\(?"?(-?[A-Za-z0-9_.-]+)"?\)?').Groups[1].Value) -replace 'u$', ''
     }
@@ -47,6 +47,9 @@ try {
     Write-Host 'Building firmware (no programming)...'
     & $Creator -wrk (Join-Path $repo 'DRV8825.cywrk') -build *> (Join-Path $dest 'firmware-build.log')
     if ($LASTEXITCODE -ne 0) { throw "Firmware build failed; see $dest\firmware-build.log" }
+    # The archive lives in flash that only cm3gcc_trajstore.ld keeps free of program code: prove this image was linked with it.
+    $map = Get-Content -LiteralPath 'DRV8825.cydsn\CortexM3\ARM_GCC_541\Debug\DRV8825.map' -Raw
+    if ($map -notmatch '0x00020000\s+__trajstore_start' -or $map -notmatch '(?m)^store\s+0x00020000\s+0x0001a000') { throw 'Firmware was not linked with cm3gcc_trajstore.ld (Project > Build Settings > Linker > Custom Linker Script); see docs\TRAJ_STORE.md.' }
     & (Join-Path $repo 'verify-creator-pins.ps1') -NamedInstances -HardwareUart *> (Join-Path $dest 'pin-checks.log')
     Write-Host 'Publishing host...'
     dotnet publish Commissioning/Commissioning.csproj -c Release -r win-x64 --self-contained false -o (Join-Path $dest 'host') --nologo *> (Join-Path $dest 'host-build.log')
@@ -63,7 +66,7 @@ try {
         Arm1AccelMax = 'CFG_ACCEL_MAX_AXIS1'; Arm2AccelMax = 'CFG_ACCEL_MAX_AXIS2'
         PlanRateMax = 'PTP_RATE_MAX', 'TRAJ_RATE_MAX'; PlanAccelMax = 'PTP_ACCEL', 'TRAJ_ACCEL_MAX'; HomeSlowRate = 'HOME_SLOW_RATE_USTEP_S'
         TrajCapacity = 'TRAJ_CAPACITY'; TrajNodeMinMs = 'TRAJ_NODE_MIN_MS'; TrajNodeMaxMs = 'TRAJ_NODE_MAX_MS'
-        TrajTotalMaxMs = 'TRAJ_TOTAL_MAX_MS'; JointLimitCdMax = 'CFG_JOINT_CD_MAX'; ElbowDefaultCd = 'PTP_ELBOW_DEFAULT_CD'; TelemRateMin = 'TELEM_HZ_MIN'; TelemRateMax = 'TELEM_HZ_MAX'; DeadmanMs = 'JOG_DEADMAN_MS'; ProtocolVersion = 'PROTO_VERSION'
+        TrajTotalMaxMs = 'TRAJ_TOTAL_MAX_MS'; TrajStoreSlots = 'TS_SLOTS'; JointLimitCdMax = 'CFG_JOINT_CD_MAX'; ElbowDefaultCd = 'PTP_ELBOW_DEFAULT_CD'; TelemRateMin = 'TELEM_HZ_MIN'; TelemRateMax = 'TELEM_HZ_MAX'; DeadmanMs = 'JOG_DEADMAN_MS'; ProtocolVersion = 'PROTO_VERSION'
     }
     $hostValues = @{}
     foreach ($line in Get-Content -LiteralPath $contractFile) { $name, $value = $line -split '=', 2; $hostValues[$name] = [int]$value }

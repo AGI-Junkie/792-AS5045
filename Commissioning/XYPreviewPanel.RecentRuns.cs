@@ -20,12 +20,10 @@ public sealed partial class XYPreviewPanel
     private static readonly string[] PresetKeys = ["shape", "branch", "x", "y", "a", "b", "c", "rotation", "scale", "direction", "v1", "v2", "a1", "a2"];
     private static readonly string[] FigureKeys = ["shape", "branch", "x", "y", "a", "b", "c", "rotation", "scale", "direction"];
     private const int RecentCount = 8;
-    internal static string? RunsRootOverride, FavoritesPathOverride;   // tests keep the real archive and file untouched
+    internal static string? RunsRootOverride;   // tests keep the real archive untouched
     private static string RunsRoot => RunsRootOverride ?? ControlWindow.ExperimentRoot;
-    private static string FavoritesPath => FavoritesPathOverride ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "favorite-runs.json");
     private List<ExperimentRun> recentRuns = [];
     private int recentRefreshVersion;
-    private HashSet<string> favorites = [];
     private readonly List<(Button Star, Button Load)> recentRows = [];
     private readonly StackPanel recentList = new();
     private readonly ContentControl recentHost = new() { IsTabStop = false, Focusable = false };   // locked with the other edit controls while the arm moves
@@ -79,8 +77,6 @@ public sealed partial class XYPreviewPanel
     internal void RefreshRecentRuns()
     {
         recentRefreshVersion++;
-        try { favorites = File.Exists(FavoritesPath) && new FileInfo(FavoritesPath).Length < 65_536 ? JsonSerializer.Deserialize<HashSet<string>>(File.ReadAllText(FavoritesPath)) ?? [] : []; }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { favorites = []; }
         // A point move to a shape's start is not a drawing of its own; a single-point run is.
         recentRuns = ReadRecentRuns(RunsRoot);
         ShowRecentRuns();
@@ -122,32 +118,25 @@ public sealed partial class XYPreviewPanel
         // Speeds are left out of the identity, a slower repeat is still the same figure. Runs that cannot be loaded stay apart.
         var seen = new HashSet<string>();
         bool NewFigure(ExperimentRun r) => RunValues(r.SettingsText) is not { } v || seen.Add(string.Join("|", FigureKeys.Select(k => v.GetValueOrDefault(k))));
-        var starredRuns = recentRuns.Where(r => favorites.Contains(r.Id)).Where(NewFigure).ToList();
-        foreach (var run in starredRuns.Concat(recentRuns.Where(r => !favorites.Contains(r.Id)).Where(NewFigure).Take(RecentCount)))
+        // A star means "stored on the board" (XYPreviewPanel.Board.cs): those runs come first, however old.
+        var starredRuns = recentRuns.Where(r => StarSlot(RunValues(r.SettingsText)) is not null).Where(NewFigure).ToList();
+        foreach (var run in starredRuns.Concat(recentRuns.Where(r => StarSlot(RunValues(r.SettingsText)) is null).Where(NewFigure).Take(RecentCount)))
         {
             var values = RunValues(run.SettingsText);
-            bool starred = favorites.Contains(run.Id);
+            var stored = StarSlot(values);
+            bool starred = stored is not null;
             string summary = RunSummary(run);
+            string starTip = starred ? Lang.T("board.star.stored", stored!.Slot + 1) : boardSupported ? Lang.T("board.star.save") : Lang.T("board.star.unavailable");
             var star = new Button { Content = starred ? "★" : "☆", Width = 24, Margin = new Thickness(2), Padding = new Thickness(0), Background = Brushes.Transparent, BorderThickness = new Thickness(0),
-                Foreground = starred ? WorkbenchTheme.Warn : WorkbenchTheme.Muted, ToolTip = Lang.T(starred ? "recent.unstar" : "recent.star") };
-            System.Windows.Automation.AutomationProperties.SetName(star, Lang.T(starred ? "recent.unstar" : "recent.star"));
+                Foreground = starred ? WorkbenchTheme.Warn : WorkbenchTheme.Muted, ToolTip = starTip, IsEnabled = boardSupported && !boardBusy && (starred || values is not null) };
+            ToolTipService.SetShowOnDisabled(star, true);
+            System.Windows.Automation.AutomationProperties.SetName(star, starTip);
             var load = new Button { Content = new TextBlock { Text = summary, TextTrimming = TextTrimming.CharacterEllipsis }, HorizontalContentAlignment = HorizontalAlignment.Left,
                 Margin = new Thickness(0, 1, 2, 1), Padding = new Thickness(6, 2, 6, 2), IsEnabled = values is not null,
                 ToolTip = summary + "\n" + (values is null ? Lang.T("recent.cannotLoad") : string.Join("  ", values.Select(v => $"{v.Key}={v.Value}"))) };
             ToolTipService.SetShowOnDisabled(load, true);
             System.Windows.Automation.AutomationProperties.SetName(load, summary);
-            star.Click += (_, _) =>
-            {
-                if (!favorites.Remove(run.Id)) favorites.Add(run.Id);
-                try
-                {
-                    Directory.CreateDirectory(Path.GetDirectoryName(FavoritesPath)!);
-                    File.WriteAllText(FavoritesPath + ".tmp", JsonSerializer.Serialize(favorites), new UTF8Encoding(false));
-                    File.Move(FavoritesPath + ".tmp", FavoritesPath, true);
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Lang.Text(recentNote, () => Lang.T("recent.err.write") + ex.Message); }
-                ShowRecentRuns();
-            };
+            star.Click += (_, _) => { if (!star.IsEnabled) return; if (stored is not null) StoredStarClicked(star, stored); else StarClicked(star, run, values!); };
             load.Click += (_, _) => { ApplyPreset(values!); Lang.Text(recentNote, () => Lang.T("recent.loaded", RunSummary(run))); };
             var row = new DockPanel { Margin = new Thickness(6, 0, 8, 0) };
             DockPanel.SetDock(star, Dock.Left); row.Children.Add(star); row.Children.Add(load);
@@ -160,10 +149,11 @@ public sealed partial class XYPreviewPanel
         recentHost.Content = recentList;
         editControls.Add(recentHost);
         Lang.Text(recentNote, () => Lang.T("recent.empty", RecentCount));
-        return new StackPanel { Children = { recentHost, recentNote } };
+        UpdateBoardNote();
+        return new StackPanel { Children = { recentHost, recentNote, boardNote } };
     }
 
-    private void RefreshRecentLanguage() { ShowRecentRuns(); Lang.RefreshText(recentNote); }
+    private void RefreshRecentLanguage() { ShowRecentRuns(); Lang.RefreshText(recentNote); Lang.RefreshText(boardNote); UpdateUploadCaption(); }
 
     // The motor speed/accel boxes show what will really be used: a value above the per-axis cap (2500 µsteps/s etc.) is written back as the cap,
     // the same number the slider tops out at. Called when a box loses focus and when values are loaded; typing is never rewritten mid-edit.
@@ -248,7 +238,7 @@ public sealed partial class XYPreviewPanel
         static void Fail(string message) => throw new InvalidOperationException("最近运行与参数状态：" + message);
         string temp = Path.Combine(Path.GetTempPath(), "arm-recent-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(temp);
-        RunsRootOverride = Path.Combine(temp, "runs"); FavoritesPathOverride = Path.Combine(temp, "favorite-runs.json");
+        RunsRootOverride = Path.Combine(temp, "runs");
         try
         {
             // The settings text as recorded: an empty c stays empty, an older recording gets the default transform,
@@ -284,24 +274,67 @@ public sealed partial class XYPreviewPanel
             panel.SetEditingAllowed(false);
             if (panel.recentHost.IsEnabled) Fail("运动中不应能载入记录");
             panel.SetEditingAllowed(true);
-            // A star puts the older run first, and survives a restart; a damaged favourites file is ignored.
-            rows[1].Star.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
-            var again = new XYPreviewPanel(); again.RefreshRecentRuns();
-            if (again.recentRows.Count != 2 || (string)again.recentRows[0].Star.Content != "★" || !again.recentRows[0].Load.IsEnabled || (string)again.recentRows[1].Star.Content != "☆") Fail("加星的记录应排在最前，重启后仍在");
-            again.recentRows[0].Star.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
-            if ((string)again.recentRows[0].Star.Content != "☆" || again.recentRows[0].Load.IsEnabled) Fail("取消收藏后应回到按时间排序");
-            File.WriteAllText(FavoritesPathOverride, "not json");
+            // A star means "stored on the board".  Without an archive-capable device every star is off, and says so.
+            if (rows.Any(r => r.Star.IsEnabled || !((string)r.Star.ToolTip).Contains("板上存档"))) Fail("没有存档能力时星标应不可点并说明原因");
+            SuppressMenus = true;
+            var savedRequests = new List<(ExecutionTrajectory Plan, int Slot)>(); var erased = new List<int>();
+            static BoardSlot Held(int slot, uint crc, int nodes = 20, int ms = 8200) => new(slot, true, 1, nodes, ms, 0, 0, crc);
+            static BoardSlot Free(int slot) => new(slot, false, 0, 0, 0, 0, 0, 0);
+            Thread.Sleep(15);
+            ExperimentArchiveTests.WriteSyntheticRun(RunsRootOverride, DrawingShape.Circle, 8200, settings.Replace("shape=2", "shape=3"), out _);
+            var star = new XYPreviewPanel();
+            star.SaveToBoardRequested += (plan, slot) => savedRequests.Add((plan, slot)); star.EraseBoardRequested += erased.Add;
+            star.RefreshRecentRuns();
+            if (star.recentRows.Count != 3) Fail("应有圆、自定义轮廓和矩形三条记录：" + star.recentRows.Count);
+            // The board holds the rectangle: this computer recorded the settings that made it, and the device reports the same plan.
+            var ledger = new List<LedgerEntry> { new(1, 0xABCD1234, settings) };
+            star.SetBoard(true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
+            string[] stars = star.recentRows.Select(r => (string)r.Star.Content).ToArray();
+            if (!stars.SequenceEqual(["★", "☆", "☆"]) || !star.recentRows[0].Star.IsEnabled || !((string)star.recentRows[0].Star.ToolTip).Contains("槽2")) Fail("存在板上的图形应排在最前并标 ★：" + string.Join("", stars));
+            if (!star.recentRows[1].Star.IsEnabled || star.recentRows[2].Star.IsEnabled) Fail("可载入的图形能存，自定义轮廓不能存");
+            if (!star.boardNote.Text.Contains("槽2：矩形") || !star.boardNote.Text.Contains("槽1：空")) Fail("应列出每个槽：" + star.boardNote.Text);
+            // A stale record (the device now reports another plan in that slot) is not a star.
+            star.SetBoard(true, false, [Free(0), Held(1, 0x11111111), null, null], ledger, null);
+            if (star.recentRows.Any(r => (string)r.Star.Content == "★") || !star.boardNote.Text.Contains("别处存的图形")) Fail("设备上的计划与记录不符时不应标 ★，而应说明是别处存的");
+            star.SetBoard(true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
+            // ★ asks first (one menu item), then clears that slot.
+            star.recentRows[0].Star.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (erased.Count != 0 || LastMenu is not { Items.Count: 1 } clear || ((MenuItem)clear.Items[0]!).Header is not string clearText || !clearText.Contains("槽2")) Fail("点 ★ 应先出一个确认菜单项");
+            ((MenuItem)clear.Items[0]!).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            if (!erased.SequenceEqual([1])) Fail("确认后应请求清除槽 2");
+            // ☆ loads the run's figure, checks it and asks for it to be saved into the first free slot (slot 1 here).
+            star.recentRows[1].Star.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (savedRequests.Count != 1 || savedRequests[0].Slot != 0 || star.shape.SelectedIndex != 3 || savedRequests[0].Plan != star.execution || !star.recentNote.Text.Contains("槽1")) Fail("点 ☆ 应载入图形并请求存入第一个空槽");
+            if (requests != 0) Fail("存到板子的请求不得驱动手臂运动");
+            // With every slot taken the operator picks which one to replace.
+            star.SetBoard(true, false, [Held(0, 1), Held(1, 0xABCD1234), Held(2, 2), Held(3, 3)], ledger, null);
+            savedRequests.Clear();
+            star.recentRows[1].Star.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (savedRequests.Count != 0 || LastMenu is not { Items.Count: 4 } pick || ((MenuItem)pick.Items[2]!).Header is not string pickText || !pickText.Contains("替换槽3")) Fail("槽都满了应让操作者选替换哪一个");
+            ((MenuItem)pick.Items[2]!).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            if (savedRequests.Count != 1 || savedRequests[0].Slot != 2) Fail("选了槽 3 就应请求存入槽 3");
+            // While the device writes or moves, the stars are off.
+            star.SetBoard(true, true, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
+            if (star.recentRows.Any(r => r.Star.IsEnabled)) Fail("存档进行中星标应不可点");
+            // The Upload button says when the figure on screen is already on the board.
+            var onScreen = star.execution ?? throw new InvalidOperationException("应有已检查的图形");
+            if ((string)star.upload.Content != "上传图形") Fail("板上没有这个图形时按钮应是上传图形：" + star.upload.Content);
+            star.SetBoard(true, false, [Free(0), Held(1, TrajectoryArchive.PlanCrc(onScreen.Nodes), onScreen.Nodes.Length, (int)onScreen.Nodes.Sum(n => (int)n.Milliseconds)), null, null], ledger, null);
+            if ((string)star.upload.Content != "从板上加载") Fail("板上已有这个图形时按钮应是从板上加载：" + star.upload.Content);
+            star.SetBoard(true, false, [Free(0), Held(1, TrajectoryArchive.PlanCrc(onScreen.Nodes), onScreen.Nodes.Length + 1, 1), null, null], ledger, null);
+            if ((string)star.upload.Content != "上传图形") Fail("节点数或时长不同就不是同一个计划");
+            SuppressMenus = false;
             var broken = new XYPreviewPanel(); broken.RefreshRecentRuns();
-            if (broken.recentRows.Count != 2 || broken.recentRows.Any(r => (string)r.Star.Content == "★")) Fail("损坏的收藏文件应被忽略");
+            if (broken.recentRows.Count != 3 || broken.recentRows.Any(r => (string)r.Star.Content == "★")) Fail("没有板上记录时不应有 ★");
             // The same figure run again (only the speed differs) stays one row, showing the newest run; a different figure is a new row.
             Thread.Sleep(15);
             ExperimentArchiveTests.WriteSyntheticRun(RunsRootOverride, DrawingShape.Rectangle, 8200, settings.Replace("v1=6.5", "v1=3"), out _);
             broken.RefreshRecentRuns();
-            if (broken.recentRows.Count != 2 || !((TextBlock)broken.recentRows[0].Load.Content).Text.Contains("v3/3")) Fail("同一个图形重复运行应只占一行并显示最新一次");
+            if (broken.recentRows.Count != 3 || !((TextBlock)broken.recentRows[0].Load.Content).Text.Contains("v3/3")) Fail("同一个图形重复运行应只占一行并显示最新一次");
             Thread.Sleep(15);
             ExperimentArchiveTests.WriteSyntheticRun(RunsRootOverride, DrawingShape.Rectangle, 8200, settings.Replace("a=10", "a=12"), out _);
             broken.RefreshRecentRuns();
-            if (broken.recentRows.Count != 3) Fail("尺寸不同就是另一个图形，应新增一行");
+            if (broken.recentRows.Count != 4) Fail("尺寸不同就是另一个图形，应新增一行");
 
             // The calibration wizard may put measured link lengths and an elbow range into the boxes: the preview is re-planned from them, nothing moves.
             var before = panel.execution ?? throw new InvalidOperationException("填杆长前应有已检查的图形");
@@ -346,6 +379,6 @@ public sealed partial class XYPreviewPanel
             // Every lamp has an explanation for the pointer.
             if (p.lampRows.Any(r => r.Lamps.Any(l => l.ToolTip is not string tip || tip.Length < 10))) Fail("每个状态灯都应有说明");
         }
-        finally { RunsRootOverride = FavoritesPathOverride = null; if (Directory.Exists(temp)) Directory.Delete(temp, true); }
+        finally { RunsRootOverride = null; SuppressMenus = false; if (Directory.Exists(temp)) Directory.Delete(temp, true); }
     }
 }
