@@ -3339,7 +3339,7 @@ static void jog_axis_tick(jog_axis_t *a)
         a->settleMs--;
         if (a->settleMs == 0u) { jog_axis_settled(a); }
     }
-    else if ((a->hasEnc != 0u) && (a->holding != 0u))
+    else if ((a->hasEnc != 0u) && (a->holding != 0u) && !g_store.busy)   /* a flash job keeps the stage still: no corrections meanwhile */
     {
         /* Closed-loop hold: nudge the rotor back one microstep at a time.
          * A huge error invalidates the position and stops the whole stage. */

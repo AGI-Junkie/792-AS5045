@@ -126,9 +126,9 @@ public sealed partial class XYPreviewPanel
             var stored = StarSlot(values);
             bool starred = stored is not null;
             string summary = RunSummary(run);
-            string starTip = starred ? Lang.T("board.star.stored", stored!.Slot + 1) : boardSupported ? Lang.T("board.star.save") : Lang.T("board.star.unavailable");
+            string starTip = starred ? Lang.T("board.star.stored", stored!.Slot + 1) : !boardSupported ? Lang.T("board.star.unavailable") : !boardKnown ? Lang.T("board.star.reading") : Lang.T("board.star.save");
             var star = new Button { Content = starred ? "★" : "☆", Width = 24, Margin = new Thickness(2), Padding = new Thickness(0), Background = Brushes.Transparent, BorderThickness = new Thickness(0),
-                Foreground = starred ? WorkbenchTheme.Warn : WorkbenchTheme.Muted, ToolTip = starTip, IsEnabled = boardSupported && !boardBusy && (starred || values is not null) };
+                Foreground = starred ? WorkbenchTheme.Warn : WorkbenchTheme.Muted, ToolTip = starTip, IsEnabled = boardSupported && boardKnown && !boardBusy && (starred || values is not null) };
             ToolTipService.SetShowOnDisabled(star, true);
             System.Windows.Automation.AutomationProperties.SetName(star, starTip);
             var load = new Button { Content = new TextBlock { Text = summary, TextTrimming = TextTrimming.CharacterEllipsis }, HorizontalContentAlignment = HorizontalAlignment.Left,
@@ -288,15 +288,15 @@ public sealed partial class XYPreviewPanel
             if (star.recentRows.Count != 3) Fail("应有圆、自定义轮廓和矩形三条记录：" + star.recentRows.Count);
             // The board holds the rectangle: this computer recorded the settings that made it, and the device reports the same plan.
             var ledger = new List<LedgerEntry> { new(1, 0xABCD1234, settings) };
-            star.SetBoard(true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
             string[] stars = star.recentRows.Select(r => (string)r.Star.Content).ToArray();
             if (!stars.SequenceEqual(["★", "☆", "☆"]) || !star.recentRows[0].Star.IsEnabled || !((string)star.recentRows[0].Star.ToolTip).Contains("槽2")) Fail("存在板上的图形应排在最前并标 ★：" + string.Join("", stars));
             if (!star.recentRows[1].Star.IsEnabled || star.recentRows[2].Star.IsEnabled) Fail("可载入的图形能存，自定义轮廓不能存");
             if (!star.boardNote.Text.Contains("槽2：矩形") || !star.boardNote.Text.Contains("槽1：空")) Fail("应列出每个槽：" + star.boardNote.Text);
             // A stale record (the device now reports another plan in that slot) is not a star.
-            star.SetBoard(true, false, [Free(0), Held(1, 0x11111111), null, null], ledger, null);
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0x11111111), null, null], ledger, null);
             if (star.recentRows.Any(r => (string)r.Star.Content == "★") || !star.boardNote.Text.Contains("别处存的图形")) Fail("设备上的计划与记录不符时不应标 ★，而应说明是别处存的");
-            star.SetBoard(true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
             // ★ asks first (one menu item), then clears that slot.
             star.recentRows[0].Star.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
             if (erased.Count != 0 || LastMenu is not { Items.Count: 1 } clear || ((MenuItem)clear.Items[0]!).Header is not string clearText || !clearText.Contains("槽2")) Fail("点 ★ 应先出一个确认菜单项");
@@ -307,21 +307,32 @@ public sealed partial class XYPreviewPanel
             if (savedRequests.Count != 1 || savedRequests[0].Slot != 0 || star.shape.SelectedIndex != 3 || savedRequests[0].Plan != star.execution || !star.recentNote.Text.Contains("槽1")) Fail("点 ☆ 应载入图形并请求存入第一个空槽");
             if (requests != 0) Fail("存到板子的请求不得驱动手臂运动");
             // With every slot taken the operator picks which one to replace.
-            star.SetBoard(true, false, [Held(0, 1), Held(1, 0xABCD1234), Held(2, 2), Held(3, 3)], ledger, null);
+            star.SetBoard(4, true, false, [Held(0, 1), Held(1, 0xABCD1234), Held(2, 2), Held(3, 3)], ledger, null);
             savedRequests.Clear();
             star.recentRows[1].Star.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
             if (savedRequests.Count != 0 || LastMenu is not { Items.Count: 4 } pick || ((MenuItem)pick.Items[2]!).Header is not string pickText || !pickText.Contains("替换槽3")) Fail("槽都满了应让操作者选替换哪一个");
             ((MenuItem)pick.Items[2]!).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
             if (savedRequests.Count != 1 || savedRequests[0].Slot != 2) Fail("选了槽 3 就应请求存入槽 3");
             // While the device writes or moves, the stars are off.
-            star.SetBoard(true, true, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
+            star.SetBoard(4, true, true, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
             if (star.recentRows.Any(r => r.Star.IsEnabled)) Fail("存档进行中星标应不可点");
+            // Until every slot has been reported nothing is assumed empty: the stars stay off, and say why.
+            star.SetBoard(4, false, false, [null, null, null, null], ledger, null);
+            if (star.recentRows.Any(r => r.Star.IsEnabled) || !((string)star.recentRows[1].Star.ToolTip).Contains("读取") || !star.BoardNoteText.Contains("读取")) Fail("没读全板上存档时不应能存");
+            // Only the slots the device advertises exist: with two, both held, the menu offers two and the summary lists two.
+            star.SetBoard(2, true, false, [Held(0, 1), Held(1, 0xABCD1234), null, null], ledger, null);
+            savedRequests.Clear();
+            star.recentRows[1].Star.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (LastMenu is not { Items.Count: 2 } two || savedRequests.Count != 0 || star.BoardNoteText.Contains("槽3")) Fail("只有两个槽时菜单和提示行都应只有两个");
+            ((MenuItem)two.Items[0]!).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            if (savedRequests.Count != 1 || savedRequests[0].Slot != 0) Fail("选了槽 1 就应请求存入槽 1");
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
             // The Upload button says when the figure on screen is already on the board.
             var onScreen = star.execution ?? throw new InvalidOperationException("应有已检查的图形");
             if ((string)star.upload.Content != "上传图形") Fail("板上没有这个图形时按钮应是上传图形：" + star.upload.Content);
-            star.SetBoard(true, false, [Free(0), Held(1, TrajectoryArchive.PlanCrc(onScreen.Nodes), onScreen.Nodes.Length, (int)onScreen.Nodes.Sum(n => (int)n.Milliseconds)), null, null], ledger, null);
+            star.SetBoard(4, true, false, [Free(0), Held(1, TrajectoryArchive.PlanCrc(onScreen.Nodes), onScreen.Nodes.Length, (int)onScreen.Nodes.Sum(n => (int)n.Milliseconds)), null, null], ledger, null);
             if ((string)star.upload.Content != "从板上加载") Fail("板上已有这个图形时按钮应是从板上加载：" + star.upload.Content);
-            star.SetBoard(true, false, [Free(0), Held(1, TrajectoryArchive.PlanCrc(onScreen.Nodes), onScreen.Nodes.Length + 1, 1), null, null], ledger, null);
+            star.SetBoard(4, true, false, [Free(0), Held(1, TrajectoryArchive.PlanCrc(onScreen.Nodes), onScreen.Nodes.Length + 1, 1), null, null], ledger, null);
             if ((string)star.upload.Content != "上传图形") Fail("节点数或时长不同就不是同一个计划");
             SuppressMenus = false;
             var broken = new XYPreviewPanel(); broken.RefreshRecentRuns();

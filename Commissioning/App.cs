@@ -336,6 +336,7 @@ public sealed partial class ControlWindow : Window
             PumpSerial();
             RetryPendingPoint(DateTime.UtcNow);
             PollStoreJob(DateTime.UtcNow);
+            RetryDeferredBoardSave(DateTime.UtcNow);
             CheckControlTimeout(DateTime.UtcNow);
             CheckTelemetryTimeout(DateTime.UtcNow);
             if ((uploading is not null || executing) && ((DateTime.UtcNow - lastPtpAt).TotalSeconds > 2 ||
@@ -685,7 +686,7 @@ public sealed partial class ControlWindow : Window
         pendingPoint = 0; ptp = null;
         manualReferencePending = false;
         uploading = uploaded = runPlan = null; executing = false;
-        pendingBoardSave = null; loadingSlot = null;
+        pendingBoardSave = null; deferredBoardSave = null; loadingSlot = null;
         keyboardMask = mouseMask = 0;
         pendingControl = null; telemetry = null; limitsReportSince = default; enableAfterReport = false;
         if (serial is not null) {

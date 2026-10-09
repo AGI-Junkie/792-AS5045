@@ -1947,6 +1947,24 @@ static void store_test(const char *t) {
         ts_active(1,&in);assert(!in.valid && g_storeResult.last==2);
         return;
     }
+    if(!strcmp(t,"store_hold")) {
+        /* A settled jog leaves the closed-loop hold on, and a rotor that drifted is nudged back one microstep at a time.  While a flash
+         * job runs the stage must stay still: no corrections until it ends, and they resume afterwards. */
+        unsigned moved,k;
+        store_make_plan(485,0);
+        g_arm1.holding=1u;g_arm1.holdTarget=g_enc.pos+60;g_arm1.holdCooldownMs=0u;
+        moved=simPulse1+simPulse2;jog_axis_tick(&g_arm1);
+        assert(simPulse1+simPulse2>moved);                                   /* the fixture does produce a correction when idle */
+        store_send(12,g_controlSequence+1u,0,2,0);assert(g_store.busy);
+        g_arm1.holding=1u;g_arm1.holdTarget=g_enc.pos+60;g_arm1.holdCooldownMs=0u;
+        moved=simPulse1+simPulse2;
+        for(k=0;k<50;k++)jog_axis_tick(&g_arm1);
+        assert(simPulse1+simPulse2==moved);                                  /* none while saving */
+        store_run();assert(g_storeResult.last==1);
+        g_arm1.holdCooldownMs=0u;jog_axis_tick(&g_arm1);
+        assert(simPulse1+simPulse2>moved);                                   /* and they resume */
+        return;
+    }
     if(!strcmp(t,"store_abort")) {
         store_make_plan(485,0);crcA=store_plan_crc();store_save(0);
         store_make_plan(485,1);
@@ -3145,7 +3163,7 @@ ptp_cases += ['ptp_zero','ptp_axis1','ptp_axis2']
 ptp_cases += ['ptp_power_stable','ptp_fast_stall']
 ptp_cases += ['limits_ptp','limits_jog','limits_elbow','limits_elbow_traj','limits_elbow_jog']
 ptp_cases += ['rates_ptp','rates_traj','rates_live']
-ptp_cases += ['store_'+n for n in ['roundtrip','capacity','ab','power_loss','write_error','corrupt','load_checks','commands','abort','unlinked','write_guard']]
+ptp_cases += ['store_'+n for n in ['roundtrip','capacity','ab','power_loss','write_error','corrupt','load_checks','commands','hold','abort','unlinked','write_guard']]
 ptp_cases += ['ptp_final_'+name for name in ['positive','negative','boundary','over_limit','following','counts']]
 ptp_cases += ['ptp_logged_retry']
 ptp_cases += ['traj_rx_'+name for name in ['retry','ready_retry','repeated','stop','timeout','overrun','overflow','break','parity','mixed','heartbeat','holding','fault','encoder','motion']]

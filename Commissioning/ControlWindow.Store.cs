@@ -21,7 +21,9 @@ public sealed partial class ControlWindow
 
     private int storeSlotCount;                                           // traj_store=<n> in LINK; 0 = this firmware cannot archive
     private readonly BoardSlot?[] boardSlots = new BoardSlot?[DeviceContract.TrajStoreSlots];
-    private bool boardKnown;                                              // the slots are the device's answer on this link
+    private bool boardKnown;                                              // a COMPLETE inventory (every slot reported) has arrived on this link
+    private int boardSeen;                                                // bit per slot reported by the query in flight
+    private (ExecutionTrajectory Plan, int Slot, DateTime Since)? deferredBoardSave;   // asked while the device was still confirming new speeds
     private StoreStatus? storeStatus;
     private StoreJob? storeJob;
     private StoreOp storeRequestOp;
@@ -42,19 +44,20 @@ public sealed partial class ControlWindow
     {
         string? slots = words.FirstOrDefault(w => w.StartsWith("traj_store=", StringComparison.Ordinal));
         storeSlotCount = slots is not null && int.TryParse(slots.AsSpan(11), out int n) && n is > 0 and <= DeviceContract.TrajStoreSlots ? n : 0;
-        if (storeSlotCount == 0) { boardKnown = false; Array.Clear(boardSlots); }
+        if (storeSlotCount == 0) { boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); }
         PublishBoard();
     }
 
     private void ResetBoard()
     {
-        storeSlotCount = 0; boardKnown = false; Array.Clear(boardSlots); storeStatus = null; storeJob = null; storePacket = []; storeResend = false;
-        pendingBoardSave = null; loadingSlot = null; boardMessage = null; lastBoardQueryAt = default;
+        storeSlotCount = 0; boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); storeStatus = null; storeJob = null; storePacket = []; storeResend = false;
+        pendingBoardSave = null; deferredBoardSave = null; loadingSlot = null; boardMessage = null; lastBoardQueryAt = default;
         lock (wireSync) { if (pendingControlType == 12) pendingControlType = 0; }
         PublishBoard();
     }
 
-    private void PublishBoard() => xyPreview.SetBoard(storeSlotCount > 0, storeJob is not null && storeJob.Op != StoreOp.Query || pendingBoardSave is not null, boardSlots, boardLedger, boardMessage);
+    private void PublishBoard() => xyPreview.SetBoard(storeSlotCount, boardKnown, storeJob is not null && storeJob.Op != StoreOp.Query || pendingBoardSave is not null || deferredBoardSave is not null,
+        boardSlots, boardLedger, boardMessage);
     private void SetBoardMessage(Func<string>? message) { boardMessage = message; PublishBoard(); }
 
     private bool StartStoreJob(StoreOp op, int slot, Action<bool, string>? done)
@@ -65,6 +68,7 @@ public sealed partial class ControlWindow
             if (pendingControlType != 0) return false;
             storeJob = new StoreJob(op, slot, done);
             storeRequestOp = op; storeRequestSlot = slot; storePacket = []; storeResend = false; pendingControlType = 12;
+            if (op == StoreOp.Query) boardSeen = 0;   // only a query that reports every slot completes the inventory
         }
         Append($"HOST archive request {op} slot={(slot < 0 ? "all" : slot.ToString())}");
         PublishBoard();
@@ -114,8 +118,14 @@ public sealed partial class ControlWindow
     {
         if (line.StartsWith("TRAJ_SLOT ", StringComparison.Ordinal))
         {
-            if (BoardSlot.Parse(line) is { } slot) { boardSlots[slot.Slot] = slot; boardKnown = true; if (storeJob is { } q) q.LastSeenAt = DateTime.UtcNow; PublishBoard(); }
-            else Append("HOST malformed archive slot line", LogLevel.Warning);
+            if (BoardSlot.Parse(line) is { } slot && slot.Slot < storeSlotCount)
+            {
+                boardSlots[slot.Slot] = slot; boardSeen |= 1 << slot.Slot;
+                if (boardSeen == (1 << storeSlotCount) - 1) boardKnown = true;
+                if (storeJob is { } q) q.LastSeenAt = DateTime.UtcNow;
+                PublishBoard();
+            }
+            else Append("HOST malformed or unexpected archive slot line", LogLevel.Warning);
             return;
         }
         if (storeJob is not { } job) return;
@@ -148,13 +158,26 @@ public sealed partial class ControlWindow
     // The plan the device holds is what gets saved.  A figure that is not held yet is uploaded first, then saved: one click.
     private void RequestSaveToBoard(ExecutionTrajectory plan, int slot)
     {
-        if (slot is < 0 or >= DeviceContract.TrajStoreSlots) return;
-        if (!StoreAvailable || storeJob is not null || pendingBoardSave is not null || PointBusy) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
-        if (uploaded is { } held && held.Nodes.SequenceEqual(plan.Nodes)) { BeginBoardSave(plan.Nodes, slot); return; }
+        if (slot < 0 || slot >= storeSlotCount) return;
+        if (!StoreAvailable || !boardKnown || storeJob is not null || pendingBoardSave is not null || PointBusy) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
+        if (uploaded is { } held && held.Nodes.SequenceEqual(plan.Nodes)) { deferredBoardSave = null; BeginBoardSave(plan.Nodes, slot); return; }
+        // A figure with other speeds makes the panel re-send them first; the upload has to wait until the device confirmed them.
+        if (!LimitsReady) { deferredBoardSave = (plan, slot, DateTime.UtcNow); SetBoardMessage(() => Lang.T("board.waitSync", slot + 1)); return; }
+        deferredBoardSave = null;
         pendingBoardSave = (plan.Nodes, slot);
         RequestTrajectory(plan, allowBoard: false);
         if (uploading is null) { pendingBoardSave = null; SetBoardMessage(() => Lang.T("board.err.needStart")); return; }
         SetBoardMessage(() => Lang.T("board.uploadThenSave", slot + 1));
+    }
+
+    // The save that was waiting for the speed synchronisation goes ahead once the device confirmed it, or is dropped after 15 s.
+    private void RetryDeferredBoardSave(DateTime now)
+    {
+        if (deferredBoardSave is not { } deferred) return;
+        if ((now - deferred.Since).TotalSeconds > 15) { deferredBoardSave = null; SetBoardMessage(() => Lang.T("board.err.needStart")); return; }
+        if (!LimitsReady || PointBusy) return;
+        deferredBoardSave = null;
+        RequestSaveToBoard(deferred.Plan, deferred.Slot);
     }
 
     private void BeginBoardSave(ExecutionNode[] nodes, int slot)
@@ -178,7 +201,7 @@ public sealed partial class ControlWindow
 
     private void RequestEraseBoardSlot(int slot)
     {
-        if (slot is < 0 or >= DeviceContract.TrajStoreSlots) return;
+        if (slot < 0 || slot >= storeSlotCount) return;
         if (!StoreAvailable || storeJob is not null || PointBusy) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
         if (StartStoreJob(StoreOp.Erase, slot, (ok, message) =>
         {
@@ -216,7 +239,7 @@ public sealed partial class ControlWindow
         if (loadingSlot is not { } slot || uploading is null) return;
         Append($"HOST board slot {slot} could not be loaded ({reason}); uploading the plan instead", LogLevel.Warning);
         loadingSlot = null; pendingPoint = 0; lock (wireSync) { pointWire.Clear(); }
-        boardKnown = false; uploadNext = 0;
+        boardKnown = false; boardSeen = 0; uploadNext = 0;
         SetBoardMessage(() => Lang.T("board.loadFallback", slot + 1));
         SendNextTrajectoryPacket();
     }
@@ -283,11 +306,26 @@ public sealed partial class ControlWindow
             // The slots, then the status that ends it.  A status for another sequence is not ours.
             w.HandleLine("TRAJ_SLOT slot=0 valid=0");
             w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=2 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746");
-            w.HandleLine("TRAJ_SLOT slot=2 valid=0"); w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            w.HandleLine("TRAJ_SLOT slot=2 valid=0");
+            Check(!w.boardKnown && TrajectoryArchive.FreeSlot(w.boardSlots, w.storeSlotCount) == 0, "a partial inventory was taken as complete");
+            w.HandleLine("TRAJ_SLOT slot=3 valid=0");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={seq + 5} last=none last_slot=0 row_max_us=0");
             Check(w.storeJob is not null, "a status for another command ended the job");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={seq} last=none last_slot=0 row_max_us=0");
             Check(w.storeJob is null && w.boardKnown && w.boardSlots[1] is { Valid: true, Crc: 0xBD3EB746 } && w.boardSlots[0] is { Valid: false }, "the query answer was not taken");
+            // Saving waits for the complete inventory, and for the device to confirm new speeds: a figure with other speeds makes the panel
+            // re-send them, and the upload that follows is held back instead of being dropped.
+            w.xyPreview.SelectShapeForSelfTest(3); w.xyPreview.LoadExampleForSelfTest();
+            var shown = w.xyPreview.Plan ?? throw new InvalidOperationException("Archive: the example figure has no plan");
+            Check(!w.LimitsReady, "the fixture was expected to be waiting for the device's ranges");
+            w.RequestSaveToBoard(shown, 0);
+            Check(w.deferredBoardSave is { Slot: 0 } && w.uploading is null && w.pendingBoardSave is null && w.storeJob is null, "a save asked during speed synchronisation was not held back");
+            w.RetryDeferredBoardSave(DateTime.UtcNow.AddSeconds(2));
+            Check(w.deferredBoardSave is not null, "the held save was dropped before its time");
+            w.RetryDeferredBoardSave(DateTime.UtcNow.AddSeconds(16));
+            Check(w.deferredBoardSave is null && w.uploading is null, "a save that never became possible was not dropped");
+            w.RequestSaveToBoard(shown, 7);
+            Check(w.deferredBoardSave is null && w.pendingBoardSave is null, "a slot the device does not have was accepted");
             // A plan on the device is saved into the free slot; the receipt, progress and the end are matched by sequence.
             var nodes = new[] { new ExecutionNode(new JointPose(0, 0), 0), new ExecutionNode(new JointPose(0.5, -0.25), 100), new ExecutionNode(new JointPose(1, -0.5), 100), new ExecutionNode(new JointPose(1, -0.5), 50) };
             Check(TrajectoryArchive.FreeSlot(w.boardSlots) == 0 && TrajectoryArchive.SlotFor(w.boardSlots, nodes) is null, "slot choice before saving");
@@ -315,6 +353,12 @@ public sealed partial class ControlWindow
             Check(done && !ok && w.storeJob is null, "silence did not end the job");
             // Disconnecting forgets the board; a stop forgets a pending save.
             w.pendingBoardSave = (nodes, 0);
+            w.ResetBoard();
+            w.HandleLine(Link(" traj_store=2 telem_hz=0"));
+            Check(w.storeSlotCount == 2, "a smaller slot count was not read");
+            w.StartStoreJob(StoreOp.Query, -1, null); Next(12);
+            w.HandleLine("TRAJ_SLOT slot=0 valid=0"); w.HandleLine("TRAJ_SLOT slot=1 valid=0"); w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            Check(w.boardKnown && w.boardSlots[3] is null, "the advertised slot count was not honoured");
             w.ResetBoard();
             Check(w.storeSlotCount == 0 && !w.boardKnown && w.boardSlots.All(s => s is null) && w.pendingBoardSave is null && w.pendingControlType == 0, "the board state survived a reset");
         }

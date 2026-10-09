@@ -12,7 +12,9 @@ public sealed partial class XYPreviewPanel
     public event Action<ExecutionTrajectory, int>? SaveToBoardRequested;   // plan, slot: upload it if the device does not hold it, then save
     public event Action<int>? EraseBoardRequested;
 
-    private bool boardSupported, boardBusy;
+    private int boardSlotCount;                    // the slots the device advertises (traj_store=<n>); 0 = no archive
+    private bool boardKnown, boardBusy;            // the inventory is complete; a save/erase/upload-then-save is in progress
+    private bool boardSupported => boardSlotCount > 0;
     private IReadOnlyList<BoardSlot?> boardSlots = new BoardSlot?[DeviceContract.TrajStoreSlots];
     private IReadOnlyList<LedgerEntry> boardLedger = [];
     private Func<string>? boardMessage;
@@ -23,9 +25,10 @@ public sealed partial class XYPreviewPanel
     internal string BoardNoteText => boardNote.Text;
     private readonly TextBlock boardNote = new() { TextWrapping = TextWrapping.Wrap, FontSize = 11, Foreground = WorkbenchTheme.Muted, Margin = new Thickness(10, 2, 10, 6) };
 
-    public void SetBoard(bool supported, bool busy, IReadOnlyList<BoardSlot?> slots, IReadOnlyList<LedgerEntry> ledger, Func<string>? message)
+    // known: every slot has been reported on this link.  Until then no slot is assumed empty, and saving stays off.
+    public void SetBoard(int slotCount, bool known, bool busy, IReadOnlyList<BoardSlot?> slots, IReadOnlyList<LedgerEntry> ledger, Func<string>? message)
     {
-        boardSupported = supported; boardBusy = busy; boardSlots = slots.ToArray(); boardLedger = ledger.ToList(); boardMessage = message;
+        boardSlotCount = Math.Clamp(slotCount, 0, DeviceContract.TrajStoreSlots); boardKnown = known; boardBusy = busy; boardSlots = slots.ToArray(); boardLedger = ledger.ToList(); boardMessage = message;
         ShowRecentRuns();
         UpdateBoardNote();
         UpdatePointButton();
@@ -68,7 +71,8 @@ public sealed partial class XYPreviewPanel
         Lang.Text(boardNote, () =>
         {
             if (!boardSupported) return Lang.T("board.unsupported");
-            string slots = string.Join("\n", Enumerable.Range(0, DeviceContract.TrajStoreSlots).Select(i => Lang.T("board.slot", i + 1, SlotLabel(boardSlots.ElementAtOrDefault(i)))));
+            if (!boardKnown) return Lang.T("board.reading") + (boardMessage is { } pending ? "\n" + pending() : "");
+            string slots = string.Join("\n", Enumerable.Range(0, boardSlotCount).Select(i => Lang.T("board.slot", i + 1, SlotLabel(boardSlots.ElementAtOrDefault(i)))));
             return Lang.T("board.summary", slots) + (boardMessage is { } message ? "\n" + message() : "");
         });
     }
@@ -76,9 +80,9 @@ public sealed partial class XYPreviewPanel
     // ☆: the figure goes to the first free slot; with none free the operator chooses which one to replace.
     private void StarClicked(Button star, ExperimentRun run, Dictionary<string, string> values)
     {
-        if (TrajectoryArchive.FreeSlot(boardSlots) is { } free) { SaveRunToBoard(run, values, free); return; }
+        if (TrajectoryArchive.FreeSlot(boardSlots, boardSlotCount) is { } free) { SaveRunToBoard(run, values, free); return; }
         var menu = new ContextMenu { PlacementTarget = star };
-        for (int i = 0; i < DeviceContract.TrajStoreSlots; i++)
+        for (int i = 0; i < boardSlotCount; i++)
         {
             int slot = i;
             var item = new MenuItem { Header = Lang.T("board.replace", slot + 1, SlotLabel(boardSlots.ElementAtOrDefault(slot))) };

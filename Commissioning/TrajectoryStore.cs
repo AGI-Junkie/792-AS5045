@@ -81,10 +81,11 @@ public static class TrajectoryArchive
         return slots.FirstOrDefault(s => s is { Valid: true } && s.Crc == crc && s.Nodes == nodes.Count && s.DurationMs == total);
     }
 
-    // A free slot to save into: the first empty one, else none (the operator then picks which to replace).
-    public static int? FreeSlot(IReadOnlyList<BoardSlot?> slots)
+    // A free slot to save into: the first one the device reported as empty, else none (the operator then picks which to replace).
+    // A slot nothing has been heard about is not free: only `count` slots exist, and an unread one may hold a figure.
+    public static int? FreeSlot(IReadOnlyList<BoardSlot?> slots, int count = DeviceContract.TrajStoreSlots)
     {
-        for (int i = 0; i < DeviceContract.TrajStoreSlots; i++) if (slots.ElementAtOrDefault(i) is not { Valid: true }) return i;
+        for (int i = 0; i < Math.Min(count, DeviceContract.TrajStoreSlots); i++) if (slots.ElementAtOrDefault(i) is { Valid: false }) return i;
         return null;
     }
 }
@@ -143,7 +144,9 @@ public static class BoardLedger
         Check(stream.Length == 12 && stream.SequenceEqual(new byte[] { 0x83, 0xFF, 0xFA, 0x00, 0, 0, 0x01, 0x00, 0xB0, 0xB9, 0xF4, 0x01 }), "node stream layout: " + Convert.ToHexString(stream));
         Check(PlanCrc(nodes) == Crc32(stream), "plan CRC");
         var slots = new BoardSlot?[] { null, new BoardSlot(1, true, 1, 2, 500, -125, 250, PlanCrc(nodes)), new BoardSlot(2, false, 0, 0, 0, 0, 0, 0), null };
-        Check(FreeSlot(slots) == 0 && FreeSlot([slots[1], slots[1], slots[1], slots[1]]) is null && FreeSlot([slots[1], slots[1], slots[2], slots[1]]) == 2, "free slot choice");
+        // slots: unknown, held, reported empty, unknown.  Only a reported-empty slot is free, and only within the advertised count.
+        Check(FreeSlot(slots) == 2 && FreeSlot([slots[1], slots[1], slots[1], slots[1]]) is null && FreeSlot([slots[1], slots[1], slots[2], slots[1]]) == 2 && FreeSlot([null, null, null, null]) is null, "free slot choice");
+        Check(FreeSlot([slots[1], slots[1], slots[2], slots[2]], 2) is null && FreeSlot([slots[1], slots[2], slots[2], slots[2]], 2) == 1 && FreeSlot([slots[2], slots[2], slots[2], slots[2]], 0) is null, "free slot choice must honour the slot count");
         Check(SlotFor(slots, nodes) is { Slot: 1 } && SlotFor(slots, [nodes[0], nodes[1] with { Milliseconds = 400 }]) is null, "slot lookup by plan");
         // Packets: type 12 query-all, save, erase and type 13 load; refused when out of range.
         static byte[] Decode(byte[] wire) => Enumerable.Range(0, 17).Select(i => (byte)(((wire[1 + i * 2] >> 1) & 15) | (((wire[2 + i * 2] >> 1) & 15) << 4))).ToArray();

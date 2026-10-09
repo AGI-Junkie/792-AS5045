@@ -86,7 +86,7 @@ public sealed partial class ControlWindow
                 ExecutionTrajectory.SelfTest();
             } finally { CultureInfo.CurrentCulture = culture; }
             // The board archive's note and messages follow the language, and show up in the snapshots below.
-            p.SetBoard(true, false, [new BoardSlot(0, true, 1, 69, 16584, 0, 0, 1), null, null, null], [], () => Lang.T("board.saved", 1));
+            p.SetBoard(4, true, false, [new BoardSlot(0, true, 1, 69, 16584, 0, 0, 1), new BoardSlot(1, false, 0, 0, 0, 0, 0, 0), new BoardSlot(2, false, 0, 0, 0, 0, 0, 0), new BoardSlot(3, false, 0, 0, 0, 0, 0, 0)], [], () => Lang.T("board.saved", 1));
             Toggle(false); Check(p.BoardNoteText.Contains("板上存档") && p.BoardNoteText.Contains("别处存的图形") && p.BoardNoteText.Contains("已存到板上槽1"), "board note not Chinese");
             Toggle(true); Check(p.BoardNoteText.Contains("Stored on the board") && p.BoardNoteText.Contains("saved elsewhere") && p.BoardNoteText.Contains("Saved to board slot 1"), "board note not English");
             Toggle(false); Check(p.BoardNoteText.Contains("板上存档"), "board note stale after switching back");
