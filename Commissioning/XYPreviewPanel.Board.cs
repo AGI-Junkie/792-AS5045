@@ -23,6 +23,10 @@ public sealed partial class XYPreviewPanel
     internal static ContextMenu? LastMenu;
     private static void ShowMenu(ContextMenu menu) { LastMenu = menu; if (!SuppressMenus) menu.IsOpen = true; }
     internal string BoardNoteText => boardNote.Text;
+    // One clear button per stored slot, so a figure saved from another computer (or whose record was lost) can be cleared too.
+    private readonly WrapPanel boardClear = new() { Margin = new Thickness(10, 0, 10, 6) };
+    private readonly ContentControl boardClearHost = new() { IsTabStop = false, Focusable = false };   // locked with the other edit controls while the arm moves
+    internal IReadOnlyList<Button> BoardClearButtons => boardClear.Children.OfType<Button>().ToList();
     private readonly TextBlock boardNote = new() { TextWrapping = TextWrapping.Wrap, FontSize = 11, Foreground = WorkbenchTheme.Muted, Margin = new Thickness(10, 2, 10, 6) };
 
     // known: every slot has been reported on this link.  Until then no slot is assumed empty, and saving stays off.
@@ -31,7 +35,22 @@ public sealed partial class XYPreviewPanel
         boardSlotCount = Math.Clamp(slotCount, 0, DeviceContract.TrajStoreSlots); boardKnown = known; boardBusy = busy; boardSlots = slots.ToArray(); boardLedger = ledger.ToList(); boardMessage = message;
         ShowRecentRuns();
         UpdateBoardNote();
+        UpdateBoardClear();
         UpdatePointButton();
+    }
+
+    private void UpdateBoardClear()
+    {
+        boardClear.Children.Clear();
+        if (!boardSupported || !boardKnown) return;
+        foreach (var slot in boardSlots.Take(boardSlotCount).OfType<BoardSlot>().Where(s => s.Valid))
+        {
+            var button = new Button { Content = Lang.T("board.clearButton", slot.Slot + 1), ToolTip = Lang.T("board.clearButton.tip", slot.Slot + 1),
+                Margin = new Thickness(0, 0, 6, 0), Padding = new Thickness(8, 1, 8, 1), IsEnabled = !boardBusy };
+            ToolTipService.SetShowOnDisabled(button, true);
+            button.Click += (_, _) => { if (button.IsEnabled) StoredStarClicked(button, slot); };
+            boardClear.Children.Add(button);
+        }
     }
 
     // The slot holding the plan on screen, cached per plan and slot contents: the check is a CRC over the node bytes.

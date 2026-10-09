@@ -148,12 +148,13 @@ public sealed partial class XYPreviewPanel
     {
         recentHost.Content = recentList;
         editControls.Add(recentHost);
+        boardClearHost.Content = boardClear; editControls.Add(boardClearHost);
         Lang.Text(recentNote, () => Lang.T("recent.empty", RecentCount));
         UpdateBoardNote();
-        return new StackPanel { Children = { recentHost, recentNote, boardNote } };
+        return new StackPanel { Children = { recentHost, recentNote, boardNote, boardClearHost } };
     }
 
-    private void RefreshRecentLanguage() { ShowRecentRuns(); Lang.RefreshText(recentNote); Lang.RefreshText(boardNote); UpdateUploadCaption(); }
+    private void RefreshRecentLanguage() { ShowRecentRuns(); Lang.RefreshText(recentNote); Lang.RefreshText(boardNote); UpdateBoardClear(); UpdateUploadCaption(); }
 
     // The motor speed/accel boxes show what will really be used: a value above the per-axis cap (2500 µsteps/s etc.) is written back as the cap,
     // the same number the slider tops out at. Called when a box loses focus and when values are loaded; typing is never rewritten mid-edit.
@@ -296,6 +297,18 @@ public sealed partial class XYPreviewPanel
             // A stale record (the device now reports another plan in that slot) is not a star.
             star.SetBoard(4, true, false, [Free(0), Held(1, 0x11111111), null, null], ledger, null);
             if (star.recentRows.Any(r => (string)r.Star.Content == "★") || !star.boardNote.Text.Contains("别处存的图形")) Fail("设备上的计划与记录不符时不应标 ★，而应说明是别处存的");
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
+            // A slot this computer has no record of (saved elsewhere, or the record is lost) still gets its own clear button, with the same confirmation.
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0x11111111), null, null], ledger, null);
+            if (star.BoardClearButtons.Count != 1 || !((string)star.BoardClearButtons[0].Content).Contains("槽2")) Fail("别处存的槽应有清除按钮：" + star.BoardClearButtons.Count);
+            star.BoardClearButtons[0].RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (erased.Count != 0 || LastMenu is not { Items.Count: 1 } unknownClear) Fail("清除按钮也应先确认");
+            ((MenuItem)unknownClear.Items[0]!).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            if (!erased.SequenceEqual([1])) Fail("确认后应请求清除槽 2"); erased.Clear();
+            star.SetBoard(4, true, true, [Free(0), Held(1, 0x11111111), null, null], ledger, null);
+            if (star.BoardClearButtons.Any(b => b.IsEnabled)) Fail("存档进行中清除按钮应不可点");
+            star.SetBoard(4, false, false, [Free(0), Held(1, 0x11111111), null, null], ledger, null);
+            if (star.BoardClearButtons.Count != 0) Fail("没读全板上存档时不应显示清除按钮");
             star.SetBoard(4, true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
             // ★ asks first (one menu item), then clears that slot.
             star.recentRows[0].Star.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));

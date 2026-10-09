@@ -80,10 +80,16 @@ public sealed partial class ControlWindow
         if (storeJob is not { } job) return;
         storeJob = null;
         lock (wireSync) { if (pendingControlType == 12) pendingControlType = 0; }
-        Append($"HOST archive {job.Op} slot={(job.Slot < 0 ? "all" : job.Slot.ToString())} {(ok ? "done" : "failed: " + message)}", ok ? null : LogLevel.Warning);
+        Append($"HOST archive {job.Op} slot={(job.Slot < 0 ? "all" : job.Slot.ToString())} {(ok ? "done" : "failed")}", ok ? null : LogLevel.Warning);   // the raw log stays raw; the reason goes to the panel
         job.Done?.Invoke(ok, message);
-        // A change on the board is read back, so the picture shown is the device's and not what was hoped for.
-        if (ok && job.Op != StoreOp.Query) StartStoreJob(StoreOp.Query, -1, null);
+        // A change on the board is read back, so the picture shown is the device's and not what was hoped for.  A FAILED save or erase
+        // is read back too: it may have changed flash before it failed (erase clears block A before block B), or have finished with its
+        // final status lost.  Until the answer is complete the inventory is not trusted.
+        if (job.Op != StoreOp.Query)
+        {
+            if (!ok) { boardKnown = false; boardSeen = 0; }
+            StartStoreJob(StoreOp.Query, -1, null);
+        }
         PublishBoard();
     }
 
@@ -164,9 +170,10 @@ public sealed partial class ControlWindow
         // A figure with other speeds makes the panel re-send them first; the upload has to wait until the device confirmed them.
         if (!LimitsReady) { deferredBoardSave = (plan, slot, DateTime.UtcNow); SetBoardMessage(() => Lang.T("board.waitSync", slot + 1)); return; }
         deferredBoardSave = null;
-        pendingBoardSave = (plan.Nodes, slot);
+        // The marker comes AFTER the upload has started: it counts as busy, and RequestTrajectory refuses to start while busy.
         RequestTrajectory(plan, allowBoard: false);
-        if (uploading is null) { pendingBoardSave = null; SetBoardMessage(() => Lang.T("board.err.needStart")); return; }
+        if (uploading is null) { SetBoardMessage(() => Lang.T("board.err.needStart")); return; }
+        pendingBoardSave = (plan.Nodes, slot);
         SetBoardMessage(() => Lang.T("board.uploadThenSave", slot + 1));
     }
 
@@ -253,7 +260,7 @@ public sealed partial class ControlWindow
     }
 
     // The archive's message handling, checked against the lines the firmware prints.
-    private static void StoreSelfTest()
+    internal static void StoreSelfTest()
     {
         static void Check(bool yes, string reason) { if (!yes) throw new InvalidOperationException("Archive: " + reason); }
         string ledger = Path.Combine(Path.GetTempPath(), "arm-board-" + Guid.NewGuid().ToString("N") + ".json");
@@ -344,13 +351,16 @@ public sealed partial class ControlWindow
             done = false; Check(w.StartStoreJob(StoreOp.Save, 2, (success, _) => { done = true; ok = success; }), "save 2 queued"); Next(12); uint failSeq = w.storeJob!.Sequence;
             w.HandleLine($"TRAJ_STORE state=idle slot=2 rows=3/12 seq={failSeq} last=failed last_slot=2 row_max_us=0");
             Check(done && !ok, "a failed save was reported as done");
+            Check(w.storeJob is { Op: StoreOp.Query } && !w.boardKnown, "a failed save did not trigger a read-back and distrust of the inventory");
             w.FinishStoreJob(true, "");
             done = false; Check(w.StartStoreJob(StoreOp.Erase, 1, (success, _) => { done = true; ok = success; }), "erase queued");
             w.HandleLine("TRAJ_STORE refused: stage not idle");
-            Check(done && !ok && w.storeJob is null, "a refusal did not end the job");
+            Check(done && !ok && w.storeJob is { Op: StoreOp.Query }, "a refusal did not end the job (and read the board back)");
+            w.FinishStoreJob(true, "");
             done = false; Check(w.StartStoreJob(StoreOp.Erase, 1, (success, _) => { done = true; ok = success; }), "erase queued again"); Next(12);
-            w.PollStoreJob(DateTime.UtcNow.AddSeconds(30)); w.PollStoreJob(DateTime.UtcNow.AddSeconds(31)); w.PollStoreJob(DateTime.UtcNow.AddSeconds(32)); w.PollStoreJob(DateTime.UtcNow.AddSeconds(33));
-            Check(done && !ok && w.storeJob is null, "silence did not end the job");
+            for (int later = 30; later < 40 && !done; later++) w.PollStoreJob(DateTime.UtcNow.AddSeconds(later));   // stops at the first poll that gives up
+            Check(done && !ok && w.storeJob is { Op: StoreOp.Query }, "silence did not end the job (and read the board back)");
+            w.FinishStoreJob(true, "");
             // Disconnecting forgets the board; a stop forgets a pending save.
             w.pendingBoardSave = (nodes, 0);
             w.ResetBoard();
@@ -363,5 +373,68 @@ public sealed partial class ControlWindow
             Check(w.storeSlotCount == 0 && !w.boardKnown && w.boardSlots.All(s => s is null) && w.pendingBoardSave is null && w.pendingControlType == 0, "the board state survived a reset");
         }
         finally { w.Close(); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }
+    }
+
+    // The whole flow through the real window, the way the panel drives it: a figure that is not on the device is uploaded and then saved
+    // (the pending-save marker must not block its own upload), a figure on the board is loaded instead of uploaded, and a refused load
+    // falls back to the node-by-node upload.
+    internal static void BoardSaveFlowSelfTest()
+    {
+        static void Check(bool yes, string reason) { if (!yes) throw new InvalidOperationException("Archive flow: " + reason); }
+        static int Type(byte[] f) => ((f[1] >> 1) & 15) | (((f[2] >> 1) & 15) << 4);
+        static int Field(byte[] f, int i) => ((f[1 + 2 * i] >> 1) & 15) | (((f[2 + 2 * i] >> 1) & 15) << 4);
+        string ledger = Path.Combine(Path.GetTempPath(), "arm-board-flow-" + Guid.NewGuid().ToString("N") + ".json");
+        BoardLedger.PathOverride = ledger;
+        bool language = Lang.IsEn; Lang.Set(false, false);
+        var w = new ControlWindow { selfTesting = true, ShowActivated = false, ShowInTaskbar = false };
+        try
+        {
+            var p = w.xyPreview; p.SelectShapeForSelfTest(3); p.LoadExampleForSelfTest();
+            w.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
+            w.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=4 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
+            w.TestLine($"LINK fw=stage2-v7-absolute-q2 proto={DeviceContract.ProtocolVersion} motion_rates=1 joint_limits=1 traj_store=4");
+            var plan = p.Plan ?? throw new InvalidOperationException("Archive flow: no plan");
+            var start = plan.Nodes[0].Pose;
+            w.TestLine($"TELEM t=10 epoch=4 seq=1 ref=1 source=2 p1={ExecutionTrajectory.Counts(0, start)} p2={ExecutionTrajectory.Counts(1, start)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
+            w.TestLine("INPUTS: J4-1/P0[4]=1 J4-2/P0[3]=1 NPN/P1[0]=1 nFAULT=1");
+            Check(p.UploadButton.IsEnabled && w.CanPoint, "the fixture is not ready to upload");
+            for (int slot = 0; slot < 4; slot++) w.TestLine($"TRAJ_SLOT slot={slot} valid=0");
+            // The first LINK line already started the initial query (as it does on a real link); let it finish.
+            if (w.storeJob is { } initial) { initial.Sequence = 30; w.TestLine("TRAJ_STORE state=idle slot=0 rows=0/0 seq=30 last=none last_slot=0 row_max_us=0"); }
+            Check(w.storeJob is null, "the initial query did not finish");
+            Check(w.StoreAvailable && w.boardKnown, $"the archive is not available (slots={w.storeSlotCount} framed={w.framedControl} epoch={w.reportedEpoch} known={w.boardKnown})");
+
+            // One request on a figure that is not on the device: upload first, then save into the slot.
+            w.RequestSaveToBoard(plan, 0);
+            Check(w.uploading is not null && w.pendingBoardSave is { Slot: 0 } && w.deferredBoardSave is null && w.pointPacket.Length > 0 && Type(w.pointPacket) == 2, $"the save did not start its upload (uploading={w.uploading is not null} pending={w.pendingBoardSave} deferred={w.deferredBoardSave is not null} limitsReady={w.LimitsReady} busy={w.PointBusy} packet={w.pointPacket.Length}/{(w.pointPacket.Length > 2 ? Type(w.pointPacket) : -1)} message={w.boardMessage?.Invoke()})");
+            for (int i = 0; i < plan.Nodes.Length; i++)
+                w.TestLine($"TRAJ_STATE state={(i + 1 == plan.Nodes.Length ? 2 : 1)} count={i + 1} total={plan.Nodes.Length} index=0 seq={w.pendingPoint} epoch=4");
+            Check(w.uploaded == plan && w.pendingBoardSave is null && w.storeJob is { Op: StoreOp.Save, Slot: 0 } && w.pendingControlType == 12, "the save did not follow the upload");
+            w.storeJob!.Sequence = 40;   // the writer thread is not running in this fixture
+            w.TestLine("TRAJ_STORE state=idle slot=0 rows=1/1 seq=40 last=saved last_slot=0 row_max_us=4000");
+            Check(BoardLedger.Load().Any(e => e.Slot == 0 && e.Crc == TrajectoryArchive.PlanCrc(plan.Nodes)) && w.storeJob is { Op: StoreOp.Query }, "the save was not recorded and read back");
+            // The read-back: the device reports the plan in slot 0, and the screen then offers to load it.
+            int ms = plan.Nodes.Sum(n => (int)n.Milliseconds);
+            w.TestLine($"TRAJ_SLOT slot=0 valid=1 seq=1 nodes={plan.Nodes.Length} duration_ms={ms} q1={(int)Math.Round(start.Q1 * 100)} q2={(int)Math.Round(start.Q2 * 100)} crc={TrajectoryArchive.PlanCrc(plan.Nodes):X8}");
+            for (int slot = 1; slot < 4; slot++) w.TestLine($"TRAJ_SLOT slot={slot} valid=0");
+            w.storeJob!.Sequence = 41;
+            w.TestLine("TRAJ_STORE state=idle slot=0 rows=0/0 seq=41 last=saved last_slot=0 row_max_us=4000");
+            Check(w.storeJob is null && TrajectoryArchive.SlotFor(w.boardSlots, plan.Nodes) is { Slot: 0 } && (string)p.UploadButton.Content == "从板上加载", "the plan on the board was not recognised: " + p.UploadButton.Content);
+
+            // A figure on the board is loaded (type 13, slot 0) instead of uploaded, and nothing runs by itself.
+            w.uploaded = null; w.uploadedRan = false;
+            w.RequestTrajectory(plan);
+            Check(w.loadingSlot == 0 && w.uploading is not null && Type(w.pointPacket) == 13 && (short)(Field(w.pointPacket, 9) | Field(w.pointPacket, 10) << 8) == 0 && !w.executing, "the stored plan was not loaded from its slot");
+            w.TestLine($"TRAJ_STATE state=2 count={plan.Nodes.Length} total={plan.Nodes.Length} index=0 seq={w.pendingPoint} epoch=4");
+            Check(w.uploaded == plan && w.uploading is null && w.loadingSlot is null && !w.executing && w.pendingPoint == 0, "the load was not completed as a held plan");
+
+            // The device refuses the stored plan (limits changed, slot damaged): the same figure is uploaded the normal way.
+            w.uploaded = null; w.uploadedRan = false;
+            w.RequestTrajectory(plan);
+            Check(w.loadingSlot == 0, "second load did not start");
+            w.TestLine("PTP refused: archived plan does not fit the current limits");
+            Check(w.loadingSlot is null && w.uploading is not null && Type(w.pointPacket) == 2 && !w.boardKnown, "a refused load did not fall back to the upload");
+        }
+        finally { w.Close(); Lang.Set(language, false); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }
     }
 }

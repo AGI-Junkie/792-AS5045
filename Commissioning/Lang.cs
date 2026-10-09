@@ -257,6 +257,8 @@ internal static class Lang
         ["board.star.reading"] = ("正在读取板上存档，读完才能存。", "Reading the board archive; saving is possible once it is read."),
         ["board.reading"] = ("板上存档：正在读取各个槽……", "Board archive: reading the slots…"),
         ["board.waitSync"] = ("等设备确认新的速度设置后，自动上传并存到槽{0}……", "Waiting for the device to confirm the new speeds; then it uploads and saves to slot {0}…"),
+        ["board.clearButton"] = ("清除槽{0}", "Clear slot {0}"),
+        ["board.clearButton.tip"] = ("把板上槽{0}里的图形清掉（还会再确认一次）。别的电脑存的图形也可以这样清除。", "Remove the figure in board slot {0} (asks once more). This also works for a figure saved from another computer."),
         ["board.empty"] = ("空", "empty"),
         ["board.size"] = (" · {0} 点 · {1:0.#} 秒", " · {0} points · {1:0.#} s"),
         ["board.unknown"] = ("别处存的图形", "figure saved elsewhere"),
