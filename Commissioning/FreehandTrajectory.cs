@@ -1,8 +1,9 @@
 using System.Windows;
+using System.Text.Json.Serialization;
 
 namespace TwoLinkCommissioning;
 
-public readonly record struct FreehandPoint(double X, double Y)
+public readonly record struct FreehandPoint([property: JsonRequired] double X, [property: JsonRequired] double Y)
 {
     internal Point Point => new(X, Y);
 }

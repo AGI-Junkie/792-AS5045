@@ -78,6 +78,9 @@ public sealed partial class XYPreviewPanel
             catch (Exception ex) when (ex is ArgumentException or JsonException) { continue; }
             throw new InvalidOperationException("Freehand UI accepted invalid saved points");
         }
+        string missingCoordinate = JsonSerializer.Serialize(new { savedRecord.Schema, savedRecord.Shape, savedRecord.Branch, savedRecord.Fields, savedRecord.Direction, Freehand = new[] { new { X = 330.0 } } });
+        try { panel.RestoreParameters(missingCoordinate); throw new InvalidOperationException("Missing Y was replaced by zero"); }
+        catch (JsonException) { }
         panel.RestoreParameters(saved);
         panel.freehandPoints.Add(new(340, 0)); panel.UpdateLamps();
         Check(panel.savedFields is null || panel.SnapshotFields()[24] != panel.savedFields[24], "draft absent from saved state");
