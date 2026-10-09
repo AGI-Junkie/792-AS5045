@@ -110,6 +110,10 @@ public sealed partial class XYPreviewPanel
         double position = cursor.Value, scale = pixelsPerMm; var center = cameraCenter;
         int shapeIndex = shape.SelectedIndex, branchIndex = branch.SelectedIndex;
         toggle();
+        if(!Equals(unreachableLayer.Content,Lang.T("vp.unreachable")) ||
+            !Equals(unreachableLayer.ToolTip,Lang.T("vp.unreachable.tip")) ||
+            PointerReach(new Point(100,0)) != Lang.T("vp.boundaryIn")+Lang.T("vp.unreach"))
+            throw new InvalidOperationException("Link boundary and tip reachability text did not switch language");
         if (SaveParameters()!=parameters || execution!=plan || trajectory!=path || timing!=time || parametersDirty!=dirty ||
             offlineSim!=following || playbackTimer.IsEnabled!=playing || cursor.Value!=position || cameraCenter!=center || pixelsPerMm!=scale ||
             shape.SelectedIndex!=shapeIndex || branch.SelectedIndex!=branchIndex)

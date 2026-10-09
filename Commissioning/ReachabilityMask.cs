@@ -1,16 +1,14 @@
 using System.Windows;
 using System.Windows.Media;
-using System.Windows.Media.Imaging;
 
 namespace TwoLinkCommissioning;
 
-// This layer describes geometric reachability, not firmware permission or collision clearance.
+// The straight link boundary is a visual reference; exact tip IK remains a separate check.
 internal sealed class ReachabilityMask
 {
-    private const int Pixels = 512;
     private readonly PlanarArm model;
     private readonly JointLimits? limits;
-    private BitmapSource? bitmap;
+    private Geometry? linkBoundary;
 
     private ReachabilityMask(PlanarArm model, JointLimits? limits)
     {
@@ -19,10 +17,57 @@ internal sealed class ReachabilityMask
     }
 
     public static ReachabilityMask Build(PlanarArm model, JointLimits? limits) => new(model, limits);
-    public double ViewRadius => model.OuterRadius;
     public bool Matches(PlanarArm arm, JointLimits? range) =>
         model.L1 == arm.L1 && model.L2 == arm.L2 && limits == range;
-    public BitmapSource Bitmap => bitmap ??= CreateBitmap();
+    public Geometry LinkBoundary => linkBoundary ??= CreateLinkBoundary();
+
+    public bool IsWithinLinkBoundary(Point point) => double.IsFinite(point.X) && double.IsFinite(point.Y) &&
+        LinkBoundary.FillContains(point, 1e-8, ToleranceType.Absolute);
+
+    private Geometry CreateLinkBoundary()
+    {
+        if (limits is not { } range)
+        {
+            var circle = new EllipseGeometry(new Point(), model.OuterRadius, model.OuterRadius);
+            circle.Freeze();
+            return circle;
+        }
+        // The editor accepts ordered ranges containing zero, within +/-180 degrees.
+        for (int axis = 0; axis < 3; axis++)
+        {
+            var bounds = range.Bounds(axis);
+            if (!double.IsFinite(bounds.Q1) || !double.IsFinite(bounds.Q2) || bounds.Q1 < -180 ||
+                bounds.Q2 > 180 || bounds.Q1 > 0 || bounds.Q2 < 0 || bounds.Q1 >= bounds.Q2)
+                return Geometry.Empty;
+        }
+        double low1 = Math.Max(range.Min1, range.Min2 - range.ElbowMax);
+        double high1 = Math.Min(range.Max1, range.Max2 - range.ElbowMin);
+        var low = model.Forward(new JointPose(low1, Math.Max(range.Min2, low1 + range.ElbowMin)));
+        var high = model.Forward(new JointPose(high1, Math.Min(range.Max2, high1 + range.ElbowMax)));
+        Point Outer(Point tip, Point elbow)
+        {
+            Vector direction = tip - elbow;
+            direction.Normalize();
+            double along = Vector.Multiply((Vector)elbow, direction);
+            double distance = -along + Math.Sqrt(along * along + model.OuterRadius * model.OuterRadius - model.L1 * model.L1);
+            return elbow + direction * distance;
+        }
+        var outline = new StreamGeometry();
+        using (var context = outline.Open())
+        {
+            context.BeginFigure(new Point(), true, true);
+            context.LineTo(low.Elbow, true, false);
+            // Continue the elbow-to-tip line to the outer circle without adding another corner.
+            context.LineTo(Outer(low.Tip, low.Elbow), true, false);
+            var radius = new Size(model.OuterRadius, model.OuterRadius);
+            // Split at +X so the full +/-180 range also produces a complete circle.
+            context.ArcTo(new Point(model.OuterRadius, 0), radius, 0, false, SweepDirection.Clockwise, true, false);
+            context.ArcTo(Outer(high.Tip, high.Elbow), radius, 0, false, SweepDirection.Clockwise, true, false);
+            context.LineTo(high.Elbow, true, false);
+        }
+        outline.Freeze();
+        return outline;
+    }
 
     public bool IsReachable(Point tip)
     {
@@ -46,28 +91,6 @@ internal sealed class ReachabilityMask
     // Preserve equivalent boundary poses, including q1 = +180 versus Inverse's normalized -180.
     private static double Equivalent(double angle, double minimum) =>
         angle + 360 * Math.Ceiling((minimum - angle - 1e-8) / 360);
-
-    private Point PixelCenter(int x, int y) => new(
-        ((x + 0.5) / Pixels * 2 - 1) * ViewRadius,
-        (1 - (y + 0.5) / Pixels * 2) * ViewRadius);
-
-    private BitmapSource CreateBitmap()
-    {
-        // ponytail: fixed world raster approximates boundaries to one pixel; increase resolution if closer zoom needs it.
-        // Cache once per lengths/range, so telemetry and camera changes never rerun inverse kinematics for this layer.
-        var pixels = new byte[Pixels * Pixels * 4];
-        for (int y = 0; y < Pixels; y++)
-            for (int x = 0; x < Pixels; x++)
-            {
-                if (IsReachable(PixelCenter(x, y))) continue;
-                int index = (y * Pixels + x) * 4;
-                pixels[index] = 0x38; pixels[index + 1] = 0x23;
-                pixels[index + 2] = 0xB4; pixels[index + 3] = 0x38;
-            }
-        var result = BitmapSource.Create(Pixels, Pixels, 96, 96, PixelFormats.Bgra32, null, pixels, Pixels * 4);
-        result.Freeze();
-        return result;
-    }
 
     public static void SelfTest()
     {
@@ -122,20 +145,43 @@ internal sealed class ReachabilityMask
         Check(!Build(arm, wide with { ElbowMin = 10, ElbowMax = 90 }).IsReachable(new Point(356, 0)), "肘 [10,90]：接近伸直（<10°）不可达");
         Check(!Build(arm, wide with { ElbowMin = -20, ElbowMax = 20 }).IsReachable(new Point(300, 0)), "肘 ±20°：r=300 需要 65°");
 
-        var image = mask.Bitmap;
-        Check(image.IsFrozen && ReferenceEquals(image, mask.Bitmap), "遮罩缓存必须复用冻结图像");
-        var bytes = new byte[Pixels * Pixels * 4];
-        image.CopyPixels(bytes, Pixels * 4, 0);
-        int red = 0, transparent = 0;
-        for (int y = 0; y < Pixels; y += 17)
-            for (int x = 0; x < Pixels; x += 17)
+        Check(mask.LinkBoundary.IsFrozen && ReferenceEquals(mask.LinkBoundary, mask.LinkBoundary), "复用冻结的直线边界");
+        Check(mask.IsWithinLinkBoundary(new Point(100, 0)) && !mask.IsReachable(new Point(100, 0)), "连杆可经过不等于笔尖可达");
+        Check(!mask.IsWithinLinkBoundary(new Point(double.NaN, 0)), "边界拒绝非有限点");
+        Check(!mask.IsWithinLinkBoundary(new Point(arm.OuterRadius + 0.1, 0)), "保留最大伸展半径");
+        var linkRange = new JointLimits(-100, 100, -150, 150, -180, 180);
+        var links = Build(arm, linkRange);
+        Check(links.IsWithinLinkBoundary(new Point(0, 100)) && !links.IsReachable(new Point(0, 100)), "旧圆弧红区内的连杆空间应留白");
+        Check(!links.IsWithinLinkBoundary(new Point(-100, 0)), "极限连杆后方仍为红区");
+        foreach (var pose in new[] { new JointPose(-100, -150), new JointPose(100, 150) })
+        {
+            var (elbow, tip) = arm.Forward(pose);
+            foreach (var (from, to) in new[] { (new Point(), elbow), (elbow, tip) })
+                foreach (double fraction in new[] { 0.2, 0.5, 0.8 })
+                {
+                    Point edge = from + (to - from) * fraction;
+                    Check(links.IsWithinLinkBoundary(edge + new Vector(0.1, 0)), "极限端点连线右侧应留白");
+                    Check(!links.IsWithinLinkBoundary(edge - new Vector(0.1, 0)), "极限端点连线左侧应标红");
+                }
+        }
+        var asymmetricLinks = Build(arm, linkRange with { Min1 = -30, Min2 = -60 });
+        Check(asymmetricLinks.IsWithinLinkBoundary(new Point(0, 100)) &&
+            !asymmetricLinks.IsWithinLinkBoundary(new Point(0, -100)), "直线边界不可镜像非对称范围");
+        var full = Build(arm, new JointLimits(-180, 180, -180, 180, -180, 180));
+        foreach (var point in new[] { new Point(0, 100), new Point(0, -100), new Point(-100, 0), new Point(100, 0), new Point() })
+            Check(full.IsWithinLinkBoundary(point), "全角范围覆盖整个圆盘，包括连杆可经过的内圆");
+        Check(free.IsWithinLinkBoundary(new Point()), "无范围时连杆空间包含基座");
+        Check(!Build(arm, defaults with { Min1 = double.NaN }).IsWithinLinkBoundary(new Point(100, 0)), "无效范围不显示可用区域");
+        foreach (var (range, low, high) in new[] {
+            (linkRange with { ElbowMin = -20, ElbowMax = 30 }, new JointPose(-100,-120), new JointPose(100,130)),
+            (new JointLimits(-100,100,-10,10,-20,30), new JointPose(-40,-10), new JointPose(30,10)) })
+            foreach (var pose in new[] { low, high })
             {
-                int index = (y * Pixels + x) * 4;
-                bool reachable = mask.IsReachable(mask.PixelCenter(x, y));
-                Check(bytes[index + 3] == (reachable ? 0 : 0x38), "像素颜色与精确点判定一致");
-                if (reachable) transparent++;
-                else { red++; Check(bytes[index + 2] == 0xB4 && bytes[index + 1] == 0x23, "不可达像素为透明红色"); }
+                var (elbow, tip) = arm.Forward(pose);
+                Point edge = elbow + (tip-elbow)*0.5;
+                var bounded = Build(arm, range);
+                Check(range.Contains(pose) && bounded.IsWithinLinkBoundary(edge+new Vector(0.1,0)) &&
+                    !bounded.IsWithinLinkBoundary(edge-new Vector(0.1,0)), "肘限制必须约束极限连线的两根杆");
             }
-        Check(red > 0 && transparent > 0, "同时覆盖可达与不可达像素");
     }
 }

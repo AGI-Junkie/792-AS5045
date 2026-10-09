@@ -59,7 +59,11 @@ public sealed partial class XYPreviewPanel
     private string PointerReach(Point world)
     {
         if(overlayLimits is null || !overlayUnreachable) return "";
-        try { return Reachability(Model).IsReachable(world) ? Lang.T("vp.reach") : Lang.T("vp.unreach"); }
+        try {
+            var mask = Reachability(Model);
+            return (mask.IsWithinLinkBoundary(world) ? Lang.T("vp.boundaryIn") : Lang.T("vp.boundaryOut")) +
+                (mask.IsReachable(world) ? Lang.T("vp.reach") : Lang.T("vp.unreach"));
+        }
         catch(ArgumentException) { return ""; }
     }
     private void RefreshLanguageViewport()
@@ -213,20 +217,13 @@ public sealed partial class XYPreviewPanel
         }
         var origin=ToScreen(new Point());
         if(overlayUnreachable && overlayLimits is not null) {
-            var mask=Reachability(model);
-            var topLeft=ToScreen(new Point(-mask.ViewRadius,mask.ViewRadius));
-            double side=mask.ViewRadius*2*pixelsPerMm;
-            var bounds=new Rect(topLeft,new Size(side,side));
-            // Outside the bitmap's world square is unreachable too, including when panning away from the arm.
+            var boundary=Reachability(model).LinkBoundary.Clone();
+            boundary.Transform=new MatrixTransform(pixelsPerMm,0,0,-pixelsPerMm,origin.X,origin.Y);
             plot.Children.Add(new Path { IsHitTestVisible=false, Fill=WorkbenchTheme.Brush("#38B42338"),
-                Data=new CombinedGeometry(GeometryCombineMode.Exclude,new RectangleGeometry(Plot),new RectangleGeometry(bounds)) });
-            var image=new Image { Source=mask.Bitmap, Width=side, Height=side, Stretch=Stretch.Fill, IsHitTestVisible=false };
-            RenderOptions.SetBitmapScalingMode(image,BitmapScalingMode.NearestNeighbor);
-            Canvas.SetLeft(image,topLeft.X); Canvas.SetTop(image,topLeft.Y); plot.Children.Add(image);
+                Data=new CombinedGeometry(GeometryCombineMode.Exclude,new RectangleGeometry(Plot),boundary) });
         }
         if(!detail) {
             Arc(plot,origin,model.OuterRadius*pixelsPerMm,WorkbenchTheme.Brush("#8FB42338"));
-            if(model.InnerRadius*pixelsPerMm>1.5) Arc(plot,origin,model.InnerRadius*pixelsPerMm,WorkbenchTheme.Brush("#8FB42338"));
         }
         double step=GridStep(65/pixelsPerMm);
         var low=ToWorld(new Point(Plot.Left,Plot.Bottom)); var high=ToWorld(new Point(Plot.Right,Plot.Top));
@@ -380,9 +377,18 @@ public sealed partial class XYPreviewPanel
             var strokes=plot.Children.OfType<Path>().Count(shape=>shape.Stroke is not null);
             var fills=plot.Children.OfType<Path>().Count(shape=>shape.Fill is not null);
             int images=plot.Children.OfType<Image>().Count();
-            if(links!=2 || strokes!=(detail?0:2) || fills!=1 || images!=1)
+            if(links!=2 || strokes!=(detail?0:1) || fills!=1 || images!=0)
                 throw new InvalidOperationException($"Preview links/不可达区域层不符：detail={detail} links={links} strokes={strokes} fills={fills} images={images}");
+            var red=plot.Children.OfType<Path>().Single(shape=>shape.Fill is not null).Data;
+            for(int row=0;row<5;row++) for(int col=0;col<5;col++) {
+                var screen=new Point(Plot.Left+Plot.Width*(col+0.5)/5,Plot.Top+Plot.Height*(row+0.5)/5);
+                if(red.FillContains(screen,1e-8,ToleranceType.Absolute)==Reachability(Model).IsWithinLinkBoundary(ToWorld(screen)))
+                    throw new InvalidOperationException("缩放/平移后的红色图层与世界坐标边界不符");
+            }
         }
+        if(!PointerReach(new Point(100,0)).Contains(Lang.T("vp.boundaryIn")) ||
+            !PointerReach(new Point(100,0)).Contains(Lang.T("vp.unreach")))
+            throw new InvalidOperationException("鼠标必须区分连杆边界内与笔尖不可达");
         if(requests!=0 || GridStep(4)!=5) throw new InvalidOperationException("Viewport separation failed");
         PointMoveRequested-=CountPoint; TrajectoryRequested-=CountPath; SetStartFeedback(null); FitView(initialDetail);
     }
