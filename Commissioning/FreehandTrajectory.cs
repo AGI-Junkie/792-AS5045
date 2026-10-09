@@ -15,6 +15,7 @@ internal static class FreehandTrajectory
     private const double SimplifyTolerance = 0.25, CurveTolerance = Tolerance - SimplifyTolerance;
     internal static FreehandPoint[] Example => Enumerable.Range(0, 41)
         .Select(i => new FreehandPoint(330 + i * 0.25, 2 * Math.Sin(i * Math.PI / 20))).ToArray();
+    internal static FreehandPoint[] RefinementExample => [new(320, 0), new(340, 0), new(340, 20)];
 
     internal static void Validate(IReadOnlyList<FreehandPoint> points)
     {
@@ -30,23 +31,27 @@ internal static class FreehandTrajectory
             if (raw.Count == 0 || (p.Point - raw[^1]).Length > 1e-9) raw.Add(p.Point);
         if (raw.Count < 2 || raw.Zip(raw.Skip(1)).Sum(p => (p.Second - p.First).Length) < 1)
             throw Lang.Error("err.freehandShort");
-        var kept = Simplify(raw);
-        for (int round = 0; round <= 12; round++)
+        var sources = Simplify(raw);
+        var points = sources.Select(i => raw[i]).ToList();
+        for (int round = 0; round <= 16; round++)
         {
-            var spline = new Spline(kept.Select(i => raw[i]).ToArray());
-            var failed = Enumerable.Range(0, kept.Count - 1).Where(i => !spline.Bounded(i)).ToArray();
+            var spline = new Spline(points.ToArray());
+            var failed = Enumerable.Range(0, points.Count - 1).Where(i => !spline.Bounded(i)).ToArray();
             if (failed.Length == 0) return spline.Piece();
-            if (round == 12 || failed.Any(i => kept[i + 1] - kept[i] <= 1))
-                throw Lang.Error("err.freehandFit", kept[failed[0]] + 1);
-            foreach (int i in failed.Reverse()) kept.Insert(i + 1, (kept[i] + kept[i + 1]) / 2);
-            kept = Simplify(raw, kept);
+            if (round == 16 || points.Count + failed.Length > MaxPoints)
+                throw Lang.Error("err.freehandFit", sources[failed[0]] + 1);
+            // Split the certified simplified chord so refinement preserves its 0.25 mm budget.
+            foreach (int i in failed.Reverse()) {
+                points.Insert(i + 1, points[i] + (points[i + 1] - points[i]) * 0.5);
+                sources.Insert(i + 1, sources[i]);
+            }
         }
         throw Lang.Error("err.freehandFit", 1);
     }
 
-    private static List<int> Simplify(IReadOnlyList<Point> points, IEnumerable<int>? anchors = null)
+    private static List<int> Simplify(IReadOnlyList<Point> points)
     {
-        var keep = new SortedSet<int>(anchors ?? [0, points.Count - 1]);
+        var keep = new SortedSet<int> { 0, points.Count - 1 };
         var pending = new Stack<(int First, int Last)>();
         foreach (var pair in keep.Zip(keep.Skip(1))) pending.Push((pair.First, pair.Second));
         while (pending.TryPop(out var pair))
@@ -104,11 +109,8 @@ internal static class FreehandTrajectory
 
         internal bool Bounded(int i)
         {
-            var chord = points[i + 1] - points[i];
-            bool Inside(Point p) {
-                double projection = Vector.Multiply(p - points[i], chord) / chord.LengthSquared;
-                return projection >= -1e-9 && projection <= 1 + 1e-9 && Distance(p, points[i], points[i + 1]) <= CurveTolerance;
-            }
+            // Segment distance includes rounded end caps; a bounded reversal may pass its endpoint.
+            bool Inside(Point p) => Distance(p, points[i], points[i + 1]) <= CurveTolerance;
             bool Bound(Point a, Point b, Point c, Point d, int depth) {
                 if (!Inside(a) || !Inside(d)) return false;
                 if (Inside(b) && Inside(c)) return true;
@@ -198,13 +200,34 @@ internal static class FreehandTrajectory
             foreach (double s in smooth.Checks!)
                 Check(shape.Zip(shape.Skip(1)).Min(v => Distance(smooth.At(s).P, v.First.Point, v.Second.Point)) <= Tolerance + 1e-8, "turn/return/crossing deviation");
         }
-        Reject([new(0, 0), new(100, 0), new(100, 100)]);
+        foreach (var shape in new[] {
+            new[] { new FreehandPoint(0, 0), new(100, 0), new(100, 100) },
+            new[] { new FreehandPoint(0, 0), new(100, 0), new(0, 0) },
+            new[] { new FreehandPoint(0, 0), new(99.75, 0), new(100, 0), new(100, 0.25), new(100, 100), new(0, 100) },
+            new[] { new FreehandPoint(0, 0), new(80, 0), new(0.25, 0.25), new(80, 0.5), new(0, 0.75) } }) {
+            var refined = Create(shape);
+            Check((refined.At(0).P - shape[0].Point).Length < 1e-8 && (refined.At(1).P - shape[^1].Point).Length < 1e-8, "refined endpoints");
+            foreach (double s in refined.Checks!)
+                Check(shape.Zip(shape.Skip(1)).Min(v => Distance(refined.At(s).P, v.First.Point, v.Second.Point)) <= Tolerance + 1e-8, "automatic refinement exceeds tolerance");
+            foreach (var p in shape)
+                Check(refined.Checks!.Min(s => (p.Point - refined.At(s).P).Length) <= Tolerance + CaptureSpacing, "refinement loses draft points");
+        }
         var model = new PlanarArm(180, 176.38); var range = new JointLimits(-90, 90, -160, 160);
         var path = DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, 0, range,
             new ShapeOptions { FreehandPoints = raw.Select(p => new FreehandPoint(320 + p.X, p.Y)).ToArray() });
         var execution = new ExecutionTrajectory(new TimedTrajectory(path, new PlanningRates(10, 5, 3, 10, 6)), range);
         ExecutionTrajectory.Validate(execution.Nodes, range);
         Check(path.Stops.Length == 2 && execution.Timing.At(0).Speed < 1e-8 && execution.Timing.At(execution.Timing.Duration).Speed < 1e-8, "continuous stroke and endpoint rest");
+        var refinedPath = DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, 0, range,
+            new ShapeOptions { FreehandPoints = RefinementExample });
+        var refinedExecution = new ExecutionTrajectory(new TimedTrajectory(refinedPath, new PlanningRates(10, 5, 3, 10, 6)), range);
+        ExecutionTrajectory.Validate(refinedExecution.Nodes, range);
+        Check(refinedPath.Stops.Length == 2, "refinement added internal stops");
+        for (int i = 0; i <= 3000; i++) {
+            var state = refinedExecution.Timing.At(refinedExecution.Timing.Duration * i / 3000);
+            Check(state.Speed <= 10 && Math.Abs(state.Velocity.Q1) <= 5 && Math.Abs(state.Velocity.Q2 - state.Velocity.Q1) <= 3, "refined speed limit");
+            Check(Math.Abs(state.Acceleration.Q1) <= 10 && Math.Abs(state.Acceleration.Q2 - state.Acceleration.Q1) <= 6, "refined acceleration limit");
+        }
         try {
             DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, 0, range,
                 new ShapeOptions { FreehandPoints = [new(50, 0), new(-50, 0)] });

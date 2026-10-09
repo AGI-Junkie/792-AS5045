@@ -48,6 +48,9 @@ public sealed partial class XYPreviewPanel
         Check(panel.CancelFreehandOnEscape(), "Escape did not cancel recording");
         Check(panel.freehandPoints.SequenceEqual(original), "cancel lost committed points");
         panel.UndoFreehand(); Check((panel.freehandPoints[^1].Point - end).Length < 1e-8, "undo last stroke");
+        panel.RestoreParameters(JsonSerializer.Serialize(savedRecord with { Freehand = FreehandTrajectory.RefinementExample }));
+        Check(panel.execution is not null && panel.trajectory!.Stops.Length == 2, "automatic corner refinement: " + panel.result.Text);
+        Check(panel.freehandPoints.SequenceEqual(FreehandTrajectory.RefinementExample), "refinement rewrote the saved draft");
         panel.RestoreParameters(saved);
         var large = savedRecord with { Freehand = Enumerable.Range(0, 5000).Select(i => new FreehandPoint(330 + i / 1000.0, 0)).ToArray() };
         string largeJson = JsonSerializer.Serialize(large);
@@ -104,7 +107,7 @@ public sealed partial class XYPreviewPanel
         Check(requests == 0, "editing issued a motion command");
         panel.ClearFreehand(); Check(panel.freehandPoints.Count == 0 && panel.execution is null, "clear");
         if (snapshotPath is not null)
-            File.WriteAllText(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(snapshotPath))!, "freehand-tests.txt"), "PASS: analytic spline and deviation budget, capture/resume/undo/cancel/lock, plan invalidation, save/restore validation, old files, language, unchanged motion queues.\n");
+            File.WriteAllText(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(snapshotPath))!, "freehand-tests.txt"), "PASS: automatic corner/reversal refinement within the deviation budget, analytic spline and rate limits, unchanged draft, capture/resume/undo/cancel/lock, plan invalidation, save/restore validation, old files, language, unchanged motion queues.\n");
         panel.viewportRedrawTimer.Stop();
     }
 }

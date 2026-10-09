@@ -1062,7 +1062,7 @@ public sealed partial class ControlWindow : Window
             binary.Write((ushort)execution.Nodes.Length);
             foreach (var n in execution.Nodes) { binary.Write((short)Math.Round(n.Pose.Q1 * 100)); binary.Write((short)Math.Round(n.Pose.Q2 * 100)); binary.Write(n.Milliseconds); }
             foreach(var kind in new[]{DrawingShape.Line,DrawingShape.Rectangle,DrawingShape.Freehand}) {
-                var options = kind == DrawingShape.Freehand ? new ShapeOptions { FreehandPoints = FreehandTrajectory.Example } : null;
+                var options = kind == DrawingShape.Freehand ? new ShapeOptions { FreehandPoints = FreehandTrajectory.RefinementExample } : null;
                 var extraPath=DrawingTrajectory.Create(new PlanarArm(180,176.38),kind,338,-4,kind==DrawingShape.Line?344:6,kind==DrawingShape.Line?4:8,0,null,options);
                 var extraPlan=new ExecutionTrajectory(new TimedTrajectory(extraPath,new PlanningRates(20,5,3,10,6)),new JointLimits(-30,30,-60,60));
                 using var extra=new BinaryWriter(File.Create(Path.Combine(Path.GetDirectoryName(snapshotPath)!,kind.ToString().ToLowerInvariant()+".execution.bin")));

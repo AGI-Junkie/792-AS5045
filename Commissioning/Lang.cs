@@ -782,7 +782,7 @@ internal static class Lang
         ["fh.end"] = ("续画末端", "Resume here"),
         ["err.freehandPoints"] = ("手绘最多 5000 个有限坐标点，坐标绝对值须不超过 20000 mm。", "Freehand accepts up to 5000 finite points with coordinates within ±20000 mm."),
         ["err.freehandShort"] = ("请绘制至少两个不同点，轨迹长度须达到 1 mm。", "Draw at least two distinct points and a path at least 1 mm long."),
-        ["err.freehandFit"] = ("手绘点 {0} 附近无法在 1 mm 偏差内平滑通过，请调整该处后重新预览。", "Cannot smooth near drawing point {0} within 1 mm. Adjust that section and preview again."),
+        ["err.freehandFit"] = ("手绘点 {0} 附近自动细化后仍无法在 1 mm 偏差内平滑通过，请缩短或调整该处后重新预览。", "Automatic refinement could not smooth near drawing point {0} within 1 mm. Shorten or adjust that section and preview again."),
         ["xy.shape"] = ("形状", "Shape"),
         ["xy.branch"] = ("逆解分支", "IK branch"),
         ["xy.l1"] = ("L1", "L1"),
