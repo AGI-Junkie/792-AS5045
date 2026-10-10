@@ -118,9 +118,9 @@
 
 /* Physical directions confirmed on the bench: left DIR=0 for both axes.
  * Encoder polarity is learned only during manually requested homing.
- * arm1 always needs its motor encoder.  arm2's is optional: with ARM2_ENCODER_FEEDBACK=0 (the delivery default)
+ * arm1 always needs its motor encoder.  arm2's is optional: with ARM2_ENCODER_FEEDBACK=0
  * arm2 runs on commanded steps without feedback; with 1 both encoders are required.  Either way a lost encoder
- * that is required stops the machine; there is no automatic open-loop fallback. */
+ * that is required stops the machine; there is no automatic open-loop fallback.  The current default is 1. */
 #define ARM2_LEFT_DIR_LEVEL         (0u)
 #define ARM1_LEFT_DIR_LEVEL         (0u)
 
@@ -148,7 +148,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-guards2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -1996,25 +1996,25 @@ static uint8 ptp_counts_in_range(uint8 axis, int32 count)
            elbow>=g_jointMinCd[JOINT_ELBOW] && elbow<=g_jointMaxCd[JOINT_ELBOW];
 }
 _Static_assert(ENCODER_CPR * GEAR_RATIO * 225 == 36000 * 1024, "joint_step_allowed: 225/1024 must equal 36000/(ENCODER_CPR*GEAR_RATIO)");
-static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
+static uint8 joint_step_allowed_core(const jog_axis_t *a, int8 s, uint8 checkCommandQ2, int32 fallbackElbowCount)
 {
     uint8 axis = (a == &g_arm1) ? 0u : 1u;
     if(g_home.phase!=HOME_IDLE || !g_directionKnown || !(axis ? g_homed2 : g_homed1)) { return 1u; }
     /* Homed/manual-reference zero survives switching to jog. Permit retreat from
      * outside a bound, but never another outward step (including deceleration). */
-    int32 q1=ptp_angle_from_counts(0u,g_arm1.usteps);
-    int32 elbow=ptp_angle_from_counts(1u,g_arm2.usteps);
+    int32 elbow=ptp_angle_from_counts(1u,fallbackElbowCount);
+    int32 nextQ2=ptp_angle_from_counts(0u,g_arm1.usteps+(axis==0u?s:0))+
+                 ptp_angle_from_counts(1u,g_arm2.usteps+(axis==1u?s:0));
     /* Quantized estimates can sit just inside a limit; compare actual counts
      * with the nearest legal pulse boundary before allowing an outward jog. */
     if(axis==0u && ((s<0 && a->usteps<=g_ptp.origin[0]-ptp_offset(0u,g_jointMaxCd[0])) ||
                     (s>0 && a->usteps>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[0])))) return 0u;
-    if(axis==1u && ((s<0 && a->usteps<=g_ptp.origin[1]-ptp_offset(1u,g_jointMaxCd[1]-q1)) ||
-                    (s>0 && a->usteps>=g_ptp.origin[1]-ptp_offset(1u,g_jointMinCd[1]-q1)))) return 0u;
+    /* Match the joint contract's count-to-centidegree rounding, but check the
+     * prospective pose so an inward compensation pulse can make room. */
+    if(checkCommandQ2 && ((s<0 && nextQ2>g_jointMaxCd[1]) || (s>0 && nextQ2<g_jointMinCd[1]))) return 0u;
     /* The elbow is motor 2's own angle, so its range bounds that motor directly. */
     if(axis==1u && ((s<0 && a->usteps<=g_ptp.origin[1]-ptp_offset(1u,g_jointMaxCd[JOINT_ELBOW])) ||
                     (s>0 && a->usteps>=g_ptp.origin[1]-ptp_offset(1u,g_jointMinCd[JOINT_ELBOW])))) return 0u;
-    if(axis==0u && ((s<0 && g_arm1.usteps<=g_ptp.origin[0]-ptp_offset(0u,g_jointMaxCd[1]-elbow)) ||
-                    (s>0 && g_arm1.usteps>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[1]-elbow)))) return 0u;
     if(dual_ready()) {
         /* 36000 / (ENCODER_CPR * GEAR_RATIO) = 225 / 1024: same truncated quotient, but a shift instead of a 64-bit divide. */
         int32 m1=(int32)(((int64)g_enc.pos-g_enc.softCenter)*(g_enc.incDir==ARM1_LEFT_DIR_LEVEL?1:-1)*225/1024);
@@ -2024,6 +2024,10 @@ static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
            (s>0 && (m2<=g_jointMinCd[1] || (axis ? me<=g_jointMinCd[2] : m1<=g_jointMinCd[0])))) { return 0u; }
     }
     return 1u;
+}
+static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
+{
+    return joint_step_allowed_core(a,s,1u,g_arm2.usteps);
 }
 static void traj_status(void)
 {
@@ -2450,13 +2454,25 @@ static uint8 ptp_receive(uint8 b)
  * validate low-speed tracking on hardware before increasing these caps. */
 static uint8 pulse_axes_try(const int8 step[2])   /* false when a step was refused; stops nothing (interrupt safe) */
 {
-    uint8 i;
+    uint8 i, axis, first=0u;
     jog_axis_t *axes[2]; axes[0]=&g_arm1; axes[1]=&g_arm2;
+    if(g_ptp.reference && step[0] && step[1]) {
+        int32 q1=ptp_angle_from_counts(0u,g_arm1.usteps+step[0]);
+        int32 q2=q1+ptp_angle_from_counts(1u,g_arm2.usteps+step[1]);
+        if(!joint_range_ok(q1,q2)) { return 0u; }
+        /* At a shared q2 bound, move inward first; every pulse still passes the single-axis and measured guards. */
+        if(!joint_step_allowed(&g_arm1,step[0])) { first=1u; }
+        /* With arm2 feedback off, arm1's hybrid q2 uses the elbow count after
+         * a preceding arm2 pulse. Arm2 still sees the current measured arm1. */
+        if(!joint_step_allowed_core(&g_arm1,step[0],0u,g_arm2.usteps+(first?step[1]:0)) ||
+           !joint_step_allowed_core(&g_arm2,step[1],0u,g_arm2.usteps)) { return 0u; }
+    }
     for(i=0u;i<2u;i++) {
-        if(step[i]) {
-            int32 before=axes[i]->usteps;
-            jog_step(axes[i],step[i]);
-            if(axes[i]->usteps!=before+step[i]) { return 0u; }
+        axis=(uint8)(first^i);
+        if(step[axis]) {
+            int32 before=axes[axis]->usteps;
+            jog_step(axes[axis],step[axis]);
+            if(axes[axis]->usteps!=before+step[axis]) { return 0u; }
         }
     }
     return 1u;
@@ -3522,6 +3538,9 @@ static void jog_handle_byte(uint8 b)
             as5045_t s;
             uint8 code;
             uint32 timeoutsBefore = g_ssiTimeouts;
+#if (HW_SSI != 0u)
+            if(g_encFlight) { g_encFlight=0u; ssi_abort(); }
+#endif
             as5045_read(&s);
             code = classify(&s);
             /* raw=0 is either DO held low or a frame that never completed: report which, and the pin as it is right now */
@@ -3552,6 +3571,9 @@ static void jog_handle_byte(uint8 b)
         {
             /* Daisy chain check: board 1 and board 2 frames from one 38-clock read. */
             uint32 f1, f2;
+#if (HW_SSI != 0u)
+            if(g_encFlight) { g_encFlight=0u; ssi_abort(); }
+#endif
             as5045_read_chain(&f1, &f2);
             JLOGF("CHAIN board1 raw=0x%05lX angle=%u OCF=%u COF=%u LIN=%u par=%s | board2 raw=0x%05lX angle=%u OCF=%u COF=%u LIN=%u par=%s\r\n",
                   (unsigned long)f1, (unsigned)((f1 >> 6) & ENCODER_MASK),

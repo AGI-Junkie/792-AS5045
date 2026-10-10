@@ -340,6 +340,14 @@ public sealed partial class XYPreviewPanel
         Line(canvas,scaleStart,scaleStart+new Vector(scaleLength,0),WorkbenchTheme.Ink,2);
         Label(canvas,$"{step:0.###} mm",scaleStart+new Vector(0,-18));
         DrawFreehand();
+        if (rangeFailure is { } failure) {
+            var diagnostic = new Canvas { Clip = new RectangleGeometry(Plot), IsHitTestVisible = false };
+            var location = ToScreen(failure.Target);
+            Circle(diagnostic, location, 7, WorkbenchTheme.Red, Brushes.White);
+            ((Ellipse)diagnostic.Children[0]).Tag = failure.Target;
+            Label(diagnostic, Lang.T("diag.marker"), location + new Vector(10, -22), WorkbenchTheme.Red, fit: Plot);
+            canvas.Children.Add(diagnostic);
+        }
         if(dragging && boxDrag) {
             var r=new Rect(dragFrom,dragTo); var selection=new Rectangle {Width=r.Width,Height=r.Height,Stroke=WorkbenchTheme.Blue,Fill=WorkbenchTheme.Brush("#22245BE8"),IsHitTestVisible=false};
             Canvas.SetLeft(selection,r.Left); Canvas.SetTop(selection,r.Top); canvas.Children.Add(selection);

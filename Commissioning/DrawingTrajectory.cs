@@ -8,6 +8,25 @@ namespace TwoLinkCommissioning;
 public enum DrawingShape { Line, Rectangle, Circle, Ellipse, Arc, RoundedRectangle, Figure8, Polygon, Spiral, Custom, Freehand }
 public readonly record struct DrawingSample(double Distance, Point Target, JointPose Pose);
 
+// Captured at the real range check, before a rejected plan is discarded. Never used as a motion target.
+internal sealed record JointRangeFailure(Point Target, JointPose Pose, JointLimits Limits, int Branch)
+{
+    internal string Details()
+    {
+        var causes = new List<string>();
+        for (int axis = 0; axis < 3; axis++) {
+            double value = axis == 0 ? Pose.Q1 : axis == 1 ? Pose.Q2 : JointLimits.Elbow(Pose);
+            var bounds = Limits.Bounds(axis);
+            string name = axis == 0 ? "q1" : axis == 1 ? "q2" : Lang.T("diag.elbow");
+            // Match Contains' tolerance; do not name a bound that the planner accepted.
+            if (value < bounds.Q1 - 1e-8) causes.Add(Lang.T("diag.below", name, value, bounds.Q1, bounds.Q1 - value));
+            if (value > bounds.Q2 + 1e-8) causes.Add(Lang.T("diag.above", name, value, bounds.Q2, value - bounds.Q2));
+        }
+        return Lang.T("diag.location", Target.X, Target.Y, Lang.T(Branch == 0 ? "xy.branchPos" : "xy.branchNeg")) +
+            "\n" + string.Join("\n", causes) + "\n" + Lang.T("diag.adjust");
+    }
+}
+
 // What a, b mean depends on the shape; this carries the rest.  Every shape is drawn around its anchor (x, y), then
 // rotated about it, scaled about it, and finally traversed in the chosen direction.
 //   C: arc sweep (deg) | rounded-rectangle corner radius (mm) | Lissajous y-frequency (2 = a figure 8) | spiral turns
@@ -21,6 +40,7 @@ public sealed record ShapeOptions
     public bool Clockwise { get; init; }           // open shapes: reversed stroke order (arc and spiral: sweep clockwise)
     public string Text { get; init; } = "";
     public IReadOnlyList<FreehandPoint> FreehandPoints { get; init; } = [];
+    internal int FreehandFitLevel { get; init; } // session-only; restored files use the legacy fit, never the toolbar selection.
 }
 
 // One stroke between two dwell points: P(s) with its first and second derivative in s, 0 <= s <= 1.
@@ -124,7 +144,7 @@ public sealed class DrawingTrajectory
         switch (shape)
         {
             case DrawingShape.Freehand:
-                curved = [FreehandTrajectory.Create(options.FreehandPoints)]; break;
+                curved = [FreehandTrajectory.Create(options.FreehandPoints, options.FreehandFitLevel)]; break;
             case DrawingShape.Line:
             {
                 Point end = identity ? new Point(a, b) : anchor + Turn(new Vector(a - x, b - y));
@@ -272,8 +292,8 @@ public sealed class DrawingTrajectory
                 };
             }
             if (limits is { } range && !range.Contains(pose))
-                throw Lang.Error("err.sampleOutOfRange", i + 1, pose.Q1, pose.Q2, range.Min1, range.Max1, range.Min2, range.Max2,
-                    JointLimits.Elbow(pose), range.ElbowMin, range.ElbowMax);
+                throw new Lang.ValidationException("err.sampleOutOfRange", [i + 1, pose.Q1, pose.Q2, range.Min1, range.Max1, range.Min2, range.Max2,
+                    JointLimits.Elbow(pose), range.ElbowMin, range.ElbowMax]) { RangeFailure = new(point, pose, range, branch) };
             samples[i] = new DrawingSample(distance, point, pose);
         }
         bool nearSingularity = samples.Any(s => Math.Abs(Math.Sin((s.Pose.Q2 - s.Pose.Q1) * Math.PI / 180)) < 0.05);
@@ -288,7 +308,9 @@ public sealed class DrawingTrajectory
             };
             nearSingularity |= Math.Abs(Math.Sin((pose.Q2 - pose.Q1) * Math.PI / 180)) < 0.05;
             if (limits is { } range && !range.Contains(pose))
-                throw Lang.Error("err.betweenSamples", pose.Q1, pose.Q2, JointLimits.Elbow(pose));
+                throw new Lang.ValidationException("err.betweenSamples", [pose.Q1, pose.Q2, JointLimits.Elbow(pose)]) {
+                    RangeFailure = new(target, pose, range, branch)
+                };
         }
         void CheckBetween(double t, int first, int last)
         {

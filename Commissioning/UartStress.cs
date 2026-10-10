@@ -61,7 +61,7 @@ public static class UartStress
 
     public static int Run(string[] args)
     {
-        if (args.Length < 3 || !double.TryParse(args[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double seconds) || seconds < 1)
+        if (args.Length < 3 || !double.TryParse(args[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double seconds) || !double.IsFinite(seconds) || seconds < 1)
             return 2;
         string label = args.Length > 3 ? args[3] : "";
         var report = new StringBuilder();
@@ -138,6 +138,8 @@ public static class UartStress
     public static void SelfTest()
     {
         static void Check(bool ok, string why) { if (!ok) throw new InvalidOperationException("UartStress: " + why); }
+        foreach (string seconds in new[] { "NaN", "Infinity", "-Infinity", "1e309", "0", "0.99", "-1", "invalid" })
+            Check(UartStress.Run(["invalid-port", seconds, "unused-report"]) == 2, "invalid duration reached the serial port: " + seconds);
         var t = Counters.Empty
             .With("LINK uart=hw baud=115200 rx_overflow=1 rx_error=129 tx_dropped=5 fw=x short_hb=1 proto=1")
             .With("PTP_RX short_ok=7 drop_crc=2 drop_short=3 drop_timeout=4 rejected=5 epoch_rejected=6 last_rejected_byte=0x00")

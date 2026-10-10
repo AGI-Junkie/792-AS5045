@@ -2,6 +2,10 @@ using System.IO;
 using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Threading;
+using System.Windows.Automation.Peers;
+using System.Windows.Automation.Provider;
 
 namespace TwoLinkCommissioning;
 
@@ -12,6 +16,7 @@ public sealed partial class ControlWindow
     {
         bool language = Lang.IsEn;
         Lang.Set(false, false);
+        DisplayTextQueueSelfTest();
         var w = new ControlWindow { selfTesting = true, ShowActivated = false, ShowInTaskbar = false };
         static void Check(bool ok, string why) { if (!ok) throw new InvalidOperationException("Language UI: " + why); }
         try {
@@ -27,6 +32,7 @@ public sealed partial class ControlWindow
                 bool executing = w.executing; int index = w.uploadNext;
                 string raw = w.log.Text;
                 Lang.Set(english, false);
+                w.Dispatcher.Invoke(() => { }, DispatcherPriority.ContextIdle);
                 Check(w.pointWire.SequenceEqual(wire) && w.pointSequence == seq && w.controlSequence == control &&
                     w.limitAxis == axis && w.pendingControlType == type && requests == 0, "switch queued a device command");
                 Check(w.uploaded == held && w.uploading == uploading && w.executing == executing && w.uploadNext == index,
@@ -86,6 +92,7 @@ public sealed partial class ControlWindow
                 ExecutionTrajectory.SelfTest();
             } finally { CultureInfo.CurrentCulture = culture; }
             // The board archive's note and messages follow the language, and show up in the snapshots below.
+            StoreFailureLanguageSelfTest();
             p.SetBoard(4, true, false, [new BoardSlot(0, true, 1, 69, 16584, 0, 0, 1), new BoardSlot(1, false, 0, 0, 0, 0, 0, 0), new BoardSlot(2, false, 0, 0, 0, 0, 0, 0), new BoardSlot(3, false, 0, 0, 0, 0, 0, 0)], [], () => Lang.T("board.saved", 1));
             Toggle(false); Check(p.BoardNoteText.Contains("板上存档") && p.BoardNoteText.Contains("别处存的图形") && p.BoardNoteText.Contains("已存到板上槽1"), "board note not Chinese");
             Toggle(true); Check(p.BoardNoteText.Contains("Stored on the board") && p.BoardNoteText.Contains("saved elsewhere") && p.BoardNoteText.Contains("Saved to board slot 1"), "board note not English");
@@ -105,12 +112,98 @@ public sealed partial class ControlWindow
             }
         } finally { w.Close(); Lang.Set(language, false); }
     }
+
+    private static void DisplayTextQueueSelfTest()
+    {
+        bool language = Lang.IsEn;
+        var first = new TextBox { IsReadOnly = true, Text = Lang.T("live.waiting") };
+        var second = new TextBox { IsReadOnly = true, Text = Lang.T("live.experimentHint") };
+        var editable = new TextBox();
+        var content = new StackPanel { Children = { first, second, editable } };
+        var window = new Window { Content = content, Width = 320, Height = 160, Left = -12000, Top = -12000,
+            ShowActivated = false, ShowInTaskbar = false };
+        WorkbenchTheme.Apply(window);
+        static void Check(bool ok, string why) { if (!ok) throw new InvalidOperationException("Display text queue: " + why); }
+        void Drain() => window.Dispatcher.Invoke(() => { }, DispatcherPriority.ContextIdle);
+        try {
+            window.Show(); Drain();
+            int obsolete = 0, latest = 0, changes = 0;
+            bool inputBetween = false;
+            string oldSecond = second.Text;
+            first.TextChanged += (_, _) => {
+                changes++;
+                window.Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(() => inputBetween |= second.Text == oldSecond));
+            };
+            Lang.QueueText(first, () => { obsolete++; return Lang.T("live.experimentHint"); });
+            Lang.QueueText(first, () => { latest++; return Lang.T("live.waiting"); });
+            Lang.QueueText(second, () => Lang.T("live.experimentHint"));
+            Lang.Set(true, false); Lang.QueueText(first); Lang.QueueText(second);
+            Check(obsolete == 0 && latest == 0, "loaded editors updated synchronously");
+            Drain();
+            Check(obsolete == 0 && latest == 1 && changes == 1, "superseded formatter or duplicate update ran");
+            Check(inputBetween && first.Text == Lang.T("live.waiting") && second.Text == Lang.T("live.experimentHint"),
+                "input did not run between the latest translated editors");
+            first.SelectAll();
+            Check(first.SelectedText == first.Text && ApplicationCommands.Copy.CanExecute(null, first), "selection/copy unavailable");
+            var peer = FrameworkElementAutomationPeer.CreatePeerForElement(first)!;
+            Check(peer.GetPattern(PatternInterface.Value) is IValueProvider { IsReadOnly: true } value && value.Value == first.Text &&
+                peer.GetPattern(PatternInterface.Text) is ITextProvider text && text.DocumentRange.GetText(-1).TrimEnd('\r', '\n') == first.Text,
+                "read-only accessibility value/text patterns changed");
+            Check(InputMethod.GetIsInputMethodEnabled(editable), "editable input method disabled");
+            Lang.QueueText(first, () => Lang.T("exp.savedNote"));
+            content.Children.Remove(first); Drain();
+            Check(first.Text == Lang.T("exp.savedNote"), "unloaded editor lost its latest summary");
+            content.Children.Add(first); Drain();
+            Lang.Set(false, false); Lang.QueueText(first); Drain();
+            Check(first.Text == Lang.T("exp.savedNote"), "reloaded editor retained a previous language");
+            Lang.QueueText(first, () => Lang.T("live.waiting")); window.Close(); Drain();
+            Check(first.Text == Lang.T("live.waiting"), "closing discarded pending display text");
+        } finally { window.Close(); Lang.Set(language, false); }
+    }
+
+    private static void StoreFailureLanguageSelfTest()
+    {
+        bool language = Lang.IsEn;
+        var w = new ControlWindow { selfTesting = true, ShowActivated = false, ShowInTaskbar = false,
+            compatible = true, framedControl = true, protocolMatches = true, reportedEpoch = 1 };
+        var nodes = new[] { new ExecutionNode(new JointPose(0, 0), 0), new ExecutionNode(new JointPose(0, 0), 50) };
+        try {
+            foreach (StoreOp op in new[] { StoreOp.Save, StoreOp.Erase })
+            foreach (string failure in new[] { "noAnswer", "stalled", "device", "refused" }) {
+                Lang.Set(false, false); w.ResetBoard(); w.storeSlotCount = 4;
+                if (op == StoreOp.Save) w.BeginBoardSave(nodes, 0, "shape=3");
+                else w.RequestEraseBoardSlot(0);
+                var job = w.storeJob ?? throw new InvalidOperationException("Language UI: failed archive fixture did not start");
+                job.Sequence = 1;
+                if (failure == "noAnswer") w.PollStoreJob(job.RequestedAt.AddSeconds(9));
+                else if (failure == "stalled") {
+                    w.ObserveStoreLine($"TRAJ_STORE state={(op == StoreOp.Save ? "saving" : "erasing")} slot=0 rows=0/1 seq=1 last=none last_slot=0 row_max_us=0");
+                    w.PollStoreJob(job.LastSeenAt.AddSeconds(13));
+                }
+                else if (failure == "device") w.ObserveStoreLine("TRAJ_STORE state=idle slot=0 rows=0/1 seq=1 last=failed last_slot=0 row_max_us=0");
+                else w.ObserveStoreLine("TRAJ_STORE refused: stage not idle");
+                foreach (bool english in new[] { false, true, false }) {
+                    Lang.Set(english, false);
+                    string reason = failure switch {
+                        "device" => Lang.T("board.err.device", "failed"),
+                        "refused" => Lang.T("board.err.refused", "stage not idle"),
+                        _ => Lang.T("board.err." + failure),
+                    };
+                    string expected = Lang.T(op == StoreOp.Save ? "board.saveFailed" : "board.eraseFailed", 1, reason);
+                    if (w.boardMessage?.Invoke() != expected || !w.xyPreview.BoardNoteText.Contains(expected))
+                        throw new InvalidOperationException($"Language UI: archive {op} {failure} did not switch its whole failure message");
+                }
+            }
+        }
+        finally { w.Close(); Lang.Set(language, false); }
+    }
 }
 
 public sealed partial class XYPreviewPanel
 {
     internal void CheckLanguagePreservesPreview(Action toggle)
     {
+        WaitForFreehand(this);
         string parameters = SaveParameters(); var plan = execution; var path = trajectory; var time = timing;
         bool dirty = parametersDirty, following = offlineSim, playing = playbackTimer.IsEnabled;
         double position = cursor.Value, scale = pixelsPerMm; var center = cameraCenter;
@@ -141,7 +234,7 @@ public sealed partial class XYPreviewPanel
         if (!result.Text.Contains("请输入有效数值") || execution is not null) throw new InvalidOperationException("Validation error stale");
         CheckLanguagePreservesPreview(english);
         if (!result.Text.Contains("enter a valid number") || result.Text.Any(c => c is >= '\u4e00' and <= '\u9fff')) throw new InvalidOperationException("Validation error stale");
-        x.Text = "340"; Refresh(); TogglePlayback(); cursor.Value = Math.Min(1, cursor.Maximum);
+        x.Text = "340"; Refresh(); WaitForFreehand(this); TogglePlayback(); cursor.Value = Math.Min(1, cursor.Maximum);
         TogglePlayback(); CheckLanguagePreservesPreview(chinese); PausePlayback();
     }
 }

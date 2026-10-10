@@ -12,7 +12,7 @@ internal static class FreehandTrajectory
 {
     internal const int MaxPoints = 5000;
     internal const double CaptureSpacing = 0.25, Tolerance = 1;
-    private const double SimplifyTolerance = 0.25, CurveTolerance = Tolerance - SimplifyTolerance;
+    private const double SimplifyTolerance = 0.25;
     internal static FreehandPoint[] Example => Enumerable.Range(0, 41)
         .Select(i => new FreehandPoint(330 + i * 0.25, 2 * Math.Sin(i * Math.PI / 20))).ToArray();
     internal static FreehandPoint[] RefinementExample => [new(320, 0), new(340, 0), new(340, 20)];
@@ -23,7 +23,10 @@ internal static class FreehandTrajectory
             throw Lang.Error("err.freehandPoints");
     }
 
-    internal static PathPiece Create(IReadOnlyList<FreehandPoint> input)
+    internal static double FitTolerance(int level) => level switch { 1 => 0.75, 2 => 1, 3 => 1.25, _ => Tolerance };
+    private static double Simplification(int level) => level switch { 1 or 2 => 0.5, 3 => 0.75, _ => SimplifyTolerance };
+
+    internal static PathPiece Create(IReadOnlyList<FreehandPoint> input, int level = 0)
     {
         Validate(input);
         var raw = new List<Point>();
@@ -31,16 +34,16 @@ internal static class FreehandTrajectory
             if (raw.Count == 0 || (p.Point - raw[^1]).Length > 1e-9) raw.Add(p.Point);
         if (raw.Count < 2 || raw.Zip(raw.Skip(1)).Sum(p => (p.Second - p.First).Length) < 1)
             throw Lang.Error("err.freehandShort");
-        var sources = Simplify(raw);
+        var sources = Simplify(raw, Simplification(level));
         var points = sources.Select(i => raw[i]).ToList();
         for (int round = 0; round <= 16; round++)
         {
-            var spline = new Spline(points.ToArray());
+            var spline = new Spline(points.ToArray(), FitTolerance(level) - Simplification(level));
             var failed = Enumerable.Range(0, points.Count - 1).Where(i => !spline.Bounded(i)).ToArray();
             if (failed.Length == 0) return spline.Piece();
             if (round == 16 || points.Count + failed.Length > MaxPoints)
                 throw Lang.Error("err.freehandFit", sources[failed[0]] + 1);
-            // Split the certified simplified chord so refinement preserves its 0.25 mm budget.
+            // Split the certified simplified chord so refinement preserves its simplification budget.
             foreach (int i in failed.Reverse()) {
                 points.Insert(i + 1, points[i] + (points[i + 1] - points[i]) * 0.5);
                 sources.Insert(i + 1, sources[i]);
@@ -56,11 +59,11 @@ internal static class FreehandTrajectory
     // The draft as drawn when the whole plan checks. Otherwise a smoothed copy with its out-of-reach points pulled into the
     // reachable region, the mildest one that checks. Shift: how far (mm) the plan strays from the draft; 0 when untouched.
     // ponytail: a stroke that crosses an unreachable hole is not re-routed, only pulled to the edge, so it still fails.
-    internal static (FreehandPoint[] Points, double Shift) Repair(IReadOnlyList<FreehandPoint> draft, PlanarArm model, JointLimits? limits, int branch, PlanningRates rates)
+    internal static (FreehandPoint[] Points, double Shift) Repair(IReadOnlyList<FreehandPoint> draft, PlanarArm model, JointLimits? limits, int branch, PlanningRates rates, int level = 0)
     {
         void Verify(FreehandPoint[] points)
         {
-            var path = DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, branch, limits, new ShapeOptions { FreehandPoints = points });
+            var path = DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, branch, limits, new ShapeOptions { FreehandPoints = points, FreehandFitLevel = level });
             var timing = new TimedTrajectory(path, rates);
             if (limits is { } range) _ = new ExecutionTrajectory(timing, range);
         }
@@ -78,7 +81,7 @@ internal static class FreehandTrajectory
                 var candidate = Reshape(raw, model, limits, branch, passes, margin);
                 if (candidate is null) continue;
                 // Both ways: the plan must stay near the draft, and every draft vertex (a retraced excursion included) near the plan.
-                double Away(IEnumerable<Point> from, List<Point> to) => from.Max(p => to.Zip(to.Skip(1)).Min(s => Distance(p, s.First, s.Second)));
+                double Away(IEnumerable<Point> from, List<Point> to) => MaximumDistance(from.ToArray(), to.ToArray());
                 double shift = Math.Max(Away(candidate.Select(p => p.Point), reference), Away(reference, candidate.Select(p => p.Point).ToList()));
                 if (shift > RepairShift) continue;
                 try { Verify(candidate); return (candidate, shift); } catch (ArgumentException) { }
@@ -87,10 +90,33 @@ internal static class FreehandTrajectory
         }
     }
 
-    private static FreehandPoint[]? Reshape(List<Point> raw, PlanarArm model, JointLimits? limits, int branch, int passes, double margin)
+    // Reserve fitting error from the 2/3/4 mm total budget; reject an over-budget filter, never clamp individual passes.
+    internal static FreehandPoint[] Smooth(IReadOnlyList<FreehandPoint> input, int level)
+    {
+        Validate(input);
+        if (level == 0 || input.Count < 2) return input.ToArray();
+        if (level is < 0 or > 3) throw new ArgumentOutOfRangeException(nameof(level));
+        var raw = input.Select(p => p.Point).ToList();
+        if (raw.Zip(raw.Skip(1)).Sum(s => (s.Second - s.First).Length) < 1) return input.ToArray();
+        // Sampling plus half the sampling spacing bounds distances everywhere on each polyline (distance is 1-Lipschitz).
+        double Away(Point[] from, Point[] to) {
+            double length = from.Zip(from.Skip(1)).Sum(s => (s.Second - s.First).Length);
+            var samples = Resample(from.ToList(), 0.25);
+            return MaximumDistance(samples, to) + length / (2 * (samples.Length - 1));
+        }
+        foreach (int passes in new[] { level switch { 1 => 2, 2 => 8, _ => 32 }, 1, 0 }.Distinct()) {
+            var candidate = Resample(Filter(raw, passes).ToList());
+            double shift = Math.Max(Away(raw.ToArray(), candidate), Away(candidate, raw.ToArray()));
+            if (candidate.Zip(candidate.Skip(1)).Sum(s => (s.Second - s.First).Length) >= 1 && shift + FitTolerance(level) <= level + 1)
+                return candidate.Select(p => new FreehandPoint(p.X, p.Y)).ToArray();
+        }
+        return input.ToArray(); // Sharp excursions must survive when no 1 mm resampling meets the budget.
+    }
+
+    private static Point[] Resample(List<Point> raw, double spacing = 1)
     {
         double total = raw.Zip(raw.Skip(1)).Sum(s => (s.Second - s.First).Length);
-        int n = Math.Max(1, (int)Math.Ceiling(total / Math.Max(1, total / 4000)));
+        int n = Math.Max(1, (int)Math.Ceiling(total / Math.Max(spacing, total / 4000)));
         var line = new Point[n + 1]; line[0] = raw[0]; line[n] = raw[^1];
         double done = 0;
         for (int k = 1, seg = 0; k < n; k++)
@@ -100,12 +126,24 @@ internal static class FreehandTrajectory
             double length = (raw[seg + 1] - raw[seg]).Length;
             line[k] = raw[seg] + (raw[seg + 1] - raw[seg]) * Math.Clamp(length == 0 ? 0 : (target - done) / length, 0, 1);
         }
+        return line;
+    }
+
+    private static Point[] Filter(List<Point> raw, int passes)
+    {
+        var line = Resample(raw); int n = line.Length - 1;
         for (int pass = 0; pass < passes; pass++)
         {
             var next = (Point[])line.Clone();
             for (int i = 1; i < n; i++) next[i] = new Point((line[i - 1].X + 2 * line[i].X + line[i + 1].X) / 4, (line[i - 1].Y + 2 * line[i].Y + line[i + 1].Y) / 4);
             line = next;
         }
+        return line;
+    }
+
+    private static FreehandPoint[]? Reshape(List<Point> raw, PlanarArm model, JointLimits? limits, int branch, int passes, double margin)
+    {
+        var line = Filter(raw, passes); int n = line.Length - 1;
         double inner = model.InnerRadius + margin, outer = model.OuterRadius - margin, degrees = margin / 2;
         JointLimits? inside = limits is { } l ? new(l.Min1 + degrees, l.Max1 - degrees, l.Min2 + degrees, l.Max2 - degrees, l.ElbowMin + degrees, l.ElbowMax - degrees) : null;
         bool Feasible(Point p)
@@ -138,14 +176,14 @@ internal static class FreehandTrajectory
         return line.Select(p => new FreehandPoint(p.X, p.Y)).ToArray();
     }
 
-    private static List<int> Simplify(IReadOnlyList<Point> points)
+    private static List<int> Simplify(IReadOnlyList<Point> points, double tolerance = SimplifyTolerance)
     {
         var keep = new SortedSet<int> { 0, points.Count - 1 };
         var pending = new Stack<(int First, int Last)>();
         foreach (var pair in keep.Zip(keep.Skip(1))) pending.Push((pair.First, pair.Second));
         while (pending.TryPop(out var pair))
         {
-            double worst = SimplifyTolerance; int at = -1;
+            double worst = tolerance; int at = -1;
             for (int i = pair.First + 1; i < pair.Last; i++)
             {
                 double error = Distance(points[i], points[pair.First], points[pair.Last]);
@@ -159,22 +197,60 @@ internal static class FreehandTrajectory
         return keep.ToList();
     }
 
-    private static double Distance(Point p, Point a, Point b)
+    private static double Distance(Point p, Point a, Point b) => Math.Sqrt(DistanceSquared(p, a, b));
+
+    private static double DistanceSquared(Point p, Point a, Point b)
     {
         var d = b - a;
         double u = d.LengthSquared == 0 ? 0 : Math.Clamp(Vector.Multiply(p - a, d) / d.LengthSquared, 0, 1);
-        return (p - (a + d * u)).Length;
+        return (p - (a + d * u)).LengthSquared;
+    }
+
+    private static double MaximumDistance(Point[] from, Point[] to)
+    {
+        const int blockSize = 32;
+        var bounds = new (double MinX, double MinY, double MaxX, double MaxY)[(to.Length - 2) / blockSize + 1];
+        for (int block = 0; block < bounds.Length; block++) {
+            var first = to[block * blockSize];
+            var box = (MinX: first.X, MinY: first.Y, MaxX: first.X, MaxY: first.Y);
+            for (int i = block * blockSize + 1; i <= Math.Min((block + 1) * blockSize, to.Length - 1); i++) {
+                box.MinX = Math.Min(box.MinX, to[i].X); box.MaxX = Math.Max(box.MaxX, to[i].X);
+                box.MinY = Math.Min(box.MinY, to[i].Y); box.MaxY = Math.Max(box.MaxY, to[i].Y);
+            }
+            bounds[block] = box;
+        }
+        double worstSquared = 0; int closestBlock = 0;
+        foreach (var p in from) {
+            double nearestSquared = double.PositiveInfinity;
+            void Check(int block) {
+                for (int i = block * blockSize + 1; i <= Math.Min((block + 1) * blockSize, to.Length - 1); i++) {
+                    double squared = DistanceSquared(p, to[i - 1], to[i]);
+                    if (squared < nearestSquared) { nearestSquared = squared; closestBlock = block; }
+                }
+            }
+            int firstBlock = closestBlock; Check(firstBlock);
+            for (int block = 0; block < bounds.Length; block++) {
+                if (block == firstBlock) continue;
+                var box = bounds[block];
+                double dx = Math.Max(0, Math.Max(box.MinX - p.X, p.X - box.MaxX));
+                double dy = Math.Max(0, Math.Max(box.MinY - p.Y, p.Y - box.MaxY));
+                // The box distance is a lower bound for every segment it encloses.
+                if (dx * dx + dy * dy < nearestSquared) Check(block);
+            }
+            worstSquared = Math.Max(worstSquared, nearestSquared);
+        }
+        return Math.Sqrt(worstSquared);
     }
 
     private sealed class Spline
     {
         private readonly Point[] points, c1, c2;
         private readonly double[] knots;
-        private readonly double total;
+        private readonly double total, curveTolerance;
 
-        internal Spline(Point[] p)
+        internal Spline(Point[] p, double tolerance)
         {
-            points = p; int n = p.Length;
+            points = p; curveTolerance = tolerance; int n = p.Length;
             knots = new double[n]; c1 = new Point[n - 1]; c2 = new Point[n - 1];
             for (int i = 1; i < n; i++) knots[i] = knots[i - 1] + (p[i] - p[i - 1]).Length;
             total = knots[^1];
@@ -199,7 +275,7 @@ internal static class FreehandTrajectory
         internal bool Bounded(int i)
         {
             // Segment distance includes rounded end caps; a bounded reversal may pass its endpoint.
-            bool Inside(Point p) => Distance(p, points[i], points[i + 1]) <= CurveTolerance;
+            bool Inside(Point p) => Distance(p, points[i], points[i + 1]) <= curveTolerance;
             bool Bound(Point a, Point b, Point c, Point d, int depth) {
                 if (!Inside(a) || !Inside(d)) return false;
                 if (Inside(b) && Inside(c)) return true;
@@ -260,6 +336,13 @@ internal static class FreehandTrajectory
         }
         Reject([]); Reject([new(0, 0), new(0, 0)]); Reject([new(0, 0), new(0.5, 0)]);
         Reject([new(double.NaN, 0), new(2, 0)]); Reject(new FreehandPoint[MaxPoints + 1]);
+        foreach (int count in new[] { 2, 32, 33, 34, 65, 66 }) {
+            var contour = Enumerable.Range(0, count).Select(i => new Point(i * 2, Math.Sin(i))).ToArray();
+            contour[1] = contour[0]; // A zero-length segment and complete/partial distance blocks.
+            var probes = Enumerable.Range(0, 83).Select(i => new Point(i * 1.7 - 8, 3 * Math.Cos(i))).Concat(contour).ToArray();
+            double exhaustive = probes.Max(p => contour.Zip(contour.Skip(1)).Min(s => Distance(p, s.First, s.Second)));
+            Check(Math.Abs(MaximumDistance(probes, contour) - exhaustive) < 1e-12, "distance pruning skipped the nearest segment");
+        }
         var line = Create([new(0, 0), new(5, 0), new(5, 0), new(10, 0)]);
         Check((line.At(0).P - new Point(0, 0)).Length < 1e-9 && (line.At(1).P - new Point(10, 0)).Length < 1e-9, "endpoints");
         Check(Math.Abs(line.Length - 10) < 1e-8 && line.At(0.4).D2.Length < 1e-8, "line derivatives");
@@ -301,6 +384,10 @@ internal static class FreehandTrajectory
             foreach (var p in shape)
                 Check(refined.Checks!.Min(s => (p.Point - refined.At(s).P).Length) <= Tolerance + CaptureSpacing, "refinement loses draft points");
         }
+        var noisy = Enumerable.Range(0, 241).Select(i => new FreehandPoint(320 + i * 0.1, 2 * Math.Sin(i * 0.025) + (i is 0 or 240 ? 0 : 0.6 * Math.Sin(i * 1.7)))).ToArray();
+        // Release-time smoothing must reduce both stored points and actual execution duration.
+        var noisySmoothed = Smooth(noisy, 2);
+        Check(noisySmoothed.Length < noisy.Length && noisySmoothed[0] == noisy[0] && noisySmoothed[^1] == noisy[^1], "smoothing count/endpoints");
         var model = new PlanarArm(180, 176.38); var range = new JointLimits(-90, 90, -160, 160);
         var path = DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, 0, range,
             new ShapeOptions { FreehandPoints = raw.Select(p => new FreehandPoint(320 + p.X, p.Y)).ToArray() });
@@ -324,6 +411,19 @@ internal static class FreehandTrajectory
         } catch (ArgumentException) { }
         // Repair: a legal draft is untouched; one overshooting the reach (356.38 mm) or jittery is made legal within RepairShift.
         var rates = new PlanningRates(10, 5, 3, 10, 6);
+        double Duration(FreehandPoint[] points, int level) => new ExecutionTrajectory(new TimedTrajectory(
+            DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, 0, range,
+                new ShapeOptions { FreehandPoints = points, FreehandFitLevel = level }), rates), range).Duration;
+        Check(Duration(noisySmoothed, 2) < Duration(noisy, 0), "smoothing did not shorten execution duration");
+        Check(Smooth(noisy, 0).SequenceEqual(noisy), "Off rewrote points");
+        foreach (int level in new[] { 1, 2, 3 }) {
+            var processed = Smooth(noisy, level); var fit = Create(processed, level);
+            Check(processed[0] == noisy[0] && processed[^1] == noisy[^1], "level endpoints");
+            foreach (double s in fit.Checks!)
+                Check(noisy.Zip(noisy.Skip(1)).Min(v => Distance(fit.At(s).P, v.First.Point, v.Second.Point)) <= level + 1 + 1e-8, "total smoothing + fitting budget");
+            foreach (var p in noisy)
+                Check(fit.Checks!.Zip(fit.Checks.Skip(1)).Min(v => Distance(p.Point, fit.At(v.First).P, fit.At(v.Second).P)) <= level + 1 + CaptureSpacing, "smoothing lost an excursion");
+        }
         var legal = Repair(raw.Select(p => new FreehandPoint(320 + p.X, p.Y)).ToArray(), model, range, 0, rates);
         Check(legal.Shift == 0, "repair touched a legal draft");
         var overshoot = Enumerable.Range(0, 81).Select(i => new FreehandPoint(330 + i * 0.4, 3 * Math.Sin(i * 0.2))).ToArray();

@@ -32,6 +32,7 @@ function Restore-CreatorProject {
 Push-Location -LiteralPath $repo
 try {
     $sources = @('DRV8825.cydsn\main.c','DRV8825.cydsn\traj.h','DRV8825.cydsn\trajstore.h','DRV8825.cydsn\cm3gcc_trajstore.ld','docs\TRAJ_STORE.md','DRV8825.cydsn\hw_ssi.h','DRV8825.cydsn\DRV8825.cyprj','DRV8825.cydsn\DRV8825.cydwr','DRV8825.cydsn\TopDesign\TopDesign.cysch','Commissioning\Commissioning.csproj','tests\test_stage1.py','build-release.ps1','verify-creator-pins.ps1','RELEASE_VERSION','README.md','CHANGELOG.md','docs\PROTOCOL.md','docs\ARM2_FEEDBACK.md','docs\STOP_DIAG.md','docs\STATE_MODEL.md','docs\UART_DIAGNOSIS.md','docs\history\RUN_REVIEW_20260929.md','tools\check-log.py')
+    $sources += @('tests\test_verify_creator_pins.py','docs\FREEHAND_TRAJECTORY.md')
     $sources += Get-ChildItem -LiteralPath Commissioning -Filter '*.cs' | ForEach-Object { 'Commissioning\' + $_.Name }
     $sourceHashes = @{}
     foreach ($source in $sources) { $sourceHashes[$source] = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash }
@@ -51,6 +52,10 @@ try {
     $map = Get-Content -LiteralPath 'DRV8825.cydsn\CortexM3\ARM_GCC_541\Debug\DRV8825.map' -Raw
     if ($map -notmatch '0x00020000\s+__trajstore_start' -or $map -notmatch '(?m)^store\s+0x00020000\s+0x0001a000') { throw 'Firmware was not linked with cm3gcc_trajstore.ld (Project > Build Settings > Linker > Custom Linker Script); see docs\TRAJ_STORE.md.' }
     & (Join-Path $repo 'verify-creator-pins.ps1') -NamedInstances -HardwareUart *> (Join-Path $dest 'pin-checks.log')
+    python -B tests/test_verify_creator_pins.py *> (Join-Path $dest 'pin-regression-tests.log')
+    if ($LASTEXITCODE -ne 0) { throw 'Pin rejection regression failed.' }
+    python -B tools/check-log.py --self-test *> (Join-Path $dest 'log-analyser-tests.log')
+    if ($LASTEXITCODE -ne 0) { throw 'Log analyser self-test failed.' }
     Write-Host 'Publishing host...'
     dotnet publish Commissioning/Commissioning.csproj -c Release -r win-x64 --self-contained false -o (Join-Path $dest 'host') --nologo *> (Join-Path $dest 'host-build.log')
     if ($LASTEXITCODE -ne 0) { throw "Host build failed; see $dest\host-build.log" }
@@ -88,6 +93,9 @@ try {
     $process = Start-Process -FilePath (Join-Path $dest 'host\TwoLinkCommissioning.exe') -ArgumentList @('--self-test','--snapshot',('"' + $snapshot + '"')) -WindowStyle Hidden -Wait -PassThru
     "Host self-test exit=$($process.ExitCode); no serial opened." | Set-Content (Join-Path $dest 'host-tests.log')
     if ($process.ExitCode -ne 0) { throw 'Host self-test failed; see commissioning-self-test-error.txt.' }
+    $process = Start-Process -FilePath (Join-Path $dest 'host\TwoLinkCommissioning.exe') -ArgumentList @('--language-self-test','--snapshot',('"' + (Join-Path $dest 'language.png') + '"')) -WindowStyle Hidden -Wait -PassThru
+    "Language self-test exit=$($process.ExitCode); no serial opened." | Set-Content (Join-Path $dest 'language-tests.log')
+    if ($process.ExitCode -ne 0) { throw 'Language self-test failed.' }
     Write-Host 'Testing actual firmware C with mocked GPIO and host-generated paths...'
     python tests/test_stage1.py "--host-plan=$dest\preview.execution.bin" "--host-control=$dest\preview.control.bin" *> (Join-Path $dest 'firmware-tests.log')
     if ($LASTEXITCODE -ne 0) { throw "Firmware checks failed; see $dest\firmware-tests.log" }
@@ -125,10 +133,13 @@ try {
         (Get-Content (Join-Path $dest 'pin-checks.log') | Where-Object { $_ -like 'PASS:*' }),
         $contractLine,
         'Host self-test passed: guards, parameter roundtrip, recording, numerical planning, UI snapshots.',
+        'Language self-test, log analyser self-test and pin rejection regression passed (offline).',
         (Get-Content (Join-Path $dest 'heartbeat-tests.txt') | Where-Object { $_ -match 'UI lease max gap' }),
+        (Get-Content (Join-Path $dest 'freehand-async-tests.txt') | Where-Object { $_ -like 'PASS:*' }),
         (Get-Content (Join-Path $dest 'firmware-tests.log') | Where-Object { $_ -like 'fuzz coverage*' -or $_ -like '*actual-C simulation cases passed*' }),
         ('Line: ' + (Get-Content (Join-Path $dest 'line-tests.log') -Tail 1)),
         ('Rectangle: ' + (Get-Content (Join-Path $dest 'rectangle-tests.log') -Tail 1)),
+        ('Freehand: ' + (Get-Content (Join-Path $dest 'freehand-tests.log') -Tail 1)),
         'No serial connection, programming, or real motor movement performed by this build.',
         'Screenshots contain explicitly marked simulated data, not hardware evidence.',
         "Arm2 encoder feedback enabled: $(Def 'ARM2_ENCODER_FEEDBACK') (0 = arm2 commanded steps without feedback; arm1 encoder still required). Pen XY is not measured. Tracking servo, real-machine acceptance and calibration remain."

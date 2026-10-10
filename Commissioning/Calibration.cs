@@ -56,8 +56,8 @@ public static class Calibrations
         if (record.Zero is { } z && (!Ok(z.Q1OffsetDeg) || !Ok(z.Q2OffsetDeg) || Math.Abs(z.Q1OffsetDeg) > 180 || Math.Abs(z.Q2OffsetDeg) > 180 || z.TipX is { } x && !Ok(x) || z.TipY is { } y && !Ok(y))) return "zero";
         if (record.Stroke is { } s && (s.ElbowMin is { } e0 && s.ElbowMax is { } e1 && e0 >= e1 || s.Q1Min is { } a0 && s.Q1Max is { } a1 && a0 >= a1 ||
             new[] { s.ElbowMin, s.ElbowMax, s.Q1Min, s.Q1Max }.Any(v => v is { } d && (!Ok(d) || Math.Abs(d) > 360)))) return "stroke";
-        if (record.Repeatability is { } r && (!Ok(r.TargetQ1) || !Ok(r.TargetQ2) || !Ok(r.ApproachDeg) || r.ApproachDeg <= 0 || r.ApproachDeg > 90 || r.Trials.Count > 200 ||
-            r.Trials.Any(t => t.Direction is not ("+" or "-") || t.X is { } tx && !Ok(tx) || t.Y is { } ty && !Ok(ty)))) return "repeatability";
+        if (record.Repeatability is { } r && (!Ok(r.TargetQ1) || !Ok(r.TargetQ2) || !Ok(r.ApproachDeg) || r.ApproachDeg <= 0 || r.ApproachDeg > 90 || r.Trials is null || r.Trials.Count > 200 ||
+            r.Trials.Any(t => t is null || t.Direction is not ("+" or "-") || t.X is { } tx && !Ok(tx) || t.Y is { } ty && !Ok(ty)))) return "repeatability";
         return record.Links is null && record.Zero is null && record.Stroke is null && record.Repeatability is null ? "empty" : "";
     }
 
@@ -88,7 +88,7 @@ public static class Calibrations
             {
                 if (new FileInfo(file).Length > 2_000_000) continue;
                 var record = JsonSerializer.Deserialize<CalibrationRecord>(File.ReadAllText(file));
-                if (record is { Schema: 1 } && record.Id == Path.GetFileNameWithoutExtension(file) && record.Version > 0 && Validate(record) is "") list.Add(record);
+                if (record is { Schema: 1, Firmware: not null, Note: not null } && record.Id == Path.GetFileNameWithoutExtension(file) && record.Version > 0 && Validate(record) is "") list.Add(record);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { }
         }
@@ -145,6 +145,7 @@ public static class Calibrations
             int files = Directory.GetFiles(Root).Length;
             foreach (var bad in new[] { draft with { Links = new LinkMeasurement(0, 176, "x", 0) }, draft with { Links = new LinkMeasurement(180, double.NaN, "x", 0) }, draft with { Zero = new ZeroMeasurement("m", 200, 0, null, null, "") },
                 draft with { Stroke = new StrokeMeasurement(10, -10, null, null) }, draft with { Repeatability = new RepeatabilityMeasurement(0, 0, 0, []) }, draft with { Repeatability = new RepeatabilityMeasurement(0, 0, 4, [new Trial("x", 1, 1, 1, null, null, null)]) },
+                draft with { Repeatability = new RepeatabilityMeasurement(0, 0, 4, null!) }, draft with { Repeatability = new RepeatabilityMeasurement(0, 0, 4, [null!]) },
                 new CalibrationRecord(0, "", 0, default, "", "", null, null, null, null) })
             {
                 bool refused = false; try { Save(bad, "fw"); } catch (ArgumentException) { refused = true; }
@@ -153,6 +154,12 @@ public static class Calibrations
             Check(Directory.GetFiles(Root).Length == files, "a refused calibration left nothing behind");
             // A damaged or foreign file never hides the good ones.
             File.WriteAllText(Path.Combine(Root, "cal-20000101-000000-v9.json"), "{ nope"); File.WriteAllText(Path.Combine(Root, "cal-20000101-000001-v8.json"), JsonSerializer.Serialize(loaded with { Id = "cal-other" }));
+            var malformed = new[] { loaded with { Repeatability = loaded.Repeatability! with { Trials = null! } },
+                loaded with { Repeatability = loaded.Repeatability! with { Trials = [null!] } }, loaded with { Note = null! }, loaded with { Firmware = null! } };
+            for (int i = 0; i < malformed.Length; i++) {
+                string id = $"cal-20000101-00000{i + 2}-v{i + 3}";
+                File.WriteAllText(Path.Combine(Root, id + ".json"), JsonSerializer.Serialize(malformed[i] with { Id = id }));
+            }
             Check(List().Count == 2 && Active()!.Id == first.Id, "damaged files and files whose id does not match their name are ignored");
             File.WriteAllText(Path.Combine(Root, ActiveFile), "cal-does-not-exist"); Check(Active()!.Id == second.Id, "an active pointer to nothing falls back to the newest");
         }

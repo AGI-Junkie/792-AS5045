@@ -235,7 +235,7 @@ public sealed partial class ControlWindow
             tabs.Height=compact?140:190;
             chartTitleBlock.Visibility=errorPlot.Visibility=chartNoteBlock.Visibility=compact?Visibility.Collapsed:Visibility.Visible;
         };
-        Lang.Text(experimentResult, () => Lang.T("live.experimentHint"));
+        Lang.QueueText(experimentResult, () => Lang.T("live.experimentHint"));
         ShowFeedback(null, () => Lang.T("live.waiting"));
     }
     private IEnumerable<Expander> Sections() => Descendants(this).OfType<Expander>();
@@ -247,7 +247,7 @@ public sealed partial class ControlWindow
     // One place that turns a telemetry sample (or its absence) into the joint rows and input LEDs.
     private void ShowFeedback(TelemetrySample? sample, Func<string> note)
     {
-        Lang.Text(liveValues, note);
+        Lang.QueueText(liveValues, note);
         var v = Enumerable.Repeat("—", JointNames.Length).ToArray();
         if (sample is { Referenced: true }) {
             v[0] = $"{sample.Command.Q1:F3}"; v[1] = $"{sample.Measured1:F3}"; v[2] = $"{sample.Error1:+0.000;-0.000;0.000}"; v[3] = $"{sample.Command.Q2:F3}";
@@ -268,7 +268,7 @@ public sealed partial class ControlWindow
     private void OpenDataFolder()
     {
         try { string path = lastExperimentDirectory ?? ExperimentRoot; Directory.CreateDirectory(path); Process.Start(new ProcessStartInfo("explorer.exe",path) { UseShellExecute = true }); }
-        catch(Exception ex) { Lang.Text(experimentResult, () => Lang.T("fault.openFolder") + ex.Message); }
+        catch(Exception ex) { Lang.QueueText(experimentResult, () => Lang.T("fault.openFolder") + ex.Message); }
     }
     private void DrawErrorPlot()
     {
@@ -286,6 +286,7 @@ public sealed partial class ControlWindow
     private void SaveWorkbenchSnapshot(string path, double width, double height)
     {
         Width=width; Height=height; Show(); UpdateLayout();
+        Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.ContextIdle);
         xyPreview.FlushViewport(); UpdateLayout();   // a pose change only schedules a redraw; the snapshot must show what the timer would paint
         xyPreview.CheckViewportLayout();
         bool wasEnabled=connect.IsEnabled;

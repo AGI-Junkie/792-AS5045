@@ -13,6 +13,7 @@ import argparse
 import os
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 KEY_GAP_MAX_MS = 100   # WORKBENCH_HARDENING.md: acceptance is key_max_gap_ms <= 100 (0.4 x the 250 ms firmware deadman)
@@ -30,7 +31,8 @@ def analyse(text):
     info.append("协议 proto " + (", ".join(protos) if protos else "（日志里没有 proto=，固件早于协议版本号）"))
 
     stops = [s.strip() for s in re.findall(r"STOP: ([^;\r\n]+)", text)]
-    protective = [s for s in stops if not s.startswith("operator stop")]
+    stop_counts, last_counts, snapshot_counts = Counter(stops), Counter(), Counter()
+    seen_last, seen_snapshots = set(), set()
     recovered = set(re.findall(r'LAST_STOP id=\d+ [^\r\n]+', text))
     for line in sorted(recovered):
         reason = re.search(r'reason="([^"]+)"', line)
@@ -38,11 +40,29 @@ def analyse(text):
         info.append("锁存停机：" + reason[1])
         timing = re.search(r'elapsed_us=(\d+) plan_us=(\d+) late_us=(\d+) done=(\d+) total=(\d+)', line)
         if timing: info.append("停机段耗时 %s us / 计划 %s us；超时 %s us；已走 %s/%s 步" % timing.groups())
-        short_reason = reason[1].split(';', 1)[0]
-        if not short_reason.startswith("operator stop") and short_reason not in protective: protective.append(short_reason)
+        event_id = re.search(r'LAST_STOP id=(\d+)', line)[1]
+        if event_id not in seen_last:
+            seen_last.add(event_id)
+            last_counts[reason[1].split(';', 1)[0].strip()] += 1
+
+    # A snapshot can survive even when the following STOP line was lost.
+    for m in re.finditer(r"FAULT_SNAPSHOT .*?phase=(\S+) .*?drv=(\S+) reason=\"([^\"\r\n]*)", text):
+        short_reason = m.group(3).split(';', 1)[0].strip()
+        if m.group(1) != "disabled" or short_reason.startswith("operator stop"):
+            identity = tuple(re.findall(r'\b(t|epoch|seq)=(\d+)', m[0])) or m[0]
+            if identity not in seen_snapshots:
+                seen_snapshots.add(identity)
+                snapshot_counts[short_reason] += 1
+        if m.group(1) != "disabled" and not short_reason.startswith("operator stop"):
+            note = "；驱动器 nFAULT 有效，原因待诊断（过流/过热/欠压无法区分）" if m.group(2) != "ok" else ""
+            info.append("停机快照：阶段 %s，%s%s" % (m.group(1), m.group(3), note))
+    counts = (stop_counts, last_counts, snapshot_counts)
+    # STOP has no event id: the largest source count is a lower bound without double-counting paired records.
+    protective = {reason: max(c[reason] for c in counts) for reason in set().union(*counts) if not reason.startswith("operator stop")}
     if protective:
-        fails.append("保护性停机 %d 次：%s" % (len(protective), "；".join(sorted(set(protective)))))
-    info.append("人为停止 %d 次" % (len(stops) - len(protective)))
+        fails.append("保护性停机至少 %d 次：%s" % (sum(protective.values()), "；".join(sorted(protective))))
+    operator_count = max(sum(n for reason, n in c.items() if reason.startswith("operator stop")) for c in counts)
+    info.append("人为停止至少 %d 次" % operator_count)
 
     links = re.findall(r"rx_overflow=(\d+) rx_error=(\d+) tx_dropped=(\d+)", text)
     if len(links) >= 2:
@@ -81,12 +101,6 @@ def analyse(text):
             loops = [int(x) for pair in re.findall(r"TIMING loop_max_ms=(\d+) tick_lag_max_ms=(\d+)", text) for x in pair]
             if loops:
                 info.append("流式遥测期间 loop_max_ms/tick_lag_max_ms 最大 %d" % max(loops))
-
-    # The firmware's own account of each stop; a driver nFAULT is never explained, because the pin cannot say which cause.
-    for m in re.finditer(r"FAULT_SNAPSHOT .*?phase=(\S+) .*?drv=(\S+) reason=\"([^\"\r\n]*)", text):
-        if m.group(1) != "disabled" and not m.group(3).startswith("operator stop"):
-            note = "；驱动器 nFAULT 有效，原因待诊断（过流/过热/欠压无法区分）" if m.group(2) != "ok" else ""
-            info.append("停机快照：阶段 %s，%s%s" % (m.group(1), m.group(3), note))
 
     leases = [int(v) for v in re.findall(r"HOST UI lease gap max=(\d+)", text)]
     leases += [int(v) for v in re.findall(r"worstUiLeaseGap=(\d+)ms", text)]
@@ -143,6 +157,23 @@ def self_test():
     assert verdict(diag % (20, 40, 0, 1500)) == (False, True), "a slow TELEM format must warn"
     assert "遥测流未开启" in "".join(analyse("\n".join(base + [diag % (0, 0, 0, 0)]))[2]), "hz=0 must say the stream is off"
     snap = '[10:00:06] FAULT_SNAPSHOT t=1500 epoch=3 seq=4 phase=traj_run home=0 traj=3 idx=1/3 ref=1 p1=1 p2=2 e1=3 err=0 inputs=8 hb_age_ms=23 hb_max_gap_ms=41 drv=nfault_undetermined reason="DRV8825 nFAULT; drivers OFF"'
+    assert verdict(snap)[0], "a protective snapshot must fail even without a STOP or LAST_STOP line"
+    fails, _, info = analyse("\n".join([base[0], snap]))
+    assert fails and "人为停止至少 0 次" in info, "a snapshot-only log must not invent a negative operator-stop count"
+    fails, _, _ = analyse("\n".join(base + [snap, '[10:00:06] STOP: DRV8825 nFAULT; drivers OFF']))
+    assert len(fails) == 1 and "保护性停机至少 1 次" in fails[0], "STOP and snapshot must not count the same protective reason twice"
+    fails, _, _ = analyse("\n".join([snap, snap, snap.replace("t=1500", "t=2500")]))
+    assert "保护性停机至少 2 次" in fails[0], "distinct snapshots with the same reason must count separately"
+    latch = 'LAST_STOP id=1 reason="DRV8825 nFAULT"'
+    fails, _, _ = analyse("\n".join([latch, latch, latch.replace("id=1", "id=2")]))
+    assert "保护性停机至少 2 次" in fails[0], "distinct latched events with the same reason must count separately"
+    paired = [snap, '[10:00:06] STOP: DRV8825 nFAULT; drivers OFF', latch,
+              snap.replace("t=1500", "t=2500"), '[10:00:07] STOP: DRV8825 nFAULT; drivers OFF', latch.replace("id=1", "id=2")]
+    assert "保护性停机至少 2 次" in analyse("\n".join(paired))[0][0], "paired snapshots, stops and latches must not triple-count events"
+    for event in [snap, latch]:
+        assert "人为停止至少 1 次" in analyse(event.replace("DRV8825 nFAULT", "operator stop"))[2], "recovered operator stops must count"
+    assert not verdict(snap.replace('reason="DRV8825 nFAULT', 'reason="operator stop'))[0], "operator-stop snapshots must not fail"
+    assert not verdict(snap.replace("phase=traj_run", "phase=disabled"))[0], "disabled snapshots retain their existing treatment"
     assert "原因待诊断" in "".join(analyse("\n".join(base + [snap]))[2]), "a driver stop must be reported as undiagnosed"
     assert "过热" not in "".join(analyse("\n".join(base + [snap.replace("nfault_undetermined", "ok")]))[2]), "a non-driver stop must not mention overheating"
     print("check-log self-test passed")

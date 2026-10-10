@@ -172,7 +172,8 @@ public sealed partial class ControlWindow : Window
         xyPreview.RefreshLanguage();
         langToggle.ToolTip = Lang.T("lang.toggle.tip");
         System.Windows.Automation.AutomationProperties.SetName(langToggle, Lang.T("lang.toggle.tip"));
-        foreach (var element in new FrameworkElement[] { state, lastStop, inputs, liveValues, experimentResult, logPath }) Lang.RefreshText(element);
+        foreach (var element in new FrameworkElement[] { state, lastStop, inputs, logPath }) Lang.RefreshText(element);
+        Lang.QueueText(liveValues); Lang.QueueText(experimentResult);
         if (lastLinkLine is { } link) connectionBadge.ToolTip = Lang.T("link.diag") + link;
         if (compatible) ShowDeviceState();
         UpdateControls(synchronize: false);
@@ -233,6 +234,7 @@ public sealed partial class ControlWindow : Window
     }
     private void Connect()
     {
+        if (wireThread is { IsAlive: true }) { Lang.Text(state, () => Lang.T("state.writerStopping")); return; }
         if (ports.SelectedItem is not string port) { Lang.Text(state, () => Lang.T("state.needPort")); return; }
         try
         {
@@ -698,7 +700,7 @@ public sealed partial class ControlWindow : Window
             SafeAction(() => { Send(0x79); Send(0x41); });
         }
         PublishHeartbeatLease();   // disabled confirmation first, then idle epoch probes
-        try { FinishExperiment("aborted"); } catch(Exception ex) { Lang.Text(experimentResult, () => Lang.T("fault.saveSummary") + ex.Message); }
+        try { FinishExperiment("aborted"); } catch(Exception ex) { Lang.QueueText(experimentResult, () => Lang.T("fault.saveSummary") + ex.Message); }
         UpdateControls();
     }
     private void UpdateControls(bool synchronize = true)
@@ -809,7 +811,7 @@ public sealed partial class ControlWindow : Window
         try { Send(0x79); } catch { /* Firmware heartbeat timeout remains the fallback. */ }
         hardwareUart = false; supportsShortHeartbeat = false; connectionBadge.ToolTip = null; lastLinkLine = null;
         RefreshFirmwareStatus();
-        try { FinishExperiment("disconnected: " + reason()); } catch(Exception ex) { Lang.Text(experimentResult, () => Lang.T("fault.saveSummary2") + ex.Message); }
+        try { FinishExperiment("disconnected: " + reason()); } catch(Exception ex) { Lang.QueueText(experimentResult, () => Lang.T("fault.saveSummary2") + ex.Message); }
         lastExperimentOutcome = null; trajectoryRanOnce = false;
         try { serial?.Dispose(); } catch { }
         serial = null;

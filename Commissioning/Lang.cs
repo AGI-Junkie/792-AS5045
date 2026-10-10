@@ -24,9 +24,26 @@ internal static class Lang
     // Retain the formatter, not yesterday's rendered status/error. No global control subscriptions.
     private static readonly DependencyProperty TextSourceProperty = DependencyProperty.RegisterAttached(
         "TextSource", typeof(Func<string>), typeof(Lang));
+    private static readonly DependencyProperty TextRefreshPendingProperty = DependencyProperty.RegisterAttached(
+        "TextRefreshPending", typeof(bool), typeof(Lang), new PropertyMetadata(false));
     internal static void Text(FrameworkElement element, Func<string> source)
     {
         element.SetValue(TextSourceProperty, source);
+        RefreshText(element);
+    }
+    // Split display-only editors so synchronous Windows text-service calls cannot add up in one input turn.
+    internal static void QueueText(TextBox element, Func<string>? source = null)
+    {
+        if (source is not null) element.SetValue(TextSourceProperty, source);
+        if (element.IsLoaded) {
+            if ((bool)element.GetValue(TextRefreshPendingProperty)) return;
+            element.SetValue(TextRefreshPendingProperty, true);
+            element.Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, new Action(() => {
+                element.ClearValue(TextRefreshPendingProperty);
+                RefreshText(element);
+            }));
+            return;
+        }
         RefreshText(element);
     }
     internal static void RefreshText(FrameworkElement element)
@@ -39,7 +56,9 @@ internal static class Lang
     internal sealed class ValidationException(string key, object[] args) : ArgumentException
     {
         public string Key { get; } = key;
-        public override string Message => T(Key, args.Select(arg => arg is Func<string> text ? text() : arg).ToArray());
+        internal JointRangeFailure? RangeFailure { get; init; }
+        public override string Message => T(Key, args.Select(arg => arg is Func<string> text ? text() : arg).ToArray()) +
+            (RangeFailure is { } failure ? "\n" + failure.Details() : "");
     }
     internal static ArgumentException Error(string key, params object[] args) => new ValidationException(key, args);
 
@@ -606,6 +625,7 @@ internal static class Lang
         ["state.inputsEmpty"] = ("输入尚未读取", "Inputs not read yet"),
         ["inputs.raw"] = ("输入电平（0＝触发）：", "Input levels (0 = active): "),
         ["state.needPort"] = ("请选择 KitProg 的 COM 口", "Select the KitProg COM port first"),
+        ["state.writerStopping"] = ("上次连接的发送线程还未退出，请稍后重试连接。", "The previous connection's writer is still stopping. Try connecting again shortly."),
         ["state.logSaved"] = ("日志自动保存：", "Log auto-saved: "),
         ["state.connected"] = ("已连接，等待 stage1-v3 / stage2 固件状态；不会自动使能",
             "Connected, waiting for stage1-v3 / stage2 firmware state; will not auto-enable"),
@@ -802,13 +822,21 @@ internal static class Lang
         ["xy.shape9"] = ("螺旋", "Spiral"),
         ["xy.shape10"] = ("自定义轮廓", "Custom contour"),
         ["xy.shape11"] = ("手绘", "Freehand"),
+        ["fh.smoothing"] = ("平滑", "Smoothing"),
+        ["fh.processing"] = ("正在处理手绘轨迹…", "Processing freehand trajectory…"),
+        ["fh.processingFailed"] = ("手绘处理失败：{0}", "Freehand processing failed: {0}"),
+        ["fh.off"] = ("关闭", "Off"),
+        ["fh.low"] = ("低 · 2 mm", "Low · 2 mm"),
+        ["fh.medium"] = ("中 · 3 mm", "Medium · 3 mm"),
+        ["fh.high"] = ("高 · 4 mm", "High · 4 mm"),
+        ["fh.smoothing.tip"] = ("松开左键时平滑新笔画；切换档位立即从会话原始点重算已有草稿和预览，保留首尾。关闭恢复会话原始点。仅保存处理后的点；载入文件后以文件点为基线，无法恢复未保存的原始鼠标点。", "Smooth new strokes on left-button release. Changing level immediately rebuilds the draft and preview from session raw points, preserving endpoints. Off restores that baseline. Only processed points are saved; loaded files use their saved points as the baseline and cannot recover unsaved raw mouse points."),
         ["fh.draw"] = ("手绘", "Draw"),
-        ["fh.draw.tip"] = ("切换手绘模式。左键绘制，末端附近继续；中键平移，滚轮缩放。绘制不驱动机械臂。", "Toggle freehand mode. Draw with the left button; resume near the end. Middle-button pan, wheel zoom. Drawing does not move the arm."),
+        ["fh.draw.tip"] = ("进入手绘模式（未连接设备也可绘制）。左键绘制，末端附近继续；中键平移，滚轮缩放。绘制不驱动机械臂。", "Enter freehand mode (drawing also works while disconnected). Draw with the left button; resume near the end. Middle-button pan, wheel zoom. Drawing does not move the arm."),
         ["fh.undo"] = ("撤销上一笔", "Undo stroke"),
         ["fh.undo.tip"] = ("撤销最后一笔。恢复的草稿视为一笔；需要重新预览。", "Remove the last stroke. A restored draft counts as one stroke. Preview again before execution."),
         ["fh.clear"] = ("清除手绘", "Clear drawing"),
         ["fh.clear.tip"] = ("清除手绘草稿并使原执行计划失效。", "Clear the draft and invalidate the execution plan."),
-        ["fh.hint"] = ("左键手绘 · 末端吸附续画 · 中键平移 · 滚轮缩放 · Esc 取消当前笔画 · 平滑偏差 ≤ 1 mm，不合法处自动修正", "Left-button draw · snap to end to resume · middle-button pan · wheel zoom · Esc cancels stroke · smoothing deviation ≤ 1 mm, illegal parts are repaired"),
+        ["fh.hint"] = ("左键手绘 · 末端吸附续画 · 中键平移 · 滚轮缩放 · Esc 取消当前笔画 · 松开平滑新笔画 · 不合法处另行自动修正", "Left-button draw · snap to end to resume · middle-button pan · wheel zoom · Esc cancels stroke · release smooths the new stroke · illegal parts are repaired separately"),
         ["fh.canvasName"] = ("手绘轨迹：左键绘制，从末端续画，中键平移，滚轮缩放，Esc 取消当前笔画；绘制不驱动机械臂。", "Freehand trajectory: left-button draw, resume at the end, middle-button pan, wheel zoom, Esc cancels the stroke. Drawing does not move the arm."),
         ["fh.resumeNear"] = ("请从上一笔末端附近续画（10 像素且不超过 3 mm），或清除后重新绘制。", "Resume within 10 pixels and 3 mm of the end, or clear the drawing to start again."),
         ["fh.cancelOutside"] = ("移出绘图区，当前笔画已取消；此前笔画已保留。", "Left the drawing area: the current stroke was cancelled. Earlier strokes are retained."),
@@ -817,7 +845,7 @@ internal static class Lang
         ["fh.end"] = ("续画末端", "Resume here"),
         ["err.freehandPoints"] = ("手绘最多 5000 个有限坐标点，坐标绝对值须不超过 20000 mm。", "Freehand accepts up to 5000 finite points with coordinates within ±20000 mm."),
         ["err.freehandShort"] = ("请绘制至少两个不同点，轨迹长度须达到 1 mm。", "Draw at least two distinct points and a path at least 1 mm long."),
-        ["err.freehandFit"] = ("手绘点 {0} 附近自动细化后仍无法在 1 mm 偏差内平滑通过，请缩短或调整该处后重新预览。", "Automatic refinement could not smooth near drawing point {0} within 1 mm. Shorten or adjust that section and preview again."),
+        ["err.freehandFit"] = ("手绘点 {0} 附近自动细化后仍无法在当前偏差预算内平滑通过，请缩短或调整该处后重新预览。", "Automatic refinement could not smooth near drawing point {0} within the current deviation budget. Shorten or adjust that section and preview again."),
         ["xy.shape"] = ("形状", "Shape"),
         ["xy.branch"] = ("逆解分支", "IK branch"),
         ["xy.l1"] = ("L1", "L1"),
@@ -1122,10 +1150,18 @@ internal static class Lang
             "Trajectory crosses a geometrically unreachable region; move or shrink the shape."),
         ["err.singularPath"] = ("轨迹触及完全伸直或折叠的奇异位形；请留出余量。",
             "Trajectory touches a fully straight/folded singularity; leave margin."),
-        ["err.sampleOutOfRange"] = ("第 {0} 个采样点超出规划范围：q1={1:F2}°，q2={2:F2}°，肘={7:F2}°；允许 q1 [{3:F2},{4:F2}]°、q2 [{5:F2},{6:F2}]°、肘 [{8:F2},{9:F2}]°。红区、规划与设备执行共用当前关节范围，请调整图形或关节范围。",
-            "Sample {0} outside planning range: q1={1:F2}°, q2={2:F2}°, elbow={7:F2}°; allowed q1 [{3:F2},{4:F2}]°, q2 [{5:F2},{6:F2}]°, elbow [{8:F2},{9:F2}]°. Red region, planning and execution share this range; adjust the shape or range."),
-        ["err.betweenSamples"] = ("图形在采样点之间超出当前关节范围：q1={0:F6}°，q2={1:F6}°，肘={2:F6}°；请调整图形或关节范围。",
-            "Shape leaves the current joint range between samples: q1={0:F6}°, q2={1:F6}°, elbow={2:F6}°; adjust the shape or range."),
+        ["err.sampleOutOfRange"] = ("第 {0} 个采样点超出规划范围：q1={1:F2}°，q2={2:F2}°，肘={7:F2}°；允许 q1 [{3:F2},{4:F2}]°、q2 [{5:F2},{6:F2}]°、肘 [{8:F2},{9:F2}]°。",
+            "Sample {0} outside planning range: q1={1:F2}°, q2={2:F2}°, elbow={7:F2}°; allowed q1 [{3:F2},{4:F2}]°, q2 [{5:F2},{6:F2}]°, elbow [{8:F2},{9:F2}]°."),
+        ["err.betweenSamples"] = ("图形在采样点之间超出当前关节范围：q1={0:F6}°，q2={1:F6}°，肘={2:F6}°。",
+            "Shape leaves the current joint range between samples: q1={0:F6}°, q2={1:F6}°, elbow={2:F6}°."),
+        ["diag.elbow"] = ("肘 (q2−q1)", "elbow (q2−q1)"),
+        ["diag.below"] = ("{0}={1:F6}° < 下限 {2:F6}°；超出 {3:F6}°。", "{0}={1:F6}° < minimum {2:F6}°; overrun {3:F6}°."),
+        ["diag.above"] = ("{0}={1:F6}° > 上限 {2:F6}°；超出 {3:F6}°。", "{0}={1:F6}° > maximum {2:F6}°; overrun {3:F6}°."),
+        ["diag.location"] = ("首次检测到的越界位置：X={0:F6} mm，Y={1:F6} mm；逆解：{2}。", "First detected range failure: X={0:F6} mm, Y={1:F6} mm; IK: {2}."),
+        ["diag.adjust"] = ("红圈处不满足当前逆解分支的关节范围。调整这一区域的路径，在可达范围内留出余量；也可尝试另一逆解分支并重新预览。不要盲目放宽关节范围；白色区域不保证整条曲线可执行。",
+            "The red marker violates the selected IK branch's joint limits. Reshape this region within reach with margin, or try the alternate IK branch and preview again. Do not widen limits blindly; white space does not guarantee an executable curve."),
+        ["diag.marker"] = ("首次检测越界", "First detected range failure"),
+        ["diag.detailsName"] = ("完整检查结果与拒绝原因", "Full validation result and rejection reason"),
         ["err.execCapacity"] = ("执行轨迹超出 {0} 点容量或时间间隔范围；请缩短路径。",
             "Execution trajectory exceeds {0} nodes or dt limits; shorten the path."),
         ["err.chord"] = ("执行轨迹的弦线近似误差超过 0.15 mm；请降低速度或调整图形。",
