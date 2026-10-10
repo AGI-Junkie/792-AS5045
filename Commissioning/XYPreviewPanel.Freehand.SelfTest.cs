@@ -142,10 +142,14 @@ public sealed partial class XYPreviewPanel
         Check(panel.freehandPoints.Count == 0 && panel.execution is null, "old file inherited a draft");
         Check(RunValues("shape=11; v1=5; v2=3; a1=10; a2=6") is null, "recent run reloaded the wrong drawing");
         panel.ClearFreehand(); panel.RedrawViewport(); panel.freehandSmoothing.SelectedIndex = 2; WaitForFreehand(panel);
+        panel.cameraCenter.Y = 1e-12; // Exercise screen/world roundoff while keeping exact captured-point comparisons.
         Check(panel.BeginFreehandStroke(panel.ToScreen(start)), "smoothed first stroke");
         for (int i = 1; i < 80; i++) panel.AddFreehandPoint(panel.ToScreen(new Point(330 + i * 0.1, 0.4 * Math.Sin(i * 1.7))));
         var captured = panel.freehandPoints.ToArray();
-        panel.CompleteFreehandStroke(panel.ToScreen(new Point(338, 0))); WaitForFreehand(panel);
+        var releaseScreen = panel.ToScreen(new Point(338, 0)); var releaseWorld = panel.ToWorld(releaseScreen);
+        var baseline = captured.Append(new FreehandPoint(releaseWorld.X, releaseWorld.Y)).ToArray();
+        panel.CompleteFreehandStroke(releaseScreen); WaitForFreehand(panel);
+        Check(panel.freehandRawStrokes.Single().SequenceEqual(baseline) && (releaseWorld - new Point(338, 0)).Length < 1e-8, "release changed captured baseline or endpoint");
         Check(panel.freehandPoints.Count < captured.Length && panel.FreehandFitLevel == 2, "release did not process the stored tail");
         var committed = panel.freehandPoints.ToArray();
         panel.Refresh(); WaitForFreehand(panel); var oldPreview = panel.trajectory;
@@ -157,7 +161,7 @@ public sealed partial class XYPreviewPanel
         panel.freehandSmoothing.SelectedIndex = 1; WaitForFreehand(panel);
         Check(panel.freehandPoints.SequenceEqual(low), "Low-High-Low accumulated filtering");
         panel.freehandSmoothing.SelectedIndex = 0; WaitForFreehand(panel);
-        Check(panel.freehandPoints.SequenceEqual(captured.Append(new FreehandPoint(338, 0))), "Off did not restore captured baseline");
+        Check(panel.freehandPoints.SequenceEqual(baseline), "Off did not restore captured baseline");
         panel.freehandSmoothing.SelectedIndex = 2; WaitForFreehand(panel);
         Check(panel.freehandPoints.SequenceEqual(committed), "Medium did not restore original processed draft");
         panel.RedrawViewport();

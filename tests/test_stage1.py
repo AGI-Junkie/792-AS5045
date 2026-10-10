@@ -2223,6 +2223,18 @@ int main(int argc,char **argv) {
             assert(simPulse1==p1+1u && simPulse2==p2+1u);
             assert(ptp_counts_in_range(0u,g_arm1.usteps) && ptp_counts_in_range(1u,g_arm2.usteps));
         }
+        if(!ARM2_ENCODER_FEEDBACK) for(bound=-1;bound<=1;bound+=2) {
+            int8 step[2]={(int8)-bound,(int8)bound};unsigned p1=simPulse1,p2=simPulse2;
+            g_arm1.usteps=bound*4444;g_arm2.usteps=-bound*19286;
+            g_enc.pos=g_enc.softCenter-bound*11374;
+            assert(ptp_angle_from_counts(0u,g_arm1.usteps)==-bound*2500);
+            assert(ptp_angle_from_counts(1u,g_arm2.usteps)==bound*8499);
+            assert(!joint_step_allowed(&g_arm1,step[0]) && joint_step_allowed(&g_arm2,step[1]));
+            assert(pulse_axes_try(step)); /* hybrid q2 6000 -> 5999 after arm2, so arm1 can then pulse */
+            assert(g_arm1.usteps==bound*4443 && g_arm2.usteps==-bound*19285);
+            assert(simPulse1==p1+1u && simPulse2==p2+1u);
+            assert(ptp_angle_from_counts(0u,g_arm1.usteps)+ptp_angle_from_counts(1u,g_arm2.usteps)==bound*5999);
+        }
         puts(t);return 0;
     }
     if(!strcmp(t,"pulse_joint_trajectory")) {
@@ -2276,16 +2288,35 @@ int main(int argc,char **argv) {
         g_homed1=g_homed2=g_ptp.reference=g_enc.directionKnown=g_enc2.directionKnown=1u;
         g_ptp.origin[0]=g_ptp.origin[1]=0;
         g_enc.incDir=ARM1_LEFT_DIR_LEVEL;
-        g_enc.pos=g_enc.softCenter+out_deg10_to_lsb(300)+1;
-        p1=simPulse1;step[0]=-1;step[1]=1;
-        assert(!pulse_axes_try(step) && simPulse1==p1); /* measured arm1 at +30 deg must still refuse an outward pulse */
         for(bound=-1;bound<=1;bound+=2) {
+            g_arm1.usteps=g_arm2.usteps=0;g_enc2.pos=g_enc2.softCenter;
+            g_enc.pos=g_enc.softCenter+bound*(out_deg10_to_lsb(300)+1);
+            p1=simPulse1;p2=simPulse2;step[0]=(int8)-bound;step[1]=(int8)bound;
+            assert(!pulse_axes_try(step) && simPulse1==p1 && simPulse2==p2);
+            assert(!g_arm1.usteps && !g_arm2.usteps); /* measured arm1 at +/-30 deg refuses the whole paired event */
+        }
+        for(bound=-1;bound<=1;bound+=2) {
+            int direction;
             g_arm1.usteps=-ptp_offset(0u,-bound*2500);g_arm2.usteps=-ptp_offset(1u,bound*3500);
             g_enc.pos=g_enc.softCenter+bound*((int32)((int64)2500*1024/225)+1);
             g_enc2.incDir=ARM2_LEFT_DIR_LEVEL;
             g_enc2.pos=g_enc2.softCenter+bound*((int32)((int64)3500*ENCODER_CPR*ARM2_GEAR_RATIO_X100/3600000)+1);
-            p1=simPulse1;step[0]=(int8)-bound;step[1]=(int8)bound;
-            assert(!pulse_axes_try(step) && simPulse1==p1); /* commanded pose is inside; measured q2 is at its bound */
+            for(direction=-1;direction<=1;direction+=2) {
+                from[0]=g_arm1.usteps;from[1]=g_arm2.usteps;
+                p1=simPulse1;p2=simPulse2;step[0]=(int8)direction;step[1]=(int8)-direction;
+                if(!ARM2_ENCODER_FEEDBACK && direction==-bound)
+                    assert(ptp_angle_from_counts(1u,from[1]+step[1])==bound*3500); /* compensation does not cross a rounding boundary */
+                assert(!pulse_axes_try(step) && simPulse1==p1 && simPulse2==p2);
+                assert(g_arm1.usteps==from[0] && g_arm2.usteps==from[1]); /* measured q2 refuses either axis before any pulse */
+            }
+        }
+        if(!ARM2_ENCODER_FEEDBACK) for(bound=-1;bound<=1;bound+=2) {
+            from[0]=g_arm1.usteps=bound*4444;from[1]=g_arm2.usteps=-bound*19286;
+            g_enc.pos=g_enc.softCenter-bound*11374;
+            p1=simPulse1;p2=simPulse2;step[0]=(int8)bound;step[1]=(int8)-bound;
+            assert(joint_step_allowed(&g_arm1,step[0]) && !joint_step_allowed(&g_arm2,step[1]));
+            assert(!pulse_axes_try(step) && simPulse1==p1 && simPulse2==p2);
+            assert(g_arm1.usteps==from[0] && g_arm2.usteps==from[1]); /* hybrid q2 refuses arm2 before arm1 can pulse */
         }
         puts(t);return 0;
     }

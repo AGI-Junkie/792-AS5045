@@ -148,7 +148,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-guards1"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-guards2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -1996,13 +1996,13 @@ static uint8 ptp_counts_in_range(uint8 axis, int32 count)
            elbow>=g_jointMinCd[JOINT_ELBOW] && elbow<=g_jointMaxCd[JOINT_ELBOW];
 }
 _Static_assert(ENCODER_CPR * GEAR_RATIO * 225 == 36000 * 1024, "joint_step_allowed: 225/1024 must equal 36000/(ENCODER_CPR*GEAR_RATIO)");
-static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
+static uint8 joint_step_allowed_core(const jog_axis_t *a, int8 s, uint8 checkCommandQ2, int32 fallbackElbowCount)
 {
     uint8 axis = (a == &g_arm1) ? 0u : 1u;
     if(g_home.phase!=HOME_IDLE || !g_directionKnown || !(axis ? g_homed2 : g_homed1)) { return 1u; }
     /* Homed/manual-reference zero survives switching to jog. Permit retreat from
      * outside a bound, but never another outward step (including deceleration). */
-    int32 elbow=ptp_angle_from_counts(1u,g_arm2.usteps);
+    int32 elbow=ptp_angle_from_counts(1u,fallbackElbowCount);
     int32 nextQ2=ptp_angle_from_counts(0u,g_arm1.usteps+(axis==0u?s:0))+
                  ptp_angle_from_counts(1u,g_arm2.usteps+(axis==1u?s:0));
     /* Quantized estimates can sit just inside a limit; compare actual counts
@@ -2011,7 +2011,7 @@ static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
                     (s>0 && a->usteps>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[0])))) return 0u;
     /* Match the joint contract's count-to-centidegree rounding, but check the
      * prospective pose so an inward compensation pulse can make room. */
-    if((s<0 && nextQ2>g_jointMaxCd[1]) || (s>0 && nextQ2<g_jointMinCd[1])) return 0u;
+    if(checkCommandQ2 && ((s<0 && nextQ2>g_jointMaxCd[1]) || (s>0 && nextQ2<g_jointMinCd[1]))) return 0u;
     /* The elbow is motor 2's own angle, so its range bounds that motor directly. */
     if(axis==1u && ((s<0 && a->usteps<=g_ptp.origin[1]-ptp_offset(1u,g_jointMaxCd[JOINT_ELBOW])) ||
                     (s>0 && a->usteps>=g_ptp.origin[1]-ptp_offset(1u,g_jointMinCd[JOINT_ELBOW])))) return 0u;
@@ -2024,6 +2024,10 @@ static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
            (s>0 && (m2<=g_jointMinCd[1] || (axis ? me<=g_jointMinCd[2] : m1<=g_jointMinCd[0])))) { return 0u; }
     }
     return 1u;
+}
+static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
+{
+    return joint_step_allowed_core(a,s,1u,g_arm2.usteps);
 }
 static void traj_status(void)
 {
@@ -2458,6 +2462,10 @@ static uint8 pulse_axes_try(const int8 step[2])   /* false when a step was refus
         if(!joint_range_ok(q1,q2)) { return 0u; }
         /* At a shared q2 bound, move inward first; every pulse still passes the single-axis and measured guards. */
         if(!joint_step_allowed(&g_arm1,step[0])) { first=1u; }
+        /* With arm2 feedback off, arm1's hybrid q2 uses the elbow count after
+         * a preceding arm2 pulse. Arm2 still sees the current measured arm1. */
+        if(!joint_step_allowed_core(&g_arm1,step[0],0u,g_arm2.usteps+(first?step[1]:0)) ||
+           !joint_step_allowed_core(&g_arm2,step[1],0u,g_arm2.usteps)) { return 0u; }
     }
     for(i=0u;i<2u;i++) {
         axis=(uint8)(first^i);
