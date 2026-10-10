@@ -149,7 +149,7 @@ public sealed partial class ControlWindow
     // ---- the single writer -------------------------------------------------
     private void StartWireWriter()
     {
-        if (wireThread is not null) return;
+        if (wireThread is { IsAlive: true }) return;
         wireStop = false;
         // AboveNormal so UI load cannot delay a beat, but the writer only ever sleeps
         // (never spins): a spinning AboveNormal writer starved the UI dispatcher in the
@@ -161,8 +161,8 @@ public sealed partial class ControlWindow
     private void StopWireWriter()
     {
         wireStop = true;
-        wireThread?.Join(500);
-        wireThread = null;
+        // A stalled write must finish before another session can reset its stop flag.
+        if (wireThread is null || wireThread.Join(500)) wireThread = null;
         lock (wireSync) { urgentWire.Clear(); }
     }
 
@@ -388,8 +388,47 @@ public sealed partial class ControlWindow
         }
     }
 
+    private static void WireWriterLifecycleSelfTest()
+    {
+        static void Check(bool ok, string reason) {
+            if (!ok) throw new InvalidOperationException("Wire writer lifecycle: " + reason);
+        }
+        bool language = Lang.IsEn, oldSawStop = false;
+        var window = new ControlWindow { selfTesting = true };
+        using var entered = new ManualResetEvent(false);
+        using var release = new ManualResetEvent(false);
+        // Stand in for a serial write that is blocked beyond the production join timeout.
+        var blocked = new Thread(() => { entered.Set(); release.WaitOne(); oldSawStop = window.wireStop; }) { IsBackground = true };
+        try {
+            window.wireThread = blocked; blocked.Start();
+            Check(entered.WaitOne(1000), "the blocked writer did not start");
+            window.StopWireWriter();
+            Check(ReferenceEquals(window.wireThread, blocked) && blocked.IsAlive && window.wireStop,
+                "a timed-out stop forgot the live writer");
+            window.ports.ItemsSource = new[] { "offline-test-port" }; window.ports.SelectedIndex = 0;
+            window.Connect();
+            Check(window.serial is null && window.recording is null && window.state.Text == Lang.T("state.writerStopping"),
+                "reconnect reached the port while the previous writer was alive");
+            Lang.Set(!language, false);
+            Check(window.state.Text == Lang.T("state.writerStopping"), "the reconnect message did not switch language");
+            window.StartWireWriter();
+            Check(ReferenceEquals(window.wireThread, blocked) && window.wireStop, "restart cleared the old writer's stop request");
+            release.Set();
+            Check(blocked.Join(1000) && oldSawStop, "the old writer resumed without its stop request");
+            window.ports.SelectedIndex = -1; window.Connect();
+            Check(window.serial is null && window.state.Text == Lang.T("state.needPort"), "reconnect stayed blocked after the old writer exited");
+            window.StartWireWriter();
+            Check(window.wireThread is { IsAlive: true } && !ReferenceEquals(window.wireThread, blocked) && !window.wireStop,
+                "a finished old writer prevented the new writer from starting");
+            window.StopWireWriter();
+            Check(window.wireThread is null, "the new writer did not stop");
+        }
+        finally { release.Set(); blocked.Join(1000); window.StopWireWriter(); window.Close(); Lang.Set(language, false); }
+    }
+
     private static void ControlTransportSelfTest(string? snapshotPath)
     {
+        WireWriterLifecycleSelfTest();
         var window = new ControlWindow { selfTesting = true };
         var frames = new List<byte[]>();
         var bytes = new List<byte>();

@@ -41,6 +41,15 @@ def port(text, instance, terminal):
                      r"\(\{?(\w+)(?:\[0:0\])?\}?\)", text, re.S).group(1)
 
 
+def fault_edge(text):
+    # USB D+ also has a falling-edge mode; mutate the FAULT instance's parameters.
+    pattern = r"\bcy_psoc3_pins_\w+\s*#\((?P<params>(?:(?!\);).)*?)\)\s*FAULT\s*\("
+    match = re.search(pattern, text, re.S)
+    assert match, "FAULT pin parameters"
+    params = replace(match['params'], r"\.intr_mode\(2'b10\)", ".intr_mode(2'b00)")
+    return text[:match.start('params')] + params + text[match.end('params'):]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--software-project", type=Path)
@@ -63,7 +72,7 @@ def main():
         ("STEP polarity", FILES[1],
          lambda s: replace(s, r"(assign\s+" + port(v, "STEP2", "y") + r"\s*=\s*)~", r"\g<1>"), "STEP2 inversion"),
         ("fault edge", FILES[1],
-         lambda s: replace(s, r"\.intr_mode\(2'b10\)", ".intr_mode(2'b00)"), "FAULT.intr_mode"),
+         fault_edge, "FAULT.intr_mode"),
         ("fault ISR", FILES[1],
          lambda s: replace(s, r"(\bFaultIsr\s*\(.*?\.int_signal\()\w+(\))", r"\g<1>BrokenIrq\2"), "FaultIsr.int_signal"),
         ("DMA buffer", FILES[3],

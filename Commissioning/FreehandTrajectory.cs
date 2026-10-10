@@ -81,7 +81,7 @@ internal static class FreehandTrajectory
                 var candidate = Reshape(raw, model, limits, branch, passes, margin);
                 if (candidate is null) continue;
                 // Both ways: the plan must stay near the draft, and every draft vertex (a retraced excursion included) near the plan.
-                double Away(IEnumerable<Point> from, List<Point> to) => from.Max(p => to.Zip(to.Skip(1)).Min(s => Distance(p, s.First, s.Second)));
+                double Away(IEnumerable<Point> from, List<Point> to) => MaximumDistance(from.ToArray(), to.ToArray());
                 double shift = Math.Max(Away(candidate.Select(p => p.Point), reference), Away(reference, candidate.Select(p => p.Point).ToList()));
                 if (shift > RepairShift) continue;
                 try { Verify(candidate); return (candidate, shift); } catch (ArgumentException) { }
@@ -102,7 +102,7 @@ internal static class FreehandTrajectory
         double Away(Point[] from, Point[] to) {
             double length = from.Zip(from.Skip(1)).Sum(s => (s.Second - s.First).Length);
             var samples = Resample(from.ToList(), 0.25);
-            return samples.Max(p => to.Zip(to.Skip(1)).Min(s => Distance(p, s.First, s.Second))) + length / (2 * (samples.Length - 1));
+            return MaximumDistance(samples, to) + length / (2 * (samples.Length - 1));
         }
         foreach (int passes in new[] { level switch { 1 => 2, 2 => 8, _ => 32 }, 1, 0 }.Distinct()) {
             var candidate = Resample(Filter(raw, passes).ToList());
@@ -197,11 +197,49 @@ internal static class FreehandTrajectory
         return keep.ToList();
     }
 
-    private static double Distance(Point p, Point a, Point b)
+    private static double Distance(Point p, Point a, Point b) => Math.Sqrt(DistanceSquared(p, a, b));
+
+    private static double DistanceSquared(Point p, Point a, Point b)
     {
         var d = b - a;
         double u = d.LengthSquared == 0 ? 0 : Math.Clamp(Vector.Multiply(p - a, d) / d.LengthSquared, 0, 1);
-        return (p - (a + d * u)).Length;
+        return (p - (a + d * u)).LengthSquared;
+    }
+
+    private static double MaximumDistance(Point[] from, Point[] to)
+    {
+        const int blockSize = 32;
+        var bounds = new (double MinX, double MinY, double MaxX, double MaxY)[(to.Length - 2) / blockSize + 1];
+        for (int block = 0; block < bounds.Length; block++) {
+            var first = to[block * blockSize];
+            var box = (MinX: first.X, MinY: first.Y, MaxX: first.X, MaxY: first.Y);
+            for (int i = block * blockSize + 1; i <= Math.Min((block + 1) * blockSize, to.Length - 1); i++) {
+                box.MinX = Math.Min(box.MinX, to[i].X); box.MaxX = Math.Max(box.MaxX, to[i].X);
+                box.MinY = Math.Min(box.MinY, to[i].Y); box.MaxY = Math.Max(box.MaxY, to[i].Y);
+            }
+            bounds[block] = box;
+        }
+        double worstSquared = 0; int closestBlock = 0;
+        foreach (var p in from) {
+            double nearestSquared = double.PositiveInfinity;
+            void Check(int block) {
+                for (int i = block * blockSize + 1; i <= Math.Min((block + 1) * blockSize, to.Length - 1); i++) {
+                    double squared = DistanceSquared(p, to[i - 1], to[i]);
+                    if (squared < nearestSquared) { nearestSquared = squared; closestBlock = block; }
+                }
+            }
+            int firstBlock = closestBlock; Check(firstBlock);
+            for (int block = 0; block < bounds.Length; block++) {
+                if (block == firstBlock) continue;
+                var box = bounds[block];
+                double dx = Math.Max(0, Math.Max(box.MinX - p.X, p.X - box.MaxX));
+                double dy = Math.Max(0, Math.Max(box.MinY - p.Y, p.Y - box.MaxY));
+                // The box distance is a lower bound for every segment it encloses.
+                if (dx * dx + dy * dy < nearestSquared) Check(block);
+            }
+            worstSquared = Math.Max(worstSquared, nearestSquared);
+        }
+        return Math.Sqrt(worstSquared);
     }
 
     private sealed class Spline
@@ -298,6 +336,13 @@ internal static class FreehandTrajectory
         }
         Reject([]); Reject([new(0, 0), new(0, 0)]); Reject([new(0, 0), new(0.5, 0)]);
         Reject([new(double.NaN, 0), new(2, 0)]); Reject(new FreehandPoint[MaxPoints + 1]);
+        foreach (int count in new[] { 2, 32, 33, 34, 65, 66 }) {
+            var contour = Enumerable.Range(0, count).Select(i => new Point(i * 2, Math.Sin(i))).ToArray();
+            contour[1] = contour[0]; // A zero-length segment and complete/partial distance blocks.
+            var probes = Enumerable.Range(0, 83).Select(i => new Point(i * 1.7 - 8, 3 * Math.Cos(i))).Concat(contour).ToArray();
+            double exhaustive = probes.Max(p => contour.Zip(contour.Skip(1)).Min(s => Distance(p, s.First, s.Second)));
+            Check(Math.Abs(MaximumDistance(probes, contour) - exhaustive) < 1e-12, "distance pruning skipped the nearest segment");
+        }
         var line = Create([new(0, 0), new(5, 0), new(5, 0), new(10, 0)]);
         Check((line.At(0).P - new Point(0, 0)).Length < 1e-9 && (line.At(1).P - new Point(10, 0)).Length < 1e-9, "endpoints");
         Check(Math.Abs(line.Length - 10) < 1e-8 && line.At(0.4).D2.Length < 1e-8, "line derivatives");

@@ -24,6 +24,110 @@ public sealed partial class XYPreviewPanel
     private Border xRow = null!, yRow = null!;
     private FrameworkElement transformSection = null!;
     private bool RecordingFreehand => freehandStrokeStart >= 0;
+    private int freehandWorkVersion;
+    private bool freehandWorkerActive, freehandNeedsProcessing, freehandReprocessAll;
+    private FreehandWork? freehandPendingWork, freehandRunningWork;
+    private Task<bool>? freehandRequest;
+    private bool ProcessingFreehand => freehandWorkerActive || freehandPendingWork is not null;
+    private sealed record FreehandWork(int Version, FreehandPoint[] Points, int[] Starts, int[] Levels, FreehandPoint[][] Raw,
+        bool Process, bool All, PlanarArm? Model, JointLimits Limits, int Branch, PlanningRates Rates, TaskCompletionSource<bool> Done);
+    private sealed record FreehandResult(FreehandPoint[] Points, int[] Starts, bool Processed,
+        DrawingTrajectory? Path, TimedTrajectory? Time, ExecutionTrajectory? Execution, double Shift, double Asked, ArgumentException? Failure);
+
+    private void CancelFreehandWork()
+    {
+        ++freehandWorkVersion;
+        freehandPendingWork?.Done.TrySetResult(false); freehandPendingWork = null;
+        freehandRunningWork?.Done.TrySetResult(false);
+    }
+
+    private void QueueFreehandWork(PlanarArm? model = null, JointLimits limits = default, int branch = 0, PlanningRates rates = default)
+    {
+        freehandPendingWork?.Done.TrySetResult(false);
+        var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        freehandPendingWork = new(++freehandWorkVersion, freehandPoints.ToArray(), freehandStrokes.ToArray(), freehandLevels.ToArray(),
+            freehandRawStrokes.Select(s => s.ToArray()).ToArray(), freehandNeedsProcessing, freehandReprocessAll, model, limits, branch, rates, done);
+        freehandRequest = done.Task;
+        if (shape.SelectedIndex == FreehandIndex) { Lang.Text(result, () => Lang.T("fh.processing")); result.Foreground = Brushes.DarkSlateGray; }
+        StartFreehandWorker(); UpdateFreehandTools(); UpdatePointButton();
+    }
+
+    private void StartFreehandWorker()
+    {
+        if (freehandWorkerActive || freehandPendingWork is not { } work) return;
+        freehandPendingWork = null; freehandRunningWork = work; freehandWorkerActive = true;
+        _ = FinishFreehandWorkAsync(work);
+    }
+
+    private async Task FinishFreehandWorkAsync(FreehandWork work)
+    {
+        FreehandResult computed;
+        try { computed = await Task.Run(() => ComputeFreehand(work)).ConfigureAwait(false); }
+        catch (Exception ex) {
+            System.Diagnostics.Trace.TraceError("Freehand processing: " + ex);
+            computed = new(work.Points, work.Starts, false, null, null, null, 0, 0, Lang.Error("fh.processingFailed", ex.Message));
+        }
+        try { await Dispatcher.InvokeAsync(() => {
+            freehandWorkerActive = false; freehandRunningWork = null;
+            bool current = work.Version == freehandWorkVersion;
+            if (current) {
+                if (computed.Processed) {
+                    freehandPoints.Clear(); freehandPoints.AddRange(computed.Points);
+                    freehandStrokes.Clear(); freehandStrokes.AddRange(computed.Starts);
+                    freehandNeedsProcessing = freehandReprocessAll = false;
+                }
+                if (computed.Failure is { } failure) {
+                    InvalidPlan(() => failure.Message, (failure as Lang.ValidationException)?.RangeFailure, false); checksSection.IsExpanded = true;
+                } else if (computed.Path is { } path && computed.Time is { } time && computed.Execution is { } plan) {
+                    trajectory = path; timing = time; execution = plan; pointTarget = time.At(0).Pose;
+                    ShowExecutionInfo(plan, computed.Asked); ShowDrawingPreview(work.Limits, computed.Shift);
+                } else {
+                    if (shape.SelectedIndex == FreehandIndex) Lang.Text(result, () => Lang.T("err.needPreview"));
+                    UpdateLamps(); RequestViewportRedraw();
+                }
+            }
+            StartFreehandWorker(); UpdateFreehandTools(); UpdatePointButton();
+            work.Done.TrySetResult(current);
+        }); }
+        catch (OperationCanceledException) { work.Done.TrySetResult(false); }
+        catch (InvalidOperationException) when (Dispatcher.HasShutdownStarted) { work.Done.TrySetResult(false); }
+    }
+
+    private static FreehandResult ComputeFreehand(FreehandWork work)
+    {
+        var points = work.Points.ToList(); var starts = work.Starts.ToArray(); bool processed = work.Process && work.Raw.Length == 0;
+        try {
+            if (work.Process && work.Raw.Length > 0) {
+                if (work.All) {
+                    points.Clear();
+                    int remaining = work.Raw.Sum(s => s.Length) - Math.Max(0, work.Raw.Length - 1);
+                    for (int i = 0; i < work.Raw.Length; i++) {
+                        int start = points.Count, skip = start == 0 ? 0 : 1;
+                        remaining -= work.Raw[i].Length - skip;
+                        var stroke = FreehandTrajectory.Smooth(work.Raw[i], work.Levels[i]);
+                        // Reserve the later raw strokes so Off can still restore every captured point.
+                        if (start + stroke.Length - skip + remaining > FreehandTrajectory.MaxPoints) stroke = work.Raw[i];
+                        starts[i] = start; points.AddRange(stroke.Skip(skip));
+                    }
+                } else {
+                    int start = starts[^1], first = Math.Max(0, start - 1);
+                    var stroke = FreehandTrajectory.Smooth(work.Raw[^1], work.Levels[^1]);
+                    if (first + stroke.Length > FreehandTrajectory.MaxPoints) stroke = work.Raw[^1];
+                    points.RemoveRange(start, points.Count - start); points.AddRange(stroke.Skip(start == 0 ? 0 : 1));
+                }
+                processed = true;
+            }
+            var draft = points.ToArray();
+            if (work.Model is not { } model) return new(draft, starts, processed, null, null, null, 0, 0, null);
+            int fit = work.Levels.DefaultIfEmpty(0).OrderBy(FreehandTrajectory.FitTolerance).First();
+            var repaired = FreehandTrajectory.Repair(draft, model, work.Limits, work.Branch, work.Rates, fit);
+            var path = DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, work.Branch, work.Limits,
+                new ShapeOptions { FreehandPoints = repaired.Points, FreehandFitLevel = fit });
+            var time = new TimedTrajectory(path, work.Rates); double asked = time.Duration;
+            var plan = new ExecutionTrajectory(time, work.Limits);
+            return new(draft, starts, processed, path, plan.Timing, plan, repaired.Shift, asked, null);
+        } catch (ArgumentException ex) { return new(points.ToArray(), starts, processed, null, null, null, 0, 0, ex); }
+    }
 
     private void BuildFreehandTools(Panel bar)
     {
@@ -49,19 +153,8 @@ public sealed partial class XYPreviewPanel
 
     private void ReprocessFreehand()
     {
-        freehandPoints.Clear(); freehandStrokes.Clear(); freehandLevels.Clear();
-        int level = freehandSmoothing.SelectedIndex;
-        int rawRemaining = freehandRawStrokes.Sum(s => s.Length) - Math.Max(0, freehandRawStrokes.Count - 1);
-        foreach (var raw in freehandRawStrokes) {
-            int start = freehandPoints.Count;
-            rawRemaining -= raw.Length - (start == 0 ? 0 : 1);
-            var processed = FreehandTrajectory.Smooth(raw, level);
-            int skip = start == 0 ? 0 : 1;
-            // Reserve space for later raw strokes so Off can always restore the complete captured draft.
-            if (start + processed.Length - skip + rawRemaining > FreehandTrajectory.MaxPoints) processed = raw;
-            freehandStrokes.Add(start); freehandLevels.Add(level);
-            freehandPoints.AddRange(processed.Skip(skip));
-        }
+        for (int i = 0; i < freehandLevels.Count; i++) freehandLevels[i] = freehandSmoothing.SelectedIndex;
+        freehandNeedsProcessing = freehandReprocessAll = true;
     }
 
     private void RefreshFreehandLanguage()
@@ -86,9 +179,9 @@ public sealed partial class XYPreviewPanel
 
     private void UpdateFreehandTools()
     {
-        if (previewButton is { } preview) preview.IsEnabled = editingAllowed && !RecordingFreehand;
-        if (saveButton is { } save) save.IsEnabled = editingAllowed && !RecordingFreehand;
-        if (sampleButton is { } sample) sample.IsEnabled = editingAllowed && !RecordingFreehand;
+        if (previewButton is { } preview) preview.IsEnabled = editingAllowed && !RecordingFreehand && !ProcessingFreehand;
+        if (saveButton is { } save) save.IsEnabled = editingAllowed && !RecordingFreehand && !ProcessingFreehand && !freehandNeedsProcessing;
+        if (sampleButton is { } sample) sample.IsEnabled = editingAllowed && !RecordingFreehand && !ProcessingFreehand;
         freehandSmoothingLabel.Visibility = freehandSmoothing.Visibility = shape.SelectedIndex == FreehandIndex ? Visibility.Visible : Visibility.Collapsed;
         freehandTool.IsEnabled = editingAllowed;
         freehandSmoothing.IsEnabled = editingAllowed && !RecordingFreehand;
@@ -110,7 +203,7 @@ public sealed partial class XYPreviewPanel
 
     private bool BeginFreehandStroke(Point screen)
     {
-        if (!editingAllowed || !freehandMode || shape.SelectedIndex != FreehandIndex || RecordingFreehand || !cameraReady || !Plot.Contains(screen)) return false;
+        if (!editingAllowed || ProcessingFreehand || !freehandMode || shape.SelectedIndex != FreehandIndex || RecordingFreehand || !cameraReady || !Plot.Contains(screen)) return false;
         Point world = ToWorld(screen);
         if (freehandPoints.Count > 0 && ((ToScreen(freehandPoints[^1].Point) - screen).Length > 10 || (freehandPoints[^1].Point - world).Length > 3)) {
             Lang.Text(result, () => Lang.T("fh.resumeNear")); return false;
@@ -142,13 +235,10 @@ public sealed partial class XYPreviewPanel
         if (freehandPoints.Count <= Math.Max(1, freehandStrokeStart)) { CancelFreehandStroke(); return; }
         int first = Math.Max(0, freehandStrokeStart - 1);
         var stroke = freehandPoints.Skip(first).ToArray();
-        var processed = FreehandTrajectory.Smooth(stroke, freehandSmoothing.SelectedIndex);
-        if (first + processed.Length > FreehandTrajectory.MaxPoints) processed = stroke; // Never grow a continuation past the saved-point limit.
-        freehandPoints.RemoveRange(freehandStrokeStart, freehandPoints.Count - freehandStrokeStart);
-        freehandPoints.AddRange(processed.Skip(freehandStrokeStart == 0 ? 0 : 1));
         freehandStrokes.Add(freehandStrokeStart); freehandLevels.Add(freehandSmoothing.SelectedIndex); freehandRawStrokes.Add(stroke);
+        freehandNeedsProcessing = true;
         freehandStrokeStart = -1; freehandPlot = null;
-        canvas.ReleaseMouseCapture(); UpdateFreehandTools(); UpdateLamps(); RedrawViewport();
+        canvas.ReleaseMouseCapture(); QueueFreehandWork(); UpdateLamps(); RedrawViewport();
     }
 
     private void CancelFreehandStroke()
@@ -169,17 +259,22 @@ public sealed partial class XYPreviewPanel
     {
         if (!editingAllowed || RecordingFreehand || shape.SelectedIndex != FreehandIndex || freehandStrokes.Count == 0) return;
         int start = freehandStrokes[^1]; freehandStrokes.RemoveAt(freehandStrokes.Count - 1); freehandLevels.RemoveAt(freehandLevels.Count - 1); freehandRawStrokes.RemoveAt(freehandRawStrokes.Count - 1);
-        freehandPoints.RemoveRange(start, freehandPoints.Count - start); InvalidateFreehand();
+        freehandPoints.RemoveRange(start, freehandPoints.Count - start);
+        if (freehandRawStrokes.Count == 0) freehandNeedsProcessing = freehandReprocessAll = false;
+        InvalidateFreehand();
+        if (freehandNeedsProcessing && freehandRawStrokes.Count > 0) QueueFreehandWork();
     }
 
     private void ClearFreehand()
     {
         if (!editingAllowed || shape.SelectedIndex != FreehandIndex) return;
-        CancelFreehandStroke(); freehandPoints.Clear(); freehandStrokes.Clear(); freehandLevels.Clear(); freehandRawStrokes.Clear(); InvalidateFreehand();
+        CancelFreehandStroke(); freehandPoints.Clear(); freehandStrokes.Clear(); freehandLevels.Clear(); freehandRawStrokes.Clear();
+        freehandNeedsProcessing = freehandReprocessAll = false; InvalidateFreehand();
     }
 
     private void RestoreFreehand(FreehandPoint[]? points)
     {
+        CancelFreehandWork(); freehandNeedsProcessing = freehandReprocessAll = false;
         CancelFreehandStroke(); freehandPoints.Clear(); freehandStrokes.Clear(); freehandLevels.Clear(); freehandRawStrokes.Clear();
         if (points is not null) freehandPoints.AddRange(points);
         if (freehandPoints.Count > 0) { freehandStrokes.Add(0); freehandLevels.Add(0); freehandRawStrokes.Add(freehandPoints.ToArray()); }

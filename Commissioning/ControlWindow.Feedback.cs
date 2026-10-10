@@ -58,7 +58,7 @@ public sealed partial class ControlWindow
             errorHistory.Enqueue(sample.Error1); while(errorHistory.Count > 600) errorHistory.Dequeue(); if (paint) DrawErrorPlot();
             if (experiment is { } recorder) {
                 recorder.Record(sample,uploading is not null ? "upload" : uploaded is not null ? "ready" : experimentPhase=="trajectory" ? "drawing" : "point",trajectoryIndex);
-                Lang.Text(experimentResult, () => recorder.MotionSamples==0 ? Lang.T("exp.savedWaiting", recorder.Samples) :
+                Lang.QueueText(experimentResult, () => recorder.MotionSamples==0 ? Lang.T("exp.savedWaiting", recorder.Samples) :
                     recorder.MotionSamples2 > 0 ? Lang.T("exp.live", recorder.Samples, recorder.Rmse, recorder.Peak, recorder.RmseElbow, recorder.PeakElbow) : Lang.T("exp.liveArm1", recorder.Samples, recorder.Rmse, recorder.Peak));
                 if(experimentPhase=="point" && pendingPoint==0 && ptp.Active==0 && sample.Sequence==experimentSequence) experimentCompleting="complete";
                 if (experimentCompleting is { } outcome) FinishExperiment(outcome);
@@ -86,7 +86,7 @@ public sealed partial class ControlWindow
         if (recorder is null) return;
         recorder.Finish(outcome); RecordExperimentOutcome(outcome, recorder);
         _ = xyPreview.RefreshRecentRunsAsync(); // Archive IO must not block the dispatcher heartbeat lease.
-        Lang.Text(experimentResult, () => Lang.T("exp.finished", outcome=="complete"?Lang.T("exp.complete"):Lang.T("exp.aborted"), recorder.Samples) +
+        Lang.QueueText(experimentResult, () => Lang.T("exp.finished", outcome=="complete"?Lang.T("exp.complete"):Lang.T("exp.aborted"), recorder.Samples) +
             (recorder.MotionSamples>0?Lang.T("exp.rmse", recorder.Rmse) + (recorder.MotionSamples2>0 ? Lang.T("exp.rmse2", recorder.RmseElbow) : "") + "\n":Lang.T("exp.noMotion")) +
             Lang.T("exp.savedNote"));
         diagnostics.IsExpanded = true;

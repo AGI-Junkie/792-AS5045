@@ -24,9 +24,26 @@ internal static class Lang
     // Retain the formatter, not yesterday's rendered status/error. No global control subscriptions.
     private static readonly DependencyProperty TextSourceProperty = DependencyProperty.RegisterAttached(
         "TextSource", typeof(Func<string>), typeof(Lang));
+    private static readonly DependencyProperty TextRefreshPendingProperty = DependencyProperty.RegisterAttached(
+        "TextRefreshPending", typeof(bool), typeof(Lang), new PropertyMetadata(false));
     internal static void Text(FrameworkElement element, Func<string> source)
     {
         element.SetValue(TextSourceProperty, source);
+        RefreshText(element);
+    }
+    // Split display-only editors so synchronous Windows text-service calls cannot add up in one input turn.
+    internal static void QueueText(TextBox element, Func<string>? source = null)
+    {
+        if (source is not null) element.SetValue(TextSourceProperty, source);
+        if (element.IsLoaded) {
+            if ((bool)element.GetValue(TextRefreshPendingProperty)) return;
+            element.SetValue(TextRefreshPendingProperty, true);
+            element.Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, new Action(() => {
+                element.ClearValue(TextRefreshPendingProperty);
+                RefreshText(element);
+            }));
+            return;
+        }
         RefreshText(element);
     }
     internal static void RefreshText(FrameworkElement element)
@@ -608,6 +625,7 @@ internal static class Lang
         ["state.inputsEmpty"] = ("输入尚未读取", "Inputs not read yet"),
         ["inputs.raw"] = ("输入电平（0＝触发）：", "Input levels (0 = active): "),
         ["state.needPort"] = ("请选择 KitProg 的 COM 口", "Select the KitProg COM port first"),
+        ["state.writerStopping"] = ("上次连接的发送线程还未退出，请稍后重试连接。", "The previous connection's writer is still stopping. Try connecting again shortly."),
         ["state.logSaved"] = ("日志自动保存：", "Log auto-saved: "),
         ["state.connected"] = ("已连接，等待 stage1-v3 / stage2 固件状态；不会自动使能",
             "Connected, waiting for stage1-v3 / stage2 firmware state; will not auto-enable"),
@@ -805,6 +823,8 @@ internal static class Lang
         ["xy.shape10"] = ("自定义轮廓", "Custom contour"),
         ["xy.shape11"] = ("手绘", "Freehand"),
         ["fh.smoothing"] = ("平滑", "Smoothing"),
+        ["fh.processing"] = ("正在处理手绘轨迹…", "Processing freehand trajectory…"),
+        ["fh.processingFailed"] = ("手绘处理失败：{0}", "Freehand processing failed: {0}"),
         ["fh.off"] = ("关闭", "Off"),
         ["fh.low"] = ("低 · 2 mm", "Low · 2 mm"),
         ["fh.medium"] = ("中 · 3 mm", "Medium · 3 mm"),

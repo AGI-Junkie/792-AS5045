@@ -7,11 +7,11 @@ namespace TwoLinkCommissioning;
 // type 12 (one at a time, retried byte for byte like the other control requests); loading is type 13 on the PTP sequence.
 public sealed partial class ControlWindow
 {
-    private sealed class StoreJob(StoreOp op, int slot, Action<bool, string>? done)
+    private sealed class StoreJob(StoreOp op, int slot, Action<bool, Func<string>>? done)
     {
         public StoreOp Op { get; } = op;
         public int Slot { get; } = slot;
-        public Action<bool, string>? Done { get; } = done;
+        public Action<bool, Func<string>>? Done { get; } = done;
         public DateTime RequestedAt { get; set; } = DateTime.UtcNow;
         public DateTime LastSeenAt { get; set; } = DateTime.UtcNow;
         public int Attempts { get; set; } = 1;
@@ -61,7 +61,7 @@ public sealed partial class ControlWindow
         boardSlots, boardLedger, boardMessage);
     private void SetBoardMessage(Func<string>? message) { boardMessage = message; PublishBoard(); }
 
-    private bool StartStoreJob(StoreOp op, int slot, Action<bool, string>? done)
+    private bool StartStoreJob(StoreOp op, int slot, Action<bool, Func<string>>? done)
     {
         if (!StoreAvailable || storeJob is not null) return false;
         lock (wireSync)
@@ -76,7 +76,7 @@ public sealed partial class ControlWindow
         return true;
     }
 
-    private void FinishStoreJob(bool ok, string message)
+    private void FinishStoreJob(bool ok, Func<string> message)
     {
         if (storeJob is not { } job) return;
         storeJob = null;
@@ -112,7 +112,7 @@ public sealed partial class ControlWindow
         double quiet = (now - job.LastSeenAt).TotalSeconds;
         if (!job.Acked)
         {
-            if ((now - job.RequestedAt).TotalSeconds > 8 || (job.Attempts >= 3 && quiet >= StoreAnswerSeconds * 3)) { FinishStoreJob(false, Lang.T("board.err.noAnswer")); return; }
+            if ((now - job.RequestedAt).TotalSeconds > 8 || (job.Attempts >= 3 && quiet >= StoreAnswerSeconds * 3)) { FinishStoreJob(false, () => Lang.T("board.err.noAnswer")); return; }
             if (job.Sequence != 0 && job.Attempts < 3 && quiet >= StoreAnswerSeconds * job.Attempts)
             {
                 lock (wireSync) { if (pendingControlType != 0) return; storeResend = true; pendingControlType = 12; }
@@ -120,7 +120,7 @@ public sealed partial class ControlWindow
                 Append($"HOST archive retry attempt={job.Attempts}/3; identical packet", LogLevel.Warning);
             }
         }
-        else if (quiet > (job.Op == StoreOp.Query ? 3 : StoreWorkSeconds)) FinishStoreJob(false, Lang.T("board.err.stalled"));
+        else if (quiet > (job.Op == StoreOp.Query ? 3 : StoreWorkSeconds)) FinishStoreJob(false, () => Lang.T("board.err.stalled"));
     }
 
     private void ObserveStoreLine(string line)
@@ -150,10 +150,10 @@ public sealed partial class ControlWindow
                 StoreOp.Save => status.Last == "saved" && status.LastSlot == job.Slot,
                 _ => status.Last == "erased" && status.LastSlot == job.Slot,
             };
-            FinishStoreJob(ok, ok ? "" : Lang.T("board.err.device", status.Last));
+            FinishStoreJob(ok, () => ok ? "" : Lang.T("board.err.device", status.Last));
         }
         else if (line.StartsWith("TRAJ_STORE refused:", StringComparison.Ordinal) && !job.Acked)
-            FinishStoreJob(false, Lang.T("board.err.refused", line[19..].Trim()));
+            FinishStoreJob(false, () => Lang.T("board.err.refused", line[19..].Trim()));
     }
 
     // ---- what the panel asks for ----------------------------------------------------------------------------------------
@@ -199,7 +199,7 @@ public sealed partial class ControlWindow
         if (!StartStoreJob(StoreOp.Save, slot, (ok, message) =>
         {
             if (ok) { RememberBoard(slot, crc, settings); SetBoardMessage(() => Lang.T("board.saved", slot + 1)); }
-            else SetBoardMessage(() => Lang.T("board.saveFailed", slot + 1, message));
+            else SetBoardMessage(() => Lang.T("board.saveFailed", slot + 1, message()));
         })) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
         SetBoardMessage(() => Lang.T("board.saving", slot + 1));
     }
@@ -218,7 +218,7 @@ public sealed partial class ControlWindow
         if (StartStoreJob(StoreOp.Erase, slot, (ok, message) =>
         {
             if (ok) { RememberBoard(slot, 0, null); SetBoardMessage(() => Lang.T("board.erased", slot + 1)); }
-            else SetBoardMessage(() => Lang.T("board.eraseFailed", slot + 1, message));
+            else SetBoardMessage(() => Lang.T("board.eraseFailed", slot + 1, message()));
         })) SetBoardMessage(() => Lang.T("board.erasing", slot + 1));
     }
 
@@ -362,20 +362,20 @@ public sealed partial class ControlWindow
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=1/1 seq={saveSeq} last=saved last_slot=0 row_max_us=4000");
             Check(done && ok && w.storeJob is { Op: StoreOp.Query } && !w.boardKnown, "the end of the save was not taken and read back with the inventory distrusted meanwhile");
             // A failed save, a refusal, silence: each ends the job as failed; a refusal needs no waiting.
-            w.FinishStoreJob(true, "");
+            w.FinishStoreJob(true, () => "");
             done = false; Check(w.StartStoreJob(StoreOp.Save, 2, (success, _) => { done = true; ok = success; }), "save 2 queued"); Next(12); uint failSeq = w.storeJob!.Sequence;
             w.HandleLine($"TRAJ_STORE state=idle slot=2 rows=3/12 seq={failSeq} last=failed last_slot=2 row_max_us=0");
             Check(done && !ok, "a failed save was reported as done");
             Check(w.storeJob is { Op: StoreOp.Query } && !w.boardKnown, "a failed save did not trigger a read-back and distrust of the inventory");
-            w.FinishStoreJob(true, "");
+            w.FinishStoreJob(true, () => "");
             done = false; Check(w.StartStoreJob(StoreOp.Erase, 1, (success, _) => { done = true; ok = success; }), "erase queued");
             w.HandleLine("TRAJ_STORE refused: stage not idle");
             Check(done && !ok && w.storeJob is { Op: StoreOp.Query }, "a refusal did not end the job (and read the board back)");
-            w.FinishStoreJob(true, "");
+            w.FinishStoreJob(true, () => "");
             done = false; Check(w.StartStoreJob(StoreOp.Erase, 1, (success, _) => { done = true; ok = success; }), "erase queued again"); Next(12);
             for (int later = 30; later < 40 && !done; later++) w.PollStoreJob(DateTime.UtcNow.AddSeconds(later));   // stops at the first poll that gives up
             Check(done && !ok && w.storeJob is { Op: StoreOp.Query }, "silence did not end the job (and read the board back)");
-            w.FinishStoreJob(true, "");
+            w.FinishStoreJob(true, () => "");
             // Disconnecting forgets the board; a stop forgets a pending save.
             w.pendingBoardSave = (nodes, 0, "shape=3");
             w.ResetBoard();
