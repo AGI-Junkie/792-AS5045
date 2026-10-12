@@ -165,8 +165,10 @@ public sealed partial class XYPreviewPanel
     {
         viewportRedrawTimer.Stop();
         try {
-            if(overlayLimits is null) { canvas.Children.Clear(); return; }
+            // No joint range to overlay: nothing is drawn, except the board's plan, which is a picture of its own and has no use for one.
+            if(overlayLimits is null) { if(boardView is not null && timing is null) DrawBoardSample(); else canvas.Children.Clear(); return; }
             if(timing is not null) DrawSample();
+            else if(boardView is not null) DrawBoardSample();
             else if(pointTarget is {} pose) {
                 var model=Model; var tip=model.Forward(pose).Tip;
                 Draw(model,pose,tip.X,tip.Y,planningLimits is null || planningLimits.Value.Contains(pose), Reachability(model).IsReachable(tip));
@@ -280,6 +282,7 @@ public sealed partial class XYPreviewPanel
                 var finish=ToScreen(path.Samples[^1].Target); Circle(plot,finish,4,WorkbenchTheme.Teal,WorkbenchTheme.Teal); Label(plot,Lang.T("vp.end"),finish+new Vector(8,-22),fit:Plot);
             }
         }
+        if(boardView is {} saved) DrawBoardPath(plot,saved.Path);
         var color=inRange || follow?WorkbenchTheme.Blue:WorkbenchTheme.Red;
         var secondColor=inRange || follow?Brushes.SlateBlue:WorkbenchTheme.Red;
         if(showPreview || follow) {

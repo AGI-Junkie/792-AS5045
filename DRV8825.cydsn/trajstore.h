@@ -14,6 +14,14 @@
  * `contract` says which joint-angle convention the nodes use; raise TS_CONTRACT when that changes and every old slot
  * becomes invalid instead of being drawn wrong.  A block is valid only when the header and the data both check out.
  *
+ * Description (optional).  The host may keep a short text with a plan (which figure and settings made it, so another computer
+ * can show and restore it).  The device never reads it: it stores up to TS_META_MAX opaque bytes in row TS_META_ROW0, the first
+ * row after the largest plan, and records them in the header row after the old fields:
+ *   32 metaLen u16   34 0xFFFF   36 metaCrc u32 (of the text)   40 extCrc u32 (bytes 32..39)
+ * Older firmware never looks past byte 31 and leaves 0xFF there, so a block without a description (or one written by older
+ * firmware) reads as "no description", and a block with one is still a good plan to older firmware.  The text row is written
+ * before the header, so the header row commits plan and description together.
+ *
  * Saving never touches the newest valid block of the slot: the other block is invalidated, filled row by row (each row
  * read back), and only then given its header, with seq one higher.  Power lost at any point leaves the old block (or an
  * invalid new one), never a half plan.  Nothing here is called from an interrupt; the save runs one row per foreground
@@ -32,6 +40,8 @@
 #define TS_REGION_BYTES     (TS_SLOTS * 2u * TS_BLOCK_BYTES)
 #define TS_NODE_BYTES       (6u)
 #define TS_DATA_ROWS_MAX    ((TRAJ_CAPACITY * TS_NODE_BYTES + TS_ROW_BYTES - 1u) / TS_ROW_BYTES)
+#define TS_META_ROW0        (1u + TS_DATA_ROWS_MAX)   /* the description sits in the spare row after a full plan */
+#define TS_META_MAX         (TS_ROW_BYTES)
 #define TS_MAGIC            (0x534A5254u)        /* "TRJS" */
 #define TS_VERSION          (1u)
 #define TS_CONTRACT         (1u)
@@ -43,6 +53,7 @@ extern const uint8 __trajstore_start[] __attribute__((weak));
 #define TS_LINKED() ((uint32)__trajstore_start == (uint32)(CYDEV_FLASH_BASE + TS_REGION_OFFSET))
 #endif
 _Static_assert(TS_DATA_ROWS_MAX + 1u <= TS_BLOCK_ROWS, "a full plan must fit in one block");
+_Static_assert(TS_META_ROW0 + 1u <= TS_BLOCK_ROWS, "the description row must fit in one block");
 _Static_assert(TS_REGION_OFFSET + TS_REGION_BYTES <= 0x40000u, "the archive must fit in the 256 KB flash");
 
 /* ---- little-endian helpers and CRC-32 (IEEE, reflected, the same as zlib/.NET callers compute) ----------------------- */
@@ -82,6 +93,7 @@ typedef struct {
     uint16 count;
     uint32 seq, durationMs, dataCrc;
     int16  q1, q2;                /* start pose, cdeg: node 0 */
+    uint16 metaLen;               /* 0 = no (valid) description */
 } ts_info_t;
 
 static uint32 ts_block_offset(uint8 slot, uint8 which) { return TS_REGION_OFFSET + ((uint32)slot * 2u + which) * TS_BLOCK_BYTES; }
@@ -96,6 +108,12 @@ static uint8 ts_check_block(const uint8 *blk, uint8 slot, ts_info_t *info)
         ts_crc32(0u, blk + TS_ROW_BYTES, (uint32)count * TS_NODE_BYTES) != ts_get32(blk + 24)) { return 0u; }
     info->valid = 1u; info->count = count; info->seq = ts_get32(blk + 12); info->durationMs = ts_get32(blk + 16);
     info->q1 = (int16)ts_get16(blk + 20); info->q2 = (int16)ts_get16(blk + 22); info->dataCrc = ts_get32(blk + 24);
+    info->metaLen = 0u;
+    {
+        uint16 len = ts_get16(blk + 32);
+        if (len >= 1u && len <= TS_META_MAX && ts_crc32(0u, blk + 32, 8u) == ts_get32(blk + 40) &&
+            ts_crc32(0u, blk + TS_META_ROW0 * TS_ROW_BYTES, len) == ts_get32(blk + 36)) { info->metaLen = len; }
+    }
     return 1u;
 }
 
@@ -120,11 +138,13 @@ typedef enum { TS_STEP_MORE = 0, TS_STEP_DONE = 1, TS_STEP_FAIL = 2 } ts_step_t;
 
 typedef struct {
     uint8  busy, kind, slot, which;       /* which: the block being written (erase: the one being cleared) */
-    uint8  phase;                         /* 0 clear the header, 1 data rows, 2 commit the header */
+    uint8  phase;                         /* 0 clear the header, 1 data rows, 3 description row (if any), 2 commit the header */
+    uint8  mismatch;                      /* the description was made for another plan: nothing was committed */
     uint16 row, rows;                     /* next data row (1-based) / how many there are */
-    uint16 count;
-    uint32 seq, crc, durationMs;
+    uint16 count, metaLen;
+    uint32 seq, crc, durationMs, planCrc;
     const traj_node_t *nodes;             /* the RAM plan; the caller keeps it unchanged while busy */
+    const uint8 *meta;                    /* the description (metaLen bytes, 0 = none); also kept unchanged while busy */
     uint32 rowMaxCy;                      /* slowest row write, SysTick cycles */
     uint32 rowsWritten;
     uint8  buf[TS_ROW_BYTES];
@@ -132,7 +152,10 @@ typedef struct {
 
 static uint8 ts_write_row(uint32 offset, const uint8 *row);   /* main.c: program one row at offset and read it back; 1 = ok */
 
-static void ts_job_save(ts_job_t *j, uint8 slot, const traj_node_t *nodes, uint16 count, uint32 durationMs)
+/* `meta` (metaLen > 0) is written with the plan, but only if planCrc is the CRC of the node stream actually written: a
+ * description made for another plan is never committed. */
+static void ts_job_save(ts_job_t *j, uint8 slot, const traj_node_t *nodes, uint16 count, uint32 durationMs,
+                        const uint8 *meta, uint16 metaLen, uint32 planCrc)
 {
     ts_info_t cur;
     ts_active(slot, &cur);
@@ -141,6 +164,7 @@ static void ts_job_save(ts_job_t *j, uint8 slot, const traj_node_t *nodes, uint1
     j->which = cur.valid ? (uint8)(cur.which ^ 1u) : 0u;
     j->seq = cur.valid ? cur.seq + 1u : 1u;
     j->nodes = nodes; j->count = count; j->durationMs = durationMs;
+    j->meta = meta; j->metaLen = meta ? metaLen : 0u; j->planCrc = planCrc;
     j->rows = (uint16)(((uint32)count * TS_NODE_BYTES + TS_ROW_BYTES - 1u) / TS_ROW_BYTES);
     j->row = 1u;
 }
@@ -172,7 +196,16 @@ static ts_step_t ts_step(ts_job_t *j)
         j->crc = ts_crc32(j->crc, j->buf, n);
         ok = ts_write_row(base + (uint32)j->row * TS_ROW_BYTES, j->buf);
         j->rowsWritten++;
-        if (ok && ++j->row > j->rows) { j->phase = 2u; }
+        if (ok && ++j->row > j->rows) {
+            if (j->metaLen && j->planCrc != j->crc) { ok = 0u; j->mismatch = 1u; }
+            else { j->phase = j->metaLen ? 3u : 2u; }
+        }
+    } else if (j->phase == 3u) {
+        memset(j->buf, 0xFF, TS_ROW_BYTES);
+        memcpy(j->buf, j->meta, j->metaLen);
+        ok = ts_write_row(base + TS_META_ROW0 * TS_ROW_BYTES, j->buf);
+        j->rowsWritten++;
+        if (ok) { j->phase = 2u; }
     } else {
         memset(j->buf, 0xFF, TS_ROW_BYTES);
         ts_put32(j->buf, TS_MAGIC); ts_put16(j->buf + 4, TS_VERSION); ts_put16(j->buf + 6, TS_CONTRACT);
@@ -181,6 +214,11 @@ static ts_step_t ts_step(ts_job_t *j)
         ts_put16(j->buf + 20, (uint16)j->nodes[0].q1); ts_put16(j->buf + 22, (uint16)j->nodes[0].q2);
         ts_put32(j->buf + 24, j->crc);
         ts_put32(j->buf + 28, ts_crc32(0u, j->buf, 28u));
+        if (j->metaLen) {
+            ts_put16(j->buf + 32, j->metaLen);
+            ts_put32(j->buf + 36, ts_crc32(0u, j->meta, j->metaLen));
+            ts_put32(j->buf + 40, ts_crc32(0u, j->buf + 32, 8u));
+        }
         ok = ts_write_row(base, j->buf);
         j->rowsWritten++;
         if (ok) { j->busy = 0u; }

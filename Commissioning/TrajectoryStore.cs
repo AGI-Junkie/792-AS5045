@@ -8,7 +8,7 @@ namespace TwoLinkCommissioning;
 
 // Host side of the device's flash archive of finished trajectories (docs/TRAJ_STORE.md, protocol types 12 and 13).
 
-public enum StoreOp : short { Query = 1, Save = 2, Erase = 3 }
+public enum StoreOp : short { Query = 1, Save = 2, Erase = 3, Meta = 4, Nodes = 5 }   // Meta: read back one slot's description; Nodes: its nodes
 
 // One archive slot as the device reports it (TRAJ_SLOT line).  Crc is the CRC-32 of the node stream, the same value PlanCrc
 // computes for a plan on this side, so "is this plan already on the board" is a number comparison.
@@ -30,6 +30,50 @@ public sealed record BoardSlot(int Slot, bool Valid, uint Seq, int Nodes, int Du
     }
 }
 
+// The description a computer keeps with a plan on the board: a short text of the settings that made it (the same "key=value;"
+// text the experiment archive records), so another computer can name the figure and restore its settings.  The device stores the
+// bytes and gives them back without reading them (docs/TRAJ_STORE.md); it is sent four bytes per frame, type 14.
+public sealed record BoardMeta(int Slot, uint Seq, string Text)
+{
+    public const int MaxBytes = 256;                    // TS_META_MAX; the device advertises the value it really has (traj_meta=<n>)
+    private static readonly Regex Pattern = new(@"^TRAJ_META slot=(\d+) seq=(\d+) len=(\d+) crc=([0-9A-F]{8}) hex=([0-9A-F]+)$", RegexOptions.CultureInvariant);
+    // The answer to a type 12 op 4 query.  A damaged line (length or CRC off, a byte that is not printable ASCII) gives null.
+    public static BoardMeta? Parse(string line)
+    {
+        var m = Pattern.Match(line);
+        if (!m.Success || !int.TryParse(m.Groups[1].Value, out int slot) || slot is < 0 or >= DeviceContract.TrajStoreSlots ||
+            !uint.TryParse(m.Groups[2].Value, out uint seq) || !int.TryParse(m.Groups[3].Value, out int len) || len is < 1 or > MaxBytes ||
+            !uint.TryParse(m.Groups[4].Value, System.Globalization.NumberStyles.HexNumber, null, out uint crc) || m.Groups[5].Value.Length != len * 2) return null;
+        byte[] bytes = Convert.FromHexString(m.Groups[5].Value);
+        if (TrajectoryArchive.Crc32(bytes) != crc || bytes.Any(b => b is < 0x20 or > 0x7E)) return null;
+        return new BoardMeta(slot, seq, Encoding.ASCII.GetString(bytes));
+    }
+
+    // What of a figure's settings is worth keeping on the board: the figure, its transform and speeds (what the recent runs
+    // restore), and the link lengths (so a different machine setup can be told).  Null when it does not fit or is not plain text.
+    private static readonly string[] Keys = ["shape", "branch", "x", "y", "a", "b", "c", "rot", "scale", "dir", "v1", "v2", "a1", "a2", "L1", "L2"];
+    public static string? TextFor(string settings, int max = MaxBytes)
+    {
+        var kept = settings.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Where(part => part.IndexOf('=') is int eq and > 0 && Keys.Contains(part[..eq].Trim()));
+        string text = string.Join(";", kept);
+        return text.Length is > 0 && text.Length <= max && text.All(c => c is >= ' ' and <= '~') ? text : null;
+    }
+
+    // The frames' data: the stream the device checks (text length, CRC-32 of the text, CRC-32 of the plan's node stream, the text),
+    // cut into four-byte chunks; the chunk number travels in the frame.
+    public static byte[][] Chunks(string text, uint planCrc)
+    {
+        byte[] body = Encoding.ASCII.GetBytes(text);
+        var stream = new byte[(12 + body.Length + 3) / 4 * 4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(stream, (ushort)body.Length);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(stream.AsSpan(4), TrajectoryArchive.Crc32(body));
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(stream.AsSpan(8), planCrc);
+        body.CopyTo(stream, 12);
+        return Enumerable.Range(0, stream.Length / 4).Select(i => stream[(i * 4)..(i * 4 + 4)]).ToArray();
+    }
+}
+
 // The device's account of the archive job: the receipt of a type 12 command and its progress and end.
 public sealed record StoreStatus(string State, int Slot, int RowsDone, int RowsTotal, uint Seq, string Last, int LastSlot, int RowMaxUs)
 {
@@ -42,6 +86,23 @@ public sealed record StoreStatus(string State, int Slot, int RowsDone, int RowsT
             !uint.TryParse(m.Groups[5].Value, out uint seq) || !int.TryParse(m.Groups[7].Value, out int lastSlot) || !int.TryParse(m.Groups[8].Value, out int rowMax) ||
             slot >= DeviceContract.TrajStoreSlots || lastSlot >= DeviceContract.TrajStoreSlots || done > total) return null;
         return new StoreStatus(m.Groups[1].Value, slot, done, total, seq, m.Groups[6].Value, lastSlot, rowMax);
+    }
+}
+
+// A run of a slot's nodes as the device sends it (type 12 op 5): the node bytes exactly as stored.  Seq is the slot's save counter, so
+// a read that crosses a re-save is noticed; the whole stream is checked against the slot's CRC when the last run is in.
+public sealed record BoardNodes(int Slot, uint Seq, int Total, int First, byte[] Bytes)
+{
+    public const int MaxPerLine = 40;                   // STORE_NODES_LINE
+    public int Count => Bytes.Length / 6;
+    private static readonly Regex Pattern = new(@"^TRAJ_NODES slot=(\d+) seq=(\d+) total=(\d+) first=(\d+) count=(\d+) hex=([0-9A-F]+)$", RegexOptions.CultureInvariant);
+    public static BoardNodes? Parse(string line)
+    {
+        var m = Pattern.Match(line);
+        if (!m.Success || !int.TryParse(m.Groups[1].Value, out int slot) || slot is < 0 or >= DeviceContract.TrajStoreSlots || !uint.TryParse(m.Groups[2].Value, out uint seq) ||
+            !int.TryParse(m.Groups[3].Value, out int total) || total is < 2 or > DeviceContract.TrajCapacity || !int.TryParse(m.Groups[4].Value, out int first) || first < 0 || first >= total ||
+            !int.TryParse(m.Groups[5].Value, out int count) || count is < 1 or > MaxPerLine || first + count > total || m.Groups[6].Value.Length != count * 12) return null;
+        return new BoardNodes(slot, seq, total, first, Convert.FromHexString(m.Groups[6].Value));
     }
 }
 
@@ -73,6 +134,18 @@ public static class TrajectoryArchive
         return bytes;
     }
     public static uint PlanCrc(IReadOnlyList<ExecutionNode> nodes) => Crc32(Stream(nodes));
+    // The inverse of Stream: the nodes a stored plan holds (0.01 degree and ms, as the device keeps them).
+    public static ExecutionNode[] Nodes(ReadOnlySpan<byte> stream)
+    {
+        var nodes = new ExecutionNode[stream.Length / 6];
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            var span = stream[(i * 6)..];
+            nodes[i] = new ExecutionNode(new JointPose(System.Buffers.Binary.BinaryPrimitives.ReadInt16LittleEndian(span) / 100.0, System.Buffers.Binary.BinaryPrimitives.ReadInt16LittleEndian(span[2..]) / 100.0),
+                System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(span[4..]));
+        }
+        return nodes;
+    }
 
     // The slot holding exactly this plan (same node bytes, so the same drawing at the same speeds), if any.
     public static BoardSlot? SlotFor(IReadOnlyList<BoardSlot?> slots, IReadOnlyList<ExecutionNode> nodes)
@@ -118,7 +191,23 @@ public static class BoardLedger
         if (settings is not null) entries.Add(new LedgerEntry(slot, crc, settings));
         Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
         File.WriteAllText(FilePath + ".tmp", JsonSerializer.Serialize(entries.OrderBy(e => e.Slot)), new UTF8Encoding(false));
-        File.Move(FilePath + ".tmp", FilePath, true);
+        // A virus scanner may still hold the file it has just seen written: the rename is tried a few times before it is given up.
+        for (int attempt = 1; ; attempt++)
+        {
+            try { File.Move(FilePath + ".tmp", FilePath, true); break; }
+            catch (Exception ex) when (attempt < 5 && ex is IOException or UnauthorizedAccessException) { Thread.Sleep(40 * attempt); }
+        }
+    }
+
+    // What is known about each slot: the description stored on the board wins (it belongs to the plan in that slot by
+    // construction); the file on this computer fills in the slots without one (saved by older firmware).
+    public static List<LedgerEntry> Merge(IReadOnlyList<BoardSlot?> slots, IReadOnlyList<BoardMeta?> metas, IEnumerable<LedgerEntry> local)
+    {
+        var merged = new List<LedgerEntry>();
+        for (int i = 0; i < slots.Count && i < metas.Count; i++)
+            if (slots[i] is { Valid: true } slot && metas[i] is { } meta && meta.Seq == slot.Seq) merged.Add(new LedgerEntry(i, slot.Crc, meta.Text));
+        merged.AddRange(local.Where(e => merged.All(m => m.Slot != e.Slot)));
+        return merged;
     }
 
     // The entry for a slot, only while the device still reports the plan it was recorded for.
@@ -131,7 +220,9 @@ public static class BoardLedger
         Check(Crc32("123456789"u8) == 0xCBF43926u, "CRC-32 of 123456789 must be CBF43926");
         Check(BoardSlot.Parse("TRAJ_SLOT slot=2 valid=0") is { Slot: 2, Valid: false }, "empty slot line");
         Check(BoardSlot.Parse("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=-5686 q2=5871 crc=BD3EB746") is { Valid: true, Seq: 3, Nodes: 485, DurationMs: 60480, Q1Cd: -5686, Q2Cd: 5871, Crc: 0xBD3EB746 }, "valid slot line");
-        foreach (string bad in new[] { "TRAJ_SLOT slot=4 valid=0", "TRAJ_SLOT slot=0 valid=1", "TRAJ_SLOT slot=0 valid=0 seq=1", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=1 duration_ms=5 q1=0 q2=0 crc=00000000",
+        // Nothing follows the CRC on a slot line (an older host parses it end-anchored); the description is asked for slot by slot.
+        foreach (string bad in new[] { "TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746 meta=257", "TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746 meta=",
+            "TRAJ_SLOT slot=1 valid=0 meta=5", "TRAJ_SLOT slot=4 valid=0", "TRAJ_SLOT slot=0 valid=1", "TRAJ_SLOT slot=0 valid=0 seq=1", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=1 duration_ms=5 q1=0 q2=0 crc=00000000",
             "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=2049 duration_ms=5 q1=0 q2=0 crc=00000000", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=18001 q2=0 crc=00000000",
             "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=0 q2=0 crc=bd3eb746", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=0 q1=0 q2=0 crc=BD3EB746",
             "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=-2147483648 q2=0 crc=BD3EB746", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=0 q2=-2147483648 crc=BD3EB746" })
@@ -159,12 +250,55 @@ public static class BoardLedger
         var load = Decode(PtpProtocol.EncodeLoad(9, 7, 1));
         Check(load[0] == 13 && BitConverter.ToInt16(load, 9) == 1 && BitConverter.ToInt16(load, 11) == 0 && BitConverter.ToUInt16(load, 13) == 0, "load packet");
         foreach (var refused in new Action[] { () => PtpProtocol.EncodeStore(0, 7, 0, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 0, 0, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 7, 4, StoreOp.Save),
-            () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Erase), () => PtpProtocol.EncodeStore(1, 7, 0, (StoreOp)4), () => PtpProtocol.EncodeLoad(1, 7, 4), () => PtpProtocol.EncodeLoad(1, 7, -1) })
+            () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Erase), () => PtpProtocol.EncodeStore(1, 7, 0, (StoreOp)6), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Nodes, 2048), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Nodes, -1), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Save, 1), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Nodes), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Meta), () => PtpProtocol.EncodeStore(1, 7, 4, StoreOp.Meta),
+            () => PtpProtocol.EncodeMeta(1, 7, 0, new byte[3]), () => PtpProtocol.EncodeMeta(1, 7, 67, new byte[4]), () => PtpProtocol.EncodeMeta(1, 7, -1, new byte[4]), () => PtpProtocol.EncodeMeta(0, 7, 0, new byte[4]), () => PtpProtocol.EncodeLoad(1, 7, 4), () => PtpProtocol.EncodeLoad(1, 7, -1) })
         {
             bool threw = false;
             try { refused(); } catch (ArgumentException) { threw = true; }
             Check(threw, "an invalid archive packet was encoded");
         }
+        // The description kept with a plan: only the keys that restore a figure (and the link lengths), as plain text that fits.
+        const string settings = "shape=3; branch=0; L1=181.5; L2=176.38; x=340; y=0; a=10; b=6; feed=1; v1=6.5; v2=3; a1=10; a2=6; min1=-1; max1=1; emin=-1; emax=1; c=; rot=20; scale=1.2; dir=cw; custom_chars=0";
+        string text = BoardMeta.TextFor(settings) ?? "";
+        Check(text == "shape=3;branch=0;L1=181.5;L2=176.38;x=340;y=0;a=10;b=6;v1=6.5;v2=3;a1=10;a2=6;c=;rot=20;scale=1.2;dir=cw", "description text: " + text);
+        Check(BoardMeta.TextFor("feed=1; min1=2") is null && BoardMeta.TextFor("shape=\u00e9") is null && BoardMeta.TextFor("x=" + new string('9', 300)) is null && BoardMeta.TextFor(settings, 20) is null, "descriptions that must not be sent");
+        // Cut into four-byte chunks: text length, 0, CRC-32 of the text, CRC-32 of the plan, the text; the chunk number rides in the frame.
+        var chunks = BoardMeta.Chunks(text, 0x12345678);
+        var body = chunks.SelectMany(c => c).ToArray();
+        Check(chunks.Length == (12 + text.Length + 3) / 4 && chunks.All(c => c.Length == 4) && BitConverter.ToUInt16(body, 0) == text.Length && BitConverter.ToUInt16(body, 2) == 0 &&
+              BitConverter.ToUInt32(body, 4) == Crc32(Encoding.ASCII.GetBytes(text)) && BitConverter.ToUInt32(body, 8) == 0x12345678 && Encoding.ASCII.GetString(body, 12, text.Length) == text, "description stream");
+        var chunkFrame = Decode(PtpProtocol.EncodeMeta(8, 7, 2, chunks[2]));
+        Check(chunkFrame[0] == 14 && BitConverter.ToUInt32(chunkFrame, 1) == 8 && BitConverter.ToUInt32(chunkFrame, 5) == 7 && chunkFrame[9..13].SequenceEqual(chunks[2]) && BitConverter.ToUInt16(chunkFrame, 13) == 2 &&
+              BitConverter.ToUInt16(chunkFrame, 15) == PtpProtocol.Crc(chunkFrame.AsSpan(0, 15)), "description chunk frame");
+        var op4 = Decode(PtpProtocol.EncodeStore(9, 7, 2, StoreOp.Meta));
+        Check(op4[0] == 12 && BitConverter.ToInt16(op4, 9) == 2 && BitConverter.ToInt16(op4, 11) == 4, "description query frame");
+        // Type 12 op 5 asks for a slot's nodes from node `first` on; the answer is the node bytes as stored.
+        var ask = Decode(PtpProtocol.EncodeStore(10, 7, 1, StoreOp.Nodes, 40));
+        Check(ask[0] == 12 && BitConverter.ToInt16(ask, 9) == 1 && BitConverter.ToInt16(ask, 11) == 5 && BitConverter.ToUInt16(ask, 13) == 40, "node query frame");
+        var plan = new[] { new ExecutionNode(new JointPose(-1.25, 2.5), 0), new ExecutionNode(new JointPose(0.01, -180), 500), new ExecutionNode(new JointPose(179.99, 0), 50) };
+        Check(TrajectoryArchive.Nodes(Stream(plan)).SequenceEqual(plan), "nodes read back are not the nodes stored");
+        string NodeLine(int slot = 1, uint seq = 4, int total = 3, int first = 0, int count = 3, string? hex = null) =>
+            $"TRAJ_NODES slot={slot} seq={seq} total={total} first={first} count={count} hex={hex ?? Convert.ToHexString(Stream(plan))}";
+        Check(BoardNodes.Parse(NodeLine()) is { Slot: 1, Seq: 4, Total: 3, First: 0, Count: 3 } run && run.Bytes.SequenceEqual(Stream(plan)), "node line");
+        foreach (string bad in new[] { NodeLine(count: 2), NodeLine(first: 1), NodeLine(total: 1), NodeLine(total: 2049), NodeLine(slot: 4), NodeLine(count: 0, hex: "00"), NodeLine(hex: Convert.ToHexString(Stream(plan)).ToLowerInvariant()),
+            NodeLine(count: 41, total: 100, hex: new string('0', 41 * 12)), "TRAJ_NODES slot=1 count=0" })
+            Check(BoardNodes.Parse(bad) is null, "bad node line accepted: " + bad);
+        // What the device answers (type 12 op 4): one hex line, checked for length, CRC and plain text.
+        string Answer(string t, int slot = 1, int? len = null, uint? crc = null)
+        {
+            byte[] b = Encoding.ASCII.GetBytes(t);
+            return $"TRAJ_META slot={slot} seq=3 len={len ?? b.Length} crc={crc ?? Crc32(b):X8} hex={Convert.ToHexString(b)}";
+        }
+        Check(BoardMeta.Parse(Answer(text)) is { Slot: 1, Seq: 3 } meta && meta.Text == text, "description answer");
+        foreach (string bad in new[] { Answer(text, len: text.Length + 1), Answer(text, crc: 5), Answer("a\u0001b"), Answer(text, slot: 4), Answer(text).ToLowerInvariant(), "TRAJ_META slot=1 len=0", Answer(new string('A', BoardMeta.MaxBytes + 1)) })
+            Check(BoardMeta.Parse(bad) is null, "bad description answer accepted: " + bad);
+        // What is known about a slot: the board's own description (for the plan it holds), else the file of this computer.
+        var held = new BoardSlot(1, true, 3, 2, 500, 0, 0, 0xBD3EB746);
+        var local = new[] { new LedgerEntry(1, 0xBD3EB746, "shape=1"), new LedgerEntry(2, 7, "shape=2") };
+        var merged = BoardLedger.Merge([null, held, null, null], [null, new BoardMeta(1, 3, text), null, null], local);
+        Check(merged.Count == 2 && merged.Single(e => e.Slot == 1).Settings == text && merged.Single(e => e.Slot == 1).Crc == 0xBD3EB746 && merged.Single(e => e.Slot == 2).Settings == "shape=2", "board description beats the local record");
+        merged = BoardLedger.Merge([null, held, null, null], [null, new BoardMeta(1, 2, text), null, null], local);
+        Check(merged.Count == 2 && merged.Single(e => e.Slot == 1).Settings == "shape=1", "a description of an older save must not be used");
         // The ledger: recorded per slot, only trusted while the device still reports the same plan, ignored when damaged.
         string file = Path.Combine(Path.GetTempPath(), "arm-ledger-" + Guid.NewGuid().ToString("N") + ".json");
         PathOverride = file;

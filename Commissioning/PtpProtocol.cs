@@ -100,11 +100,19 @@ public static class PtpProtocol
         wire.Add(0xd3); return wire.ToArray();
     }
     // Type 12 (control sequence): slot 0..3 (-1 = every slot, queries only) and what to do with it.
-    public static byte[] EncodeStore(uint sequence, uint epoch, int slot, StoreOp op)
+    // `first` (value field) is the first node to send back, only for StoreOp.Nodes.
+    public static byte[] EncodeStore(uint sequence, uint epoch, int slot, StoreOp op, int first = 0)
     {
-        if (sequence == 0 || epoch == 0 || op is not (StoreOp.Query or StoreOp.Save or StoreOp.Erase) ||
-            slot < (op == StoreOp.Query ? -1 : 0) || slot >= DeviceContract.TrajStoreSlots) throw Lang.Error("err.storePacket");
-        return EncodeRaw(12, sequence, epoch, (short)slot, (short)op, 0);
+        if (sequence == 0 || epoch == 0 || op is not (StoreOp.Query or StoreOp.Save or StoreOp.Erase or StoreOp.Meta or StoreOp.Nodes) ||
+            slot < (op == StoreOp.Query ? -1 : 0) || slot >= DeviceContract.TrajStoreSlots ||
+            first < 0 || first >= DeviceContract.TrajCapacity || (first != 0 && op != StoreOp.Nodes)) throw Lang.Error("err.storePacket");
+        return EncodeRaw(12, sequence, epoch, (short)slot, (short)op, (ushort)first);
+    }
+    // Type 14 (control sequence): chunk `index` of a plan's description (BoardMeta.Chunks), four bytes in the two angle fields.
+    public static byte[] EncodeMeta(uint sequence, uint epoch, int index, ReadOnlySpan<byte> chunk)
+    {
+        if (sequence == 0 || epoch == 0 || chunk.Length != 4 || index is < 0 or >= (12 + BoardMeta.MaxBytes + 3) / 4) throw Lang.Error("err.storePacket");
+        return EncodeRaw(14, sequence, epoch, BinaryPrimitives.ReadInt16LittleEndian(chunk), BinaryPrimitives.ReadInt16LittleEndian(chunk[2..]), (ushort)index);
     }
     // Type 13 (PTP sequence): fill the device's RAM plan from a slot; the device refuses it unless the arms stand at the plan's start.
     public static byte[] EncodeLoad(uint sequence, uint epoch, int slot)

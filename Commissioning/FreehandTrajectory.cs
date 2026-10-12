@@ -393,14 +393,14 @@ internal static class FreehandTrajectory
             new ShapeOptions { FreehandPoints = raw.Select(p => new FreehandPoint(320 + p.X, p.Y)).ToArray() });
         var execution = new ExecutionTrajectory(new TimedTrajectory(path, new PlanningRates(10, 5, 3, 10, 6)), range);
         ExecutionTrajectory.Validate(execution.Nodes, range);
-        Check(path.Stops.Length == 2 && execution.Timing.At(0).Speed < 1e-8 && execution.Timing.At(execution.Timing.Duration).Speed < 1e-8, "continuous stroke and endpoint rest");
+        Check(path.Stops.Length == 2 && execution.Timing!.At(0).Speed < 1e-8 && execution.Timing.At(execution.Timing.Duration).Speed < 1e-8, "continuous stroke and endpoint rest");
         var refinedPath = DrawingTrajectory.Create(model, DrawingShape.Freehand, 0, 0, 0, 0, 0, range,
             new ShapeOptions { FreehandPoints = RefinementExample });
         var refinedExecution = new ExecutionTrajectory(new TimedTrajectory(refinedPath, new PlanningRates(10, 5, 3, 10, 6)), range);
         ExecutionTrajectory.Validate(refinedExecution.Nodes, range);
         Check(refinedPath.Stops.Length == 2, "refinement added internal stops");
         for (int i = 0; i <= 3000; i++) {
-            var state = refinedExecution.Timing.At(refinedExecution.Timing.Duration * i / 3000);
+            var state = refinedExecution.Timing!.At(refinedExecution.Timing.Duration * i / 3000);
             Check(state.Speed <= 10 && Math.Abs(state.Velocity.Q1) <= 5 && Math.Abs(state.Velocity.Q2 - state.Velocity.Q1) <= 3, "refined speed limit");
             Check(Math.Abs(state.Acceleration.Q1) <= 10 && Math.Abs(state.Acceleration.Q2 - state.Acceleration.Q1) <= 6, "refined acceleration limit");
         }

@@ -69,7 +69,8 @@ public sealed partial class XYPreviewPanel : UserControl
             RestoreFreehand(p.Freehand); freehandMode = p.Shape == FreehandIndex; ClampRateFields(); }
         finally { updating=false; ShapeFields(); Refresh(); NotifyLimitsChanged(); }
     }
-    private static string ParametersPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "parameters.json");
+    internal static string? ParametersPathOverride;   // tests keep the real file untouched
+    private static string ParametersPath => ParametersPathOverride ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "parameters.json");
     public event Action? ParametersSaved;
     private async void SaveCurrentParameters(string path)
     {
@@ -106,8 +107,10 @@ public sealed partial class XYPreviewPanel : UserControl
     }
     // The click only fires while a validated plan matches the fields, so what is written is exactly what is uploaded.
     // Best effort and silent: a full disk must not block a motion the operator already approved.
+    // A plan read back from the board is not what the boxes describe: nothing is remembered for it.
     private void RememberUploaded()
     {
+        if (execFromBoard is not null) return;
         try { WriteParameters(ParametersPath); } catch(Exception ex) when(ex is IOException or UnauthorizedAccessException) { }
     }
     public void RestoreSavedParameters() => ReadSavedParameters(ParametersPath);
@@ -123,7 +126,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private bool detailView;   // false = whole arm and reach circle; the default and only view the operator gets
     private JointLimits? overlayLimits = DefaultTrialRange;
     public PlanarArm Model => new(Number(l1), Number(l2));
-    public string SettingsDescription => $"shape={shape.SelectedIndex}; branch={branch.SelectedIndex}; L1={l1.Text}; L2={l2.Text}; x={x.Text}; y={y.Text}; a={a.Text}; b={b.Text}; feed={feed.Text}; v1={v1.Text}; v2={v2.Text}; a1={acc1.Text}; a2={acc2.Text}; min1={min1.Text}; max1={max1.Text}; min2={min2.Text}; max2={max2.Text}; emin={elbowMin.Text}; emax={elbowMax.Text}; c={c.Text}; rot={rotation.Text}; scale={scale.Text}; dir={(direction.SelectedIndex==1?"cw":"ccw")}; custom_chars={custom.Text.Length}";
+    public string SettingsDescription => $"shape={(execFromBoard is null ? shape.SelectedIndex : 10)}; branch={branch.SelectedIndex}; L1={l1.Text}; L2={l2.Text}; x={x.Text}; y={y.Text}; a={a.Text}; b={b.Text}; feed={feed.Text}; v1={v1.Text}; v2={v2.Text}; a1={acc1.Text}; a2={acc2.Text}; min1={min1.Text}; max1={max1.Text}; min2={min2.Text}; max2={max2.Text}; emin={elbowMin.Text}; emax={elbowMax.Text}; c={c.Text}; rot={rotation.Text}; scale={scale.Text}; dir={(direction.SelectedIndex==1?"cw":"ccw")}; custom_chars={custom.Text.Length}" + (execFromBoard is { } fromSlot ? $"; board_slot={fromSlot + 1}" : "");
     // `whyNot` explains a missing device pose on the canvas (homing, no reference, waiting for feedback); null when offline.
     public void SetStartFeedback(TelemetrySample? sample, string? whyNot = null) {
         bool changed=startFeedback!=sample || deviceNote!=whyNot;
@@ -139,7 +142,7 @@ public sealed partial class XYPreviewPanel : UserControl
         editingAllowed = allowed;
         if (!allowed && changed) { CancelFreehandStroke(); CancelFreehandWork(); }
         foreach(var c in editControls) c.IsEnabled = allowed;
-        if (allowed) { export.IsEnabled = play.IsEnabled = rewind.IsEnabled = cursor.IsEnabled = timing is not null; }
+        if (allowed) { export.IsEnabled = timing is not null; play.IsEnabled = rewind.IsEnabled = cursor.IsEnabled = PlaybackLength is not null; }
         else PausePlayback();
         UpdateFreehandTools();
         if (allowed && changed && freehandNeedsProcessing) QueueFreehandWork();
@@ -249,6 +252,7 @@ public sealed partial class XYPreviewPanel : UserControl
     public event Action? ExecuteRequested;                            // start the plan the device already holds
     private readonly Button upload = new() { Content = Lang.T("btn.upload"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
     private readonly Button run = new() { Content = Lang.T("btn.run"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
+    private readonly Button saveBoard = new() { Content = Lang.T("btn.saveBoard"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };   // the figure on screen -> a board slot
     private ExecutionTrajectory? uploadedPlan;   // complete plan waiting on the device for 执行图形
     private bool uploadedRan;                    // ...and it has already been drawn: single moves are open again, 执行图形 repeats it
     private readonly TextBox executionInfo = new() { IsReadOnly = true, TextWrapping = TextWrapping.Wrap, Background = Brushes.Transparent, BorderThickness = new Thickness(0), Margin = new Thickness(4) };
@@ -271,6 +275,7 @@ public sealed partial class XYPreviewPanel : UserControl
         play.Content = playbackTimer.IsEnabled ? Lang.T("btn.playPause") : Lang.T("btn.play");
         rewind.Content = Lang.T("btn.rewind");
         run.Content = Lang.T("btn.run");
+        saveBoard.Content = Lang.T("btn.saveBoard");
         movePoint.Content = shape.SelectedIndex == 0 ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
         feed.ToolTip = Lang.T("xy.feed.tip");
         foreach (var (field, name, value) in new[] { (min1, Lang.T("xy.q1min"), -30), (max1, Lang.T("xy.q1max"), 30), (min2, Lang.T("xy.q2min"), -60), (max2, Lang.T("xy.q2max"), 60),
@@ -377,15 +382,17 @@ public sealed partial class XYPreviewPanel : UserControl
         sampleInfo.FontSize = 11; Grid.SetRow(sampleInfo,3); visual.Children.Add(sampleInfo);
         InitializeViewport();
         var actions = new StackPanel { Margin = new Thickness(6,2,6,4) }; var actionBar = WorkbenchTheme.Edge(actions, edge: new Thickness(0,1,0,0)); Grid.SetRow(actionBar,2); shell.Children.Add(actionBar);
-        var motion = new WrapPanel(); motion.Children.Add(movePoint); motion.Children.Add(upload); motion.Children.Add(run);
+        var motion = new WrapPanel(); motion.Children.Add(movePoint); motion.Children.Add(upload); motion.Children.Add(run); motion.Children.Add(saveBoard);
         actionStatus.Child=actionSummary; motion.Children.Add(actionStatus); actions.Children.Add(motion); actions.Children.Add(actionProgress);
         actionSummary.ToolTip = new ToolTip { Content = actionDetails };
         ToolTipService.SetShowDuration(actionSummary, 60000);
         executionInfo.FontSize=12; executionInfo.Padding=new Thickness(0);
         foreach(var b in new[] { movePoint, upload, run }) { WorkbenchTheme.Primary(b); ToolTipService.SetShowOnDisabled(b, true); }
+        ToolTipService.SetShowOnDisabled(saveBoard, true);
         movePoint.Click += (_,_) => { if(movePoint.IsEnabled && pointTarget is {} p) PointMoveRequested?.Invoke(PtpProtocol.Quantize(p)); };
         upload.Click += (_,_) => { if(upload.IsEnabled && execution is {} plan) { RememberUploaded(); TrajectoryRequested?.Invoke(plan); } };
         run.Click += (_,_) => { if(run.IsEnabled) ExecuteRequested?.Invoke(); };
+        saveBoard.Click += (_,_) => { if(saveBoard.IsEnabled) SaveCurrentToBoard(); };
         moveState.FontSize = 12;
         foreach(var control in new Control[] { l1,l2,x,y,a,b,c,rotation,scale,custom,direction,min1,max1,min2,max2,elbowMin,elbowMax,v1,v2,acc1,acc2,shape,branch,play,rewind,cursor }) editControls.Add(control);
         foreach (var field in new[] { l1, l2, x, y, a, b, c, rotation, scale, custom, min1, max1, min2, max2, elbowMin, elbowMax, v1, v2, acc1, acc2 }) field.TextChanged += (_, _) => ParametersChanged();
@@ -539,7 +546,7 @@ public sealed partial class XYPreviewPanel : UserControl
         cameraReady = false; autoFit = true; operationError=null; rangeFailure = null;
         RefreshOverlayLimits(); RefreshRangeHelp();
         pointTarget = null; movePoint.IsEnabled = false; execution = null; upload.IsEnabled = false; Lang.Text(executionInfo, () => "");
-        PausePlayback(); trajectory = null; timing = null;
+        PausePlayback(); trajectory = null; timing = null; ClearBoardView();
         export.IsEnabled = cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = false;
         canvas.Children.Clear(); Lang.Text(result, () => ""); sampleInfo.Clear(); Lang.Text(notice, () => "");
         try
@@ -588,11 +595,13 @@ public sealed partial class XYPreviewPanel : UserControl
         NotifyLimitsChanged();
         if (freehandNeedsProcessing && editingAllowed) QueueFreehandWork();
     }
+    private Func<string>? planFailure;         // why the plan was last refused, as the formatter that makes the text (it follows the language)
     private void InvalidPlan(Func<string> reason, JointRangeFailure? failure = null, bool cancelFreehandWork = true)
     {
+        planFailure = reason;
         if (cancelFreehandWork) CancelFreehandWork();
         rangeFailure = failure;
-        PausePlayback(); trajectory = null; timing = null;
+        PausePlayback(); trajectory = null; timing = null; ClearBoardView();
         export.IsEnabled = cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = false;
         canvas.Children.Clear(); sampleInfo.Clear(); result.Foreground = Brushes.Firebrick; Lang.Text(result, reason); Lang.Text(notice, () => "");
         pointTarget = null; movePoint.IsEnabled = false;
@@ -621,7 +630,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private void ShowExecutionInfo(ExecutionTrajectory shown, double asked)
     {
         var (peak1, peak2) = shown.PeakRates();
-        double capped = shown.Timing.Duration / shown.RetryStretch, slower = (capped / asked - 1) * 100, extra = (shown.RetryStretch - 1) * 100;
+        double capped = shown.Timing!.Duration / shown.RetryStretch, slower = (capped / asked - 1) * 100, extra = (shown.RetryStretch - 1) * 100;
         Lang.Text(executionInfo, () => Lang.T("plan.execInfo", shown.Nodes.Length, shown.Duration, DeviceContract.PlanRateMax, peak1, peak2) +
             (slower >= 0.5 ? Lang.T("plan.execLimited", slower, asked, capped, DeviceContract.PlanRateMax) : "") +
             (extra >= 0.5 ? Lang.T("plan.execStretch", extra) : ""));
@@ -646,7 +655,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private static void SetTip(FrameworkElement element, string tip) { if (!Equals(element.ToolTip, tip)) element.ToolTip = tip; }
     private void UpdatePointButton()
     {
-        movePoint.Content = shape.SelectedIndex == 0 ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
+        movePoint.Content = shape.SelectedIndex == 0 && execFromBoard is null ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
         bool limitsMatch = deviceLimitsConfirmed && RequestedLimits is { } requested && requested == firmwareLimits && requested == planningLimits;
         // While the device holds a plan it has not drawn yet it refuses every other move; only 执行图形 or 总停止 leaves that state.
         // After a run the plan stays on the device, so the move back to the start is allowed.
@@ -667,15 +676,16 @@ public sealed partial class XYPreviewPanel : UserControl
             target = PtpProtocol.Quantize(target);
             string label = bounds.Contains(target) ? Lang.T("move.inFw") : shape.SelectedIndex == 0 ? Lang.T("move.outFw") : Lang.T("move.outFwStart");
             move += Lang.T("move.fwBounds", label, target.Q1, target.Q2, bounds.Min1, bounds.Max1, bounds.Min2, bounds.Max2, JointLimits.Elbow(target), bounds.ElbowMin, bounds.ElbowMax);
-        } else if (pointTarget is null) move += Lang.T("move.planFail") + result.Text;
+        } else if (pointTarget is null) move += boardView is not null ? Lang.T("act.boardPreview") : Lang.T("move.planFail") + result.Text;
         if (execution is not null) move += held ? (uploadedRan ? Lang.T("move.ran") : Lang.T("move.uploaded")) : atStart ? Lang.T("move.atStart") : Lang.T("move.needStart");
         if (uploadedPlan is not null && !held) move += uploadedRan ? Lang.T("move.nextPlan") : Lang.T("move.otherPlan");
-        if (execution is null && shape.SelectedIndex > 0) move += "\n" + (executionInfo.Text.Length > 0 ? executionInfo.Text : Lang.T("move.needCheck"));
+        if (execution is null && shape.SelectedIndex > 0 && boardView is null) move += "\n" + (executionInfo.Text.Length > 0 ? executionInfo.Text : Lang.T("move.needCheck"));
         SetText(moveState, move);
         UpdateActionStatus();
         SetTip(upload, move + Lang.T(planOnBoard is null ? "move.uploadTip" : "board.loadTip"));
         SetTip(run, move);
         SetTip(movePoint, move);
+        UpdateSaveButton(held);
     }
     public void SetDeviceStatus(string? message, bool fault, bool busy, double percent, bool indeterminate)
     {
@@ -694,6 +704,7 @@ public sealed partial class XYPreviewPanel : UserControl
         if(deviceStatusFault || deviceStatusBusy) { text=(deviceStatusFault?Lang.T("act.rejected"):Lang.T("act.waiting"))+(deviceStatusMessage??deviceMoveReason); severity=deviceStatusFault?2:1; }
         else if(operationError is not null) { text=Lang.T("act.opFail")+operationError(); severity=2; }
         else if(parametersDirty) { text=Lang.T("act.paramsDirty"); severity=1; }
+        else if(boardView is not null && execution is null) { text=Lang.T("act.boardPreview"); severity=1; }
         else if(pointTarget is null) { text=Lang.T("act.rejected")+result.Text; severity=2; }
         else if(planningLimits is {} local && !local.Contains(pointTarget.Value)) { text=Lang.T("act.outOfRange"); severity=2; }
         // While the device has not confirmed, its own reason says what to do (enabled: STOP ALL first; disabled: wait for the sync).
@@ -724,22 +735,23 @@ public sealed partial class XYPreviewPanel : UserControl
     { playbackTimer.Stop(); playbackClock.Stop(); play.Content = Lang.T("btn.play"); }
     private void TogglePlayback()
     {
-        if (timing is null) return;
+        if (PlaybackLength is not { } length) return;
         offlineSim=true;
         if (playbackTimer.IsEnabled) { PausePlayback(); return; }
-        if (cursor.Value >= timing.Duration) cursor.Value = 0;
+        if (cursor.Value >= length) cursor.Value = 0;
         playbackFrom = cursor.Value; playbackClock.Restart(); playbackTimer.Start(); play.Content = Lang.T("btn.playPause");
     }
     private void AdvancePlayback(double time)
     {
-        if (!playbackTimer.IsEnabled || timing is null) return;
+        if (!playbackTimer.IsEnabled || PlaybackLength is not { } length) return;
         advancing = true;
-        try { cursor.Value = Math.Min(time, timing.Duration); }
+        try { cursor.Value = Math.Min(time, length); }
         finally { advancing = false; }
-        if (timing is null || time >= timing.Duration) PausePlayback();
+        if (PlaybackLength is not { } now || time >= now) PausePlayback();
     }
     private void DrawSample()
     {
+        if (timing is null && boardView is not null) { DrawBoardSample(); return; }
         if (timing is not { } plan) return;
         try
         {
@@ -779,7 +791,7 @@ public sealed partial class XYPreviewPanel : UserControl
         if (changes == 0 || panel.RequestedLimits != requested || panel.planningLimits != requested ||
             panel.overlayLimits != requested || plan is null || panel.execution is null || !panel.play.IsEnabled)
             throw new InvalidOperationException("截图圆必须按填写范围生成红区、预览和执行计划");
-        if(!ReferenceEquals(panel.timing,panel.execution.Timing) || Math.Abs(panel.execution.Duration-panel.timing.Duration-0.05)>0.002)
+        if(!ReferenceEquals(panel.timing,panel.execution.Timing) || Math.Abs(panel.execution.Duration-panel.timing!.Duration-0.05)>0.002)
             throw new InvalidOperationException("预览和实际执行没有共用同一时间规划");
         panel.SetPointMoveState(true, DefaultTrialRange, "旧设备范围尚未同步", true);
         if (!ReferenceEquals(plan,panel.timing) || !ReferenceEquals(mask,panel.Reachability(panel.Model)) ||
@@ -995,6 +1007,8 @@ public sealed partial class XYPreviewPanel : UserControl
         ElbowLimitSelfTest();
         ShapeFieldsSelfTest();
         RecentRunsSelfTest();
+        BoardPathSelfTest();
+        SaveButtonSelfTest();
         ShapeDefaultsSelfTest();
         FreehandSelfTest(snapshotPath);
         var panel = new XYPreviewPanel();

@@ -73,6 +73,15 @@ public sealed partial class XYPreviewPanel
         return values.TryGetValue("shape", out var s) && s != "10" && ValidPresetValues(values) ? values : null;
     }
 
+    // What a board slot's description restores.  Unlike an old recording it must be complete: nothing may be filled in from whatever figure
+    // is open now, or the click would present a hybrid as the slot's settings.  An incomplete one is not restorable (the nodes are read instead).
+    private static readonly string[] BoardKeys = ["shape", "branch", "x", "y", "a", "b", "c", "rot", "scale", "dir", "v1", "v2", "a1", "a2"];
+    internal static Dictionary<string, string>? BoardValues(string settings)
+    {
+        var keys = settings.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Select(part => part.IndexOf('=') is int eq and > 0 ? part[..eq].Trim() : "").ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return BoardKeys.All(keys.Contains) ? RunValues(settings) : null;
+    }
+
     // ponytail: reads every recording's metadata (archive list is capped at 500); keep an index file if that gets slow.
     internal void RefreshRecentRuns()
     {
@@ -110,7 +119,8 @@ public sealed partial class XYPreviewPanel
         return $"{run.StartedUtc.ToLocalTime():MM-dd HH:mm}  {shapeName}  v{s?.V1:0.#}/{s?.V2:0.#}  {status}" + (run.Rmse is { } rmse ? $"  RMSE {rmse:0.000}°" : "");
     }
 
-    // Starred runs first (however old), then the newest others.
+    // The figures on the board first (whoever saved them: what the board keeps with each plan is enough to show and restore it),
+    // then the newest runs of this computer that are not on the board.
     private void ShowRecentRuns()
     {
         recentList.Children.Clear(); recentRows.Clear();
@@ -118,30 +128,76 @@ public sealed partial class XYPreviewPanel
         // Speeds are left out of the identity, a slower repeat is still the same figure. Runs that cannot be loaded stay apart.
         var seen = new HashSet<string>();
         bool NewFigure(ExperimentRun r) => RunValues(r.SettingsText) is not { } v || seen.Add(string.Join("|", FigureKeys.Select(k => v.GetValueOrDefault(k))));
-        // A star means "stored on the board" (XYPreviewPanel.Board.cs): those runs come first, however old.
-        var starredRuns = recentRuns.Where(r => StarSlot(RunValues(r.SettingsText)) is not null).Where(NewFigure).ToList();
-        foreach (var run in starredRuns.Concat(recentRuns.Where(r => StarSlot(RunValues(r.SettingsText)) is null).Where(NewFigure).Take(RecentCount)))
+        void AddRow(Button star, Button load)
         {
-            var values = RunValues(run.SettingsText);
-            var stored = StarSlot(values);
-            bool starred = stored is not null;
-            string summary = RunSummary(run);
-            string starTip = starred ? Lang.T("board.star.stored", stored!.Slot + 1) : !boardSupported ? Lang.T("board.star.unavailable") : !boardKnown ? Lang.T("board.star.reading") : Lang.T("board.star.save");
-            var star = new Button { Content = starred ? "★" : "☆", Width = 24, Margin = new Thickness(2), Padding = new Thickness(0), Background = Brushes.Transparent, BorderThickness = new Thickness(0),
-                Foreground = starred ? WorkbenchTheme.Warn : WorkbenchTheme.Muted, ToolTip = starTip, IsEnabled = boardSupported && boardKnown && !boardBusy && (starred || values is not null) };
-            ToolTipService.SetShowOnDisabled(star, true);
-            System.Windows.Automation.AutomationProperties.SetName(star, starTip);
-            var load = new Button { Content = new TextBlock { Text = summary, TextTrimming = TextTrimming.CharacterEllipsis }, HorizontalContentAlignment = HorizontalAlignment.Left,
-                Margin = new Thickness(0, 1, 2, 1), Padding = new Thickness(6, 2, 6, 2), IsEnabled = values is not null,
-                ToolTip = summary + "\n" + (values is null ? Lang.T("recent.cannotLoad") : string.Join("  ", values.Select(v => $"{v.Key}={v.Value}"))) };
-            ToolTipService.SetShowOnDisabled(load, true);
-            System.Windows.Automation.AutomationProperties.SetName(load, summary);
-            star.Click += (_, _) => { if (!star.IsEnabled) return; if (stored is not null) StoredStarClicked(star, stored); else StarClicked(star, run, values!); };
-            load.Click += (_, _) => { ApplyPreset(values!); Lang.Text(recentNote, () => Lang.T("recent.loaded", RunSummary(run))); };
             var row = new DockPanel { Margin = new Thickness(6, 0, 8, 0) };
             DockPanel.SetDock(star, Dock.Left); row.Children.Add(star); row.Children.Add(load);
             recentList.Children.Add(row); recentRows.Add((star, load));
         }
+        void AddHeader(string text) => recentList.Children.Add(new TextBlock { Text = text, FontSize = 11, FontWeight = FontWeights.SemiBold, Foreground = WorkbenchTheme.Muted, Margin = new Thickness(10, 4, 10, 2) });
+        Button StarButton(string content, string tip, Brush colour, bool enabled)
+        {
+            var star = new Button { Content = content, Width = 24, Margin = new Thickness(2), Padding = new Thickness(0), Background = Brushes.Transparent, BorderThickness = new Thickness(0),
+                Foreground = colour, ToolTip = tip, IsEnabled = enabled };
+            ToolTipService.SetShowOnDisabled(star, true);
+            System.Windows.Automation.AutomationProperties.SetName(star, tip);
+            return star;
+        }
+        Button LoadButton(string summary, Dictionary<string, string>? values, bool pathOnly = false)
+        {
+            var load = new Button { Content = new TextBlock { Text = summary, TextTrimming = TextTrimming.CharacterEllipsis }, HorizontalContentAlignment = HorizontalAlignment.Left,
+                Margin = new Thickness(0, 1, 2, 1), Padding = new Thickness(6, 2, 6, 2), IsEnabled = values is not null || pathOnly,
+                ToolTip = summary + "\n" + (values is null ? Lang.T(pathOnly ? "recent.boardPathTip" : "recent.cannotLoad") : string.Join("  ", values.Select(v => $"{v.Key}={v.Value}"))) };
+            ToolTipService.SetShowOnDisabled(load, true);
+            System.Windows.Automation.AutomationProperties.SetName(load, summary);
+            return load;
+        }
+        // A star means "stored on the board" (XYPreviewPanel.Board.cs).  A slot is a row when the board's own description, or a record on
+        // this computer, says what is in it; a figure the board holds without one stays in the summary line below (and can be cleared there).
+        // With a firmware that sends the nodes back, every stored slot is a row (what the board does not describe can still be looked at).
+        var stored = boardSlots.Take(boardSlotCount).OfType<BoardSlot>().Where(s => s.Valid && (boardCanRead || BoardLedger.For(s, boardLedger) is not null)).ToList();
+        if (stored.Count > 0) AddHeader(Lang.T("recent.boardHeader", boardSlots.Take(boardSlotCount).Count(s => s is { Valid: true }), boardSlotCount));
+        foreach (var slot in stored)
+        {
+            var values = BoardLedger.For(slot, boardLedger) is { } entry ? BoardValues(entry.Settings) : null;
+            string label = Lang.T("board.slot", slot.Slot + 1, SlotLabel(slot));
+            var star = StarButton("★", Lang.T("board.star.stored", slot.Slot + 1), WorkbenchTheme.Warn, boardKnown && !boardBusy);
+            var load = LoadButton(label, values, boardCanRead);
+            star.Click += (_, _) => { if (star.IsEnabled) StoredStarClicked(star, slot); };
+            load.Click += (_, _) => LoadFromBoard(slot, values);
+            AddRow(star, load);
+        }
+        var local = recentRuns.Where(r => StarSlot(RunValues(r.SettingsText)) is null).Where(NewFigure).Take(RecentCount).ToList();
+        if (stored.Count > 0 && local.Count > 0) AddHeader(Lang.T("recent.localHeader"));
+        foreach (var run in local)
+        {
+            var values = RunValues(run.SettingsText);
+            string summary = RunSummary(run);
+            string starTip = !boardSupported ? Lang.T("board.star.unavailable") : !boardKnown ? Lang.T("board.star.reading") : Lang.T("board.star.save");
+            var star = StarButton("☆", starTip, WorkbenchTheme.Muted, boardSupported && boardKnown && !boardBusy && values is not null);
+            var load = LoadButton(summary, values);
+            star.Click += (_, _) => { if (star.IsEnabled) StarClicked(star, run, values!); };
+            load.Click += (_, _) => { ApplyPreset(values!); Lang.Text(recentNote, () => Lang.T("recent.loaded", RunSummary(run))); };
+            AddRow(star, load);
+        }
+    }
+
+    // Restores the settings a board slot was saved with.  Nothing moves.  The figure is planned again here, from this computer's link
+    // lengths and ranges: when the result is the same plan as the slot's (same CRC) the screen is the board's figure and Upload becomes
+    // Load From Board; when not, the preview is this computer's plan and the note says so.
+    // A slot without settings (saved elsewhere, or a custom contour) and a slot whose plan comes out different here are shown by their nodes,
+    // read back from the board.
+    private void LoadFromBoard(BoardSlot slot, Dictionary<string, string>? values)
+    {
+        int number = slot.Slot + 1;
+        planFailure = null;
+        if (values is not null) ApplyPreset(values);
+        var why = planFailure;      // taken now, as the formatter that makes the reason: the note follows the language but not later edits
+        bool none = values is null, failed = !none && execution is null, same = !none && !failed && PlanOnBoard()?.Slot == slot.Slot;
+        bool fetch = !same && boardCanRead;
+        if (fetch) { boardPathWanted = slot.Slot; BoardPathRequested?.Invoke(slot.Slot); }
+        Lang.Text(recentNote, () => (none ? Lang.T("recent.boardNoSettings", number) : failed ? Lang.T("recent.boardCheck", number) + (why?.Invoke() ?? "") : same ? Lang.T("recent.boardLoaded", number) : Lang.T("recent.boardDiffers", number)) +
+            (fetch ? Lang.T("recent.boardFetching") : ""));
     }
 
     private UIElement BuildRecentRuns()
@@ -246,6 +302,7 @@ public sealed partial class XYPreviewPanel
             // a custom contour (not recorded) or a damaged text cannot be loaded.
             if (RunValues("shape=3; v1=5; v2=3; a1=10; a2=6; x=340; c=") is not { } old || old["c"] != "" || old["rotation"] != "0" || old["scale"] != "1" || old["direction"] != "0" || old["x"] != "340") Fail("旧记录应补上默认变换并保留空的 c");
             if (RunValues("shape=2; dir=cw; v1=1")?["direction"] != "1") Fail("dir=cw 应载入为顺时针");
+            if (BoardValues("shape=2; v1=4; v2=3; a1=8; a2=6") is not null || BoardValues("shape=2; branch=0; x=330; y=0; a=12; b=7; c=; rot=0; scale=1; dir=ccw; v1=4; v2=3; a1=8; a2=6") is null) Fail("板上的描述缺字段时不能恢复，完整的才能");
             if (RunValues("shape=10; v1=5; v2=3; a1=10; a2=6") is not null || RunValues("nonsense") is not null || RunValues("shape=99; v1=1") is not null || RunValues("shape=1; x=" + new string('9', 40)) is not null) Fail("自定义轮廓或无效记录不应能载入");
 
             var panel = new XYPreviewPanel();
@@ -354,6 +411,55 @@ public sealed partial class XYPreviewPanel
             if ((string)star.upload.Content != "从板上加载") Fail("板上已有这个图形时按钮应是从板上加载：" + star.upload.Content);
             star.SetBoard(4, true, false, [Free(0), Held(1, TrajectoryArchive.PlanCrc(onScreen.Nodes), onScreen.Nodes.Length + 1, 1), null, null], ledger, null);
             if ((string)star.upload.Content != "上传图形") Fail("节点数或时长不同就不是同一个计划");
+            // A slot another computer saved: the board's own description is all there is.  It gets a row of its own under a header, with the
+            // star that clears it; clicking restores its settings (nothing moves) and says whether the plan made here is the board's plan.
+            const string foreign = "shape=2; branch=0; L1=180; L2=176.38; x=330; y=0; a=12; b=7; c=; rot=0; scale=1; dir=ccw; v1=4; v2=3; a1=8; a2=6";
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0x77777777), null, null], [new LedgerEntry(1, 0x77777777, foreign)], null);
+            var heads = star.recentList.Children.OfType<TextBlock>().Select(t => t.Text).ToArray();
+            if (!heads.SequenceEqual(["板上图形 · 1/4", "本机最近运行"]) || star.recentRows.Count != 4 || (string)star.recentRows[0].Star.Content != "★" || !((TextBlock)star.recentRows[0].Load.Content).Text.StartsWith("槽2："))
+                Fail("别的电脑存的图形应有自己的行、标题和 ★：" + string.Join("|", heads) + " " + star.recentRows.Count);
+            star.recentRows[0].Load.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (star.shape.SelectedIndex != 2 || star.a.Text != "12" || star.v1.Text != "4" || star.execution is null || !star.recentNote.Text.Contains("板上槽2") || !star.recentNote.Text.Contains("不同")) Fail("点板上的行应载入参数，并说明重新算出的图形与板上的不同：" + star.recentNote.Text);
+            if (requests != 0) Fail("载入板上的行不得请求任何运动");
+            var planned = star.execution ?? throw new InvalidOperationException("应有已检查的图形");
+            var same = Held(1, TrajectoryArchive.PlanCrc(planned.Nodes), planned.Nodes.Length, (int)planned.Nodes.Sum(n => (int)n.Milliseconds));
+            star.SetBoard(4, true, false, [Free(0), same, null, null], [new LedgerEntry(1, same.Crc, foreign)], null);
+            star.recentRows[0].Load.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (!star.recentNote.Text.Contains("就是板上那条") || (string)star.upload.Content != "从板上加载") Fail("重新算出的图形与板上一致时应这样说，并让上传变成从板上加载：" + star.recentNote.Text + " / " + star.upload.Content);
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0x77777777), null, null], [new LedgerEntry(1, 0x77777777, foreign.Replace("shape=2", "shape=10"))], null);
+            if (star.recentRows[0].Load.IsEnabled || !star.recentRows[0].Star.IsEnabled || (string)star.recentRows[0].Star.Content != "★") Fail("板上的自定义轮廓不能载入参数，但应能清除");
+            erased.Clear();
+            star.recentRows[0].Star.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            ((MenuItem)LastMenu!.Items[0]!).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            if (!erased.SequenceEqual([1])) Fail("点板上那一行的 ★ 并确认应清除槽 2");
+            // A firmware that sends the nodes back: every stored slot is a row, also one nobody described, and a click reads its plan from the
+            // board when this computer cannot show it by itself (nothing to restore, or a plan that comes out different here).
+            var fetches = new List<int>(); star.BoardPathRequested += fetches.Add;
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0x55555555), null, null], [], null, canReadNodes: true);
+            if (star.recentRows.Count != 4 || (string)star.recentRows[0].Star.Content != "★" || !((TextBlock)star.recentRows[0].Load.Content).Text.StartsWith("槽2：别处存的图形") || !star.recentRows[0].Load.IsEnabled)
+                Fail("能读回节点时，没人描述过的槽也应是一行：" + star.RecentListText);
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0x55555555), null, null], [], null);
+            if (star.recentRows.Count != 3) Fail("读不了节点时，没有描述的槽不是一行");
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0x55555555), null, null], [], null, canReadNodes: true);
+            star.recentRows[0].Load.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (!fetches.SequenceEqual([1]) || !star.recentNote.Text.Contains("没有保存可恢复的参数") || !star.recentNote.Text.Contains("正在读取")) Fail("没有参数的槽应去读板上的轨迹：" + star.recentNote.Text);
+            fetches.Clear();
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0x77777777), null, null], [new LedgerEntry(1, 0x77777777, foreign)], null, canReadNodes: true);
+            star.recentRows[0].Load.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (!fetches.SequenceEqual([1]) || !star.recentNote.Text.Contains("不同") || !star.recentNote.Text.Contains("正在读取")) Fail("重新算出的计划与板上不同时应去读板上的轨迹：" + star.recentNote.Text);
+            fetches.Clear();
+            var planned2 = star.execution ?? throw new InvalidOperationException("应有已检查的图形");
+            var match = Held(1, TrajectoryArchive.PlanCrc(planned2.Nodes), planned2.Nodes.Length, (int)planned2.Nodes.Sum(n => (int)n.Milliseconds));
+            star.SetBoard(4, true, false, [Free(0), match, null, null], [new LedgerEntry(1, match.Crc, foreign)], null, canReadNodes: true);
+            star.recentRows[0].Load.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (fetches.Count != 0 || star.recentNote.Text.Contains("正在读取")) Fail("重新算出的计划就是板上的，不必再读：" + star.recentNote.Text);
+            // A description the board holds that lacks fields is not restorable: nothing is filled in from the figure that is open, the nodes are
+            // read instead.
+            fetches.Clear(); int shapeBefore = star.shape.SelectedIndex, speedBefore = (int)Number(star.v1);
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0x66666666), null, null], [new LedgerEntry(1, 0x66666666, "shape=2; v1=4; v2=3; a1=8; a2=6")], null, canReadNodes: true);
+            star.recentRows[0].Load.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (!fetches.SequenceEqual([1]) || star.shape.SelectedIndex != shapeBefore || (int)Number(star.v1) != speedBefore || !star.recentNote.Text.Contains("没有保存可恢复的参数"))
+                Fail("缺字段的板上描述不能恢复成混合参数，应改读板上的节点：" + star.recentNote.Text);
             SuppressMenus = false;
             var broken = new XYPreviewPanel(); broken.RefreshRecentRuns();
             if (broken.recentRows.Count != 3 || broken.recentRows.Any(r => (string)r.Star.Content == "★")) Fail("没有板上记录时不应有 ★");

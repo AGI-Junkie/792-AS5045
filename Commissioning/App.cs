@@ -25,7 +25,7 @@ public sealed class App : Application
                 int snapshot = Array.IndexOf(args, "--snapshot");
                 string? path = snapshot >= 0 && snapshot + 1 < args.Length ? args[snapshot + 1] : null;
                 if (args.Contains("--freehand-self-test")) { Lang.Set(false, false); FreehandTrajectory.SelfTest(); XYPreviewPanel.FreehandSelfTest(path); }
-                else if (args.Contains("--store-self-test")) { Lang.Set(false, false); BoardLedger.SelfTest(); ControlWindow.StoreSelfTest(); ControlWindow.BoardSaveFlowSelfTest(); }
+                else if (args.Contains("--store-self-test")) { Lang.Set(false, false); BoardLedger.SelfTest(); ControlWindow.StoreSelfTest(); ControlWindow.BoardSaveFlowSelfTest(); ControlWindow.BoardMetaFlowSelfTest(); ControlWindow.BoardNodesFlowSelfTest(); ControlWindow.BoardRunFlowSelfTest(); ControlWindow.BoardPathQueueSelfTest(); }
                 else if (args.Contains("--log-level-self-test")) ControlWindow.LoggingSelfTest();
                 else if (args.Contains("--upload-language-test")) ControlWindow.UploadLanguageTest();
                 else if (args.Contains("--language-self-test")) { Lang.SelfTest(); ControlWindow.LanguageSelfTest(path); }
@@ -214,7 +214,7 @@ public sealed partial class ControlWindow : Window
         }
     }
     // A save held back for the speed synchronisation also locks editing: the plan and settings it will save must not change under it.
-    private bool PointBusyCore => pendingControl is not null || pendingPoint != 0 || ptp is { Active: > 0 } || uploading is not null || executing || StoreBusy || pendingBoardSave is not null;
+    private bool PointBusyCore => pendingControl is not null || pendingPoint != 0 || ptp is { Active: > 0 } || uploading is not null || executing || StoreBusy || pendingBoardSave is not null || nodeRead is not null;
     private bool PointBusy => PointBusyCore || deferredBoardSave is not null;
     private bool CanPoint => LimitsReady && stage2 && compatible && enabled && homed && feedbackReady && !homing && !stopPending && !PointBusy &&
         keyboardMask == 0 && mouseMask == 0 && ptp is { Locked: false, Referenced: true, Epoch: > 0 } &&
@@ -450,7 +450,7 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("FAULT_SNAPSHOT ")) { HandleFaultSnapshot(line); }
         else if (line.StartsWith("LAST_STOP ")) { HandleLatchedStop(line); }
         else if (line.StartsWith("PTP_LIMITS ") || line.StartsWith("PTP_RATES ")) { HandleLimitsAck(line); UpdateControls(); }
-        else if (line.StartsWith("TRAJ_SLOT ") || line.StartsWith("TRAJ_STORE ")) ObserveStoreLine(line);
+        else if (line.StartsWith("TRAJ_SLOT ") || line.StartsWith("TRAJ_STORE ") || line.StartsWith("TRAJ_META ") || line.StartsWith("TRAJ_NODES ")) ObserveStoreLine(line);
         else if (line.StartsWith("TRAJ_STATE ")) HandleTrajectoryState(line);
         else if (line.StartsWith("TELEM ")) HandleTelemetry(line);
         else if (line.StartsWith("LINK ")) {
@@ -854,6 +854,10 @@ public sealed partial class ControlWindow : Window
         DiagnosticsSelfTest();
         StoreSelfTest();
         BoardSaveFlowSelfTest();
+        BoardMetaFlowSelfTest();
+        BoardNodesFlowSelfTest();
+        BoardRunFlowSelfTest();
+        BoardPathQueueSelfTest();
         WorkflowSelfTest();
         StopRecoverySelfTest();
         ShapeFlowSelfTest();

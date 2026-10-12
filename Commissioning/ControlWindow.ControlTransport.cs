@@ -54,6 +54,17 @@ public sealed partial class ControlWindow
             controlEpoch = 0; lastControlHeartbeat = 0;
             controlDataSent = false;
         }
+        // A store request that never left (STOP while its description was still going out) will never be answered, and neither will a read
+        // whose answer the new reference epoch may turn away (a frame having a sequence number does not prove it was answered): end them now,
+        // instead of keeping the archive busy and the editing locked until they time out.  A save or erase that is already under way is left
+        // to report how it ended.
+        wantedPathSlot = null;   // (a path waiting for a scan job is dropped too, before that job ends)
+        if (storeJob is { } job && (job.Sequence == 0 || job.Op is StoreOp.Query or StoreOp.Meta or StoreOp.Nodes))
+        {
+            cancellingStores = true;
+            try { FinishStoreJob(false, () => Lang.T("board.err.stopped")); } finally { cancellingStores = false; }
+        }
+        if (nodeRead is { } unfinished) EndNodeRead(unfinished, () => Lang.T("board.readFailed", unfinished.Slot + 1, Lang.T("board.err.stopped")));
         if (framedControl) heartbeatTimer.Interval = TimeSpan.FromMilliseconds(8);
     }
 
@@ -263,19 +274,25 @@ public sealed partial class ControlWindow
                 // instead of 17.75 ms.  No control sequence is consumed, so command
                 // ordering is unaffected.
                 packet = PtpProtocol.EncodeShortHeartbeat((byte)keys);
-            } else if (heartbeat || (epochReady && pendingControlType != 0 && (motionAllowed || pendingControlType is 9 or 10 or 11 or 12))) {
+            } else if (heartbeat || (epochReady && pendingControlType != 0 && (motionAllowed || pendingControlType is 9 or 10 or 11 or 12 or 14))) {
                 bool limits = !heartbeat && pendingControlType is 9 or 10;
                 bool telemRate = !heartbeat && pendingControlType == 11;   // output only: taken whether or not motion is allowed
                 bool store = !heartbeat && pendingControlType == 12;       // the flash archive: the device itself insists on a still stage
+                bool metaChunk = !heartbeat && pendingControlType == 14;   // the description that goes with a save: one chunk per frame, then the Save frame
                 if (store) {
                     // A retry repeats the identical bytes, which the device answers without redoing anything.
                     if (storeResend && storePacket.Length > 0) packet = storePacket;
                     else {
                         if (controlSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("err.seqExhaustedCtrl"));
-                        packet = storePacket = PtpProtocol.EncodeStore(++controlSequence, controlEpoch, storeRequestSlot, storeRequestOp);
+                        packet = storePacket = PtpProtocol.EncodeStore(++controlSequence, controlEpoch, storeRequestSlot, storeRequestOp, storeRequestFirst);
                         if (storeJob is { } job) job.Sequence = controlSequence;
                     }
                     storeResend = false;
+                }
+                else if (metaChunk) {
+                    if (controlSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("err.seqExhaustedCtrl"));
+                    packet = PtpProtocol.EncodeMeta(++controlSequence, controlEpoch, storeMetaNext, storeMetaChunks[storeMetaNext]);
+                    storeMetaNext++;
                 }
                 else if (limits && limitPacket.Length > 0) packet = limitPacket;
                 else {
@@ -284,7 +301,7 @@ public sealed partial class ControlWindow
                         controlEpoch, limits ? limitBounds : new JointPose(0, 0), heartbeat ? keys : limits ? (ushort)limitAxis : telemRate ? (ushort)telemRequestedHz : (ushort)0);
                     if (limits) { limitSequence = controlSequence; limitPacket = packet; }
                 }
-                if (!heartbeat) pendingControlType = 0;
+                if (!heartbeat) pendingControlType = metaChunk ? (storeMetaNext < storeMetaChunks.Length ? (byte)14 : (byte)12) : (byte)0;
             } else if (epochReady && motionAllowed && pointWire.Count > 0) {
                 packet = pointWire.ToArray(); pointWire.Clear();
             } else return false;
