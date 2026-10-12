@@ -41,7 +41,7 @@ public sealed partial class ControlWindow
     internal WorkflowStep[] ComputeWorkflow()
     {
         var panel = xyPreview;
-        bool point = panel.ShapeIndex == 0;
+        bool point = panel.IsPointMode;
         var (checkOk, checkText) = panel.PlanCheck();
         var startPose = panel.WorkflowStartPose;
         // Once an upload or a run has begun this step is behind us: a running shape leaves the start, and RUN waits for its PTP_STATE.
@@ -240,12 +240,12 @@ public sealed partial class XYPreviewPanel
 {
     internal int ShapeIndex => shape.SelectedIndex;
     // Where the device has to be before anything else: the first node of the plan, or the single target.
-    internal JointPose? WorkflowStartPose => execution is { } plan ? plan.Nodes[0].Pose : shape.SelectedIndex == 0 ? pointTarget is { } p ? PtpProtocol.Quantize(p) : null : null;
+    internal JointPose? WorkflowStartPose => execution is { } plan ? plan.Nodes[0].Pose : IsPointMode ? pointTarget is { } p ? PtpProtocol.Quantize(p) : null : null;
     // Has what is on screen been checked: no pending edits, a valid plan, every sample inside the joint ranges.
     internal (bool Ok, string Text) PlanCheck()
     {
         if (parametersDirty) return (false, Lang.T("flow.check.dirty"));
-        if (shape.SelectedIndex == 0)
+        if (IsPointMode)
             return pointTarget is null ? (false, Truncate(result.Text)) :
                 planningLimits is { } range && !range.Contains(pointTarget.Value) ? (false, Lang.T("flow.check.outRange")) : (true, Lang.T("flow.check.okPoint"));
         return execution is null ? (false, Truncate(timing is null || executionInfo.Text.Length == 0 ? result.Text : executionInfo.Text)) : (true, Lang.T("flow.check.ok"));

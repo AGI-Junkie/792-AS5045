@@ -30,7 +30,17 @@ public sealed partial class XYPreviewPanel
     private static void ShowMenu(ContextMenu menu) { LastMenu = menu; if (!SuppressMenus) menu.IsOpen = true; }
     internal string BoardNoteText => boardNote.Text;
     internal string ResultText => result.Text;
+    // A single point to move to, as opposed to a trajectory: what the shape box says, unless the plan on screen came from the board (then
+    // it is a trajectory whatever the box says, e.g. an undescribed slot opened while the editor is in point mode).
+    internal bool IsPointMode => shape.SelectedIndex == 0 && boardView is null;
     internal bool BoardCanRead => boardCanRead;
+    // A read for this slot ended without a plan: the note says why instead of "reading", and nothing is pending any more.
+    public void EndBoardPath(int slot, Func<string> note)
+    {
+        if (boardPathWanted != slot) return;
+        boardPathWanted = null;
+        Lang.Text(recentNote, note);
+    }
     internal bool SaveBoardEnabled => saveBoard.IsEnabled;
     internal string SaveBoardCaption => (string)saveBoard.Content;
     internal string SaveBoardTip => saveBoard.ToolTip as string ?? "";
@@ -214,6 +224,7 @@ public sealed partial class XYPreviewPanel
             return;
         }
         PausePlayback(); trajectory = null; timing = null; execution = null; pointTarget = null; execFromBoard = null; movePoint.IsEnabled = false; upload.IsEnabled = false;
+        parametersDirty = false;   // what is on screen is the board's plan now, not the boxes (the next edit sets it again and takes the view away)
         rangeFailure = null; operationError = null; Lang.Text(executionInfo, () => ""); Lang.Text(notice, () => ""); sampleInfo.Clear();
         // Does this machine accept it?  The checks a planned figure passes: the joint ranges and speeds in the boxes.  A slot saved under
         // other settings is shown but not offered; the device checks it again when it takes the plan.
@@ -383,6 +394,18 @@ public sealed partial class XYPreviewPanel
             panel.ShowBoardPathForSelfTest(1, nodes, partial);
             if (!panel.ShowsBoardPath || !panel.ResultText.Contains("没有保存杆长")) Fail("只有一个杆长时应按没有保存杆长处理：" + partial + " / " + panel.ResultText);
         }
+        // A board plan opened while the editor is in single-point mode is a trajectory for the workflow and the checks.
+        panel.SelectShapeForSelfTest(0);
+        panel.ShowBoardPathForSelfTest(1, slow, null);
+        if (panel.IsPointMode || panel.PlanCheck() != (true, Lang.T("flow.check.ok"))) Fail("点模式下打开的板上计划应按轨迹分类：" + panel.PlanCheck());
+        panel.SelectShapeForSelfTest(3); panel.LoadExampleForSelfTest();
+        // Detail view fits the board's whole path, not just the start: every point of a wide plan lands inside the plot.
+        panel.Measure(new Size(900, 720)); panel.Arrange(new Rect(0, 0, 900, 720)); panel.UpdateLayout();
+        panel.detailView = true;
+        panel.ShowBoardPathForSelfTest(1, [new(new(0, 0), 0), new(new(30, 50), 500), new(new(30, 50), 50)], "shape=3; L1=180; L2=176.38");
+        foreach (var point in panel.boardView!.Value.Path)
+            if (!panel.Plot.Contains(panel.ToScreen(point))) Fail("详细视图应把板上轨迹的所有点都放进画面：" + point);
+        panel.detailView = false;
         // The joint ranges in the boxes are not valid numbers (no overlay limits): the board's plan is still drawn, and stays after a redraw.
         string goodMin = panel.min1.Text; panel.min1.Text = "abc";
         panel.ShowBoardPathForSelfTest(1, nodes, "shape=3; L1=180; L2=176.38");
