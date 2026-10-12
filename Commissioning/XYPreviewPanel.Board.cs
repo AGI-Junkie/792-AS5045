@@ -96,7 +96,7 @@ public sealed partial class XYPreviewPanel
     {
         if (!boardSupported || values is null) return null;
         foreach (var slot in boardSlots)
-            if (BoardLedger.For(slot, boardLedger) is { } entry && RunValues(entry.Settings) is { } stored && SameFigure(stored, values)) return slot;
+            if (BoardLedger.For(slot, boardLedger) is { } entry && BoardValues(entry.Settings) is { } stored && SameFigure(stored, values)) return slot;
         return null;
     }
 
@@ -229,7 +229,9 @@ public sealed partial class XYPreviewPanel
         var start = nodes[0].Pose;
         double here1 = here?.L1 ?? arm.L1, here2 = here?.L2 ?? arm.L2;
         double? kept1 = saved1, kept2 = saved2;   // the text is built when it is shown, so it follows the language
+        bool localOk = here is not null;   // (without a valid local model the saved one stands in for drawing, but is not "the same")
         string Links() => kept1 is null ? Lang.T("plan.boardLinksUnknown", here1, here2) :
+            !localOk ? Lang.T("plan.boardLinksNoLocal", kept1.Value, kept2!.Value) :
             Math.Abs(kept1.Value - here1) < 0.005 && Math.Abs(kept2!.Value - here2) < 0.005 ? Lang.T("plan.boardLinksSame", kept1.Value, kept2!.Value) :
             Lang.T("plan.boardLinksDiffer", kept1.Value, kept2!.Value, here1, here2);
         result.Foreground = Brushes.DarkSlateGray;
@@ -379,11 +381,19 @@ public sealed partial class XYPreviewPanel
             panel.ShowBoardPathForSelfTest(1, nodes, partial);
             if (!panel.ShowsBoardPath || !panel.ResultText.Contains("没有保存杆长")) Fail("只有一个杆长时应按没有保存杆长处理：" + partial + " / " + panel.ResultText);
         }
+        // The joint ranges in the boxes are not valid numbers (no overlay limits): the board's plan is still drawn, and stays after a redraw.
+        string goodMin = panel.min1.Text; panel.min1.Text = "abc";
+        panel.ShowBoardPathForSelfTest(1, nodes, "shape=3; L1=180; L2=176.38");
+        if (panel.overlayLimits is not null || !panel.ShowsBoardPath) Fail("夹具应是：关节范围无效、板上轨迹仍显示");
+        panel.sampleInfo.Clear(); panel.RedrawViewport();
+        if (!panel.sampleInfo.Text.Contains("板上轨迹")) Fail("没有叠加范围时，重画也不能让板上的轨迹消失：" + panel.sampleInfo.Text);
+        panel.min1.Text = goodMin;
         // The link lengths in the boxes are not valid numbers: the board's plan can be looked at (drawn with its own lengths) but not run,
         // because the experiment that would record the run needs this computer's model.
         string goodL1 = panel.l1.Text; panel.l1.Text = "abc";
         panel.ShowBoardPathForSelfTest(1, [new(new(0, 0), 0), new(new(0.5, 1), 500), new(new(1, 2), 500), new(new(1, 2), 50)], "shape=3; L1=180; L2=176.38");
         if (!panel.ShowsBoardPath || panel.execution is not null || panel.upload.IsEnabled || !panel.recentNote.Text.Contains("不能执行") || panel.recentNote.Text.Contains(Lang.T("err.planRates"))) Fail("本机杆长无效时板上的计划只能看，原因应是杆长而不是速度：" + panel.recentNote.Text);
+        if (!panel.ResultText.Contains("没法比较") || panel.ResultText.Contains("和这台电脑一致")) Fail("本机杆长无效时不能说和这台电脑一致：" + panel.ResultText);
         // And when no model at all can draw it (the board saved no lengths): the request ends with an explanation, not silently.
         panel.l1.Text = "abd";   // (an edit takes any board view away)
         panel.ShowBoardPathForSelfTest(1, nodes, "shape=3; L1=180");

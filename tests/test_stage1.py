@@ -2081,6 +2081,13 @@ static void store_test(const char *t) {
         store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
         assert(!g_store.busy && strstr(simLog,"no complete plan") && !g_meta.touched);
         store_make_plan(485,0);store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.valid && in.metaLen==0u);
+        /* a command turned away while a save is writing its description (another host's query, another save) leaves that description alone:
+         * the job reads it row by row, and it must reach the flash as it was sent */
+        meta_send_chunks(textA,crcA,-1,-1);store_send(12,g_controlSequence+1u,1,2,0);assert(g_store.busy);
+        for(i=0;i<3;i++){cycle(1);store_service();}
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,2,1,0);store_send(12,g_controlSequence+1u,2,2,0);store_send(12,g_controlSequence+1u,2,3,0);txq_flush_blocking();
+        assert(strstr(simLog,"stage not idle") && g_store.busy && g_meta.touched);
+        store_run();assert(g_storeResult.last==1);ts_active(1,&in);assert(in.valid && meta_is(1,textA));
         /* a description whose Save never arrived (the host gave up and asked something else, or simply went quiet) is not kept for a later
          * save that sends none */
         meta_send_chunks(textA,crcA,-1,-1);assert(g_meta.touched);

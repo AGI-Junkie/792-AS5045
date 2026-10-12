@@ -2266,7 +2266,7 @@ static void store_service(void)
 }
 /* A save that is turned away takes the description staged for it with it: it must not wait for, and be attached to, a later save that
  * sends none (an older host, an oversized text) or is for another plan. */
-#define STORE_REFUSE(msg) do { if(op==2u) { memset(&g_meta,0,sizeof(g_meta)); } JLOG(msg); } while(0)
+#define STORE_REFUSE(msg) do { if(op==2u && !g_store.busy) { memset(&g_meta,0,sizeof(g_meta)); } JLOG(msg); } while(0)
 static void store_accept(const uint8 *p)
 {
     uint32 seq=ptp_u32(p+1);
@@ -2279,7 +2279,7 @@ static void store_accept(const uint8 *p)
     if(!TS_LINKED()) { g_rxRejected++; STORE_REFUSE("TRAJ_STORE refused: archive region not reserved (link with cm3gcc_trajstore.ld)\r\n"); return; }
     /* The description belongs to the Save that follows its chunks (only heartbeats come between).  Any other archive command means that
      * Save never arrived (the host gave up and went on to a query): the description is forgotten, not kept for a later save that sends none. */
-    if(op!=2u) { memset(&g_meta,0,sizeof(g_meta)); }
+    if(op!=2u && !g_store.busy) { memset(&g_meta,0,sizeof(g_meta)); }   /* (never while a save is writing it: the job reads it row by row) */
     retry=(uint8)(memcmp(g_storeAccepted,p,15u)==0);   /* heartbeats keep advancing the sequence, so a retry is judged by its bytes */
     if(!retry && (!seq || seq<=g_controlSequence)) { g_rxRejected++; STORE_REFUSE("TRAJ_STORE refused: stale sequence\r\n"); return; }
     if((ptp_u16(p+13) && op!=5u) || op<1u || op>5u || (slot>=TS_SLOTS && !(op==1u && slot==0xFFFFu))) {

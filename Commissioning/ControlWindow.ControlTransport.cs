@@ -58,6 +58,7 @@ public sealed partial class ControlWindow
         // whose answer the new reference epoch may turn away (a frame having a sequence number does not prove it was answered): end them now,
         // instead of keeping the archive busy and the editing locked until they time out.  A save or erase that is already under way is left
         // to report how it ended.
+        wantedPathSlot = null;   // (a path waiting for a scan job is dropped too, before that job ends)
         if (storeJob is { } job && (job.Sequence == 0 || job.Op is StoreOp.Query or StoreOp.Meta or StoreOp.Nodes))
         {
             cancellingStores = true;

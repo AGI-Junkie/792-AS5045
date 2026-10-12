@@ -82,7 +82,7 @@ public sealed partial class ControlWindow
 
     private void ResetBoard()
     {
-        storeSlotCount = 0; storeMetaMax = 0; storeReadSupported = false; nodeRead = null; boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); Array.Clear(metaFailSeq); Array.Clear(metaFailures); Array.Clear(metaEmpty); storeStatus = null; storeJob = null; storePacket = []; storeResend = false;
+        storeSlotCount = 0; storeMetaMax = 0; storeReadSupported = false; nodeRead = null; wantedPathSlot = null; boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); Array.Clear(metaFailSeq); Array.Clear(metaFailures); Array.Clear(metaEmpty); storeStatus = null; storeJob = null; storePacket = []; storeResend = false;
         pendingBoardSave = null; deferredBoardSave = null; loadingSlot = null; boardMessage = null; lastBoardQueryAt = default;
         lock (wireSync) { if (pendingControlType is 12 or 14) pendingControlType = 0; storeMetaChunks = []; storeMetaNext = 0; }
         PublishBoard();
@@ -117,6 +117,8 @@ public sealed partial class ControlWindow
         lock (wireSync) { if (pendingControlType is 12 or 14) pendingControlType = 0; storeMetaChunks = []; storeMetaNext = 0; }
         Append($"HOST archive {job.Op} slot={(job.Slot < 0 ? "all" : job.Slot.ToString())} {(ok ? "done" : "failed")}", ok ? null : LogLevel.Warning);   // the raw log stays raw; the reason goes to the panel
         job.Done?.Invoke(ok, message);
+        // A path asked for while this read-only job ran starts now (once the inventory is complete again, if it was the inventory).
+        if (wantedPathSlot is { } waiting && storeJob is null && job.Op is StoreOp.Query or StoreOp.Meta) { wantedPathSlot = null; RequestBoardPath(waiting); }
         // A change on the board is read back, so the picture shown is the device's and not what was hoped for.  A FAILED save or erase
         // is read back too: it may have changed flash before it failed (erase clears block A before block B), or have finished with its
         // final status lost.  From the moment a save or erase ends, until the answer is complete, the old slot contents are not trusted:
@@ -292,10 +294,14 @@ public sealed partial class ControlWindow
     // ---- reading a slot's nodes back ------------------------------------------------------------------------------------
     // What the board really holds, for the preview: the nodes come back forty at a time (one type 12 op 5 request each, retried like any
     // other), and only a complete stream that matches the slot's CRC, point count and duration is shown.  Nothing moves.
+    private int? wantedPathSlot;   // a path asked for while a read-only archive job (the scan) was running: started when that ends, not dropped
+
     private void RequestBoardPath(int slot)
     {
-        if (slot < 0 || slot >= storeSlotCount || boardSlots[slot] is not { Valid: true } held) return;
-        if (!StoreAvailable || !storeReadSupported || !boardKnown || storeJob is not null || nodeRead is not null || PointBusy) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
+        if (slot < 0 || slot >= storeSlotCount) return;
+        if (!StoreAvailable || !storeReadSupported || nodeRead is not null || PointBusy) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
+        if (storeJob is { Op: StoreOp.Query or StoreOp.Meta }) { wantedPathSlot = slot; return; }   // the scan in flight: start it when that ends
+        if (!boardKnown || storeJob is not null || boardSlots[slot] is not { Valid: true } held) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
         // The slot's description (the link lengths it was saved with) comes first: the periodic read may not have reached this slot yet, and
         // the node reads would keep it out until the whole path was in, so the view would be drawn with this computer's lengths.
         if (storeMetaMax > 0 && metaAsked[slot] != held.Seq && StartMetaRead(slot, held, DateTime.UtcNow, () => BeginNodeRead(slot, held.Seq))) return;
@@ -793,6 +799,51 @@ public sealed partial class ControlWindow
             // Leaving the link drops a read in progress.
             w.ResetBoard();
             Check(w.nodeRead is null && !w.storeReadSupported, "the read survived a reset");
+        }
+        finally { w.Close(); Lang.Set(language, false); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }
+    }
+
+    // A path asked for while the periodic scan has an archive job running is not dropped: it starts when that job ends; STOP drops it.
+    internal static void BoardPathQueueSelfTest()
+    {
+        static void Check(bool yes, string reason) { if (!yes) throw new InvalidOperationException("Archive path queue: " + reason); }
+        string ledger = Path.Combine(Path.GetTempPath(), "arm-board-queue-" + Guid.NewGuid().ToString("N") + ".json");
+        BoardLedger.PathOverride = ledger;
+        bool language = Lang.IsEn; Lang.Set(false, false);
+        var w = new ControlWindow { selfTesting = true, ShowActivated = false, ShowInTaskbar = false };
+        void Pump() { for (int i = 0; i < 600 && w.pendingControlType != 0; i++) { w.PublishHeartbeatLease(); w.WireWriterStep((_, _, _) => { }); } }
+        string Link(string extra) => $"LINK uart=hw baud=115200 fw=stage2-v11-test short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 traj_repeat=1 fault_snapshot=1{extra} proto={DeviceContract.ProtocolVersion}";
+        try
+        {
+            w.HandleLine("STATE fw=stage2-v11 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
+            w.HandleLine("PTP_STATE lock=0 ref=0 active=0 epoch=3 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
+            w.HandleLine(Link(" traj_meta=256 traj_read=1 traj_store=4 telem_hz=0"));
+            Pump();
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(10)); Pump(); uint query = w.storeJob!.Sequence;
+            w.HandleLine("TRAJ_SLOT slot=0 valid=0");
+            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=2 nodes=100 duration_ms=9900 q1=0 q2=3000 crc=0000ABCD");
+            w.HandleLine("TRAJ_SLOT slot=2 valid=0"); w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={query} last=none last_slot=0 row_max_us=0");
+            Check(w.boardKnown && w.storeJob is null, "the inventory was not taken");
+            // The periodic description read is running when the click comes: the request waits, and runs when the read has ended.
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(15)); Pump();
+            Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 }, "the periodic description read did not start");
+            w.RequestBoardPath(1);
+            Check(w.wantedPathSlot == 1 && w.nodeRead is null && w.storeJob is { Op: StoreOp.Meta }, "a path asked for during the scan was dropped or started too early");
+            w.HandleLine("TRAJ_META slot=1 len=0");
+            w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+            Check(w.wantedPathSlot is null && w.nodeRead is { Slot: 1 } && w.storeJob is { Op: StoreOp.Nodes, Slot: 1 }, "the waiting path did not start when the scan's job ended");
+            w.ResetControlTransport();   // STOP ends the read
+            Check(w.nodeRead is null && w.storeJob is null, "STOP left the read");
+            // The slot is written again (its counter moves); the description read starts, the request waits, and STOP drops the request.
+            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=100 duration_ms=9900 q1=0 q2=3000 crc=0000ABCD");
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(30)); Pump();
+            Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 }, "the description read of the rewritten slot did not start");
+            w.RequestBoardPath(1);
+            Check(w.wantedPathSlot == 1, "the second request was not kept");
+            w.ResetControlTransport();
+            Check(w.wantedPathSlot is null && w.nodeRead is null && w.storeJob is null, "STOP did not drop the waiting request");
+            w.ResetBoard();
         }
         finally { w.Close(); Lang.Set(language, false); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }
     }

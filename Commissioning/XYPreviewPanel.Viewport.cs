@@ -165,7 +165,8 @@ public sealed partial class XYPreviewPanel
     {
         viewportRedrawTimer.Stop();
         try {
-            if(overlayLimits is null) { canvas.Children.Clear(); return; }
+            // No joint range to overlay: nothing is drawn, except the board's plan, which is a picture of its own and has no use for one.
+            if(overlayLimits is null) { if(boardView is not null && timing is null) DrawBoardSample(); else canvas.Children.Clear(); return; }
             if(timing is not null) DrawSample();
             else if(boardView is not null) DrawBoardSample();
             else if(pointTarget is {} pose) {

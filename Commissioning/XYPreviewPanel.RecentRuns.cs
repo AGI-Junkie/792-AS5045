@@ -73,6 +73,15 @@ public sealed partial class XYPreviewPanel
         return values.TryGetValue("shape", out var s) && s != "10" && ValidPresetValues(values) ? values : null;
     }
 
+    // What a board slot's description restores.  Unlike an old recording it must be complete: nothing may be filled in from whatever figure
+    // is open now, or the click would present a hybrid as the slot's settings.  An incomplete one is not restorable (the nodes are read instead).
+    private static readonly string[] BoardKeys = ["shape", "branch", "x", "y", "a", "b", "c", "rot", "scale", "dir", "v1", "v2", "a1", "a2"];
+    internal static Dictionary<string, string>? BoardValues(string settings)
+    {
+        var keys = settings.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Select(part => part.IndexOf('=') is int eq and > 0 ? part[..eq].Trim() : "").ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return BoardKeys.All(keys.Contains) ? RunValues(settings) : null;
+    }
+
     // ponytail: reads every recording's metadata (archive list is capped at 500); keep an index file if that gets slow.
     internal void RefreshRecentRuns()
     {
@@ -150,7 +159,7 @@ public sealed partial class XYPreviewPanel
         if (stored.Count > 0) AddHeader(Lang.T("recent.boardHeader", boardSlots.Take(boardSlotCount).Count(s => s is { Valid: true }), boardSlotCount));
         foreach (var slot in stored)
         {
-            var values = BoardLedger.For(slot, boardLedger) is { } entry ? RunValues(entry.Settings) : null;
+            var values = BoardLedger.For(slot, boardLedger) is { } entry ? BoardValues(entry.Settings) : null;
             string label = Lang.T("board.slot", slot.Slot + 1, SlotLabel(slot));
             var star = StarButton("★", Lang.T("board.star.stored", slot.Slot + 1), WorkbenchTheme.Warn, boardKnown && !boardBusy);
             var load = LoadButton(label, values, boardCanRead);
@@ -293,6 +302,7 @@ public sealed partial class XYPreviewPanel
             // a custom contour (not recorded) or a damaged text cannot be loaded.
             if (RunValues("shape=3; v1=5; v2=3; a1=10; a2=6; x=340; c=") is not { } old || old["c"] != "" || old["rotation"] != "0" || old["scale"] != "1" || old["direction"] != "0" || old["x"] != "340") Fail("旧记录应补上默认变换并保留空的 c");
             if (RunValues("shape=2; dir=cw; v1=1")?["direction"] != "1") Fail("dir=cw 应载入为顺时针");
+            if (BoardValues("shape=2; v1=4; v2=3; a1=8; a2=6") is not null || BoardValues("shape=2; branch=0; x=330; y=0; a=12; b=7; c=; rot=0; scale=1; dir=ccw; v1=4; v2=3; a1=8; a2=6") is null) Fail("板上的描述缺字段时不能恢复，完整的才能");
             if (RunValues("shape=10; v1=5; v2=3; a1=10; a2=6") is not null || RunValues("nonsense") is not null || RunValues("shape=99; v1=1") is not null || RunValues("shape=1; x=" + new string('9', 40)) is not null) Fail("自定义轮廓或无效记录不应能载入");
 
             var panel = new XYPreviewPanel();
@@ -443,6 +453,13 @@ public sealed partial class XYPreviewPanel
             star.SetBoard(4, true, false, [Free(0), match, null, null], [new LedgerEntry(1, match.Crc, foreign)], null, canReadNodes: true);
             star.recentRows[0].Load.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
             if (fetches.Count != 0 || star.recentNote.Text.Contains("正在读取")) Fail("重新算出的计划就是板上的，不必再读：" + star.recentNote.Text);
+            // A description the board holds that lacks fields is not restorable: nothing is filled in from the figure that is open, the nodes are
+            // read instead.
+            fetches.Clear(); int shapeBefore = star.shape.SelectedIndex, speedBefore = (int)Number(star.v1);
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0x66666666), null, null], [new LedgerEntry(1, 0x66666666, "shape=2; v1=4; v2=3; a1=8; a2=6")], null, canReadNodes: true);
+            star.recentRows[0].Load.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            if (!fetches.SequenceEqual([1]) || star.shape.SelectedIndex != shapeBefore || (int)Number(star.v1) != speedBefore || !star.recentNote.Text.Contains("没有保存可恢复的参数"))
+                Fail("缺字段的板上描述不能恢复成混合参数，应改读板上的节点：" + star.recentNote.Text);
             SuppressMenus = false;
             var broken = new XYPreviewPanel(); broken.RefreshRecentRuns();
             if (broken.recentRows.Count != 3 || broken.recentRows.Any(r => (string)r.Star.Content == "★")) Fail("没有板上记录时不应有 ★");

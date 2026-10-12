@@ -1085,6 +1085,7 @@ internal static class Lang
         ["act.boardPreview"] = ("正在看板上存的轨迹（只读预览）：它没有通过这台电脑当前的范围和速度检查，不能上传或执行。", "Looking at the plan stored on the board (read-only preview): it does not pass this computer's current ranges and speeds, so it cannot be uploaded or run."),
         ["plan.boardLinksSame"] = ("杆长按板上保存的 L1={0:0.##} mm、L2={1:0.##} mm 画，和这台电脑一致。", "Drawn with the link lengths saved with it, L1={0:0.##} mm, L2={1:0.##} mm, the same as on this computer."),
         ["plan.boardLinksDiffer"] = ("杆长按板上保存的 L1={0:0.##} mm、L2={1:0.##} mm 画；这台电脑是 L1={2:0.##} mm、L2={3:0.##} mm，不同。", "Drawn with the link lengths saved with it, L1={0:0.##} mm, L2={1:0.##} mm; this computer has L1={2:0.##} mm, L2={3:0.##} mm, which differ."),
+        ["plan.boardLinksNoLocal"] = ("杆长按板上保存的 L1={0:0.##} mm、L2={1:0.##} mm 画；这台电脑框里的杆长不是有效的数，没法比较。", "Drawn with the link lengths saved with it, L1={0:0.##} mm, L2={1:0.##} mm; the link lengths in the boxes here are not valid numbers, so they cannot be compared."),
         ["plan.boardLinksUnknown"] = ("板上没有保存杆长，按这台电脑的 L1={0:0.##} mm、L2={1:0.##} mm 画。", "The board holds no link lengths for it; drawn with this computer's L1={0:0.##} mm, L2={1:0.##} mm."),
         ["vp.start"] = ("起点", "Start"),
         ["vp.startEnd"] = ("起点 / 收笔点", "Start / pen-up point"),
