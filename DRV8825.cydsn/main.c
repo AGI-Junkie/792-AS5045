@@ -148,7 +148,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-guards2"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta1-guards2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -1534,6 +1534,12 @@ static ts_job_t g_store;
 static uint8  g_storeAccepted[15];
 static uint32 g_storeSeq;                         /* control sequence of the latest accepted type 12 command */
 static struct { uint8 last, slot; uint32 rowMaxCy; } g_storeResult;   /* last: 0 none, 1 saved, 2 erased, 3 failed, 4 aborted */
+/* The host's description of the plan in RAM (type 14), kept for the save that follows it.  The stream is len u16, 0 u16,
+ * CRC-32 of the text u32, CRC-32 of the plan's node stream u32, then the text; it arrives four bytes per frame (q1, q2), the
+ * chunk number in `value`.  The device never reads the text; it only stores it and gives it back (type 12 op 4). */
+#define META_HEAD   (12u)
+#define META_CHUNKS ((META_HEAD + TS_META_MAX + 3u) / 4u)
+static struct { uint8 raw[META_CHUNKS * 4u]; uint8 got[META_CHUNKS]; uint8 touched; } g_meta;
 static uint8 ts_write_row(uint32 offset, const uint8 *row)
 {
     cystatus status;
@@ -2158,14 +2164,64 @@ static void store_slot_line(uint8 slot)
     ts_info_t in;
     ts_active(slot,&in);
     if(!in.valid) { JLOGF("TRAJ_SLOT slot=%u valid=0\r\n",(unsigned)slot); return; }
+    if(in.metaLen) {
+        JLOGF("TRAJ_SLOT slot=%u valid=1 seq=%lu nodes=%u duration_ms=%lu q1=%d q2=%d crc=%08lX meta=%u\r\n",
+              (unsigned)slot,(unsigned long)in.seq,(unsigned)in.count,(unsigned long)in.durationMs,(int)in.q1,(int)in.q2,
+              (unsigned long)in.dataCrc,(unsigned)in.metaLen);
+        return;
+    }
     JLOGF("TRAJ_SLOT slot=%u valid=1 seq=%lu nodes=%u duration_ms=%lu q1=%d q2=%d crc=%08lX\r\n",
           (unsigned)slot,(unsigned long)in.seq,(unsigned)in.count,(unsigned long)in.durationMs,(int)in.q1,(int)in.q2,
           (unsigned long)in.dataCrc);
 }
+/* Type 12 op 4: one slot's description as one hex line (one slot at a time: four of them would not fit the text queue). */
+static void store_meta_line(uint8 slot)
+{
+    static const char hex[]="0123456789ABCDEF";
+    ts_info_t in;
+    const uint8 *m;
+    uint16 i, n;
+    ts_active(slot,&in);
+    if(!in.valid || !in.metaLen) { JLOGF("TRAJ_META slot=%u len=0\r\n",(unsigned)slot); return; }
+    m=ts_flash(ts_block_offset(slot,in.which))+TS_META_ROW0*TS_ROW_BYTES;
+    n=(uint16)snprintf(g_dbg,sizeof(g_dbg),"TRAJ_META slot=%u seq=%lu len=%u crc=%08lX hex=",(unsigned)slot,(unsigned long)in.seq,
+                       (unsigned)in.metaLen,(unsigned long)ts_crc32(0u,m,in.metaLen));
+    for(i=0u;i<in.metaLen;i++) { g_dbg[n++]=hex[m[i]>>4]; g_dbg[n++]=hex[m[i]&15u]; }
+    g_dbg[n++]='\r'; g_dbg[n++]='\n'; g_dbg[n]=0;
+    JLOG(g_dbg);
+}
 static void store_end(uint8 result)
 {
     g_storeResult.last=result; g_storeResult.slot=g_store.slot; g_storeResult.rowMaxCy=g_store.rowMaxCy;
-    g_store.busy=0u; store_status();
+    g_store.busy=0u; memset(&g_meta,0,sizeof(g_meta)); store_status();
+}
+/* 0 = no description was sent, 1 = a complete one is held, 2 = one was started but is incomplete or damaged. */
+static uint8 meta_state(void)
+{
+    uint16 len, i;
+    if(!g_meta.touched) { return 0u; }
+    len=ptp_u16(g_meta.raw);
+    if(len<1u || len>TS_META_MAX || ptp_u16(g_meta.raw+2)!=0u) { return 2u; }
+    for(i=0u;i<(uint16)((META_HEAD+len+3u)/4u);i++) { if(!g_meta.got[i]) { return 2u; } }
+    return ts_crc32(0u,g_meta.raw+META_HEAD,len)==ptp_u32(g_meta.raw+4) ? 1u : 2u;
+}
+/* Type 14 (control sequence): chunk `value` of the description, four bytes in q1/q2.  No receipt per chunk: a lost or damaged
+ * one shows when the save asks for the description (meta_state), which then refuses.  Chunk 0 starts a new description. */
+static void meta_accept(const uint8 *p)
+{
+    uint32 seq=ptp_u32(p+1);
+    uint16 idx=ptp_u16(p+13);
+    if(ptp_u32(p+5)!=g_ptp.epoch) {
+        g_rxRejected++; g_ptpEpochRejected++; ptp_announce_epoch();
+        JLOG("TRAJ_META refused: stale epoch\r\n"); return;
+    }
+    if(!TS_LINKED() || !seq || seq<=g_controlSequence || idx>=META_CHUNKS || g_store.busy) {
+        g_rxRejected++; JLOG("TRAJ_META refused: arguments\r\n"); return;
+    }
+    g_controlSequence=seq;
+    if(idx==0u) { memset(&g_meta,0,sizeof(g_meta)); }
+    memcpy(g_meta.raw+(uint16)(idx*4u),p+9,4u);
+    g_meta.got[idx]=1u; g_meta.touched=1u;
 }
 /* One flash row per foreground pass.  The plan being saved is g_traj itself, so anything that changes it (a stop, an
  * enable, a new upload) ends the save, and the block under construction stays invalid. */
@@ -2177,7 +2233,11 @@ static void store_service(void)
         JLOG("TRAJ_STORE aborted: the plan changed\r\n"); store_end(4u); return;
     }
     r=ts_step(&g_store);
-    if(r==TS_STEP_FAIL) { JLOGF("TRAJ_STORE failed: flash write/verify at row %lu\r\n",(unsigned long)g_store.rowsWritten); store_end(3u); }
+    if(r==TS_STEP_FAIL) {
+        if(g_store.mismatch) { JLOG("TRAJ_STORE failed: the description is not for this plan\r\n"); }
+        else { JLOGF("TRAJ_STORE failed: flash write/verify at row %lu\r\n",(unsigned long)g_store.rowsWritten); }
+        store_end(3u);
+    }
     else if(r==TS_STEP_DONE) { store_end(g_store.kind==TS_JOB_SAVE ? 1u : 2u); }
     else if(g_store.kind==TS_JOB_SAVE && g_store.phase==1u && (g_store.row&7u)==0u) { store_status(); }
 }
@@ -2193,7 +2253,7 @@ static void store_accept(const uint8 *p)
     if(!TS_LINKED()) { g_rxRejected++; JLOG("TRAJ_STORE refused: archive region not reserved (link with cm3gcc_trajstore.ld)\r\n"); return; }
     retry=(uint8)(memcmp(g_storeAccepted,p,15u)==0);   /* heartbeats keep advancing the sequence, so a retry is judged by its bytes */
     if(!retry && (!seq || seq<=g_controlSequence)) { g_rxRejected++; JLOG("TRAJ_STORE refused: stale sequence\r\n"); return; }
-    if(ptp_u16(p+13) || op<1u || op>3u || (slot>=TS_SLOTS && !(op==1u && slot==0xFFFFu))) {
+    if(ptp_u16(p+13) || op<1u || op>4u || (slot>=TS_SLOTS && !(op==1u && slot==0xFFFFu))) {
         g_rxRejected++; JLOG("TRAJ_STORE refused: arguments\r\n"); return;
     }
     if(!retry) {
@@ -2201,15 +2261,21 @@ static void store_accept(const uint8 *p)
             JLOG("TRAJ_STORE refused: stage not idle\r\n"); return;
         }
         if(op==2u && !traj_runnable(&g_traj)) { JLOG("TRAJ_STORE refused: no complete plan in RAM\r\n"); return; }
-        if(op!=1u && CySetTemp()!=CYRET_SUCCESS) { JLOG("TRAJ_STORE refused: flash temperature setup\r\n"); return; }
+        if(op==2u && meta_state()==2u) { memset(&g_meta,0,sizeof(g_meta)); JLOG("TRAJ_STORE refused: description incomplete\r\n"); return; }
+        if((op==2u || op==3u) && CySetTemp()!=CYRET_SUCCESS) { JLOG("TRAJ_STORE refused: flash temperature setup\r\n"); return; }
         g_controlSequence=seq; g_storeSeq=seq; memcpy(g_storeAccepted,p,15u);
-        if(op==2u) { ts_job_save(&g_store,(uint8)slot,g_traj.nodes,g_traj.count,g_traj.durationMs); }
+        if(op==2u) {
+            uint8 held=(uint8)(meta_state()==1u);
+            ts_job_save(&g_store,(uint8)slot,g_traj.nodes,g_traj.count,g_traj.durationMs,
+                        held ? g_meta.raw+META_HEAD : 0, held ? ptp_u16(g_meta.raw) : 0u, ptp_u32(g_meta.raw+8));
+        }
         else if(op==3u) { ts_job_erase(&g_store,(uint8)slot); }
     }
     if(op==1u) {
         uint8 s;
         for(s=0u;s<TS_SLOTS;s++) { if(slot==0xFFFFu || slot==s) { store_slot_line(s); } }
     }
+    else if(op==4u) { store_meta_line((uint8)slot); }
     store_status();
 }
 /* Fill g_traj from a slot through the same checks an upload gets, against the CURRENT joint ranges and speeds, so a
@@ -2300,6 +2366,7 @@ static void ptp_accept(void)
     if (p[0]==9u || p[0]==10u) { joint_limits_accept(p); return; }
     if (p[0]==11u) { telem_rate_accept(p); return; }
     if (p[0]==12u) { store_accept(p); return; }
+    if (p[0]==14u) { meta_accept(p); return; }
     if (p[0]>=6u && p[0]<=8u) { control_accept(p); return; }
     if (p[0] < 1u || (p[0] > 5u && p[0] != 13u)) { JLOG("PTP refused: version\r\n"); return; }
     if (!PTP_COMMISSIONED) { JLOG("PTP refused: commissioning lock\r\n"); return; }
@@ -2992,8 +3059,8 @@ static void stage_status_line(void)
     case 6u:
     traj_status(); break;
     case 7u:
-    JLOGF("LINK uart=hw baud=115200 link=%s rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=%u traj_repeat=1 fault_snapshot=1 traj_store=%u telem_hz=%u proto=%u\r\n",
-          (g_usbUp != 0u) ? "usb" : "uart", (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)ARM2_ENCODER_FEEDBACK, (unsigned)(TS_LINKED() ? TS_SLOTS : 0u), (unsigned)g_telemHz, (unsigned)PROTO_VERSION); break;
+    JLOGF("LINK uart=hw baud=115200 link=%s rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=%u traj_repeat=1 fault_snapshot=1 traj_meta=%u traj_store=%u telem_hz=%u proto=%u\r\n",
+          (g_usbUp != 0u) ? "usb" : "uart", (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)ARM2_ENCODER_FEEDBACK, (unsigned)(TS_LINKED() ? TS_META_MAX : 0u), (unsigned)(TS_LINKED() ? TS_SLOTS : 0u), (unsigned)g_telemHz, (unsigned)PROTO_VERSION); break;
     case 8u:
     JLOGF("PTP_RX short_ok=%lu drop_crc=%lu drop_short=%lu drop_timeout=%lu rejected=%lu epoch_rejected=%lu last_rejected_byte=0x%02X\r\n",
           (unsigned long)g_shortRxOk, (unsigned long)g_ptpRxCrc, (unsigned long)g_ptpRxShort, (unsigned long)g_ptpRxTimeout,

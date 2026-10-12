@@ -97,6 +97,12 @@ public sealed partial class ControlWindow
             Toggle(false); Check(p.BoardNoteText.Contains("板上存档") && p.BoardNoteText.Contains("别处存的图形") && p.BoardNoteText.Contains("已存到板上槽1"), "board note not Chinese");
             Toggle(true); Check(p.BoardNoteText.Contains("Stored on the board") && p.BoardNoteText.Contains("saved elsewhere") && p.BoardNoteText.Contains("Saved to board slot 1"), "board note not English");
             Toggle(false); Check(p.BoardNoteText.Contains("板上存档"), "board note stale after switching back");
+            // A slot that carries its own description is a row of the recent list (header, name, size) in either language.
+            p.SetBoard(4, true, false, [new BoardSlot(0, true, 1, 69, 16584, 0, 0, 1), new BoardSlot(1, false, 0, 0, 0, 0, 0, 0), new BoardSlot(2, false, 0, 0, 0, 0, 0, 0), new BoardSlot(3, false, 0, 0, 0, 0, 0, 0)],
+                [new LedgerEntry(0, 1, "shape=2; x=330; y=0; a=12; b=7; v1=4; v2=3; a1=8; a2=6")], null);
+            Toggle(false); Check(p.RecentListText.Contains("板上图形 · 1/4") && p.RecentListText.Contains("槽1：矩形 · 69 点"), "board row not Chinese: " + p.RecentListText);
+            Toggle(true); Check(p.RecentListText.Contains("On the board · 1/4") && p.RecentListText.Contains("slot 1: Rectangle · 69 points"), "board row not English: " + p.RecentListText);
+            Toggle(false); Check(p.RecentListText.Contains("板上图形"), "board row stale after switching back");
             if (snapshotPath is not null) {
                 string directory = Path.GetDirectoryName(Path.GetFullPath(snapshotPath))!;
                 Directory.CreateDirectory(directory);

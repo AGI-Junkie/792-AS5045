@@ -20,7 +20,12 @@ public sealed partial class ControlWindow
     }
 
     private int storeSlotCount;                                           // traj_store=<n> in LINK; 0 = this firmware cannot archive
+    private int storeMetaMax;                                             // traj_meta=<n> in LINK: bytes of description it keeps with a plan; 0 = none
     private readonly BoardSlot?[] boardSlots = new BoardSlot?[DeviceContract.TrajStoreSlots];
+    private readonly BoardMeta?[] boardMeta = new BoardMeta?[DeviceContract.TrajStoreSlots];   // read back from the board, one slot at a time
+    private readonly uint?[] metaAsked = new uint?[DeviceContract.TrajStoreSlots];             // the slot's save counter when its description was last asked for
+    private byte[][] storeMetaChunks = [];                                // the description of the plan being saved: sent first, then the Save frame
+    private int storeMetaNext;
     private bool boardKnown;                                              // a COMPLETE inventory (every slot reported) has arrived on this link
     private int boardSeen;                                                // bit per slot reported by the query in flight
     private (ExecutionTrajectory Plan, int Slot, DateTime Since, string Settings)? deferredBoardSave;   // asked while the device was still confirming new speeds
@@ -45,20 +50,22 @@ public sealed partial class ControlWindow
         string? slots = words.FirstOrDefault(w => w.StartsWith("traj_store=", StringComparison.Ordinal));
         int before = storeSlotCount;
         storeSlotCount = slots is not null && int.TryParse(slots.AsSpan(11), out int n) && n is > 0 and <= DeviceContract.TrajStoreSlots ? n : 0;
-        if (storeSlotCount == 0) { boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); }
+        string? meta = words.FirstOrDefault(w => w.StartsWith("traj_meta=", StringComparison.Ordinal));
+        storeMetaMax = storeSlotCount > 0 && meta is not null && int.TryParse(meta.AsSpan(10), out int m) && m > 0 ? Math.Min(m, BoardMeta.MaxBytes) : 0;
+        if (storeSlotCount == 0) { boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); }
         if (storeSlotCount != before) PublishBoard();   // the LINK line comes every 500 ms; the panel is only told when this changes
     }
 
     private void ResetBoard()
     {
-        storeSlotCount = 0; boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); storeStatus = null; storeJob = null; storePacket = []; storeResend = false;
+        storeSlotCount = 0; storeMetaMax = 0; boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); storeStatus = null; storeJob = null; storePacket = []; storeResend = false;
         pendingBoardSave = null; deferredBoardSave = null; loadingSlot = null; boardMessage = null; lastBoardQueryAt = default;
-        lock (wireSync) { if (pendingControlType == 12) pendingControlType = 0; }
+        lock (wireSync) { if (pendingControlType is 12 or 14) pendingControlType = 0; storeMetaChunks = []; storeMetaNext = 0; }
         PublishBoard();
     }
 
-    private void PublishBoard() => xyPreview.SetBoard(storeSlotCount, boardKnown, storeJob is not null && storeJob.Op != StoreOp.Query || pendingBoardSave is not null || deferredBoardSave is not null,
-        boardSlots, boardLedger, boardMessage);
+    private void PublishBoard() => xyPreview.SetBoard(storeSlotCount, boardKnown, storeJob is { Op: StoreOp.Save or StoreOp.Erase } || pendingBoardSave is not null || deferredBoardSave is not null,
+        boardSlots, BoardLedger.Merge(boardSlots, boardMeta, boardLedger), boardMessage);
     private void SetBoardMessage(Func<string>? message) { boardMessage = message; PublishBoard(); }
 
     private bool StartStoreJob(StoreOp op, int slot, Action<bool, Func<string>>? done)
@@ -68,7 +75,10 @@ public sealed partial class ControlWindow
         {
             if (pendingControlType != 0) return false;
             storeJob = new StoreJob(op, slot, done);
-            storeRequestOp = op; storeRequestSlot = slot; storePacket = []; storeResend = false; pendingControlType = 12;
+            if (op != StoreOp.Save) storeMetaChunks = [];
+            // A save that carries a description sends it first (type 14, one chunk per frame); the Save frame follows the last chunk.
+            storeRequestOp = op; storeRequestSlot = slot; storePacket = []; storeResend = false; storeMetaNext = 0;
+            pendingControlType = storeMetaChunks.Length > 0 ? (byte)14 : (byte)12;
             if (op == StoreOp.Query) boardSeen = 0;   // only a query that reports every slot completes the inventory
         }
         Append($"HOST archive request {op} slot={(slot < 0 ? "all" : slot.ToString())}");
@@ -80,7 +90,7 @@ public sealed partial class ControlWindow
     {
         if (storeJob is not { } job) return;
         storeJob = null;
-        lock (wireSync) { if (pendingControlType == 12) pendingControlType = 0; }
+        lock (wireSync) { if (pendingControlType is 12 or 14) pendingControlType = 0; storeMetaChunks = []; storeMetaNext = 0; }
         Append($"HOST archive {job.Op} slot={(job.Slot < 0 ? "all" : job.Slot.ToString())} {(ok ? "done" : "failed")}", ok ? null : LogLevel.Warning);   // the raw log stays raw; the reason goes to the panel
         job.Done?.Invoke(ok, message);
         // A change on the board is read back, so the picture shown is the device's and not what was hoped for.  A FAILED save or erase
@@ -88,7 +98,7 @@ public sealed partial class ControlWindow
         // final status lost.  From the moment a save or erase ends, until the answer is complete, the old slot contents are not trusted:
         // nothing is saved, cleared or loaded from them (a stale entry could pick the wrong plan), and if the read-back is lost the
         // periodic synchronisation asks again.
-        if (job.Op != StoreOp.Query)
+        if (job.Op is StoreOp.Save or StoreOp.Erase)
         {
             boardKnown = false; boardSeen = 0;
             StartStoreJob(StoreOp.Query, -1, null);
@@ -99,10 +109,19 @@ public sealed partial class ControlWindow
     // Reads the archive once the link is up and the machine is still, and again after the device lost the answer.
     private void SynchronizeBoard(DateTime now)
     {
-        if (!StoreAvailable || boardKnown || storeJob is not null || pendingBoardSave is not null || (now - lastBoardQueryAt).TotalSeconds < 3) return;
+        if (!StoreAvailable || storeJob is not null || pendingBoardSave is not null || (now - lastBoardQueryAt).TotalSeconds < (boardKnown ? 0.3 : 3)) return;
         if (PointBusy || homing || keyboardMask != 0 || mouseMask != 0 || ptp is not { Active: 0 }) return;
-        lastBoardQueryAt = now;
-        StartStoreJob(StoreOp.Query, -1, null);
+        if (!boardKnown) { lastBoardQueryAt = now; StartStoreJob(StoreOp.Query, -1, null); return; }
+        // Then the descriptions the slots carry, one slot per query (four at once would not fit the device's text queue); each is asked
+        // for once per save counter, so a slot that cannot be read does not keep the link busy.
+        if (storeMetaMax == 0) return;
+        for (int i = 0; i < storeSlotCount; i++)
+        {
+            if (boardSlots[i] is not { Valid: true, MetaLen: > 0 } slot || metaAsked[i] == slot.Seq) continue;
+            lastBoardQueryAt = now; metaAsked[i] = slot.Seq; boardMeta[i] = null;
+            StartStoreJob(StoreOp.Meta, i, null);
+            return;
+        }
     }
 
     // Unanswered requests are repeated byte for byte (the device only repeats its receipt); a saving device is given time.
@@ -120,7 +139,7 @@ public sealed partial class ControlWindow
                 Append($"HOST archive retry attempt={job.Attempts}/3; identical packet", LogLevel.Warning);
             }
         }
-        else if (quiet > (job.Op == StoreOp.Query ? 3 : StoreWorkSeconds)) FinishStoreJob(false, () => Lang.T("board.err.stalled"));
+        else if (quiet > (job.Op is StoreOp.Query or StoreOp.Meta ? 3 : StoreWorkSeconds)) FinishStoreJob(false, () => Lang.T("board.err.stalled"));
     }
 
     private void ObserveStoreLine(string line)
@@ -137,6 +156,12 @@ public sealed partial class ControlWindow
             else Append("HOST malformed or unexpected archive slot line", LogLevel.Warning);
             return;
         }
+        if (line.StartsWith("TRAJ_META ", StringComparison.Ordinal))
+        {
+            if (BoardMeta.Parse(line) is { } meta && storeJob is { Op: StoreOp.Meta } asking && asking.Slot == meta.Slot) { boardMeta[meta.Slot] = meta; asking.LastSeenAt = DateTime.UtcNow; PublishBoard(); }
+            else if (line.StartsWith("TRAJ_META refused:", StringComparison.Ordinal) && storeJob is { Op: StoreOp.Save, Acked: false }) FinishStoreJob(false, () => Lang.T("board.err.refused", line[18..].Trim()));
+            return;
+        }
         if (storeJob is not { } job) return;
         if (StoreStatus.Parse(line) is { } status)
         {
@@ -146,7 +171,7 @@ public sealed partial class ControlWindow
             if (status.Busy) { PublishBoard(); return; }
             bool ok = job.Op switch
             {
-                StoreOp.Query => true,
+                StoreOp.Query or StoreOp.Meta => true,
                 StoreOp.Save => status.Last == "saved" && status.LastSlot == job.Slot,
                 _ => status.Last == "erased" && status.LastSlot == job.Slot,
             };
@@ -196,11 +221,12 @@ public sealed partial class ControlWindow
     private void BeginBoardSave(ExecutionNode[] nodes, int slot, string settings)
     {
         uint crc = TrajectoryArchive.PlanCrc(nodes);
+        storeMetaChunks = storeMetaMax > 0 && BoardMeta.TextFor(settings, storeMetaMax) is { } text ? BoardMeta.Chunks(text, crc) : [];
         if (!StartStoreJob(StoreOp.Save, slot, (ok, message) =>
         {
             if (ok) { RememberBoard(slot, crc, settings); SetBoardMessage(() => Lang.T("board.saved", slot + 1)); }
             else SetBoardMessage(() => Lang.T("board.saveFailed", slot + 1, message()));
-        })) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
+        })) { storeMetaChunks = []; SetBoardMessage(() => Lang.T("board.err.busy")); return; }
         SetBoardMessage(() => Lang.T("board.saving", slot + 1));
     }
 
@@ -388,6 +414,113 @@ public sealed partial class ControlWindow
             Check(w.storeSlotCount == 0 && !w.boardKnown && w.boardSlots.All(s => s is null) && w.pendingBoardSave is null && w.pendingControlType == 0, "the board state survived a reset");
         }
         finally { w.Close(); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }
+    }
+
+    // The description kept with a plan on the board: asked for slot by slot once the inventory is complete, sent in front of a save
+    // (type 14 frames, then the Save frame), refused saves, and what the panel shows for a slot another computer saved.
+    internal static void BoardMetaFlowSelfTest()
+    {
+        static void Check(bool yes, string reason) { if (!yes) throw new InvalidOperationException("Archive description: " + reason); }
+        static int Type(byte[] f) => ((f[1] >> 1) & 15) | (((f[2] >> 1) & 15) << 4);
+        static int Field(byte[] f, int i) => ((f[1 + 2 * i] >> 1) & 15) | (((f[2 + 2 * i] >> 1) & 15) << 4);
+        string ledger = Path.Combine(Path.GetTempPath(), "arm-board-meta-" + Guid.NewGuid().ToString("N") + ".json");
+        BoardLedger.PathOverride = ledger;
+        bool language = Lang.IsEn; Lang.Set(false, false);
+        var w = new ControlWindow { selfTesting = true, ShowActivated = false, ShowInTaskbar = false };
+        var frames = new List<byte[]>();
+        void Write(byte[] data, int offset, int count) { if (offset == 0 && (frames.Count == 0 || !ReferenceEquals(frames[^1], data))) frames.Add(data); }
+        void Pump() { for (int i = 0; i < 600 && w.pendingControlType != 0; i++) { w.PublishHeartbeatLease(); w.WireWriterStep(Write); } }
+        List<byte[]> Sent() => frames.Where(f => f.Length == 36 && Type(f) is 12 or 14).ToList();
+        string Link(string extra) => $"LINK uart=hw baud=115200 fw=stage2-v11-test short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 traj_repeat=1 fault_snapshot=1{extra} proto={DeviceContract.ProtocolVersion}";
+        try
+        {
+            const string settings = "shape=2; branch=0; L1=180; L2=176.38; x=340; y=0; a=10; b=6; feed=1; v1=6.5; v2=3; a1=10; a2=6; min1=-1; max1=1; emin=-1; emax=1; c=; rot=20; scale=1.2; dir=cw; custom_chars=0";
+            string text = BoardMeta.TextFor(settings) ?? throw new InvalidOperationException("Archive description: the fixture settings were not accepted");
+            var nodes = new[] { new ExecutionNode(new JointPose(0, 0), 0), new ExecutionNode(new JointPose(0.5, -0.25), 100), new ExecutionNode(new JointPose(1, -0.5), 100), new ExecutionNode(new JointPose(1, -0.5), 50) };
+            uint planCrc = TrajectoryArchive.PlanCrc(nodes);
+            w.HandleLine("STATE fw=stage2-v11 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
+            w.HandleLine("PTP_STATE lock=0 ref=0 active=0 epoch=3 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
+            // A firmware that archives but keeps no descriptions (traj_meta absent or 0) is never asked for one and is sent none.
+            w.HandleLine(Link(" traj_store=4 telem_hz=0"));
+            Check(w.storeSlotCount == 4 && w.storeMetaMax == 0, "a firmware without descriptions was assumed to have them");
+            w.HandleLine(Link(" traj_meta=256 traj_store=4 telem_hz=0"));
+            Check(w.storeMetaMax == 256, "the description size was not read");
+            Pump();   // the stream-rate request that the LINK line triggered goes out first
+            // The inventory first; the slot that carries a description is then asked for, once.
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(10));
+            Check(w.storeJob is { Op: StoreOp.Query }, "no inventory query");
+            Pump(); uint querySeq = w.storeJob!.Sequence;
+            w.HandleLine("TRAJ_SLOT slot=0 valid=0");
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=2 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8} meta={text.Length}");
+            w.HandleLine("TRAJ_SLOT slot=2 valid=1 seq=1 nodes=9 duration_ms=900 q1=0 q2=0 crc=11111111");
+            w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={querySeq} last=none last_slot=0 row_max_us=0");
+            Check(w.boardKnown && w.storeJob is null && w.boardSlots[1] is { MetaLen: var len } && len == text.Length, "the inventory with a description size was not taken");
+            frames.Clear();
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(20));
+            Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 } && w.pendingControlType == 12, "the slot with a description was not asked for it (only that slot)");
+            Pump();
+            var ask = Sent();
+            Check(ask.Count == 1 && Field(ask[0], 0) == 12 && (short)(Field(ask[0], 9) | Field(ask[0], 10) << 8) == 1 && Field(ask[0], 11) == 4, "description query frame (slot 1, op 4)");
+            uint metaSeq = w.storeJob!.Sequence;
+            // A line for another slot is not taken; the right one is; the status then ends the job without a re-read of the inventory.
+            byte[] body = System.Text.Encoding.ASCII.GetBytes(text);
+            string Line(int slot) => $"TRAJ_META slot={slot} seq=2 len={body.Length} crc={TrajectoryArchive.Crc32(body):X8} hex={Convert.ToHexString(body)}";
+            w.HandleLine(Line(2));
+            Check(w.boardMeta.All(m => m is null), "a description for a slot that was not asked for was taken");
+            w.HandleLine(Line(1));
+            w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={metaSeq} last=none last_slot=0 row_max_us=0");
+            Check(w.storeJob is null && w.boardKnown && w.boardMeta[1] is { Seq: 2 } && w.boardMeta[1]!.Text == text, "the description was not kept");
+            Check(w.xyPreview.BoardNoteText.Contains("槽2：矩形") && w.xyPreview.BoardNoteText.Contains("槽3：别处存的图形"), "the panel does not name the figures from the board's own descriptions: " + w.xyPreview.BoardNoteText);
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(30));
+            Check(w.storeJob is null, "a description was asked for twice");
+            // The slot is saved again (its counter moves): the old description is not trusted and is asked for again.
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8} meta={text.Length}");
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(40));
+            Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 } && w.boardMeta[1] is null, "a slot saved again was not asked again");
+            w.FinishStoreJob(true, () => "");
+
+            // A save carries its description: chunks first (type 14, consecutive numbers), the Save frame after the last one.
+            frames.Clear();
+            Check(w.StoreAvailable && w.boardKnown, "the archive is not available for the save");
+            w.BeginBoardSave(nodes, 0, settings);
+            Check(w.storeJob is { Op: StoreOp.Save, Slot: 0 } && w.pendingControlType == 14, "the save did not start with its description");
+            Pump();
+            var sent = Sent();
+            var expected = BoardMeta.Chunks(text, planCrc);
+            Check(sent.Count == expected.Length + 1 && sent.Take(expected.Length).All(f => Type(f) == 14) && Type(sent[^1]) == 12, $"frames: {string.Join(",", sent.Select(Type))}");
+            for (int i = 0; i < expected.Length; i++)
+            {
+                var f = sent[i];
+                Check(Field(f, 13) == i && Field(f, 14) == 0 && Enumerable.Range(0, 4).Select(k => (byte)Field(f, 9 + k)).SequenceEqual(expected[i]), $"chunk {i} payload");
+            }
+            Check(Enumerable.Range(1, sent.Count - 1).All(i => Seq(sent[i]) > Seq(sent[i - 1])) && w.storeJob!.Sequence == Seq(sent[^1]) && w.pendingControlType == 0, "sequence numbers or the end of the chunk run");
+            Check((short)(Field(sent[^1], 9) | Field(sent[^1], 10) << 8) == 0 && Field(sent[^1], 11) == 2, "the Save frame (slot 0, op 2)");
+            // The device saved it: the job ends and the board is read back.
+            w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=1/1 seq={w.storeJob!.Sequence} last=saved last_slot=0 row_max_us=0");
+            Check(w.storeJob is { Op: StoreOp.Query } && w.storeMetaChunks.Length == 0 && w.boardMessage?.Invoke().Contains("已存到板上槽1") == true, "the end of the save");
+            w.FinishStoreJob(true, () => "");
+            // The device refuses (a chunk was lost): the job fails with its reason and the read-back follows.
+            w.BeginBoardSave(nodes, 0, settings);
+            Pump();
+            w.HandleLine("TRAJ_STORE refused: description incomplete");
+            Check(w.storeJob is { Op: StoreOp.Query } && w.boardMessage?.Invoke().Contains("失败") == true && w.boardMessage.Invoke().Contains("description incomplete"), "a refused save was not reported as failed: " + w.boardMessage?.Invoke());
+            w.FinishStoreJob(true, () => "");
+            // A refusal while the chunks are still going out stops them.
+            w.BeginBoardSave(nodes, 0, settings);
+            Check(w.pendingControlType == 14, "the second save did not start with chunks");
+            w.HandleLine("TRAJ_META refused: arguments");
+            Check(w.storeJob is { Op: StoreOp.Query } && w.storeMetaChunks.Length == 0 && w.pendingControlType == 12, "chunks kept going after the device refused them");
+            w.FinishStoreJob(true, () => "");
+            // A description that does not fit what the firmware keeps is not sent: the save goes ahead without one.
+            w.storeMetaMax = 20;
+            w.BeginBoardSave(nodes, 0, settings);
+            Check(w.storeJob is { Op: StoreOp.Save } && w.pendingControlType == 12, "an oversized description was sent");
+            w.ResetBoard();
+            Check(w.pendingControlType == 0 && w.boardMeta.All(m => m is null) && w.storeMetaMax == 0, "the description state survived a reset");
+        }
+        finally { w.Close(); Lang.Set(language, false); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }
+        static uint Seq(byte[] f) => (uint)(Field(f, 1) | Field(f, 2) << 8 | Field(f, 3) << 16 | Field(f, 4) << 24);
     }
 
     // The whole flow through the real window, the way the panel drives it: a figure that is not on the device is uploaded and then saved

@@ -23,6 +23,7 @@ public sealed partial class XYPreviewPanel
     internal static ContextMenu? LastMenu;
     private static void ShowMenu(ContextMenu menu) { LastMenu = menu; if (!SuppressMenus) menu.IsOpen = true; }
     internal string BoardNoteText => boardNote.Text;
+    internal string RecentListText => string.Join("\n", recentList.Children.Cast<UIElement>().Select(c => c is TextBlock t ? t.Text : c is DockPanel d ? string.Join(" ", d.Children.OfType<Button>().Select(b => b.Content as TextBlock is { } label ? label.Text : b.Content?.ToString())) : ""));
     // One clear button per stored slot, so a figure saved from another computer (or whose record was lost) can be cleared too.
     private readonly WrapPanel boardClear = new() { Margin = new Thickness(10, 0, 10, 6) };
     private readonly ContentControl boardClearHost = new() { IsTabStop = false, Focusable = false };   // locked with the other edit controls while the arm moves

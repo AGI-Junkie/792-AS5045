@@ -1800,6 +1800,23 @@ static void store_send(uint8 type,uint32 seq,uint16 slot,uint16 op,uint16 value)
 }
 static void store_run(void){unsigned i;for(i=0;i<400 && g_store.busy;i++){cycle(1);store_service();}assert(!g_store.busy);}
 static void store_save(uint16 slot){store_send(12,g_controlSequence+1u,slot,2,0);assert(g_store.busy);store_run();}
+/* The description as the host sends it: type 14 frames of four bytes each.  `skip` drops one chunk, `flip` damages one text bit. */
+static void meta_send_chunks(const char *text,uint32 planCrc,int skip,int flip){
+    uint8 raw[META_CHUNKS*4u];unsigned len=(unsigned)strlen(text),n,i;
+    memset(raw,0,sizeof(raw));
+    raw[0]=(uint8)len;raw[1]=(uint8)(len>>8);
+    ts_put32(raw+4,ts_crc32(0,(const uint8*)text,len));ts_put32(raw+8,planCrc);memcpy(raw+META_HEAD,text,len);
+    if(flip>=0)raw[META_HEAD+flip]^=1;
+    n=(META_HEAD+len+3u)/4u;
+    for(i=0;i<n;i++){
+        if((int)i==skip)continue;
+        store_send(14,g_controlSequence+1u,(uint16)(raw[i*4]|raw[i*4+1]<<8),(uint16)(raw[i*4+2]|raw[i*4+3]<<8),(uint16)i);
+    }
+}
+static int meta_is(uint8 slot,const char *text){
+    ts_info_t in;ts_active(slot,&in);
+    return in.valid && in.metaLen==strlen(text) && !memcmp(ts_flash(ts_block_offset(slot,in.which))+TS_META_ROW0*TS_ROW_BYTES,text,in.metaLen);
+}
 static void store_reference(void){
     g_enc2.directionKnown=1u;g_enc2.incDir=simPolarity2>0?1u:0u;
     packetType=5;ptp_send(1,g_ptp.epoch,0,0,0,0);packetType=1;
@@ -1932,7 +1949,7 @@ static void store_test(const char *t) {
         sq=g_controlSequence;
         packetType=12;
         ptp_send(sq+1u,g_ptp.epoch-1u,0,2,0,0);ptp_send(sq,g_ptp.epoch,0,2,0,0);ptp_send(0,g_ptp.epoch,0,2,0,0);
-        ptp_send(sq+1u,g_ptp.epoch,TS_SLOTS,2,0,0);ptp_send(sq+1u,g_ptp.epoch,0,0,0,0);ptp_send(sq+1u,g_ptp.epoch,0,4,0,0);
+        ptp_send(sq+1u,g_ptp.epoch,TS_SLOTS,2,0,0);ptp_send(sq+1u,g_ptp.epoch,0,0,0,0);ptp_send(sq+1u,g_ptp.epoch,0,5,0,0);
         ptp_send(sq+1u,g_ptp.epoch,0,2,1,0);ptp_send(sq+1u,g_ptp.epoch,-1,2,0,0);   /* all-slots is for queries only */
         packetType=1;
         assert(!g_store.busy && g_controlSequence==sq && simFlashWrites==0);
@@ -1995,6 +2012,71 @@ static void store_test(const char *t) {
         assert(!g_store.busy && simFlashWrites==0 && strstr(simLog,"archive region not reserved") && !strstr(simLog,"TRAJ_SLOT") && !ts_write_row(TS_REGION_OFFSET,row));
         simLogN=0;simLog[0]=0;stage_status();status_drain();
         assert(strstr(simLog," traj_store=0 telem_hz="));
+        return;
+    }
+    if(!strcmp(t,"store_meta")) {
+        /* The description a host keeps with a plan: stored in the spare row, committed with the header, given back on request. */
+        const char *textA="shape=3;branch=0;x=340;rot=20",*textB="shape=2;x=300";
+        char big[TS_META_MAX+1],want[96];unsigned w;uint32 sq;
+        store_make_plan(485,0);crcA=store_plan_crc();
+        meta_send_chunks(textA,crcA,-1,-1);
+        w=simFlashWrites;store_save(1);
+        assert(g_storeResult.last==1 && simFlashWrites-w==3u+(485u*6u+255u)/256u);   /* clear, data rows, description row, header */
+        ts_active(1,&in);assert(in.valid && in.dataCrc==crcA && meta_is(1,textA));
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,0xFFFFu,1,0);txq_flush_blocking();
+        sprintf(want,"crc=%08lX meta=%u\r\n",(unsigned long)crcA,(unsigned)strlen(textA));
+        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=1") && strstr(simLog,want) && strstr(simLog,"TRAJ_SLOT slot=0 valid=0\r\n"));
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,4,0);txq_flush_blocking();
+        sprintf(want,"TRAJ_META slot=1 seq=1 len=%u crc=%08lX hex=",(unsigned)strlen(textA),(unsigned long)ref_crc32((const uint8*)textA,(uint32)strlen(textA)));
+        assert(strstr(simLog,want) && strstr(simLog,"73686170653D33") && strstr(simLog,"TRAJ_STORE state=idle"));   /* "shape=3" */
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,3,4,0);txq_flush_blocking();
+        assert(strstr(simLog,"TRAJ_META slot=3 len=0"));
+        /* a description is used once: the next save without one carries none (and an old block is a plan without one) */
+        store_save(1);ts_active(1,&in);assert(in.valid && in.seq==2u && in.metaLen==0u);
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,1,0);txq_flush_blocking();
+        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=2") && !strstr(simLog," meta="));
+        /* an incomplete or damaged description refuses the save and writes nothing; the refusal forgets it */
+        meta_send_chunks(textA,crcA,2,-1);w=simFlashWrites;simLogN=0;simLog[0]=0;
+        store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
+        assert(!g_store.busy && simFlashWrites==w && strstr(simLog,"description incomplete") && !g_meta.touched);
+        meta_send_chunks(textA,crcA,-1,3);simLogN=0;simLog[0]=0;
+        store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
+        assert(!g_store.busy && simFlashWrites==w && strstr(simLog,"description incomplete"));
+        store_save(1);ts_active(1,&in);assert(in.seq==3u && in.metaLen==0u);
+        /* a description made for another plan is never committed: the save fails and the slot stays as it was */
+        meta_send_chunks(textB,crcA^1u,-1,-1);simLogN=0;simLog[0]=0;
+        store_send(12,g_controlSequence+1u,1,2,0);store_run();txq_flush_blocking();
+        assert(g_storeResult.last==3 && strstr(simLog,"description is not for this plan") && !g_meta.touched);
+        ts_active(1,&in);assert(in.valid && in.seq==3u && in.metaLen==0u);
+        /* chunks are checked like any control frame, and none is taken while a save runs */
+        sq=g_controlSequence;packetType=14;
+        ptp_send(sq+1u,g_ptp.epoch-1u,0,0,0,0);ptp_send(sq,g_ptp.epoch,0,0,0,0);ptp_send(sq+1u,g_ptp.epoch,0,0,(uint16)META_CHUNKS,0);
+        packetType=1;
+        assert(!g_meta.touched && g_controlSequence==sq);
+        store_send(12,g_controlSequence+1u,2,2,0);assert(g_store.busy);
+        simLogN=0;simLog[0]=0;store_send(14,g_controlSequence+1u,0,0,0);txq_flush_blocking();
+        assert(!g_meta.touched && strstr(simLog,"TRAJ_META refused: arguments"));store_run();
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,TS_SLOTS,4,0);txq_flush_blocking();
+        assert(!strstr(simLog,"TRAJ_META"));
+        /* power lost at every write of a save that replaces a plan and its description: one whole pair or the other, never a mix */
+        for(torn=0;torn<2;torn++) for(cut=0;cut<=15u;cut++) {
+            sim_flash_reset();store_make_plan(485,0);crcA=store_plan_crc();meta_send_chunks(textA,crcA,-1,-1);store_save(0);
+            store_make_plan(485,1);crcB=store_plan_crc();meta_send_chunks(textB,crcB,-1,-1);
+            simFlashWrites=0;simFlashCut=(int)cut;simFlashCutTorn=(int)torn;
+            store_send(12,g_controlSequence+1u,0,2,0);store_run();
+            ts_active(0,&in);assert(in.valid);
+            assert((in.dataCrc==crcA && in.seq==1u && meta_is(0,textA)) || (in.dataCrc==crcB && in.seq==2u && meta_is(0,textB)));
+            if(cut<=13u) assert(in.dataCrc==crcA && g_storeResult.last==3);
+            else if(cut==14u) assert(g_storeResult.last==3);
+            else assert(in.dataCrc==crcB && g_storeResult.last==1);
+        }
+        /* the largest description beside the largest plan; a damaged description costs the label, not the plan */
+        sim_flash_reset();store_make_plan(TRAJ_CAPACITY,0);crcA=store_plan_crc();
+        memset(big,'A',TS_META_MAX);big[TS_META_MAX]=0;
+        meta_send_chunks(big,crcA,-1,-1);store_save(2);
+        assert(g_storeResult.last==1);ts_active(2,&in);assert(in.valid && in.count==TRAJ_CAPACITY && meta_is(2,big));
+        simFlash[ts_block_offset(2,in.which)+TS_META_ROW0*TS_ROW_BYTES+5]^=1;
+        ts_active(2,&in);assert(in.valid && in.dataCrc==crcA && in.metaLen==0u);
         return;
     }
     if(!strcmp(t,"store_write_guard")) {
@@ -3319,7 +3401,7 @@ ptp_cases += ['ptp_zero','ptp_axis1','ptp_axis2']
 ptp_cases += ['ptp_power_stable','ptp_fast_stall']
 ptp_cases += ['limits_ptp','limits_jog','limits_elbow','limits_elbow_traj','limits_elbow_jog']
 ptp_cases += ['rates_ptp','rates_traj','rates_live']
-ptp_cases += ['store_'+n for n in ['roundtrip','capacity','ab','power_loss','write_error','corrupt','load_checks','commands','hold','abort','unlinked','write_guard']]
+ptp_cases += ['store_'+n for n in ['roundtrip','capacity','ab','power_loss','write_error','corrupt','load_checks','commands','hold','abort','unlinked','write_guard','meta']]
 ptp_cases += ['ptp_final_'+name for name in ['positive','negative','boundary','over_limit','following','counts']]
 ptp_cases += ['ptp_logged_retry']
 ptp_cases += ['traj_rx_'+name for name in ['retry','ready_retry','repeated','stop','timeout','overrun','overflow','break','parity','mixed','heartbeat','holding','fault','encoder','motion']]

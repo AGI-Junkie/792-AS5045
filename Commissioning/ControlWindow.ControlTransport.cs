@@ -263,10 +263,11 @@ public sealed partial class ControlWindow
                 // instead of 17.75 ms.  No control sequence is consumed, so command
                 // ordering is unaffected.
                 packet = PtpProtocol.EncodeShortHeartbeat((byte)keys);
-            } else if (heartbeat || (epochReady && pendingControlType != 0 && (motionAllowed || pendingControlType is 9 or 10 or 11 or 12))) {
+            } else if (heartbeat || (epochReady && pendingControlType != 0 && (motionAllowed || pendingControlType is 9 or 10 or 11 or 12 or 14))) {
                 bool limits = !heartbeat && pendingControlType is 9 or 10;
                 bool telemRate = !heartbeat && pendingControlType == 11;   // output only: taken whether or not motion is allowed
                 bool store = !heartbeat && pendingControlType == 12;       // the flash archive: the device itself insists on a still stage
+                bool metaChunk = !heartbeat && pendingControlType == 14;   // the description that goes with a save: one chunk per frame, then the Save frame
                 if (store) {
                     // A retry repeats the identical bytes, which the device answers without redoing anything.
                     if (storeResend && storePacket.Length > 0) packet = storePacket;
@@ -277,6 +278,11 @@ public sealed partial class ControlWindow
                     }
                     storeResend = false;
                 }
+                else if (metaChunk) {
+                    if (controlSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("err.seqExhaustedCtrl"));
+                    packet = PtpProtocol.EncodeMeta(++controlSequence, controlEpoch, storeMetaNext, storeMetaChunks[storeMetaNext]);
+                    storeMetaNext++;
+                }
                 else if (limits && limitPacket.Length > 0) packet = limitPacket;
                 else {
                     if (controlSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("err.seqExhaustedCtrl"));
@@ -284,7 +290,7 @@ public sealed partial class ControlWindow
                         controlEpoch, limits ? limitBounds : new JointPose(0, 0), heartbeat ? keys : limits ? (ushort)limitAxis : telemRate ? (ushort)telemRequestedHz : (ushort)0);
                     if (limits) { limitSequence = controlSequence; limitPacket = packet; }
                 }
-                if (!heartbeat) pendingControlType = 0;
+                if (!heartbeat) pendingControlType = metaChunk ? (storeMetaNext < storeMetaChunks.Length ? (byte)14 : (byte)12) : (byte)0;
             } else if (epochReady && motionAllowed && pointWire.Count > 0) {
                 packet = pointWire.ToArray(); pointWire.Clear();
             } else return false;
