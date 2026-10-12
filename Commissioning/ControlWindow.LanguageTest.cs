@@ -110,6 +110,13 @@ public sealed partial class ControlWindow
             Toggle(false); Check(p.ShowsBoardPath && p.ResultText.Contains("板上槽1保存的轨迹") && p.ResultText.Contains("L1=181.5") && p.ResultText.Contains("不同"), "board plan not Chinese: " + p.ResultText);
             Toggle(true); Check(p.ShowsBoardPath && p.ResultText.Contains("board slot 1") && p.ResultText.Contains("which differ") && p.ResultText.Contains("L1=181.5"), "board plan not English: " + p.ResultText);
             Toggle(false); Check(p.ResultText.Contains("板上槽1"), "board plan stale after switching back");
+            Toggle(false); Check(p.RecentNoteText.Contains("不能执行"), "unrunnable board plan not Chinese: " + p.RecentNoteText);
+            Toggle(true); Check(p.RecentNoteText.Contains("It cannot be run") && !p.RecentNoteText.Contains("执行轨迹"), "unrunnable board plan not English: " + p.RecentNoteText);
+            // A board plan this machine accepts is the plan on screen, and its texts follow the language too.
+            p.ShowBoardPathForSelfTest(1, [new(new(0, 0), 0), new(new(0.5, 1), 500), new(new(1, 2), 500), new(new(1, 2), 50)], "shape=2; L1=180; L2=176.38");
+            Toggle(false); Check(p.Plan is not null && p.RecentNoteText.Contains("检查通过") && p.ResultText.Contains("检查通过"), "runnable board plan not Chinese: " + p.RecentNoteText);
+            Toggle(true); Check(p.Plan is not null && p.RecentNoteText.Contains("passes this computer's current joint ranges") && p.ResultText.Contains("passes this computer's current ranges"), "runnable board plan not English: " + p.RecentNoteText + " / " + p.ResultText);
+            Toggle(false); Check(p.RecentNoteText.Contains("检查通过"), "runnable board plan stale after switching back");
             if (snapshotPath is not null) {
                 string directory = Path.GetDirectoryName(Path.GetFullPath(snapshotPath))!;
                 Directory.CreateDirectory(directory);

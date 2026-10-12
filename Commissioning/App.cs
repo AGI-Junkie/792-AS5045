@@ -25,7 +25,7 @@ public sealed class App : Application
                 int snapshot = Array.IndexOf(args, "--snapshot");
                 string? path = snapshot >= 0 && snapshot + 1 < args.Length ? args[snapshot + 1] : null;
                 if (args.Contains("--freehand-self-test")) { Lang.Set(false, false); FreehandTrajectory.SelfTest(); XYPreviewPanel.FreehandSelfTest(path); }
-                else if (args.Contains("--store-self-test")) { Lang.Set(false, false); BoardLedger.SelfTest(); ControlWindow.StoreSelfTest(); ControlWindow.BoardSaveFlowSelfTest(); ControlWindow.BoardMetaFlowSelfTest(); ControlWindow.BoardNodesFlowSelfTest(); }
+                else if (args.Contains("--store-self-test")) { Lang.Set(false, false); BoardLedger.SelfTest(); ControlWindow.StoreSelfTest(); ControlWindow.BoardSaveFlowSelfTest(); ControlWindow.BoardMetaFlowSelfTest(); ControlWindow.BoardNodesFlowSelfTest(); ControlWindow.BoardRunFlowSelfTest(); }
                 else if (args.Contains("--log-level-self-test")) ControlWindow.LoggingSelfTest();
                 else if (args.Contains("--upload-language-test")) ControlWindow.UploadLanguageTest();
                 else if (args.Contains("--language-self-test")) { Lang.SelfTest(); ControlWindow.LanguageSelfTest(path); }
@@ -856,6 +856,7 @@ public sealed partial class ControlWindow : Window
         BoardSaveFlowSelfTest();
         BoardMetaFlowSelfTest();
         BoardNodesFlowSelfTest();
+        BoardRunFlowSelfTest();
         WorkflowSelfTest();
         StopRecoverySelfTest();
         ShapeFlowSelfTest();

@@ -123,7 +123,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private bool detailView;   // false = whole arm and reach circle; the default and only view the operator gets
     private JointLimits? overlayLimits = DefaultTrialRange;
     public PlanarArm Model => new(Number(l1), Number(l2));
-    public string SettingsDescription => $"shape={shape.SelectedIndex}; branch={branch.SelectedIndex}; L1={l1.Text}; L2={l2.Text}; x={x.Text}; y={y.Text}; a={a.Text}; b={b.Text}; feed={feed.Text}; v1={v1.Text}; v2={v2.Text}; a1={acc1.Text}; a2={acc2.Text}; min1={min1.Text}; max1={max1.Text}; min2={min2.Text}; max2={max2.Text}; emin={elbowMin.Text}; emax={elbowMax.Text}; c={c.Text}; rot={rotation.Text}; scale={scale.Text}; dir={(direction.SelectedIndex==1?"cw":"ccw")}; custom_chars={custom.Text.Length}";
+    public string SettingsDescription => $"shape={(execFromBoard is null ? shape.SelectedIndex : 10)}; branch={branch.SelectedIndex}; L1={l1.Text}; L2={l2.Text}; x={x.Text}; y={y.Text}; a={a.Text}; b={b.Text}; feed={feed.Text}; v1={v1.Text}; v2={v2.Text}; a1={acc1.Text}; a2={acc2.Text}; min1={min1.Text}; max1={max1.Text}; min2={min2.Text}; max2={max2.Text}; emin={elbowMin.Text}; emax={elbowMax.Text}; c={c.Text}; rot={rotation.Text}; scale={scale.Text}; dir={(direction.SelectedIndex==1?"cw":"ccw")}; custom_chars={custom.Text.Length}" + (execFromBoard is { } fromSlot ? $"; board_slot={fromSlot + 1}" : "");
     // `whyNot` explains a missing device pose on the canvas (homing, no reference, waiting for feedback); null when offline.
     public void SetStartFeedback(TelemetrySample? sample, string? whyNot = null) {
         bool changed=startFeedback!=sample || deviceNote!=whyNot;
@@ -621,7 +621,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private void ShowExecutionInfo(ExecutionTrajectory shown, double asked)
     {
         var (peak1, peak2) = shown.PeakRates();
-        double capped = shown.Timing.Duration / shown.RetryStretch, slower = (capped / asked - 1) * 100, extra = (shown.RetryStretch - 1) * 100;
+        double capped = shown.Timing!.Duration / shown.RetryStretch, slower = (capped / asked - 1) * 100, extra = (shown.RetryStretch - 1) * 100;
         Lang.Text(executionInfo, () => Lang.T("plan.execInfo", shown.Nodes.Length, shown.Duration, DeviceContract.PlanRateMax, peak1, peak2) +
             (slower >= 0.5 ? Lang.T("plan.execLimited", slower, asked, capped, DeviceContract.PlanRateMax) : "") +
             (extra >= 0.5 ? Lang.T("plan.execStretch", extra) : ""));
@@ -646,7 +646,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private static void SetTip(FrameworkElement element, string tip) { if (!Equals(element.ToolTip, tip)) element.ToolTip = tip; }
     private void UpdatePointButton()
     {
-        movePoint.Content = shape.SelectedIndex == 0 ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
+        movePoint.Content = shape.SelectedIndex == 0 && execFromBoard is null ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
         bool limitsMatch = deviceLimitsConfirmed && RequestedLimits is { } requested && requested == firmwareLimits && requested == planningLimits;
         // While the device holds a plan it has not drawn yet it refuses every other move; only 执行图形 or 总停止 leaves that state.
         // After a run the plan stays on the device, so the move back to the start is allowed.
@@ -667,10 +667,10 @@ public sealed partial class XYPreviewPanel : UserControl
             target = PtpProtocol.Quantize(target);
             string label = bounds.Contains(target) ? Lang.T("move.inFw") : shape.SelectedIndex == 0 ? Lang.T("move.outFw") : Lang.T("move.outFwStart");
             move += Lang.T("move.fwBounds", label, target.Q1, target.Q2, bounds.Min1, bounds.Max1, bounds.Min2, bounds.Max2, JointLimits.Elbow(target), bounds.ElbowMin, bounds.ElbowMax);
-        } else if (pointTarget is null) move += Lang.T("move.planFail") + result.Text;
+        } else if (pointTarget is null) move += boardView is not null ? Lang.T("act.boardPreview") : Lang.T("move.planFail") + result.Text;
         if (execution is not null) move += held ? (uploadedRan ? Lang.T("move.ran") : Lang.T("move.uploaded")) : atStart ? Lang.T("move.atStart") : Lang.T("move.needStart");
         if (uploadedPlan is not null && !held) move += uploadedRan ? Lang.T("move.nextPlan") : Lang.T("move.otherPlan");
-        if (execution is null && shape.SelectedIndex > 0) move += "\n" + (executionInfo.Text.Length > 0 ? executionInfo.Text : Lang.T("move.needCheck"));
+        if (execution is null && shape.SelectedIndex > 0 && boardView is null) move += "\n" + (executionInfo.Text.Length > 0 ? executionInfo.Text : Lang.T("move.needCheck"));
         SetText(moveState, move);
         UpdateActionStatus();
         SetTip(upload, move + Lang.T(planOnBoard is null ? "move.uploadTip" : "board.loadTip"));
@@ -694,6 +694,7 @@ public sealed partial class XYPreviewPanel : UserControl
         if(deviceStatusFault || deviceStatusBusy) { text=(deviceStatusFault?Lang.T("act.rejected"):Lang.T("act.waiting"))+(deviceStatusMessage??deviceMoveReason); severity=deviceStatusFault?2:1; }
         else if(operationError is not null) { text=Lang.T("act.opFail")+operationError(); severity=2; }
         else if(parametersDirty) { text=Lang.T("act.paramsDirty"); severity=1; }
+        else if(boardView is not null && execution is null) { text=Lang.T("act.boardPreview"); severity=1; }
         else if(pointTarget is null) { text=Lang.T("act.rejected")+result.Text; severity=2; }
         else if(planningLimits is {} local && !local.Contains(pointTarget.Value)) { text=Lang.T("act.outOfRange"); severity=2; }
         // While the device has not confirmed, its own reason says what to do (enabled: STOP ALL first; disabled: wait for the sync).
@@ -780,7 +781,7 @@ public sealed partial class XYPreviewPanel : UserControl
         if (changes == 0 || panel.RequestedLimits != requested || panel.planningLimits != requested ||
             panel.overlayLimits != requested || plan is null || panel.execution is null || !panel.play.IsEnabled)
             throw new InvalidOperationException("截图圆必须按填写范围生成红区、预览和执行计划");
-        if(!ReferenceEquals(panel.timing,panel.execution.Timing) || Math.Abs(panel.execution.Duration-panel.timing.Duration-0.05)>0.002)
+        if(!ReferenceEquals(panel.timing,panel.execution.Timing) || Math.Abs(panel.execution.Duration-panel.timing!.Duration-0.05)>0.002)
             throw new InvalidOperationException("预览和实际执行没有共用同一时间规划");
         panel.SetPointMoveState(true, DefaultTrialRange, "旧设备范围尚未同步", true);
         if (!ReferenceEquals(plan,panel.timing) || !ReferenceEquals(mask,panel.Reachability(panel.Model)) ||

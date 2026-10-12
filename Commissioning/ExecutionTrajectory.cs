@@ -6,10 +6,18 @@ public readonly record struct ExecutionNode(JointPose Pose, ushort Milliseconds)
 public sealed class ExecutionTrajectory
 {
     public ExecutionNode[] Nodes { get; }
-    public TimedTrajectory Timing { get; }
+    public TimedTrajectory? Timing { get; }   // null for a plan that was not made here (FromNodes): there is no path behind it
     public double Duration => Nodes.Sum(n => n.Milliseconds) / 1000.0;
     // 1 when the plan fitted at its first timing; 1.15^n when pulse rounding / chord error made the planner slow it down n times.
     public double RetryStretch { get; }
+    private ExecutionTrajectory(ExecutionNode[] nodes) { Nodes = nodes; RetryStretch = 1; }
+    // The nodes of a plan that came from somewhere else (a board slot), checked exactly like a planned one against this machine's ranges
+    // and speeds.  Nothing is repaired or re-timed: it either is a plan this machine accepts, or Validate says why not.
+    public static ExecutionTrajectory FromNodes(ExecutionNode[] nodes, JointLimits limits, MotionProfile profile)
+    {
+        Validate(nodes, limits, profile);
+        return new ExecutionTrajectory(nodes);
+    }
     public ExecutionTrajectory(TimedTrajectory preview, JointLimits limits)
     {
         var profile = MotionProfile.From(preview.Rates);
@@ -124,7 +132,7 @@ public sealed class ExecutionTrajectory
                 throw new InvalidOperationException("Execution plan peak step rate above the cap");
             var slow=new ExecutionTrajectory(new TimedTrajectory(path,new PlanningRates(1,1,1,1,1)),limits);
             Validate(slow.Nodes,limits,MotionProfile.From(new PlanningRates(1,1,1,1,1)));
-            if(slow.Duration<=plan.Duration || slow.Timing.Rates.Feed!=1 || slow.Timing.Path!=path)
+            if(slow.Duration<=plan.Duration || slow.Timing!.Rates.Feed!=1 || slow.Timing.Path!=path)
                 throw new InvalidOperationException("Global rates did not affect every shape");
         }
         var circle=DrawingTrajectory.Create(new PlanarArm(180,176.38),DrawingShape.Circle,260,0,40,0,0,limits);
@@ -142,5 +150,20 @@ public sealed class ExecutionTrajectory
         Reject([new(new(-30, 0), 0), new(new(-30, 90), 250)], new JointLimits(-90, 90, -160, 160, -100, 100));
         Reject([new(new(0, 0), 0), new(new(40, -61), 250)], new JointLimits(-90, 90, -160, 160, -100, 100));
         Reject([new(new(double.NaN, 0), 0), new(new(0, 0), 250)], limits);
+        // A plan that came from elsewhere (a board slot): taken as it is when this machine's ranges and speeds allow it, refused otherwise.
+        var rates = new PlanningRates(40, 8, 2.3, 15, 13);
+        var made = new ExecutionTrajectory(new TimedTrajectory(circle, rates), limits);
+        var taken = FromNodes(made.Nodes, limits, MotionProfile.From(rates));
+        if (!taken.Nodes.SequenceEqual(made.Nodes) || taken.Timing is not null || taken.PeakRates() != made.PeakRates() || taken.Duration != made.Duration)
+            throw new InvalidOperationException("Nodes taken from elsewhere were changed");
+        foreach (var refused in new Func<ExecutionTrajectory>[] {
+            () => FromNodes(made.Nodes, limits, MotionProfile.From(new PlanningRates(1, 1, 1, 1, 1))),   // saved under faster settings than these
+            () => FromNodes(made.Nodes, new JointLimits(-5, 5, -5, 5), MotionProfile.From(rates)),       // outside this machine's range
+            () => FromNodes([made.Nodes[1], .. made.Nodes[2..]], limits, MotionProfile.From(rates)) })   // does not start at rest
+        {
+            bool threw = false;
+            try { refused(); } catch (ArgumentException) { threw = true; }
+            if (!threw) throw new InvalidOperationException("A plan from elsewhere that this machine must refuse was accepted");
+        }
     }
 }

@@ -30,6 +30,9 @@ public sealed partial class XYPreviewPanel
     private static void ShowMenu(ContextMenu menu) { LastMenu = menu; if (!SuppressMenus) menu.IsOpen = true; }
     internal string BoardNoteText => boardNote.Text;
     internal string ResultText => result.Text;
+    internal string RecentNoteText => recentNote.Text;
+    internal string ActionSummaryText => actionSummary.Text;
+    internal void SetSpeedsForSelfTest(string first, string second) { v1.Text = first; v2.Text = second; }
     internal Button? BoardRowLoadButton(int index) => index >= 0 && index < recentRows.Count ? recentRows[index].Load : null;
     internal void ShowBoardPathForSelfTest(int slot, ExecutionNode[] nodes, string? settings) { boardPathWanted = slot; ShowBoardPath(slot, nodes, settings); }
     internal string RecentListText => string.Join("\n", recentList.Children.Cast<UIElement>().Select(c => c is TextBlock t ? t.Text : c is DockPanel d ? string.Join(" ", d.Children.OfType<Button>().Select(b => b.Content as TextBlock is { } label ? label.Text : b.Content?.ToString())) : ""));
@@ -147,15 +150,18 @@ public sealed partial class XYPreviewPanel
     }
 
     // ---- what the board really holds -------------------------------------------------------------------------------------
-    // The nodes read back from a slot, drawn as a read-only path (and played back) in place of the plan made on this computer.  It
-    // lasts until the next preview or edit.  The link lengths are the ones saved with the plan when the board has them, so the picture
-    // is the board's, not this computer's re-planning; nothing here can be uploaded or run.
+    // The nodes read back from a slot, drawn (and played back) in place of the plan made on this computer.  It lasts until the next
+    // preview or edit.  The link lengths are the ones saved with the plan when the board has them, so the picture is the board's, not
+    // this computer's re-planning.  When the nodes also pass this machine's joint ranges and speeds they become the plan on screen
+    // (execution): moved to the start, loaded from the slot (the CRC is the slot's) and run like any other, by the operator's clicks.
+    // When they do not, nothing here can be uploaded or run.
     private (int Slot, ExecutionNode[] Nodes, PlanarArm Model, Point[] Path, double Duration)? boardView;
     private int? boardPathWanted;                  // the slot whose nodes were asked for; an edit in the meantime cancels it
     internal bool ShowsBoardPath => boardView is not null;
     internal double BoardPathDuration => boardView?.Duration ?? 0;
     private double? PlaybackLength => timing?.Duration ?? boardView?.Duration;
-    private void ClearBoardView() { boardView = null; boardPathWanted = null; }
+    private int? execFromBoard;                // the slot the plan on screen was read back from (null: made here)
+    private void ClearBoardView() { boardView = null; boardPathWanted = null; execFromBoard = null; }
 
     private static double? SavedNumber(string? settings, string key) =>
         settings?.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Select(part => part.Split('=', 2)).FirstOrDefault(kv => kv.Length == 2 && kv[0].Trim() == key) is { } found &&
@@ -169,8 +175,17 @@ public sealed partial class XYPreviewPanel
         try { here = Model; } catch (ArgumentException) { }   // a half-typed link length in the boxes
         try { if (saved1 is { } a && saved2 is { } b) model = new PlanarArm(a, b); } catch (ArgumentException) { saved1 = saved2 = null; }
         if ((model ?? here) is not { } arm) return;
-        PausePlayback(); trajectory = null; timing = null; execution = null; pointTarget = null; movePoint.IsEnabled = false; upload.IsEnabled = false;
+        PausePlayback(); trajectory = null; timing = null; execution = null; pointTarget = null; execFromBoard = null; movePoint.IsEnabled = false; upload.IsEnabled = false;
         rangeFailure = null; operationError = null; Lang.Text(executionInfo, () => ""); Lang.Text(notice, () => ""); sampleInfo.Clear();
+        // Does this machine accept it?  The checks a planned figure passes: the joint ranges and speeds in the boxes.  A slot saved under
+        // other settings is shown but not offered; the device checks it again when it takes the plan.
+        ArgumentException? whyNot = null; ExecutionTrajectory? plan = null; JointLimits? range = null;
+        try
+        {
+            range = PreviewLimits();
+            plan = RequestedProfile is { } profile ? ExecutionTrajectory.FromNodes(nodes, range.Value, profile) : throw Lang.Error("err.planRates");
+        }
+        catch (ArgumentException ex) { whyNot = ex; plan = null; }   // kept as the exception: its message follows the language
         double duration = nodes.Sum(n => n.Milliseconds) / 1000.0;
         boardView = (slot, nodes, arm, nodes.Select(n => arm.Forward(n.Pose).Tip).ToArray(), duration); boardPathWanted = null;
         int number = slot + 1;
@@ -181,8 +196,16 @@ public sealed partial class XYPreviewPanel
             Math.Abs(kept1.Value - here1) < 0.005 && Math.Abs(kept2!.Value - here2) < 0.005 ? Lang.T("plan.boardLinksSame", kept1.Value, kept2!.Value) :
             Lang.T("plan.boardLinksDiffer", kept1.Value, kept2!.Value, here1, here2);
         result.Foreground = Brushes.DarkSlateGray;
-        Lang.Text(result, () => Lang.T("plan.boardView", number, nodes.Length, duration, start.Q1, start.Q2) + Links());
-        Lang.Text(recentNote, () => Lang.T("recent.boardShown", number));
+        bool runnable = plan is not null;
+        Lang.Text(result, () => Lang.T(runnable ? "plan.boardViewRunnable" : "plan.boardView", number, nodes.Length, duration, start.Q1, start.Q2) + Links());
+        if (plan is not null)
+        {
+            execution = plan; planningLimits = range; pointTarget = PtpProtocol.Quantize(nodes[0].Pose); execFromBoard = slot;
+            var (peak1, peak2) = plan.PeakRates();
+            Lang.Text(executionInfo, () => Lang.T("plan.execInfo", plan.Nodes.Length, plan.Duration, DeviceContract.PlanRateMax, peak1, peak2));
+            Lang.Text(recentNote, () => Lang.T("recent.boardRunnable", number));
+        }
+        else Lang.Text(recentNote, () => Lang.T("recent.boardShown", number) + Lang.T("recent.boardNotRunnable", whyNot?.Message ?? ""));
         cursor.Maximum = duration; cursor.Value = 0; offlineSim = false; cameraReady = false; autoFit = true;
         export.IsEnabled = false; cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = editingAllowed;
         UpdatePointButton(); DrawBoardSample();
@@ -244,6 +267,23 @@ public sealed partial class XYPreviewPanel
         if (!panel.ShowsBoardPath || Math.Abs(panel.BoardPathDuration - 0.55) > 1e-9 || panel.execution is not null || panel.upload.IsEnabled || panel.movePoint.IsEnabled || panel.export.IsEnabled ||
             !panel.play.IsEnabled || !panel.rewind.IsEnabled || !panel.cursor.IsEnabled || Math.Abs(panel.cursor.Maximum - 0.55) > 1e-9) Fail("应显示为只读预览：可回放，不能上传、执行或导出");
         if (!panel.ResultText.Contains("板上槽3") || !panel.ResultText.Contains("没有保存杆长") || !panel.recentNote.Text.Contains("只读预览")) Fail("应说明这是板上槽3的只读预览：" + panel.ResultText);
+        if (!panel.recentNote.Text.Contains("不能执行") || panel.pointTarget is not null) Fail("这台电脑不接受的轨迹应说明不能执行，也没有起点可移：" + panel.recentNote.Text);
+        // Nodes this machine accepts become the plan on screen: moved to the start, loaded and run by the operator's clicks like any other.
+        // The experiment says where the plan came from, in a form that cannot be loaded back as a figure.
+        var slow = new[] { new ExecutionNode(new JointPose(0, 0), 0), new ExecutionNode(new JointPose(0.5, 1), 500), new ExecutionNode(new JointPose(1, 2), 500), new ExecutionNode(new JointPose(1, 2), 50) };
+        panel.ShowBoardPathForSelfTest(1, slow, null);
+        if (panel.execution is not { } shown || !shown.Nodes.SequenceEqual(slow) || shown.Timing is not null || panel.pointTarget != slow[0].Pose || !panel.recentNote.Text.Contains("检查通过") || !panel.executionInfo.Text.Contains('4'))
+            Fail("这台电脑接受的轨迹应成为屏幕上的计划：" + panel.recentNote.Text + " / " + panel.result.Text);
+        if (!panel.SettingsDescription.Contains("shape=10") || !panel.SettingsDescription.Contains("board_slot=2") || RunValues(panel.SettingsDescription) is not null) Fail("实验记录应说明计划来自板上槽2，且不能当图形载回：" + panel.SettingsDescription);
+        panel.SetPointMoveState(true, panel.RequestedLimits, "ok", true, true, null, false);
+        panel.SetStartFeedback(new TelemetrySample(0, 1, 1, true, 2, ExecutionTrajectory.Counts(0, slow[0].Pose), ExecutionTrajectory.Counts(1, slow[0].Pose), 0, 0, 0, 0));
+        ExecutionTrajectory? sent = null; panel.TrajectoryRequested += p => sent = p;
+        if (!panel.movePoint.IsEnabled || !panel.upload.IsEnabled || panel.run.IsEnabled) Fail("起点在手臂下时应能上传（加载），还没有设备上的计划不能执行：" + panel.moveState.Text);
+        panel.upload.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        if (sent is null || !sent.Nodes.SequenceEqual(slow)) Fail("点上传（加载）应把板上的这条计划交出去");
+        // A plan this machine's speeds do not allow stays a picture: no start to move to, nothing to upload.
+        panel.ShowBoardPathForSelfTest(1, [new(new(0, 0), 0), new(new(10, 20), 500), new(new(10, 20), 50)], null);
+        if (panel.execution is not null || panel.upload.IsEnabled || panel.movePoint.IsEnabled || !panel.actionSummary.Text.Contains("只读预览")) Fail("不被接受的轨迹只能看：" + panel.actionSummary.Text);
         // The link lengths it was saved with are named, and compared with this computer's.
         panel.ShowBoardPathForSelfTest(0, nodes, $"shape=3; L1={panel.l1.Text}; L2={panel.l2.Text}");
         if (!panel.ResultText.Contains("和这台电脑一致")) Fail("杆长一致时应这样说：" + panel.ResultText);
@@ -258,7 +298,7 @@ public sealed partial class XYPreviewPanel
         if (Math.Abs(panel.cursor.Value - 0.55) > 1e-9 || panel.playbackTimer.IsEnabled) Fail("到末尾应停住");
         // Any new preview or edit takes it away; a request an edit has overtaken shows nothing when its nodes arrive.
         panel.Refresh();
-        if (panel.ShowsBoardPath) Fail("重新预览应撤掉板上轨迹");
+        if (panel.ShowsBoardPath || panel.execution is not null && panel.SettingsDescription.Contains("board_slot")) Fail("重新预览应撤掉板上轨迹");
         panel.boardPathWanted = 1; panel.x.Text = "341";
         panel.ShowBoardPath(1, nodes, null);
         if (panel.ShowsBoardPath) Fail("编辑之后到达的轨迹不应显示");

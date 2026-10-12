@@ -716,6 +716,63 @@ public sealed partial class ControlWindow
         finally { w.Close(); Lang.Set(language, false); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }
     }
 
+    // A plan read back from the board and run: it replaces what this computer planned, only when this machine accepts it, and then is
+    // loaded from its slot by the same Upload button (the slot's CRC is its CRC); a plan this machine's speeds do not allow stays a picture.
+    internal static void BoardRunFlowSelfTest()
+    {
+        static void Check(bool yes, string reason) { if (!yes) throw new InvalidOperationException("Archive run: " + reason); }
+        string ledger = Path.Combine(Path.GetTempPath(), "arm-board-run-" + Guid.NewGuid().ToString("N") + ".json");
+        BoardLedger.PathOverride = ledger;
+        bool language = Lang.IsEn; Lang.Set(false, false);
+        var w = new ControlWindow { selfTesting = true, ShowActivated = false, ShowInTaskbar = false };
+        try
+        {
+            var p = w.xyPreview;
+            p.SelectShapeForSelfTest(2); p.LoadExampleForSelfTest();
+            var held = p.Plan ?? throw new InvalidOperationException("Archive run: no rectangle plan");   // what the board holds
+            p.SelectShapeForSelfTest(3); p.LoadExampleForSelfTest();                                      // what this computer has on screen
+            var onScreen = p.Plan ?? throw new InvalidOperationException("Archive run: no circle plan");
+            Check(!held.Nodes.SequenceEqual(onScreen.Nodes), "the two plans must differ");
+            byte[] stream = TrajectoryArchive.Stream(held.Nodes); uint crc = TrajectoryArchive.PlanCrc(held.Nodes); int total = held.Nodes.Length, ms = held.Nodes.Sum(n => (int)n.Milliseconds);
+            var start = held.Nodes[0].Pose;
+            w.TestLine("STATE fw=stage2-v7 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1");
+            w.TestLine("PTP_STATE lock=0 ref=1 active=0 epoch=4 seq=1 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
+            w.TestLine($"LINK fw=stage2-v7-absolute-q2 proto={DeviceContract.ProtocolVersion} motion_rates=1 joint_limits=1 traj_read=1 traj_store=4");
+            w.TestLine($"TELEM t=10 epoch=4 seq=1 ref=1 source=2 p1={ExecutionTrajectory.Counts(0, start)} p2={ExecutionTrajectory.Counts(1, start)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
+            w.TestLine("INPUTS: J4-1/P0[4]=1 J4-2/P0[3]=1 NPN/P1[0]=1 nFAULT=1");
+            w.TestLine("TRAJ_SLOT slot=0 valid=0");
+            w.TestLine($"TRAJ_SLOT slot=1 valid=1 seq=2 nodes={total} duration_ms={ms} q1=0 q2=0 crc={crc:X8}");
+            w.TestLine("TRAJ_SLOT slot=2 valid=0"); w.TestLine("TRAJ_SLOT slot=3 valid=0");
+            if (w.storeJob is { } initial) { initial.Sequence = 30; w.TestLine("TRAJ_STORE state=idle slot=0 rows=0/0 seq=30 last=none last_slot=0 row_max_us=0"); }
+            Check(w.boardKnown && w.storeJob is null && w.storeReadSupported, "the inventory was not taken");
+            uint fake = 40;
+            // Reads the slot's nodes as the device sends them, forty at a time.
+            void ReadSlot()
+            {
+                w.xyPreview.BoardRowLoadButton(0)!.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
+                Check(w.nodeRead is not null, "the click did not start a read");
+                while (w.nodeRead is { } read)
+                {
+                    int first = read.Next, count = Math.Min(BoardNodes.MaxPerLine, total - first);
+                    w.storeJob!.Sequence = ++fake;
+                    w.TestLine($"TRAJ_NODES slot=1 seq=2 total={total} first={first} count={count} hex={Convert.ToHexString(stream.AsSpan(first * 6, count * 6))}");
+                    w.TestLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={fake} last=none last_slot=0 row_max_us=0");
+                }
+            }
+            // This machine accepts it: it is now the plan on screen, and Upload says it loads from the slot.
+            ReadSlot();
+            Check(p.Plan is { Timing: null } shown && shown.Nodes.SequenceEqual(held.Nodes), "the plan read back is not the plan on screen");
+            w.TestLine($"TELEM t=11 epoch=4 seq=1 ref=1 source=2 p1={ExecutionTrajectory.Counts(0, start)} p2={ExecutionTrajectory.Counts(1, start)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
+            Check(p.UploadButton.IsEnabled && (string)p.UploadButton.Content == "从板上加载" && !p.RunButton.IsEnabled && p.SettingsDescription.Contains("board_slot=2"),
+                $"the board's plan cannot be loaded from its slot: enabled={p.UploadButton.IsEnabled} caption={p.UploadButton.Content} note={p.RecentNoteText}");
+            // Slower speeds in the boxes than the plan was made for: the same nodes are no longer accepted, and only a picture is left.
+            p.SetSpeedsForSelfTest("1", "1");
+            ReadSlot();
+            Check(p.Plan is null && p.ShowsBoardPath && !p.UploadButton.IsEnabled && p.RecentNoteText.Contains("不能执行"), "a plan the current speeds do not allow was offered: " + p.RecentNoteText);
+        }
+        finally { w.Close(); Lang.Set(language, false); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }
+    }
+
     // The whole flow through the real window, the way the panel drives it: a figure that is not on the device is uploaded and then saved
     // (the pending-save marker must not block its own upload), a figure on the board is loaded instead of uploaded, and a refused load
     // falls back to the node-by-node upload.
