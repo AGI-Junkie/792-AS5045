@@ -311,6 +311,7 @@ internal static class Lang
         ["board.erasing"] = ("正在清除槽{0}……", "Clearing slot {0}…"),
         ["board.erased"] = ("已清除板上槽{0}。", "Cleared board slot {0}."),
         ["board.eraseFailed"] = ("清除槽{0}失败：{1}", "Clearing slot {0} failed: {1}"),
+        ["board.savedNoDescription"] = ("已存到板上槽{0}，但设置太长或含非 ASCII 字符，没有存描述：别的电脑上会把它列为“别处存的图形”。", "Saved to board slot {0}, but the settings are too long or not plain text, so no description was stored: another computer will list it as a figure saved elsewhere."),
         ["board.readingPath"] = ("正在读取板上槽{0}的轨迹……{1}/{2} 点", "Reading the plan in board slot {0}… {1}/{2} points"),
         ["board.readFailed"] = ("读取板上槽{0}的轨迹失败：{1}", "Reading the plan in board slot {0} failed: {1}"),
         ["board.readChanged"] = ("槽{0}在读取期间被改写，没有显示；重新读完板上存档后再点一次。", "Slot {0} was rewritten while it was being read, nothing is shown; click it again once the archive has been read."),
