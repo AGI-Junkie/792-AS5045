@@ -148,7 +148,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta4-read1-guards2"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta5-read1-guards2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -1532,6 +1532,8 @@ static traj_t g_traj;
  * archive region, so a bad slot number or offset can never reach the program. */
 static ts_job_t g_store;
 static uint8  g_storeAccepted[15];
+static uint8  g_saveRefused[15];                  /* the Save last turned away for its description (a lost refusal makes the host send it again) */
+static uint8  g_saveRefusedOn;
 static uint32 g_storeSeq;                         /* control sequence of the latest accepted type 12 command */
 static struct { uint8 last, slot; uint32 rowMaxCy; } g_storeResult;   /* last: 0 none, 1 saved, 2 erased, 3 failed, 4 aborted */
 /* The host's description of the plan in RAM (type 14), kept for the save that follows it.  The stream is len u16, 0 u16,
@@ -2242,6 +2244,7 @@ static void meta_accept(const uint8 *p)
         g_rxRejected++; JLOG("TRAJ_META refused: arguments\r\n"); return;
     }
     g_controlSequence=seq;
+    if(idx==0u) { g_saveRefusedOn=0u; }   /* a new transfer: what was refused before is another story */
     if(idx==0u || (g_meta.touched && g_meta.epoch!=g_ptp.epoch)) { memset(&g_meta,0,sizeof(g_meta)); }
     memcpy(g_meta.raw+(uint16)(idx*4u),p+9,4u);
     g_meta.got[idx]=1u; g_meta.touched=1u; g_meta.epoch=g_ptp.epoch; g_meta.ms=g_jogMs;
@@ -2285,14 +2288,17 @@ static void store_accept(const uint8 *p)
     if((ptp_u16(p+13) && op!=5u) || op<1u || op>5u || (slot>=TS_SLOTS && !(op==1u && slot==0xFFFFu))) {
         g_rxRejected++; STORE_REFUSE("TRAJ_STORE refused: arguments\r\n"); return;
     }
+    /* The same Save sent again (its refusal was lost) gets the same answer: it must not succeed as a save without the description the host
+     * believes it sent.  A fresh transfer and a fresh Save (new sequence) are another matter. */
+    if(op==2u && g_saveRefusedOn && memcmp(g_saveRefused,p,15u)==0) { STORE_REFUSE("TRAJ_STORE refused: description incomplete\r\n"); return; }
     if(!retry) {
         if(g_home.phase!=HOME_IDLE || g_ptp.active || g_traj.state==TRAJ_RUNNING || !axes_idle()) {
             STORE_REFUSE("TRAJ_STORE refused: stage not idle\r\n"); return;
         }
         if(op==2u && !traj_runnable(&g_traj)) { STORE_REFUSE("TRAJ_STORE refused: no complete plan in RAM\r\n"); return; }
-        if(op==2u && meta_state()==2u) { STORE_REFUSE("TRAJ_STORE refused: description incomplete\r\n"); return; }
+        if(op==2u && meta_state()==2u) { memcpy(g_saveRefused,p,15u); g_saveRefusedOn=1u; STORE_REFUSE("TRAJ_STORE refused: description incomplete\r\n"); return; }
         if((op==2u || op==3u) && CySetTemp()!=CYRET_SUCCESS) { STORE_REFUSE("TRAJ_STORE refused: flash temperature setup\r\n"); return; }
-        g_controlSequence=seq; g_storeSeq=seq; memcpy(g_storeAccepted,p,15u);
+        g_controlSequence=seq; g_storeSeq=seq; memcpy(g_storeAccepted,p,15u); g_saveRefusedOn=0u;
         if(op==2u) {
             uint8 held=(uint8)(meta_state()==1u);
             ts_job_save(&g_store,(uint8)slot,g_traj.nodes,g_traj.count,g_traj.durationMs,

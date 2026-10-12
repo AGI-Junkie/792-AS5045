@@ -207,7 +207,9 @@ public sealed partial class XYPreviewPanel
         if ((model ?? here) is not { } arm)
         {
             // Nothing to draw it with: the board saved no (usable) link lengths and the boxes here are not numbers.  Say so.
-            boardPathWanted = null;
+            // The view of an earlier slot goes too (InvalidPlan resets the preview, the playback and the pending request): the note must not
+            // describe one slot while the canvas shows another.
+            InvalidPlan(() => Lang.T("recent.boardNoModel", slot + 1) + (localError?.Message ?? ""));
             Lang.Text(recentNote, () => Lang.T("recent.boardNoModel", slot + 1) + (localError?.Message ?? ""));
             return;
         }
@@ -395,9 +397,9 @@ public sealed partial class XYPreviewPanel
         if (!panel.ShowsBoardPath || panel.execution is not null || panel.upload.IsEnabled || !panel.recentNote.Text.Contains("不能执行") || panel.recentNote.Text.Contains(Lang.T("err.planRates"))) Fail("本机杆长无效时板上的计划只能看，原因应是杆长而不是速度：" + panel.recentNote.Text);
         if (!panel.ResultText.Contains("没法比较") || panel.ResultText.Contains("和这台电脑一致")) Fail("本机杆长无效时不能说和这台电脑一致：" + panel.ResultText);
         // And when no model at all can draw it (the board saved no lengths): the request ends with an explanation, not silently.
-        panel.l1.Text = "abd";   // (an edit takes any board view away)
+        if (!panel.ShowsBoardPath) Fail("夹具应已显示着上一个槽的轨迹");
         panel.ShowBoardPathForSelfTest(1, nodes, "shape=3; L1=180");
-        if (panel.ShowsBoardPath || !panel.recentNote.Text.Contains("没有可用的杆长") || panel.boardPathWanted is not null) Fail("没有任何杆长能画时应说明，并结束这次请求：" + panel.recentNote.Text);
+        if (panel.ShowsBoardPath || panel.play.IsEnabled || panel.playbackTimer.IsEnabled || !panel.recentNote.Text.Contains("没有可用的杆长") || panel.boardPathWanted is not null) Fail("上一个槽的画面和播放也该撤掉；" + "没有任何杆长能画时应说明，并结束这次请求：" + panel.recentNote.Text);
         panel.l1.Text = goodL1;
         // Showing the board's plan takes pending freehand work with it.
         int work = panel.freehandWorkVersion;

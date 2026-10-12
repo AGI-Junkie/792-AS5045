@@ -35,8 +35,10 @@ public sealed partial class ControlWindow
         public byte[] Bytes { get; } = new byte[total * 6];
         public int Next { get; set; }                                     // nodes taken so far
         public int AskedAt { get; set; }                                  // Next when the request in flight was made
+        public int Retries { get; set; }                                  // requests for the same nodes that got only their status
     }
     private NodeRead? nodeRead;
+    private const int NodeRetries = 3;
     private readonly BoardSlot?[] boardSlots = new BoardSlot?[DeviceContract.TrajStoreSlots];
     private readonly BoardMeta?[] boardMeta = new BoardMeta?[DeviceContract.TrajStoreSlots];   // read back from the board, one slot at a time
     private readonly uint?[] metaAsked = new uint?[DeviceContract.TrajStoreSlots];             // the slot's save counter when its description was last asked for
@@ -162,7 +164,13 @@ public sealed partial class ControlWindow
         {
             bool got = boardMeta[asked] is { } meta && meta.Seq == askedSeq || metaEmpty[asked];   // an answer, even "none"
             if (!((ok && got) || metaFailures[asked] >= MetaRetries || metaAsked[asked] != askedSeq))
-            { metaFailures[asked]++; metaAsked[asked] = null; lastBoardQueryAt = DateTime.UtcNow.AddSeconds(2); }
+            {
+                metaFailures[asked]++; metaAsked[asked] = null;
+                // A path waiting for this description asks again at once, up to the same limit, instead of reading the nodes without it (the
+                // saved link lengths could not be added to a view that is already built).
+                if (then is not null && !cancellingStores && boardSlots[asked] is { Valid: true } again && again.Seq == askedSeq && StartMetaRead(asked, again, DateTime.UtcNow, then)) return;
+                lastBoardQueryAt = DateTime.UtcNow.AddSeconds(2);
+            }
             if (!cancellingStores) then?.Invoke();
         });
         if (!started) metaAsked[i] = null;   // never sent: ask again later
@@ -345,14 +353,21 @@ public sealed partial class ControlWindow
             return;
         }
         if (run.First != read.Next) return;      // the repeated answer to a retried request: already taken
-        run.Bytes.CopyTo(read.Bytes, run.First * 6); read.Next += run.Count; job.LastSeenAt = DateTime.UtcNow;
+        run.Bytes.CopyTo(read.Bytes, run.First * 6); read.Next += run.Count; read.Retries = 0; job.LastSeenAt = DateTime.UtcNow;
     }
 
     private void NodesJobEnded(NodeRead read, bool ok, Func<string> message)
     {
         if (!ReferenceEquals(nodeRead, read)) return;
         if (!ok) { EndNodeRead(read, () => Lang.T("board.readFailed", read.Slot + 1, message())); return; }
-        if (read.Next == read.AskedAt) { EndNodeRead(read, () => Lang.T("board.readFailed", read.Slot + 1, Lang.T("board.err.noNodes"))); return; }
+        if (read.Next == read.AskedAt)
+        {
+            // The long line may simply have been lost while the short status got through (the device drops a message that does not fit its
+            // text queue whole): ask for the same nodes again, a few times, before giving the whole read up.
+            if (++read.Retries <= NodeRetries) { ReadNextNodes(); return; }
+            EndNodeRead(read, () => Lang.T("board.readFailed", read.Slot + 1, Lang.T("board.err.noNodes")));
+            return;
+        }
         if (read.Next < read.Total) { ReadNextNodes(); return; }
         var nodes = TrajectoryArchive.Nodes(read.Bytes);
         if (TrajectoryArchive.Crc32(read.Bytes) != read.Crc || nodes[0].Milliseconds != 0 || nodes.Sum(n => (int)n.Milliseconds) != read.DurationMs)
@@ -744,6 +759,9 @@ public sealed partial class ControlWindow
             Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 } && w.nodeRead is null, "the slot's description was not read before its nodes");
             Pump();
             byte[] saved = System.Text.Encoding.ASCII.GetBytes("shape=3;L1=181.5;L2=176.38");
+            w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");   // the long description line was lost
+            Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 } && w.nodeRead is null, "a lost description line was not retried before the nodes were read");
+            Pump();
             w.HandleLine($"TRAJ_META slot=1 seq=2 len={saved.Length} crc={TrajectoryArchive.Crc32(saved):X8} hex={Convert.ToHexString(saved)}");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
             frames.Clear();
@@ -752,6 +770,10 @@ public sealed partial class ControlWindow
             var f0 = frames.Last(f => f.Length == 36 && Type(f) == 12);
             Check((short)(Field(f0, 9) | Field(f0, 10) << 8) == 1 && Field(f0, 11) == 5 && (Field(f0, 13) | Field(f0, 14) << 8) == 0, "first request (slot 1, op 5, from node 0)");
             Check(w.PointBusy, "the arm is not locked while the nodes are read");
+            // The nodes line is lost while the short status gets through: the same nodes are asked for again.
+            w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+            Check(w.nodeRead is { Next: 0 } && w.storeJob is { Op: StoreOp.Nodes } && w.pendingControlType == 12, "a node request that got only its status was not asked again");
+            Pump();
             w.HandleLine(Run(0)); w.HandleLine(Run(0));   // a retried request is answered twice: counted once
             Check(w.nodeRead!.Next == 40, "a repeated run was counted twice");
             w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
@@ -778,8 +800,14 @@ public sealed partial class ControlWindow
 
             // A device that ends the request without sending anything, and one that refuses.
             Click(); Pump();
+            for (int retry = 1; retry <= 3; retry++)
+            {
+                w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+                Check(w.nodeRead is not null && w.storeJob is { Op: StoreOp.Nodes }, $"a silent answer gave the read up at once (retry {retry})");
+                Pump();
+            }
             w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
-            Check(w.nodeRead is null && w.boardMessage?.Invoke().Contains("设备没有给出节点") == true, "a silent answer did not end the read: " + w.boardMessage?.Invoke());
+            Check(w.nodeRead is null && w.boardMessage?.Invoke().Contains("设备没有给出节点") == true, "a device that stayed silent did not end the read: " + w.boardMessage?.Invoke());
             Click(); Pump();
             w.HandleLine("TRAJ_STORE refused: stage not idle");
             Check(w.nodeRead is null && w.boardMessage?.Invoke().Contains("stage not idle") == true, "a refusal did not end the read: " + w.boardMessage?.Invoke());

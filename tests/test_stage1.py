@@ -2046,7 +2046,15 @@ static void store_test(const char *t) {
         meta_send_chunks(textA,crcA,-1,3);simLogN=0;simLog[0]=0;
         store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
         assert(!g_store.busy && simFlashWrites==w && strstr(simLog,"description incomplete"));
+        g_controlSequence+=1u;   /* (the host's heartbeats move its sequence on; a refused frame does not move the device's, and an identical Save is a resend) */
         store_save(1);ts_active(1,&in);assert(in.seq==3u && in.metaLen==0u);
+        /* the same Save sent again (its refusal was lost) is turned away again, not accepted as a save without the description */
+        meta_send_chunks(textA,crcA,2,-1);sq=g_controlSequence+1u;simLogN=0;simLog[0]=0;
+        store_send(12,sq,3,2,0);txq_flush_blocking();
+        assert(strstr(simLog,"description incomplete") && !g_store.busy);
+        w=simFlashWrites;simLogN=0;simLog[0]=0;store_send(12,sq,3,2,0);txq_flush_blocking();
+        assert(strstr(simLog,"description incomplete") && !g_store.busy && simFlashWrites==w);
+        meta_send_chunks(textA,crcA,-1,-1);store_save(3);ts_active(3,&in);assert(g_storeResult.last==1 && meta_is(3,textA));   /* a fresh transfer and Save work */
         /* a description made for another plan is never committed: the save fails and the slot stays as it was */
         meta_send_chunks(textB,crcA^1u,-1,-1);simLogN=0;simLog[0]=0;
         store_send(12,g_controlSequence+1u,1,2,0);store_run();txq_flush_blocking();
