@@ -148,7 +148,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta1-guards2"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta1-read1-guards2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -2190,6 +2190,31 @@ static void store_meta_line(uint8 slot)
     g_dbg[n++]='\r'; g_dbg[n++]='\n'; g_dbg[n]=0;
     JLOG(g_dbg);
 }
+/* Type 12 op 5: up to STORE_NODES_LINE nodes of a slot's plan starting at node `first` (the frame's value), as one hex line:
+ * the bytes exactly as stored (q1, q2 cdeg s16, ms u16, little endian), so the host can check them against the slot's CRC.
+ * `seq` is the slot's save counter: a host reading across a re-save sees the number change.  Past the end or an empty slot: count=0. */
+#define STORE_NODES_LINE (40u)
+static void store_nodes_line(uint8 slot, uint16 first)
+{
+    static const char hex[]="0123456789ABCDEF";
+    ts_info_t in;
+    const uint8 *m;
+    uint16 i, n;
+    ts_active(slot,&in);
+    if(!in.valid || first>=in.count) { JLOGF("TRAJ_NODES slot=%u count=0\r\n",(unsigned)slot); return; }
+    n=(uint16)(in.count-first);
+    if(n>STORE_NODES_LINE) { n=(uint16)STORE_NODES_LINE; }
+    m=ts_flash(ts_block_offset(slot,in.which))+TS_ROW_BYTES+(uint32)first*TS_NODE_BYTES;
+    i=(uint16)snprintf(g_dbg,sizeof(g_dbg),"TRAJ_NODES slot=%u seq=%lu total=%u first=%u count=%u hex=",(unsigned)slot,(unsigned long)in.seq,
+                       (unsigned)in.count,(unsigned)first,(unsigned)n);
+    n=(uint16)(n*TS_NODE_BYTES);
+    {
+        uint16 k;
+        for(k=0u;k<n;k++) { g_dbg[i++]=hex[m[k]>>4]; g_dbg[i++]=hex[m[k]&15u]; }
+    }
+    g_dbg[i++]='\r'; g_dbg[i++]='\n'; g_dbg[i]=0;
+    JLOG(g_dbg);
+}
 static void store_end(uint8 result)
 {
     g_storeResult.last=result; g_storeResult.slot=g_store.slot; g_storeResult.rowMaxCy=g_store.rowMaxCy;
@@ -2253,7 +2278,7 @@ static void store_accept(const uint8 *p)
     if(!TS_LINKED()) { g_rxRejected++; JLOG("TRAJ_STORE refused: archive region not reserved (link with cm3gcc_trajstore.ld)\r\n"); return; }
     retry=(uint8)(memcmp(g_storeAccepted,p,15u)==0);   /* heartbeats keep advancing the sequence, so a retry is judged by its bytes */
     if(!retry && (!seq || seq<=g_controlSequence)) { g_rxRejected++; JLOG("TRAJ_STORE refused: stale sequence\r\n"); return; }
-    if(ptp_u16(p+13) || op<1u || op>4u || (slot>=TS_SLOTS && !(op==1u && slot==0xFFFFu))) {
+    if((ptp_u16(p+13) && op!=5u) || op<1u || op>5u || (slot>=TS_SLOTS && !(op==1u && slot==0xFFFFu))) {
         g_rxRejected++; JLOG("TRAJ_STORE refused: arguments\r\n"); return;
     }
     if(!retry) {
@@ -2276,6 +2301,7 @@ static void store_accept(const uint8 *p)
         for(s=0u;s<TS_SLOTS;s++) { if(slot==0xFFFFu || slot==s) { store_slot_line(s); } }
     }
     else if(op==4u) { store_meta_line((uint8)slot); }
+    else if(op==5u) { store_nodes_line((uint8)slot,ptp_u16(p+13)); }
     store_status();
 }
 /* Fill g_traj from a slot through the same checks an upload gets, against the CURRENT joint ranges and speeds, so a
@@ -3059,8 +3085,8 @@ static void stage_status_line(void)
     case 6u:
     traj_status(); break;
     case 7u:
-    JLOGF("LINK uart=hw baud=115200 link=%s rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=%u traj_repeat=1 fault_snapshot=1 traj_meta=%u traj_store=%u telem_hz=%u proto=%u\r\n",
-          (g_usbUp != 0u) ? "usb" : "uart", (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)ARM2_ENCODER_FEEDBACK, (unsigned)(TS_LINKED() ? TS_META_MAX : 0u), (unsigned)(TS_LINKED() ? TS_SLOTS : 0u), (unsigned)g_telemHz, (unsigned)PROTO_VERSION); break;
+    JLOGF("LINK uart=hw baud=115200 link=%s rx_overflow=%lu rx_error=%lu tx_dropped=%u fw=%s short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 dual_encoder=%u traj_repeat=1 fault_snapshot=1 traj_meta=%u traj_read=%u traj_store=%u telem_hz=%u proto=%u\r\n",
+          (g_usbUp != 0u) ? "usb" : "uart", (unsigned long)g_rxLate, (unsigned long)g_rxFraming, (unsigned)g_txqDropped, FW_BUILD_ID, (unsigned)ARM2_ENCODER_FEEDBACK, (unsigned)(TS_LINKED() ? TS_META_MAX : 0u), (unsigned)(TS_LINKED() ? 1u : 0u), (unsigned)(TS_LINKED() ? TS_SLOTS : 0u), (unsigned)g_telemHz, (unsigned)PROTO_VERSION); break;
     case 8u:
     JLOGF("PTP_RX short_ok=%lu drop_crc=%lu drop_short=%lu drop_timeout=%lu rejected=%lu epoch_rejected=%lu last_rejected_byte=0x%02X\r\n",
           (unsigned long)g_shortRxOk, (unsigned long)g_ptpRxCrc, (unsigned long)g_ptpRxShort, (unsigned long)g_ptpRxTimeout,

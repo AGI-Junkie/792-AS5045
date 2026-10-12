@@ -8,7 +8,7 @@ namespace TwoLinkCommissioning;
 
 // Host side of the device's flash archive of finished trajectories (docs/TRAJ_STORE.md, protocol types 12 and 13).
 
-public enum StoreOp : short { Query = 1, Save = 2, Erase = 3, Meta = 4 }   // Meta: read back one slot's description
+public enum StoreOp : short { Query = 1, Save = 2, Erase = 3, Meta = 4, Nodes = 5 }   // Meta: read back one slot's description; Nodes: its nodes
 
 // One archive slot as the device reports it (TRAJ_SLOT line).  Crc is the CRC-32 of the node stream, the same value PlanCrc
 // computes for a plan on this side, so "is this plan already on the board" is a number comparison.  MetaLen is the size of the
@@ -91,6 +91,23 @@ public sealed record StoreStatus(string State, int Slot, int RowsDone, int RowsT
     }
 }
 
+// A run of a slot's nodes as the device sends it (type 12 op 5): the node bytes exactly as stored.  Seq is the slot's save counter, so
+// a read that crosses a re-save is noticed; the whole stream is checked against the slot's CRC when the last run is in.
+public sealed record BoardNodes(int Slot, uint Seq, int Total, int First, byte[] Bytes)
+{
+    public const int MaxPerLine = 40;                   // STORE_NODES_LINE
+    public int Count => Bytes.Length / 6;
+    private static readonly Regex Pattern = new(@"^TRAJ_NODES slot=(\d+) seq=(\d+) total=(\d+) first=(\d+) count=(\d+) hex=([0-9A-F]+)$", RegexOptions.CultureInvariant);
+    public static BoardNodes? Parse(string line)
+    {
+        var m = Pattern.Match(line);
+        if (!m.Success || !int.TryParse(m.Groups[1].Value, out int slot) || slot is < 0 or >= DeviceContract.TrajStoreSlots || !uint.TryParse(m.Groups[2].Value, out uint seq) ||
+            !int.TryParse(m.Groups[3].Value, out int total) || total is < 2 or > DeviceContract.TrajCapacity || !int.TryParse(m.Groups[4].Value, out int first) || first < 0 || first >= total ||
+            !int.TryParse(m.Groups[5].Value, out int count) || count is < 1 or > MaxPerLine || first + count > total || m.Groups[6].Value.Length != count * 12) return null;
+        return new BoardNodes(slot, seq, total, first, Convert.FromHexString(m.Groups[6].Value));
+    }
+}
+
 public static class TrajectoryArchive
 {
     // CRC-32/IEEE (the polynomial of zip and PNG); the firmware's ts_crc32 produces the same values.
@@ -119,6 +136,18 @@ public static class TrajectoryArchive
         return bytes;
     }
     public static uint PlanCrc(IReadOnlyList<ExecutionNode> nodes) => Crc32(Stream(nodes));
+    // The inverse of Stream: the nodes a stored plan holds (0.01 degree and ms, as the device keeps them).
+    public static ExecutionNode[] Nodes(ReadOnlySpan<byte> stream)
+    {
+        var nodes = new ExecutionNode[stream.Length / 6];
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            var span = stream[(i * 6)..];
+            nodes[i] = new ExecutionNode(new JointPose(System.Buffers.Binary.BinaryPrimitives.ReadInt16LittleEndian(span) / 100.0, System.Buffers.Binary.BinaryPrimitives.ReadInt16LittleEndian(span[2..]) / 100.0),
+                System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(span[4..]));
+        }
+        return nodes;
+    }
 
     // The slot holding exactly this plan (same node bytes, so the same drawing at the same speeds), if any.
     public static BoardSlot? SlotFor(IReadOnlyList<BoardSlot?> slots, IReadOnlyList<ExecutionNode> nodes)
@@ -219,7 +248,7 @@ public static class BoardLedger
         var load = Decode(PtpProtocol.EncodeLoad(9, 7, 1));
         Check(load[0] == 13 && BitConverter.ToInt16(load, 9) == 1 && BitConverter.ToInt16(load, 11) == 0 && BitConverter.ToUInt16(load, 13) == 0, "load packet");
         foreach (var refused in new Action[] { () => PtpProtocol.EncodeStore(0, 7, 0, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 0, 0, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 7, 4, StoreOp.Save),
-            () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Erase), () => PtpProtocol.EncodeStore(1, 7, 0, (StoreOp)5), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Meta), () => PtpProtocol.EncodeStore(1, 7, 4, StoreOp.Meta),
+            () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Erase), () => PtpProtocol.EncodeStore(1, 7, 0, (StoreOp)6), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Nodes, 2048), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Nodes, -1), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Save, 1), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Nodes), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Meta), () => PtpProtocol.EncodeStore(1, 7, 4, StoreOp.Meta),
             () => PtpProtocol.EncodeMeta(1, 7, 0, new byte[3]), () => PtpProtocol.EncodeMeta(1, 7, 67, new byte[4]), () => PtpProtocol.EncodeMeta(1, 7, -1, new byte[4]), () => PtpProtocol.EncodeMeta(0, 7, 0, new byte[4]), () => PtpProtocol.EncodeLoad(1, 7, 4), () => PtpProtocol.EncodeLoad(1, 7, -1) })
         {
             bool threw = false;
@@ -241,6 +270,17 @@ public static class BoardLedger
               BitConverter.ToUInt16(chunkFrame, 15) == PtpProtocol.Crc(chunkFrame.AsSpan(0, 15)), "description chunk frame");
         var op4 = Decode(PtpProtocol.EncodeStore(9, 7, 2, StoreOp.Meta));
         Check(op4[0] == 12 && BitConverter.ToInt16(op4, 9) == 2 && BitConverter.ToInt16(op4, 11) == 4, "description query frame");
+        // Type 12 op 5 asks for a slot's nodes from node `first` on; the answer is the node bytes as stored.
+        var ask = Decode(PtpProtocol.EncodeStore(10, 7, 1, StoreOp.Nodes, 40));
+        Check(ask[0] == 12 && BitConverter.ToInt16(ask, 9) == 1 && BitConverter.ToInt16(ask, 11) == 5 && BitConverter.ToUInt16(ask, 13) == 40, "node query frame");
+        var plan = new[] { new ExecutionNode(new JointPose(-1.25, 2.5), 0), new ExecutionNode(new JointPose(0.01, -180), 500), new ExecutionNode(new JointPose(179.99, 0), 50) };
+        Check(TrajectoryArchive.Nodes(Stream(plan)).SequenceEqual(plan), "nodes read back are not the nodes stored");
+        string NodeLine(int slot = 1, uint seq = 4, int total = 3, int first = 0, int count = 3, string? hex = null) =>
+            $"TRAJ_NODES slot={slot} seq={seq} total={total} first={first} count={count} hex={hex ?? Convert.ToHexString(Stream(plan))}";
+        Check(BoardNodes.Parse(NodeLine()) is { Slot: 1, Seq: 4, Total: 3, First: 0, Count: 3 } run && run.Bytes.SequenceEqual(Stream(plan)), "node line");
+        foreach (string bad in new[] { NodeLine(count: 2), NodeLine(first: 1), NodeLine(total: 1), NodeLine(total: 2049), NodeLine(slot: 4), NodeLine(count: 0, hex: "00"), NodeLine(hex: Convert.ToHexString(Stream(plan)).ToLowerInvariant()),
+            NodeLine(count: 41, total: 100, hex: new string('0', 41 * 12)), "TRAJ_NODES slot=1 count=0" })
+            Check(BoardNodes.Parse(bad) is null, "bad node line accepted: " + bad);
         // What the device answers (type 12 op 4): one hex line, checked for length, CRC and plain text.
         string Answer(string t, int slot = 1, int? len = null, uint? crc = null)
         {

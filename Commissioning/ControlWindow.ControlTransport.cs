@@ -273,7 +273,7 @@ public sealed partial class ControlWindow
                     if (storeResend && storePacket.Length > 0) packet = storePacket;
                     else {
                         if (controlSequence == uint.MaxValue) throw new InvalidOperationException(Lang.T("err.seqExhaustedCtrl"));
-                        packet = storePacket = PtpProtocol.EncodeStore(++controlSequence, controlEpoch, storeRequestSlot, storeRequestOp);
+                        packet = storePacket = PtpProtocol.EncodeStore(++controlSequence, controlEpoch, storeRequestSlot, storeRequestOp, storeRequestFirst);
                         if (storeJob is { } job) job.Sequence = controlSequence;
                     }
                     storeResend = false;

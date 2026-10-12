@@ -103,6 +103,13 @@ public sealed partial class ControlWindow
             Toggle(false); Check(p.RecentListText.Contains("板上图形 · 1/4") && p.RecentListText.Contains("槽1：矩形 · 69 点"), "board row not Chinese: " + p.RecentListText);
             Toggle(true); Check(p.RecentListText.Contains("On the board · 1/4") && p.RecentListText.Contains("slot 1: Rectangle · 69 points"), "board row not English: " + p.RecentListText);
             Toggle(false); Check(p.RecentListText.Contains("板上图形"), "board row stale after switching back");
+            // The plan read back from a slot is a read-only preview, described in either language (and drawn in the snapshots below).
+            var boardNodes = new List<ExecutionNode> { new(new JointPose(-12, 55), 0) };
+            for (int k = 1; k <= 60; k++) boardNodes.Add(new(new JointPose(Math.Round(-12 + 24 * k / 60.0 + 6 * Math.Sin(k / 6.0), 2), Math.Round(55 - 35 * Math.Sin(k * Math.PI / 60), 2)), 100));
+            p.ShowBoardPathForSelfTest(0, boardNodes.ToArray(), "shape=2; L1=181.5; L2=176.38");
+            Toggle(false); Check(p.ShowsBoardPath && p.ResultText.Contains("板上槽1保存的轨迹") && p.ResultText.Contains("L1=181.5") && p.ResultText.Contains("不同"), "board plan not Chinese: " + p.ResultText);
+            Toggle(true); Check(p.ShowsBoardPath && p.ResultText.Contains("board slot 1") && p.ResultText.Contains("which differ") && p.ResultText.Contains("L1=181.5"), "board plan not English: " + p.ResultText);
+            Toggle(false); Check(p.ResultText.Contains("板上槽1"), "board plan stale after switching back");
             if (snapshotPath is not null) {
                 string directory = Path.GetDirectoryName(Path.GetFullPath(snapshotPath))!;
                 Directory.CreateDirectory(directory);

@@ -21,6 +21,22 @@ public sealed partial class ControlWindow
 
     private int storeSlotCount;                                           // traj_store=<n> in LINK; 0 = this firmware cannot archive
     private int storeMetaMax;                                             // traj_meta=<n> in LINK: bytes of description it keeps with a plan; 0 = none
+    private bool storeReadSupported;                                      // traj_read=1 in LINK: it sends a slot's nodes back (type 12 op 5)
+    private int storeRequestFirst;                                        // first node asked for by the op 5 request in flight
+    // A slot's nodes being read back, forty at a time, to show what the board really holds.
+    private sealed class NodeRead(int slot, uint seq, int total, int durationMs, uint crc, string? settings)
+    {
+        public int Slot { get; } = slot;
+        public uint Seq { get; } = seq;                                   // the slot's save counter when the read began: a re-save changes it
+        public int Total { get; } = total;
+        public int DurationMs { get; } = durationMs;
+        public uint Crc { get; } = crc;
+        public string? Settings { get; } = settings;                      // the description stored with the plan, if any (link lengths)
+        public byte[] Bytes { get; } = new byte[total * 6];
+        public int Next { get; set; }                                     // nodes taken so far
+        public int AskedAt { get; set; }                                  // Next when the request in flight was made
+    }
+    private NodeRead? nodeRead;
     private readonly BoardSlot?[] boardSlots = new BoardSlot?[DeviceContract.TrajStoreSlots];
     private readonly BoardMeta?[] boardMeta = new BoardMeta?[DeviceContract.TrajStoreSlots];   // read back from the board, one slot at a time
     private readonly uint?[] metaAsked = new uint?[DeviceContract.TrajStoreSlots];             // the slot's save counter when its description was last asked for
@@ -52,23 +68,24 @@ public sealed partial class ControlWindow
         storeSlotCount = slots is not null && int.TryParse(slots.AsSpan(11), out int n) && n is > 0 and <= DeviceContract.TrajStoreSlots ? n : 0;
         string? meta = words.FirstOrDefault(w => w.StartsWith("traj_meta=", StringComparison.Ordinal));
         storeMetaMax = storeSlotCount > 0 && meta is not null && int.TryParse(meta.AsSpan(10), out int m) && m > 0 ? Math.Min(m, BoardMeta.MaxBytes) : 0;
+        storeReadSupported = storeSlotCount > 0 && words.Contains("traj_read=1");
         if (storeSlotCount == 0) { boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); }
         if (storeSlotCount != before) PublishBoard();   // the LINK line comes every 500 ms; the panel is only told when this changes
     }
 
     private void ResetBoard()
     {
-        storeSlotCount = 0; storeMetaMax = 0; boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); storeStatus = null; storeJob = null; storePacket = []; storeResend = false;
+        storeSlotCount = 0; storeMetaMax = 0; storeReadSupported = false; nodeRead = null; boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); storeStatus = null; storeJob = null; storePacket = []; storeResend = false;
         pendingBoardSave = null; deferredBoardSave = null; loadingSlot = null; boardMessage = null; lastBoardQueryAt = default;
         lock (wireSync) { if (pendingControlType is 12 or 14) pendingControlType = 0; storeMetaChunks = []; storeMetaNext = 0; }
         PublishBoard();
     }
 
     private void PublishBoard() => xyPreview.SetBoard(storeSlotCount, boardKnown, storeJob is { Op: StoreOp.Save or StoreOp.Erase } || pendingBoardSave is not null || deferredBoardSave is not null,
-        boardSlots, BoardLedger.Merge(boardSlots, boardMeta, boardLedger), boardMessage);
+        boardSlots, BoardLedger.Merge(boardSlots, boardMeta, boardLedger), boardMessage, storeReadSupported);
     private void SetBoardMessage(Func<string>? message) { boardMessage = message; PublishBoard(); }
 
-    private bool StartStoreJob(StoreOp op, int slot, Action<bool, Func<string>>? done)
+    private bool StartStoreJob(StoreOp op, int slot, Action<bool, Func<string>>? done, int first = 0)
     {
         if (!StoreAvailable || storeJob is not null) return false;
         lock (wireSync)
@@ -77,7 +94,7 @@ public sealed partial class ControlWindow
             storeJob = new StoreJob(op, slot, done);
             if (op != StoreOp.Save) storeMetaChunks = [];
             // A save that carries a description sends it first (type 14, one chunk per frame); the Save frame follows the last chunk.
-            storeRequestOp = op; storeRequestSlot = slot; storePacket = []; storeResend = false; storeMetaNext = 0;
+            storeRequestOp = op; storeRequestSlot = slot; storeRequestFirst = first; storePacket = []; storeResend = false; storeMetaNext = 0;
             pendingControlType = storeMetaChunks.Length > 0 ? (byte)14 : (byte)12;
             if (op == StoreOp.Query) boardSeen = 0;   // only a query that reports every slot completes the inventory
         }
@@ -139,7 +156,7 @@ public sealed partial class ControlWindow
                 Append($"HOST archive retry attempt={job.Attempts}/3; identical packet", LogLevel.Warning);
             }
         }
-        else if (quiet > (job.Op is StoreOp.Query or StoreOp.Meta ? 3 : StoreWorkSeconds)) FinishStoreJob(false, () => Lang.T("board.err.stalled"));
+        else if (quiet > (job.Op is StoreOp.Query or StoreOp.Meta or StoreOp.Nodes ? 3 : StoreWorkSeconds)) FinishStoreJob(false, () => Lang.T("board.err.stalled"));
     }
 
     private void ObserveStoreLine(string line)
@@ -156,6 +173,7 @@ public sealed partial class ControlWindow
             else Append("HOST malformed or unexpected archive slot line", LogLevel.Warning);
             return;
         }
+        if (line.StartsWith("TRAJ_NODES ", StringComparison.Ordinal)) { TakeNodes(line); return; }
         if (line.StartsWith("TRAJ_META ", StringComparison.Ordinal))
         {
             if (BoardMeta.Parse(line) is { } meta && storeJob is { Op: StoreOp.Meta } asking && asking.Slot == meta.Slot) { boardMeta[meta.Slot] = meta; asking.LastSeenAt = DateTime.UtcNow; PublishBoard(); }
@@ -171,7 +189,7 @@ public sealed partial class ControlWindow
             if (status.Busy) { PublishBoard(); return; }
             bool ok = job.Op switch
             {
-                StoreOp.Query or StoreOp.Meta => true,
+                StoreOp.Query or StoreOp.Meta or StoreOp.Nodes => true,
                 StoreOp.Save => status.Last == "saved" && status.LastSlot == job.Slot,
                 _ => status.Last == "erased" && status.LastSlot == job.Slot,
             };
@@ -186,6 +204,7 @@ public sealed partial class ControlWindow
     {
         xyPreview.SaveToBoardRequested += (plan, slot) => SafeAction(() => RequestSaveToBoard(plan, slot));
         xyPreview.EraseBoardRequested += slot => SafeAction(() => RequestEraseBoardSlot(slot));
+        xyPreview.BoardPathRequested += slot => SafeAction(() => RequestBoardPath(slot));
         boardLedger = BoardLedger.Load();
     }
 
@@ -235,6 +254,63 @@ public sealed partial class ControlWindow
         try { BoardLedger.Set(slot, crc, settings); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Append("HOST could not write the board ledger: " + ex.Message, LogLevel.Warning); }
         boardLedger = BoardLedger.Load();
+    }
+
+    // ---- reading a slot's nodes back ------------------------------------------------------------------------------------
+    // What the board really holds, for the preview: the nodes come back forty at a time (one type 12 op 5 request each, retried like any
+    // other), and only a complete stream that matches the slot's CRC, point count and duration is shown.  Nothing moves.
+    private void RequestBoardPath(int slot)
+    {
+        if (slot < 0 || slot >= storeSlotCount || boardSlots[slot] is not { Valid: true } held) return;
+        if (!StoreAvailable || !storeReadSupported || !boardKnown || storeJob is not null || nodeRead is not null || PointBusy) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
+        string? settings = BoardLedger.For(held, BoardLedger.Merge(boardSlots, boardMeta, boardLedger))?.Settings;
+        nodeRead = new NodeRead(slot, held.Seq, held.Nodes, held.DurationMs, held.Crc, settings);
+        ReadNextNodes();
+    }
+
+    private void ReadNextNodes()
+    {
+        if (nodeRead is not { } read) return;
+        read.AskedAt = read.Next;
+        SetBoardMessage(() => Lang.T("board.readingPath", read.Slot + 1, read.Next, read.Total));
+        if (!StartStoreJob(StoreOp.Nodes, read.Slot, (ok, message) => NodesJobEnded(read, ok, message), read.Next))
+            EndNodeRead(read, () => Lang.T("board.readFailed", read.Slot + 1, Lang.T("board.err.busy")));
+    }
+
+    private void EndNodeRead(NodeRead read, Func<string> message)
+    {
+        if (ReferenceEquals(nodeRead, read)) nodeRead = null;
+        SetBoardMessage(message);
+    }
+
+    // One run of nodes: taken only when it is the next one of the slot being read, with the same save counter and size.
+    private void TakeNodes(string line)
+    {
+        if (nodeRead is not { } read || storeJob is not { Op: StoreOp.Nodes } job || job.Slot != read.Slot) return;
+        if (BoardNodes.Parse(line) is not { } run) { if (!line.StartsWith($"TRAJ_NODES slot={read.Slot} count=0", StringComparison.Ordinal)) Append("HOST malformed archive node line", LogLevel.Warning); return; }
+        if (run.Slot != read.Slot) return;
+        if (run.Seq != read.Seq || run.Total != read.Total)
+        {
+            boardKnown = false; boardSeen = 0;   // the slot was written meanwhile: read the inventory again
+            EndNodeRead(read, () => Lang.T("board.readChanged", read.Slot + 1));
+            return;
+        }
+        if (run.First != read.Next) return;      // the repeated answer to a retried request: already taken
+        run.Bytes.CopyTo(read.Bytes, run.First * 6); read.Next += run.Count; job.LastSeenAt = DateTime.UtcNow;
+    }
+
+    private void NodesJobEnded(NodeRead read, bool ok, Func<string> message)
+    {
+        if (!ReferenceEquals(nodeRead, read)) return;
+        if (!ok) { EndNodeRead(read, () => Lang.T("board.readFailed", read.Slot + 1, message())); return; }
+        if (read.Next == read.AskedAt) { EndNodeRead(read, () => Lang.T("board.readFailed", read.Slot + 1, Lang.T("board.err.noNodes"))); return; }
+        if (read.Next < read.Total) { ReadNextNodes(); return; }
+        var nodes = TrajectoryArchive.Nodes(read.Bytes);
+        if (TrajectoryArchive.Crc32(read.Bytes) != read.Crc || nodes[0].Milliseconds != 0 || nodes.Sum(n => (int)n.Milliseconds) != read.DurationMs)
+        { EndNodeRead(read, () => Lang.T("board.readBad", read.Slot + 1)); return; }
+        nodeRead = null;
+        SetBoardMessage(() => Lang.T("board.readDone", read.Slot + 1));
+        xyPreview.ShowBoardPath(read.Slot, nodes, read.Settings);
     }
 
     private void RequestEraseBoardSlot(int slot)
@@ -521,6 +597,98 @@ public sealed partial class ControlWindow
         }
         finally { w.Close(); Lang.Set(language, false); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }
         static uint Seq(byte[] f) => (uint)(Field(f, 1) | Field(f, 2) << 8 | Field(f, 3) << 16 | Field(f, 4) << 24);
+    }
+
+    // Reading a slot's plan back to show it: one request per forty nodes, only a complete stream that matches the slot is shown, and a
+    // slot rewritten meanwhile, a damaged stream or a silent device end the read with a reason.  Driven by clicking the slot's row.
+    internal static void BoardNodesFlowSelfTest()
+    {
+        static void Check(bool yes, string reason) { if (!yes) throw new InvalidOperationException("Archive nodes: " + reason); }
+        static int Type(byte[] f) => ((f[1] >> 1) & 15) | (((f[2] >> 1) & 15) << 4);
+        static int Field(byte[] f, int i) => ((f[1 + 2 * i] >> 1) & 15) | (((f[2 + 2 * i] >> 1) & 15) << 4);
+        string ledger = Path.Combine(Path.GetTempPath(), "arm-board-nodes-" + Guid.NewGuid().ToString("N") + ".json");
+        BoardLedger.PathOverride = ledger;
+        bool language = Lang.IsEn; Lang.Set(false, false);
+        var w = new ControlWindow { selfTesting = true, ShowActivated = false, ShowInTaskbar = false };
+        var frames = new List<byte[]>();
+        void Write(byte[] data, int offset, int count) { if (offset == 0 && (frames.Count == 0 || !ReferenceEquals(frames[^1], data))) frames.Add(data); }
+        void Pump() { for (int i = 0; i < 600 && w.pendingControlType != 0; i++) { w.PublishHeartbeatLease(); w.WireWriterStep(Write); } }
+        string Link(string extra) => $"LINK uart=hw baud=115200 fw=stage2-v11-test short_hb=1 joint_limits=1 motion_rates=1 rates_live=1 q2_absolute=1 traj_repeat=1 fault_snapshot=1{extra} proto={DeviceContract.ProtocolVersion}";
+        try
+        {
+            // A plan of 100 nodes: three runs of forty, forty and twenty.
+            var nodes = Enumerable.Range(0, 100).Select(i => new ExecutionNode(new JointPose(Math.Round(10 * Math.Sin(i / 9.0), 2), Math.Round(30 + i * 0.2, 2)), (ushort)(i == 0 ? 0 : 100))).ToArray();
+            byte[] stream = TrajectoryArchive.Stream(nodes); uint crc = TrajectoryArchive.PlanCrc(nodes); int total = nodes.Length, ms = nodes.Sum(n => (int)n.Milliseconds);
+            string Run(int first, uint seq = 2, byte[]? bytes = null)
+            {
+                int count = Math.Min(BoardNodes.MaxPerLine, total - first);
+                return $"TRAJ_NODES slot=1 seq={seq} total={total} first={first} count={count} hex={Convert.ToHexString((bytes ?? stream).AsSpan(first * 6, count * 6))}";
+            }
+            w.HandleLine("STATE fw=stage2-v11 enabled=0 home=0 homed1=0 homed2=0 fault=0 enc=1 dir=0");
+            w.HandleLine("PTP_STATE lock=0 ref=0 active=0 epoch=3 seq=0 min1=-3000 max1=3000 min2=-6000 max2=6000 emin=-15500 emax=15500");
+            // Without the capability a slot nobody described is not a row, and no read is started.
+            w.HandleLine(Link(" traj_store=4 telem_hz=0"));
+            Check(w.storeSlotCount == 4 && !w.storeReadSupported, "a firmware that cannot send nodes was assumed to");
+            w.HandleLine(Link(" traj_read=1 traj_store=4 telem_hz=0"));
+            Check(w.storeReadSupported, "the capability was not read");
+            Pump();
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(10)); Pump(); uint query = w.storeJob!.Sequence;
+            w.HandleLine("TRAJ_SLOT slot=0 valid=0");
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=2 nodes={total} duration_ms={ms} q1=0 q2=3000 crc={crc:X8}");
+            w.HandleLine("TRAJ_SLOT slot=2 valid=0"); w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={query} last=none last_slot=0 row_max_us=0");
+            Check(w.boardKnown && w.storeJob is null, "the inventory was not taken");
+            Check(w.xyPreview.RecentListText.Contains("槽2：别处存的图形"), "the undescribed slot is not a row: " + w.xyPreview.RecentListText);
+            void Click() => w.xyPreview.BoardRowLoadButton(0)!.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
+            // A request for the first forty; the answer is taken, the status ends the job, the next forty are asked for.
+            frames.Clear(); Click();
+            Check(w.nodeRead is { Slot: 1, Next: 0 } && w.storeJob is { Op: StoreOp.Nodes, Slot: 1 } && w.pendingControlType == 12, "the click did not start a read");
+            Pump();
+            var f0 = frames.Last(f => f.Length == 36 && Type(f) == 12);
+            Check((short)(Field(f0, 9) | Field(f0, 10) << 8) == 1 && Field(f0, 11) == 5 && (Field(f0, 13) | Field(f0, 14) << 8) == 0, "first request (slot 1, op 5, from node 0)");
+            Check(w.PointBusy, "the arm is not locked while the nodes are read");
+            w.HandleLine(Run(0)); w.HandleLine(Run(0));   // a retried request is answered twice: counted once
+            Check(w.nodeRead!.Next == 40, "a repeated run was counted twice");
+            w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+            Check(w.nodeRead is { Next: 40 } && w.storeJob is { Op: StoreOp.Nodes } && w.pendingControlType == 12 && w.boardMessage?.Invoke().Contains("40/100") == true, "the second request did not follow: " + w.boardMessage?.Invoke());
+            frames.Clear(); Pump();
+            var f1 = frames.Last(f => f.Length == 36 && Type(f) == 12);
+            Check((Field(f1, 13) | Field(f1, 14) << 8) == 40, "second request asks from node 40");
+            w.HandleLine(Run(40));
+            w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+            Pump(); w.HandleLine(Run(80));
+            w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+            Check(w.nodeRead is null && w.storeJob is null && w.xyPreview.ShowsBoardPath && Math.Abs(w.xyPreview.BoardPathDuration - ms / 1000.0) < 1e-9 && w.boardMessage?.Invoke().Contains("已读完板上槽2") == true,
+                "the complete plan was not shown: " + w.boardMessage?.Invoke());
+            Check(!w.PointBusy, "the arm stayed locked after the read");
+
+            // A stream that does not match the slot's CRC is not shown.
+            var damaged = (byte[])stream.Clone(); damaged[6 * 50 + 1] ^= 4;
+            Click(); Pump();
+            w.HandleLine(Run(0)); w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0"); Pump();
+            w.HandleLine(Run(40, bytes: damaged)); w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0"); Pump();
+            w.HandleLine(Run(80, bytes: damaged)); w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+            Check(w.nodeRead is null && w.boardMessage?.Invoke().Contains("没有通过校验") == true, "a damaged stream was accepted: " + w.boardMessage?.Invoke());
+
+            // A device that ends the request without sending anything, and one that refuses.
+            Click(); Pump();
+            w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+            Check(w.nodeRead is null && w.boardMessage?.Invoke().Contains("设备没有给出节点") == true, "a silent answer did not end the read: " + w.boardMessage?.Invoke());
+            Click(); Pump();
+            w.HandleLine("TRAJ_STORE refused: stage not idle");
+            Check(w.nodeRead is null && w.boardMessage?.Invoke().Contains("stage not idle") == true, "a refusal did not end the read: " + w.boardMessage?.Invoke());
+
+            // The slot is rewritten between two runs: its save counter changes, nothing is shown, and the inventory is read again.
+            Click(); Pump();
+            w.HandleLine(Run(0)); w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0"); Pump();
+            w.HandleLine(Run(40, seq: 3));
+            Check(w.nodeRead is null && !w.boardKnown && w.boardMessage?.Invoke().Contains("被改写") == true, "a rewritten slot was not noticed: " + w.boardMessage?.Invoke());
+            w.FinishStoreJob(true, () => "");
+            // Leaving the link drops a read in progress.
+            w.ResetBoard();
+            Check(w.nodeRead is null && !w.storeReadSupported, "the read survived a reset");
+        }
+        finally { w.Close(); Lang.Set(language, false); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }
     }
 
     // The whole flow through the real window, the way the panel drives it: a figure that is not on the device is uploaded and then saved

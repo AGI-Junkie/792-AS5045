@@ -139,7 +139,7 @@ public sealed partial class XYPreviewPanel : UserControl
         editingAllowed = allowed;
         if (!allowed && changed) { CancelFreehandStroke(); CancelFreehandWork(); }
         foreach(var c in editControls) c.IsEnabled = allowed;
-        if (allowed) { export.IsEnabled = play.IsEnabled = rewind.IsEnabled = cursor.IsEnabled = timing is not null; }
+        if (allowed) { export.IsEnabled = timing is not null; play.IsEnabled = rewind.IsEnabled = cursor.IsEnabled = PlaybackLength is not null; }
         else PausePlayback();
         UpdateFreehandTools();
         if (allowed && changed && freehandNeedsProcessing) QueueFreehandWork();
@@ -539,7 +539,7 @@ public sealed partial class XYPreviewPanel : UserControl
         cameraReady = false; autoFit = true; operationError=null; rangeFailure = null;
         RefreshOverlayLimits(); RefreshRangeHelp();
         pointTarget = null; movePoint.IsEnabled = false; execution = null; upload.IsEnabled = false; Lang.Text(executionInfo, () => "");
-        PausePlayback(); trajectory = null; timing = null;
+        PausePlayback(); trajectory = null; timing = null; ClearBoardView();
         export.IsEnabled = cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = false;
         canvas.Children.Clear(); Lang.Text(result, () => ""); sampleInfo.Clear(); Lang.Text(notice, () => "");
         try
@@ -592,7 +592,7 @@ public sealed partial class XYPreviewPanel : UserControl
     {
         if (cancelFreehandWork) CancelFreehandWork();
         rangeFailure = failure;
-        PausePlayback(); trajectory = null; timing = null;
+        PausePlayback(); trajectory = null; timing = null; ClearBoardView();
         export.IsEnabled = cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = false;
         canvas.Children.Clear(); sampleInfo.Clear(); result.Foreground = Brushes.Firebrick; Lang.Text(result, reason); Lang.Text(notice, () => "");
         pointTarget = null; movePoint.IsEnabled = false;
@@ -724,22 +724,23 @@ public sealed partial class XYPreviewPanel : UserControl
     { playbackTimer.Stop(); playbackClock.Stop(); play.Content = Lang.T("btn.play"); }
     private void TogglePlayback()
     {
-        if (timing is null) return;
+        if (PlaybackLength is not { } length) return;
         offlineSim=true;
         if (playbackTimer.IsEnabled) { PausePlayback(); return; }
-        if (cursor.Value >= timing.Duration) cursor.Value = 0;
+        if (cursor.Value >= length) cursor.Value = 0;
         playbackFrom = cursor.Value; playbackClock.Restart(); playbackTimer.Start(); play.Content = Lang.T("btn.playPause");
     }
     private void AdvancePlayback(double time)
     {
-        if (!playbackTimer.IsEnabled || timing is null) return;
+        if (!playbackTimer.IsEnabled || PlaybackLength is not { } length) return;
         advancing = true;
-        try { cursor.Value = Math.Min(time, timing.Duration); }
+        try { cursor.Value = Math.Min(time, length); }
         finally { advancing = false; }
-        if (timing is null || time >= timing.Duration) PausePlayback();
+        if (PlaybackLength is not { } now || time >= now) PausePlayback();
     }
     private void DrawSample()
     {
+        if (timing is null && boardView is not null) { DrawBoardSample(); return; }
         if (timing is not { } plan) return;
         try
         {
@@ -995,6 +996,7 @@ public sealed partial class XYPreviewPanel : UserControl
         ElbowLimitSelfTest();
         ShapeFieldsSelfTest();
         RecentRunsSelfTest();
+        BoardPathSelfTest();
         ShapeDefaultsSelfTest();
         FreehandSelfTest(snapshotPath);
         var panel = new XYPreviewPanel();

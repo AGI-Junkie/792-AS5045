@@ -1949,7 +1949,7 @@ static void store_test(const char *t) {
         sq=g_controlSequence;
         packetType=12;
         ptp_send(sq+1u,g_ptp.epoch-1u,0,2,0,0);ptp_send(sq,g_ptp.epoch,0,2,0,0);ptp_send(0,g_ptp.epoch,0,2,0,0);
-        ptp_send(sq+1u,g_ptp.epoch,TS_SLOTS,2,0,0);ptp_send(sq+1u,g_ptp.epoch,0,0,0,0);ptp_send(sq+1u,g_ptp.epoch,0,5,0,0);
+        ptp_send(sq+1u,g_ptp.epoch,TS_SLOTS,2,0,0);ptp_send(sq+1u,g_ptp.epoch,0,0,0,0);ptp_send(sq+1u,g_ptp.epoch,0,6,0,0);
         ptp_send(sq+1u,g_ptp.epoch,0,2,1,0);ptp_send(sq+1u,g_ptp.epoch,-1,2,0,0);   /* all-slots is for queries only */
         packetType=1;
         assert(!g_store.busy && g_controlSequence==sq && simFlashWrites==0);
@@ -2077,6 +2077,36 @@ static void store_test(const char *t) {
         assert(g_storeResult.last==1);ts_active(2,&in);assert(in.valid && in.count==TRAJ_CAPACITY && meta_is(2,big));
         simFlash[ts_block_offset(2,in.which)+TS_META_ROW0*TS_ROW_BYTES+5]^=1;
         ts_active(2,&in);assert(in.valid && in.dataCrc==crcA && in.metaLen==0u);
+        return;
+    }
+    if(!strcmp(t,"store_nodes")) {
+        /* The nodes of a slot, read back forty at a time: the bytes as stored, in order, checked against the slot's CRC. */
+        static uint8 got[TRAJ_CAPACITY*TS_NODE_BYTES];
+        unsigned n,first,count,total,lines;char want[64];uint32 sq;const char *line;
+        for(n=0;n<2;n++) {
+            sim_flash_reset();store_make_plan(n?TRAJ_CAPACITY:485u,0);crcA=store_plan_crc();store_save(1);ts_active(1,&in);
+            total=g_traj.count;memset(got,0,sizeof(got));lines=0;first=0;
+            while(first<total) {
+                simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,5,(uint16)first);txq_flush_blocking();
+                sprintf(want,"TRAJ_NODES slot=1 seq=1 total=%u first=%u count=",total,first);
+                line=strstr(simLog,want);assert(line && strstr(simLog,"TRAJ_STORE state=idle"));
+                count=(unsigned)atoi(line+strlen(want));assert(count>=1 && count<=STORE_NODES_LINE && (first+count==total || count==STORE_NODES_LINE));
+                line=strstr(line," hex=")+5;
+                for(i=0;i<count*TS_NODE_BYTES;i++){unsigned v;sscanf(line+2*i,"%2x",&v);got[first*TS_NODE_BYTES+i]=(uint8)v;}
+                first+=count;lines++;
+            }
+            assert(lines==(total+STORE_NODES_LINE-1u)/STORE_NODES_LINE);
+            assert(ref_crc32(got,total*TS_NODE_BYTES)==in.dataCrc && in.dataCrc==crcA);
+        }
+        /* past the end, an empty slot and a bad slot give nothing; a value on any other op is still refused */
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,5,(uint16)total);store_send(12,g_controlSequence+1u,3,5,0);txq_flush_blocking();
+        assert(strstr(simLog,"TRAJ_NODES slot=1 count=0") && strstr(simLog,"TRAJ_NODES slot=3 count=0"));
+        sq=g_controlSequence;simLogN=0;simLog[0]=0;
+        store_send(12,sq+1u,TS_SLOTS,5,0);store_send(12,sq+1u,1,2,1);store_send(12,sq+1u,1,4,1);txq_flush_blocking();
+        assert(!strstr(simLog,"TRAJ_NODES") && g_controlSequence==sq && !g_store.busy);
+        /* an exact retry of a request answers again; the next one (new sequence) is a new request */
+        simLogN=0;simLog[0]=0;store_send(12,sq+1u,1,5,40);txq_flush_blocking();store_send(12,sq+1u,1,5,40);txq_flush_blocking();
+        {const char *a=strstr(simLog,"TRAJ_NODES slot=1");assert(a && strstr(a+1,"TRAJ_NODES slot=1"));}
         return;
     }
     if(!strcmp(t,"store_write_guard")) {
@@ -3401,7 +3431,7 @@ ptp_cases += ['ptp_zero','ptp_axis1','ptp_axis2']
 ptp_cases += ['ptp_power_stable','ptp_fast_stall']
 ptp_cases += ['limits_ptp','limits_jog','limits_elbow','limits_elbow_traj','limits_elbow_jog']
 ptp_cases += ['rates_ptp','rates_traj','rates_live']
-ptp_cases += ['store_'+n for n in ['roundtrip','capacity','ab','power_loss','write_error','corrupt','load_checks','commands','hold','abort','unlinked','write_guard','meta']]
+ptp_cases += ['store_'+n for n in ['roundtrip','capacity','ab','power_loss','write_error','corrupt','load_checks','commands','hold','abort','unlinked','write_guard','meta','nodes']]
 ptp_cases += ['ptp_final_'+name for name in ['positive','negative','boundary','over_limit','following','counts']]
 ptp_cases += ['ptp_logged_retry']
 ptp_cases += ['traj_rx_'+name for name in ['retry','ready_retry','repeated','stop','timeout','overrun','overflow','break','parity','mixed','heartbeat','holding','fault','encoder','motion']]
