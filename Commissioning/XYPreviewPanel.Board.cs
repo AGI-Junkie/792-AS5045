@@ -212,6 +212,7 @@ public sealed partial class XYPreviewPanel
         try
         {
             range = PreviewLimits();
+            _ = Model;   // the experiment records the plan with this computer's link lengths: a half-typed one means it cannot be run, whatever the board saved
             plan = RequestedProfile is { } profile ? ExecutionTrajectory.FromNodes(nodes, range.Value, profile) : throw Lang.Error("err.planRates");
         }
         catch (ArgumentException ex) { whyNot = ex; plan = null; }   // kept as the exception: its message follows the language
@@ -371,6 +372,12 @@ public sealed partial class XYPreviewPanel
             panel.ShowBoardPathForSelfTest(1, nodes, partial);
             if (!panel.ShowsBoardPath || !panel.ResultText.Contains("没有保存杆长")) Fail("只有一个杆长时应按没有保存杆长处理：" + partial + " / " + panel.ResultText);
         }
+        // The link lengths in the boxes are not valid numbers: the board's plan can be looked at (drawn with its own lengths) but not run,
+        // because the experiment that would record the run needs this computer's model.
+        string goodL1 = panel.l1.Text; panel.l1.Text = "abc";
+        panel.ShowBoardPathForSelfTest(1, [new(new(0, 0), 0), new(new(0.5, 1), 500), new(new(1, 2), 500), new(new(1, 2), 50)], "shape=3; L1=180; L2=176.38");
+        if (!panel.ShowsBoardPath || panel.execution is not null || panel.upload.IsEnabled || !panel.recentNote.Text.Contains("不能执行") || panel.recentNote.Text.Contains(Lang.T("err.planRates"))) Fail("本机杆长无效时板上的计划只能看，原因应是杆长而不是速度：" + panel.recentNote.Text);
+        panel.l1.Text = goodL1;
         // Showing the board's plan takes pending freehand work with it.
         int work = panel.freehandWorkVersion;
         panel.ShowBoardPathForSelfTest(1, nodes, null);

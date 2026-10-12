@@ -148,7 +148,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta3-read1-guards2"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta4-read1-guards2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -1539,7 +1539,8 @@ static struct { uint8 last, slot; uint32 rowMaxCy; } g_storeResult;   /* last: 0
  * chunk number in `value`.  The device never reads the text; it only stores it and gives it back (type 12 op 4). */
 #define META_HEAD   (12u)
 #define META_CHUNKS ((META_HEAD + TS_META_MAX + 3u) / 4u)
-static struct { uint8 raw[META_CHUNKS * 4u]; uint8 got[META_CHUNKS]; uint8 touched; uint32 epoch; } g_meta;
+#define META_TTL_MS (15000ul)   /* the save follows its last chunk at once; the host's retries of it end within ~6 s */
+static struct { uint8 raw[META_CHUNKS * 4u]; uint8 got[META_CHUNKS]; uint8 touched; uint32 epoch; uint32 ms; } g_meta;
 static uint8 ts_write_row(uint32 offset, const uint8 *row)
 {
     cystatus status;
@@ -2220,7 +2221,7 @@ static void store_end(uint8 result)
 static uint8 meta_state(void)
 {
     uint16 len, i;
-    if(g_meta.touched && g_meta.epoch!=g_ptp.epoch) { memset(&g_meta,0,sizeof(g_meta)); }
+    if(g_meta.touched && (g_meta.epoch!=g_ptp.epoch || g_jogMs-g_meta.ms>META_TTL_MS)) { memset(&g_meta,0,sizeof(g_meta)); }
     if(!g_meta.touched) { return 0u; }
     len=ptp_u16(g_meta.raw);
     if(len<1u || len>TS_META_MAX || ptp_u16(g_meta.raw+2)!=0u) { return 2u; }
@@ -2243,7 +2244,7 @@ static void meta_accept(const uint8 *p)
     g_controlSequence=seq;
     if(idx==0u || (g_meta.touched && g_meta.epoch!=g_ptp.epoch)) { memset(&g_meta,0,sizeof(g_meta)); }
     memcpy(g_meta.raw+(uint16)(idx*4u),p+9,4u);
-    g_meta.got[idx]=1u; g_meta.touched=1u; g_meta.epoch=g_ptp.epoch;
+    g_meta.got[idx]=1u; g_meta.touched=1u; g_meta.epoch=g_ptp.epoch; g_meta.ms=g_jogMs;
 }
 /* One flash row per foreground pass.  The plan being saved is g_traj itself, so anything that changes it (a stop, an
  * enable, a new upload) ends the save, and the block under construction stays invalid. */
@@ -2276,6 +2277,9 @@ static void store_accept(const uint8 *p)
         STORE_REFUSE("TRAJ_STORE refused: stale epoch\r\n"); return;
     }
     if(!TS_LINKED()) { g_rxRejected++; STORE_REFUSE("TRAJ_STORE refused: archive region not reserved (link with cm3gcc_trajstore.ld)\r\n"); return; }
+    /* The description belongs to the Save that follows its chunks (only heartbeats come between).  Any other archive command means that
+     * Save never arrived (the host gave up and went on to a query): the description is forgotten, not kept for a later save that sends none. */
+    if(op!=2u) { memset(&g_meta,0,sizeof(g_meta)); }
     retry=(uint8)(memcmp(g_storeAccepted,p,15u)==0);   /* heartbeats keep advancing the sequence, so a retry is judged by its bytes */
     if(!retry && (!seq || seq<=g_controlSequence)) { g_rxRejected++; STORE_REFUSE("TRAJ_STORE refused: stale sequence\r\n"); return; }
     if((ptp_u16(p+13) && op!=5u) || op<1u || op>5u || (slot>=TS_SLOTS && !(op==1u && slot==0xFFFFu))) {

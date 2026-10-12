@@ -2081,6 +2081,15 @@ static void store_test(const char *t) {
         store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
         assert(!g_store.busy && strstr(simLog,"no complete plan") && !g_meta.touched);
         store_make_plan(485,0);store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.valid && in.metaLen==0u);
+        /* a description whose Save never arrived (the host gave up and asked something else, or simply went quiet) is not kept for a later
+         * save that sends none */
+        meta_send_chunks(textA,crcA,-1,-1);assert(g_meta.touched);
+        store_send(12,g_controlSequence+1u,1,1,0);assert(!g_meta.touched);             /* the host went on to a query */
+        store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.metaLen==0u);
+        meta_send_chunks(textA,crcA,-1,-1);g_jogMs+=META_TTL_MS+1u;                       /* or went quiet for a long time */
+        store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.metaLen==0u && !g_meta.touched);
+        meta_send_chunks(textA,crcA,-1,-1);store_send(12,g_controlSequence+1u,1,4,0);assert(!g_meta.touched);   /* any other archive command */
+        meta_send_chunks(textA,crcA,-1,-1);g_jogMs+=1000u;store_save(1);ts_active(1,&in);assert(meta_is(1,textA));   /* a prompt save keeps it */
         /* power lost at every write of a save that replaces a plan and its description: one whole pair or the other, never a mix */
         for(torn=0;torn<2;torn++) for(cut=0;cut<=15u;cut++) {
             sim_flash_reset();store_make_plan(485,0);crcA=store_plan_crc();meta_send_chunks(textA,crcA,-1,-1);store_save(0);
