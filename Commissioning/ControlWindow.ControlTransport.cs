@@ -54,6 +54,9 @@ public sealed partial class ControlWindow
             controlEpoch = 0; lastControlHeartbeat = 0;
             controlDataSent = false;
         }
+        // A store request that never left (STOP while its description was still going out) will never be answered: end it now, instead of
+        // keeping the archive busy and the editing locked until it times out.
+        if (storeJob is { Sequence: 0 }) FinishStoreJob(false, () => Lang.T("board.err.stopped"));
         if (framedControl) heartbeatTimer.Interval = TimeSpan.FromMilliseconds(8);
     }
 

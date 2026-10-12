@@ -148,7 +148,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta2-read1-guards2"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta3-read1-guards2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -2167,8 +2167,6 @@ static void store_slot_line(uint8 slot)
     JLOGF("TRAJ_SLOT slot=%u valid=1 seq=%lu nodes=%u duration_ms=%lu q1=%d q2=%d crc=%08lX\r\n",
           (unsigned)slot,(unsigned long)in.seq,(unsigned)in.count,(unsigned long)in.durationMs,(int)in.q1,(int)in.q2,
           (unsigned long)in.dataCrc);
-    /* The size of the description is a separate line: a host that does not know it must still parse every TRAJ_SLOT line. */
-    if(in.metaLen) { JLOGF("TRAJ_SLOT_META slot=%u seq=%lu len=%u\r\n",(unsigned)slot,(unsigned long)in.seq,(unsigned)in.metaLen); }
 }
 /* Type 12 op 4: one slot's description as one hex line (one slot at a time: four of them would not fit the text queue). */
 static void store_meta_line(uint8 slot)
@@ -2265,6 +2263,9 @@ static void store_service(void)
     else if(r==TS_STEP_DONE) { store_end(g_store.kind==TS_JOB_SAVE ? 1u : 2u); }
     else if(g_store.kind==TS_JOB_SAVE && g_store.phase==1u && (g_store.row&7u)==0u) { store_status(); }
 }
+/* A save that is turned away takes the description staged for it with it: it must not wait for, and be attached to, a later save that
+ * sends none (an older host, an oversized text) or is for another plan. */
+#define STORE_REFUSE(msg) do { if(op==2u) { memset(&g_meta,0,sizeof(g_meta)); } JLOG(msg); } while(0)
 static void store_accept(const uint8 *p)
 {
     uint32 seq=ptp_u32(p+1);
@@ -2272,21 +2273,21 @@ static void store_accept(const uint8 *p)
     uint8 retry;
     if(ptp_u32(p+5)!=g_ptp.epoch) {
         g_rxRejected++; g_ptpEpochRejected++; ptp_announce_epoch();
-        JLOG("TRAJ_STORE refused: stale epoch\r\n"); return;
+        STORE_REFUSE("TRAJ_STORE refused: stale epoch\r\n"); return;
     }
-    if(!TS_LINKED()) { g_rxRejected++; JLOG("TRAJ_STORE refused: archive region not reserved (link with cm3gcc_trajstore.ld)\r\n"); return; }
+    if(!TS_LINKED()) { g_rxRejected++; STORE_REFUSE("TRAJ_STORE refused: archive region not reserved (link with cm3gcc_trajstore.ld)\r\n"); return; }
     retry=(uint8)(memcmp(g_storeAccepted,p,15u)==0);   /* heartbeats keep advancing the sequence, so a retry is judged by its bytes */
-    if(!retry && (!seq || seq<=g_controlSequence)) { g_rxRejected++; JLOG("TRAJ_STORE refused: stale sequence\r\n"); return; }
+    if(!retry && (!seq || seq<=g_controlSequence)) { g_rxRejected++; STORE_REFUSE("TRAJ_STORE refused: stale sequence\r\n"); return; }
     if((ptp_u16(p+13) && op!=5u) || op<1u || op>5u || (slot>=TS_SLOTS && !(op==1u && slot==0xFFFFu))) {
-        g_rxRejected++; JLOG("TRAJ_STORE refused: arguments\r\n"); return;
+        g_rxRejected++; STORE_REFUSE("TRAJ_STORE refused: arguments\r\n"); return;
     }
     if(!retry) {
         if(g_home.phase!=HOME_IDLE || g_ptp.active || g_traj.state==TRAJ_RUNNING || !axes_idle()) {
-            JLOG("TRAJ_STORE refused: stage not idle\r\n"); return;
+            STORE_REFUSE("TRAJ_STORE refused: stage not idle\r\n"); return;
         }
-        if(op==2u && !traj_runnable(&g_traj)) { JLOG("TRAJ_STORE refused: no complete plan in RAM\r\n"); return; }
-        if(op==2u && meta_state()==2u) { memset(&g_meta,0,sizeof(g_meta)); JLOG("TRAJ_STORE refused: description incomplete\r\n"); return; }
-        if((op==2u || op==3u) && CySetTemp()!=CYRET_SUCCESS) { JLOG("TRAJ_STORE refused: flash temperature setup\r\n"); return; }
+        if(op==2u && !traj_runnable(&g_traj)) { STORE_REFUSE("TRAJ_STORE refused: no complete plan in RAM\r\n"); return; }
+        if(op==2u && meta_state()==2u) { STORE_REFUSE("TRAJ_STORE refused: description incomplete\r\n"); return; }
+        if((op==2u || op==3u) && CySetTemp()!=CYRET_SUCCESS) { STORE_REFUSE("TRAJ_STORE refused: flash temperature setup\r\n"); return; }
         g_controlSequence=seq; g_storeSeq=seq; memcpy(g_storeAccepted,p,15u);
         if(op==2u) {
             uint8 held=(uint8)(meta_state()==1u);

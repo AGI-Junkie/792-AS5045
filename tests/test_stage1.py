@@ -2024,9 +2024,9 @@ static void store_test(const char *t) {
         assert(g_storeResult.last==1 && simFlashWrites-w==3u+(485u*6u+255u)/256u);   /* clear, data rows, description row, header */
         ts_active(1,&in);assert(in.valid && in.dataCrc==crcA && meta_is(1,textA));
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,0xFFFFu,1,0);txq_flush_blocking();
-        /* the TRAJ_SLOT line itself ends at the CRC, as it always did (an older host parses it end-anchored); the size is its own line */
-        sprintf(want,"crc=%08lX\r\nTRAJ_SLOT_META slot=1 seq=1 len=%u\r\n",(unsigned long)crcA,(unsigned)strlen(textA));
-        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=1") && strstr(simLog,want) && strstr(simLog,"TRAJ_SLOT slot=0 valid=0\r\n") && !strstr(simLog," meta="));
+        /* the TRAJ_SLOT line ends at the CRC, as it always did (an older host parses it end-anchored); nothing about the description rides on it */
+        sprintf(want,"crc=%08lX\r\n",(unsigned long)crcA);
+        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=1") && strstr(simLog,want) && strstr(simLog,"TRAJ_SLOT slot=0 valid=0\r\n") && !strstr(simLog," meta=") && !strstr(simLog,"TRAJ_SLOT_META"));
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,4,0);txq_flush_blocking();
         sprintf(want,"TRAJ_META slot=1 seq=1 len=%u crc=%08lX hex=",(unsigned)strlen(textA),(unsigned long)ref_crc32((const uint8*)textA,(uint32)strlen(textA)));
         assert(strstr(simLog,want) && strstr(simLog,"73686170653D33") && strstr(simLog,"TRAJ_STORE state=idle"));   /* "shape=3" */
@@ -2036,6 +2036,9 @@ static void store_test(const char *t) {
         store_save(1);ts_active(1,&in);assert(in.valid && in.seq==2u && in.metaLen==0u);
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,1,0);txq_flush_blocking();
         assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=2") && !strstr(simLog,"TRAJ_SLOT_META"));
+        /* a slot without a description answers an op 4 query with len=0 (the host asks every valid slot) */
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,4,0);txq_flush_blocking();
+        assert(strstr(simLog,"TRAJ_META slot=1 len=0"));
         /* an incomplete or damaged description refuses the save and writes nothing; the refusal forgets it */
         meta_send_chunks(textA,crcA,2,-1);w=simFlashWrites;simLogN=0;simLog[0]=0;
         store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
@@ -2067,6 +2070,17 @@ static void store_test(const char *t) {
         meta_send_chunks(textA,crcA,-1,-1);assert(g_meta.touched);g_ptp.epoch++;
         store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.valid && in.metaLen==0u);
         meta_send_chunks(textA,crcA,-1,-1);store_save(1);ts_active(1,&in);assert(in.metaLen==(unsigned)strlen(textA) && meta_is(1,textA));   /* same epoch: kept */
+        /* a save that is refused (the same epoch, so not the epoch rule) takes its description with it: the next save, which sends none, is
+         * neither refused for it nor given it */
+        store_make_plan(485,0);crcA=store_plan_crc();
+        meta_send_chunks(textA,crcA,-1,-1);g_ptp.active=1u;simLogN=0;simLog[0]=0;
+        store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();g_ptp.active=0u;
+        assert(!g_store.busy && strstr(simLog,"stage not idle") && !g_meta.touched);
+        store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.valid && in.metaLen==0u);
+        meta_send_chunks(textA,crcA,-1,-1);traj_discard();simLogN=0;simLog[0]=0;
+        store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
+        assert(!g_store.busy && strstr(simLog,"no complete plan") && !g_meta.touched);
+        store_make_plan(485,0);store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.valid && in.metaLen==0u);
         /* power lost at every write of a save that replaces a plan and its description: one whole pair or the other, never a mix */
         for(torn=0;torn<2;torn++) for(cut=0;cut<=15u;cut++) {
             sim_flash_reset();store_make_plan(485,0);crcA=store_plan_crc();meta_send_chunks(textA,crcA,-1,-1);store_save(0);

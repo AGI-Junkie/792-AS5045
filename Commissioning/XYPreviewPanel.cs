@@ -69,7 +69,8 @@ public sealed partial class XYPreviewPanel : UserControl
             RestoreFreehand(p.Freehand); freehandMode = p.Shape == FreehandIndex; ClampRateFields(); }
         finally { updating=false; ShapeFields(); Refresh(); NotifyLimitsChanged(); }
     }
-    private static string ParametersPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "parameters.json");
+    internal static string? ParametersPathOverride;   // tests keep the real file untouched
+    private static string ParametersPath => ParametersPathOverride ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "parameters.json");
     public event Action? ParametersSaved;
     private async void SaveCurrentParameters(string path)
     {
@@ -106,8 +107,10 @@ public sealed partial class XYPreviewPanel : UserControl
     }
     // The click only fires while a validated plan matches the fields, so what is written is exactly what is uploaded.
     // Best effort and silent: a full disk must not block a motion the operator already approved.
+    // A plan read back from the board is not what the boxes describe: nothing is remembered for it.
     private void RememberUploaded()
     {
+        if (execFromBoard is not null) return;
         try { WriteParameters(ParametersPath); } catch(Exception ex) when(ex is IOException or UnauthorizedAccessException) { }
     }
     public void RestoreSavedParameters() => ReadSavedParameters(ParametersPath);

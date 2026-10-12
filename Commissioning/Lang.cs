@@ -320,6 +320,7 @@ internal static class Lang
         ["board.save.stored"] = ("这个图形已经存在板子槽{0}。", "This figure is already stored in board slot {0}."),
         ["board.save.needStart"] = ("设备上还没有这个图形，存之前要先上传：需要已使能、已回零、手臂在起点。", "The device does not hold this figure yet, so it has to be uploaded before it is stored: the stage must be enabled, homed and the arm at the start."),
         ["board.saveCurrentStarted"] = ("将把屏幕上的图形存到板上槽{0}（需要时先上传）。", "The figure on screen will be saved to board slot {0} (uploaded first if needed)."),
+        ["board.err.stopped"] = ("被总停止打断了", "interrupted by STOP"),
         ["board.readingPath"] = ("正在读取板上槽{0}的轨迹……{1}/{2} 点", "Reading the plan in board slot {0}… {1}/{2} points"),
         ["board.readFailed"] = ("读取板上槽{0}的轨迹失败：{1}", "Reading the plan in board slot {0} failed: {1}"),
         ["board.readChanged"] = ("槽{0}在读取期间被改写，没有显示；重新读完板上存档后再点一次。", "Slot {0} was rewritten while it was being read, nothing is shown; click it again once the archive has been read."),

@@ -197,7 +197,9 @@ public sealed partial class XYPreviewPanel
     public void ShowBoardPath(int slot, ExecutionNode[] nodes, string? settings)
     {
         if (boardPathWanted != slot || nodes.Length < 2) return;
+        CancelFreehandWork();   // a smoothing or planning job still running must not publish over the board's plan
         double? saved1 = SavedNumber(settings, "L1"), saved2 = SavedNumber(settings, "L2");
+        if (saved1 is null || saved2 is null) saved1 = saved2 = null;   // the board's lengths are a pair, or not used at all
         PlanarArm? here = null, model = null;
         try { here = Model; } catch (ArgumentException) { }   // a half-typed link length in the boxes
         try { if (saved1 is { } a && saved2 is { } b) model = new PlanarArm(a, b); } catch (ArgumentException) { saved1 = saved2 = null; }
@@ -338,6 +340,8 @@ public sealed partial class XYPreviewPanel
         var mid = NodePoseAt(nodes, 0.25);
         if (Math.Abs(mid.Q1 - 5) > 1e-9 || Math.Abs(mid.Q2 - 10) > 1e-9 || NodePoseAt(nodes, 0) != nodes[0].Pose || NodePoseAt(nodes, 0.5) != nodes[1].Pose || NodePoseAt(nodes, 99) != nodes[^1].Pose) Fail("节点之间应按直线插值");
         var panel = new XYPreviewPanel();
+        string parameters = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "arm-board-path-" + Guid.NewGuid().ToString("N") + ".json");
+        ParametersPathOverride = parameters;
         panel.ShowBoardPath(2, nodes, null);
         if (panel.ShowsBoardPath) Fail("没有请求过的轨迹不应显示");
         panel.ShowBoardPathForSelfTest(2, nodes, null);
@@ -361,6 +365,16 @@ public sealed partial class XYPreviewPanel
         // A plan this machine's speeds do not allow stays a picture: no start to move to, nothing to upload.
         panel.ShowBoardPathForSelfTest(1, [new(new(0, 0), 0), new(new(10, 20), 500), new(new(10, 20), 50)], null);
         if (panel.execution is not null || panel.upload.IsEnabled || panel.movePoint.IsEnabled || !panel.actionSummary.Text.Contains("只读预览")) Fail("不被接受的轨迹只能看：" + panel.actionSummary.Text);
+        // Only one of the two link lengths (or one that does not parse): not a pair, so none is used, and nothing throws.
+        foreach (string partial in new[] { "shape=3; L1=181.5", "shape=3; L2=176.38", "shape=3; L1=oops; L2=176.38" })
+        {
+            panel.ShowBoardPathForSelfTest(1, nodes, partial);
+            if (!panel.ShowsBoardPath || !panel.ResultText.Contains("没有保存杆长")) Fail("只有一个杆长时应按没有保存杆长处理：" + partial + " / " + panel.ResultText);
+        }
+        // Showing the board's plan takes pending freehand work with it.
+        int work = panel.freehandWorkVersion;
+        panel.ShowBoardPathForSelfTest(1, nodes, null);
+        if (panel.freehandWorkVersion == work) Fail("显示板上轨迹应取消还没做完的手绘计算");
         // The link lengths it was saved with are named, and compared with this computer's.
         panel.ShowBoardPathForSelfTest(0, nodes, $"shape=3; L1={panel.l1.Text}; L2={panel.l2.Text}");
         if (!panel.ResultText.Contains("和这台电脑一致")) Fail("杆长一致时应这样说：" + panel.ResultText);
@@ -379,6 +393,23 @@ public sealed partial class XYPreviewPanel
         panel.boardPathWanted = 1; panel.x.Text = "341";
         panel.ShowBoardPath(1, nodes, null);
         if (panel.ShowsBoardPath) Fail("编辑之后到达的轨迹不应显示");
+        // Uploading (loading) a plan read back from the board does not touch the saved parameters: the boxes do not describe it.  A plan
+        // made here does (the control: the same click writes the file).
+        var slowBoard = new[] { new ExecutionNode(new JointPose(0, 0), 0), new ExecutionNode(new JointPose(0.5, 1), 500), new ExecutionNode(new JointPose(1, 2), 500), new ExecutionNode(new JointPose(1, 2), 50) };
+        panel.Refresh(); panel.ShowBoardPathForSelfTest(1, slowBoard, null);
+        panel.SetPointMoveState(true, panel.RequestedLimits, "ok", true, true, null, false);
+        panel.SetStartFeedback(new TelemetrySample(0, 1, 1, true, 2, ExecutionTrajectory.Counts(0, slowBoard[0].Pose), ExecutionTrajectory.Counts(1, slowBoard[0].Pose), 0, 0, 0, 0));
+        if (!panel.upload.IsEnabled) Fail("起点在手臂下时板上的计划应能上传：" + panel.moveState.Text);
+        panel.upload.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        if (System.IO.File.Exists(parameters)) Fail("上传板上读回的计划不得把输入框写进参数文件");
+        panel.SelectShapeForSelfTest(3); panel.LoadExampleForSelfTest();
+        var made = panel.execution ?? throw new InvalidOperationException("应有已检查的图形");
+        panel.SetPointMoveState(true, panel.RequestedLimits, "ok", true, true, null, false);
+        panel.SetStartFeedback(new TelemetrySample(0, 1, 1, true, 2, ExecutionTrajectory.Counts(0, made.Nodes[0].Pose), ExecutionTrajectory.Counts(1, made.Nodes[0].Pose), 0, 0, 0, 0));
+        panel.upload.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        if (!System.IO.File.Exists(parameters)) Fail("本机规划的图形上传仍应记住参数（对照）");
+        ParametersPathOverride = null;
+        System.IO.File.Delete(parameters);
     }
 
     private void UpdateUploadCaption()
