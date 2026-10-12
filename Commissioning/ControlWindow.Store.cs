@@ -69,13 +69,15 @@ public sealed partial class ControlWindow
     private void ReadStoreCapability(string[] words)
     {
         string? slots = words.FirstOrDefault(w => w.StartsWith("traj_store=", StringComparison.Ordinal));
-        int before = storeSlotCount;
+        int before = storeSlotCount, metaBefore = storeMetaMax; bool readBefore = storeReadSupported;
         storeSlotCount = slots is not null && int.TryParse(slots.AsSpan(11), out int n) && n is > 0 and <= DeviceContract.TrajStoreSlots ? n : 0;
         string? meta = words.FirstOrDefault(w => w.StartsWith("traj_meta=", StringComparison.Ordinal));
         storeMetaMax = storeSlotCount > 0 && meta is not null && int.TryParse(meta.AsSpan(10), out int m) && m > 0 ? Math.Min(m, BoardMeta.MaxBytes) : 0;
         storeReadSupported = storeSlotCount > 0 && words.Contains("traj_read=1");
         if (storeSlotCount == 0) { boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); Array.Clear(metaFailSeq); Array.Clear(metaFailures); Array.Clear(metaEmpty); }
-        if (storeSlotCount != before) PublishBoard();   // the LINK line comes every 500 ms; the panel is only told when this changes
+        // The LINK line comes every 500 ms; the panel is only told when what it shows depends on changes (a repeated line that finally
+        // carries a token an earlier one lost must reach it too).
+        if (storeSlotCount != before || storeMetaMax != metaBefore || storeReadSupported != readBefore) PublishBoard();
     }
 
     private void ResetBoard()
@@ -141,20 +143,30 @@ public sealed partial class ControlWindow
         for (int i = 0; i < storeSlotCount; i++)
         {
             if (boardSlots[i] is not { Valid: true } slot || metaAsked[i] == slot.Seq) continue;
-            if (metaFailSeq[i] != slot.Seq) { metaFailSeq[i] = slot.Seq; metaFailures[i] = 0; }
-            lastBoardQueryAt = now; metaAsked[i] = slot.Seq; boardMeta[i] = null; metaEmpty[i] = false;
-            int asked = i; uint askedSeq = slot.Seq;
-            // A read that failed (a refusal), or ended with its status but without the description (the long line was lost), is tried again a
-            // few times, a little later; then the slot stays "saved elsewhere".
-            StartStoreJob(StoreOp.Meta, i, (ok, _) =>
-            {
-                bool got = boardMeta[asked] is { } meta && meta.Seq == askedSeq || metaEmpty[asked];   // an answer, even "none"
-                if ((ok && got) || metaFailures[asked] >= MetaRetries || metaAsked[asked] != askedSeq) return;
-                metaFailures[asked]++; metaAsked[asked] = null; lastBoardQueryAt = DateTime.UtcNow.AddSeconds(2);
-            });
+            StartMetaRead(i, slot, now);
             return;
         }
     }
+
+    // One slot's description.  A read that failed (a refusal), or ended with its status but without the description (the long line was
+    // lost), is tried again a few times, a little later; then the slot stays "saved elsewhere".  `then` runs when the read has ended,
+    // whatever came of it (but not when STOP cancelled it).
+    private bool StartMetaRead(int i, BoardSlot slot, DateTime now, Action? then = null)
+    {
+        if (metaFailSeq[i] != slot.Seq) { metaFailSeq[i] = slot.Seq; metaFailures[i] = 0; }
+        lastBoardQueryAt = now; metaAsked[i] = slot.Seq; boardMeta[i] = null; metaEmpty[i] = false;
+        int asked = i; uint askedSeq = slot.Seq;
+        bool started = StartStoreJob(StoreOp.Meta, i, (ok, _) =>
+        {
+            bool got = boardMeta[asked] is { } meta && meta.Seq == askedSeq || metaEmpty[asked];   // an answer, even "none"
+            if (!((ok && got) || metaFailures[asked] >= MetaRetries || metaAsked[asked] != askedSeq))
+            { metaFailures[asked]++; metaAsked[asked] = null; lastBoardQueryAt = DateTime.UtcNow.AddSeconds(2); }
+            if (!cancellingStores) then?.Invoke();
+        });
+        if (!started) metaAsked[i] = null;   // never sent: ask again later
+        return started;
+    }
+    private bool cancellingStores;   // STOP is ending the archive jobs that only read
 
     // Unanswered requests are repeated byte for byte (the device only repeats its receipt); a saving device is given time.
     private void PollStoreJob(DateTime now)
@@ -284,6 +296,16 @@ public sealed partial class ControlWindow
     {
         if (slot < 0 || slot >= storeSlotCount || boardSlots[slot] is not { Valid: true } held) return;
         if (!StoreAvailable || !storeReadSupported || !boardKnown || storeJob is not null || nodeRead is not null || PointBusy) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
+        // The slot's description (the link lengths it was saved with) comes first: the periodic read may not have reached this slot yet, and
+        // the node reads would keep it out until the whole path was in, so the view would be drawn with this computer's lengths.
+        if (storeMetaMax > 0 && metaAsked[slot] != held.Seq && StartMetaRead(slot, held, DateTime.UtcNow, () => BeginNodeRead(slot, held.Seq))) return;
+        BeginNodeRead(slot, held.Seq);
+    }
+
+    private void BeginNodeRead(int slot, uint seq)
+    {
+        if (boardSlots[slot] is not { Valid: true } held || held.Seq != seq || !StoreAvailable || !storeReadSupported || !boardKnown || storeJob is not null || nodeRead is not null || PointBusy)
+        { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
         string? settings = BoardLedger.For(held, BoardLedger.Merge(boardSlots, boardMeta, boardLedger))?.Settings;
         nodeRead = new NodeRead(slot, held.Seq, held.Nodes, held.DurationMs, held.Crc, settings);
         ReadNextNodes();
@@ -697,8 +719,9 @@ public sealed partial class ControlWindow
             // Without the capability a slot nobody described is not a row, and no read is started.
             w.HandleLine(Link(" traj_store=4 telem_hz=0"));
             Check(w.storeSlotCount == 4 && !w.storeReadSupported, "a firmware that cannot send nodes was assumed to");
-            w.HandleLine(Link(" traj_read=1 traj_store=4 telem_hz=0"));
+            w.HandleLine(Link(" traj_meta=256 traj_read=1 traj_store=4 telem_hz=0"));
             Check(w.storeReadSupported, "the capability was not read");
+            Check(w.xyPreview.BoardCanRead, "a capability that arrived on a repeated LINK line (same slot count) did not reach the panel");
             Pump();
             w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(10)); Pump(); uint query = w.storeJob!.Sequence;
             w.HandleLine("TRAJ_SLOT slot=0 valid=0");
@@ -710,6 +733,14 @@ public sealed partial class ControlWindow
             void Click() => w.xyPreview.BoardRowLoadButton(0)!.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
             // A request for the first forty; the answer is taken, the status ends the job, the next forty are asked for.
             frames.Clear(); Click();
+            // The periodic read has not reached the slot yet: its description (the link lengths it was saved with) is read first, so the view
+            // is not drawn with this computer's lengths for want of it.
+            Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 } && w.nodeRead is null, "the slot's description was not read before its nodes");
+            Pump();
+            byte[] saved = System.Text.Encoding.ASCII.GetBytes("shape=3;L1=181.5;L2=176.38");
+            w.HandleLine($"TRAJ_META slot=1 seq=2 len={saved.Length} crc={TrajectoryArchive.Crc32(saved):X8} hex={Convert.ToHexString(saved)}");
+            w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+            frames.Clear();
             Check(w.nodeRead is { Slot: 1, Next: 0 } && w.storeJob is { Op: StoreOp.Nodes, Slot: 1 } && w.pendingControlType == 12, "the click did not start a read");
             Pump();
             var f0 = frames.Last(f => f.Length == 36 && Type(f) == 12);
@@ -729,6 +760,7 @@ public sealed partial class ControlWindow
             Check(w.nodeRead is null && w.storeJob is null && w.xyPreview.ShowsBoardPath && Math.Abs(w.xyPreview.BoardPathDuration - ms / 1000.0) < 1e-9 && w.boardMessage?.Invoke().Contains("已读完板上槽2") == true,
                 "the complete plan was not shown: " + w.boardMessage?.Invoke());
             Check(!w.PointBusy, "the arm stayed locked after the read");
+            Check(w.xyPreview.ResultText.Contains("181.5"), "the view was not drawn with the link lengths the slot was saved with: " + w.xyPreview.ResultText);
 
             // A stream that does not match the slot's CRC is not shown.
             var damaged = (byte[])stream.Clone(); damaged[6 * 50 + 1] ^= 4;
@@ -746,6 +778,12 @@ public sealed partial class ControlWindow
             w.HandleLine("TRAJ_STORE refused: stage not idle");
             Check(w.nodeRead is null && w.boardMessage?.Invoke().Contains("stage not idle") == true, "a refusal did not end the read: " + w.boardMessage?.Invoke());
 
+            // STOP while a read is under way: the new reference epoch may turn the answer away, so the read ends at once (no waiting for the
+            // timeout with the editing locked), whatever the frame's sequence number says.
+            Click(); Pump();
+            Check(w.nodeRead is not null && w.storeJob is { Op: StoreOp.Nodes, Sequence: > 0 } && w.PointBusy, "the read did not start");
+            w.ResetControlTransport();
+            Check(w.nodeRead is null && w.storeJob is null && !w.PointBusy && w.boardMessage?.Invoke().Contains("总停止") == true, "STOP left the node read waiting: " + w.boardMessage?.Invoke());
             // The slot is rewritten between two runs: its save counter changes, nothing is shown, and the inventory is read again.
             Click(); Pump();
             w.HandleLine(Run(0)); w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0"); Pump();

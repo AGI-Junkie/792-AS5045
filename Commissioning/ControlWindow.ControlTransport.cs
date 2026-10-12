@@ -54,9 +54,16 @@ public sealed partial class ControlWindow
             controlEpoch = 0; lastControlHeartbeat = 0;
             controlDataSent = false;
         }
-        // A store request that never left (STOP while its description was still going out) will never be answered: end it now, instead of
-        // keeping the archive busy and the editing locked until it times out.
-        if (storeJob is { Sequence: 0 }) FinishStoreJob(false, () => Lang.T("board.err.stopped"));
+        // A store request that never left (STOP while its description was still going out) will never be answered, and neither will a read
+        // whose answer the new reference epoch may turn away (a frame having a sequence number does not prove it was answered): end them now,
+        // instead of keeping the archive busy and the editing locked until they time out.  A save or erase that is already under way is left
+        // to report how it ended.
+        if (storeJob is { } job && (job.Sequence == 0 || job.Op is StoreOp.Query or StoreOp.Meta or StoreOp.Nodes))
+        {
+            cancellingStores = true;
+            try { FinishStoreJob(false, () => Lang.T("board.err.stopped")); } finally { cancellingStores = false; }
+        }
+        if (nodeRead is { } unfinished) EndNodeRead(unfinished, () => Lang.T("board.readFailed", unfinished.Slot + 1, Lang.T("board.err.stopped")));
         if (framedControl) heartbeatTimer.Interval = TimeSpan.FromMilliseconds(8);
     }
 

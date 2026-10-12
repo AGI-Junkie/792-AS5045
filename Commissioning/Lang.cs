@@ -278,6 +278,7 @@ internal static class Lang
         ["recent.boardShown"] = ("已显示板上槽{0}保存的轨迹：这是只读预览，按保存时的杆长画。点“检查并预览”回到这台电脑算的计划。", "Showing the plan stored in board slot {0}: a read-only preview drawn with the link lengths it was saved with. Click Check & Preview to return to this computer's plan."),
         ["recent.boardRunnable"] = ("已显示板上槽{0}保存的轨迹，按这台电脑当前的范围和速度检查通过：把手臂移到起点后点“从板上加载”，再点“执行图形”才会运动；预览按保存时的杆长画。", "Showing the plan stored in board slot {0}; it passes this computer's current joint ranges and speeds. Move the arm to the start, click Load From Board, then Run Shape to move; the preview is drawn with the link lengths it was saved with."),
         ["recent.boardNotRunnable"] = ("不能执行：按这台电脑当前的范围和速度检查没有通过——{0}", " It cannot be run: it does not pass this computer's current joint ranges and speeds: {0}"),
+        ["recent.boardNoModel"] = ("读回了板上槽{0}的轨迹，但没有可用的杆长来画它：板上没有保存杆长，这台电脑框里的杆长也不是有效的数。", "Read the plan in board slot {0}, but there are no link lengths to draw it with: the board saved none, and the ones in the boxes here are not valid numbers. "),
         ["recent.boardPathTip"] = ("这个槽没有可恢复的参数：点它读取板上的轨迹，只能预览。", "No settings to restore for this slot: click it to read the plan from the board (preview only)."),
         ["recent.cannotLoad"] = ("自定义轮廓或手绘草稿没有随记录保存，这条不能载入；可在实验窗口回放执行记录。", "Custom contours and freehand drafts are not kept with the recording. View the execution replay in Experiments."),
         // The board's flash archive: stars on recent runs, the slot summary, and the messages around saving and loading.

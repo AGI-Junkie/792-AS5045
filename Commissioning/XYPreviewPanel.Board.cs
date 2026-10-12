@@ -30,6 +30,7 @@ public sealed partial class XYPreviewPanel
     private static void ShowMenu(ContextMenu menu) { LastMenu = menu; if (!SuppressMenus) menu.IsOpen = true; }
     internal string BoardNoteText => boardNote.Text;
     internal string ResultText => result.Text;
+    internal bool BoardCanRead => boardCanRead;
     internal bool SaveBoardEnabled => saveBoard.IsEnabled;
     internal string SaveBoardCaption => (string)saveBoard.Content;
     internal string SaveBoardTip => saveBoard.ToolTip as string ?? "";
@@ -200,10 +201,16 @@ public sealed partial class XYPreviewPanel
         CancelFreehandWork();   // a smoothing or planning job still running must not publish over the board's plan
         double? saved1 = SavedNumber(settings, "L1"), saved2 = SavedNumber(settings, "L2");
         if (saved1 is null || saved2 is null) saved1 = saved2 = null;   // the board's lengths are a pair, or not used at all
-        PlanarArm? here = null, model = null;
-        try { here = Model; } catch (ArgumentException) { }   // a half-typed link length in the boxes
+        PlanarArm? here = null, model = null; ArgumentException? localError = null;
+        try { here = Model; } catch (ArgumentException ex) { localError = ex; }   // a half-typed link length in the boxes
         try { if (saved1 is { } a && saved2 is { } b) model = new PlanarArm(a, b); } catch (ArgumentException) { saved1 = saved2 = null; }
-        if ((model ?? here) is not { } arm) return;
+        if ((model ?? here) is not { } arm)
+        {
+            // Nothing to draw it with: the board saved no (usable) link lengths and the boxes here are not numbers.  Say so.
+            boardPathWanted = null;
+            Lang.Text(recentNote, () => Lang.T("recent.boardNoModel", slot + 1) + (localError?.Message ?? ""));
+            return;
+        }
         PausePlayback(); trajectory = null; timing = null; execution = null; pointTarget = null; execFromBoard = null; movePoint.IsEnabled = false; upload.IsEnabled = false;
         rangeFailure = null; operationError = null; Lang.Text(executionInfo, () => ""); Lang.Text(notice, () => ""); sampleInfo.Clear();
         // Does this machine accept it?  The checks a planned figure passes: the joint ranges and speeds in the boxes.  A slot saved under
@@ -377,6 +384,10 @@ public sealed partial class XYPreviewPanel
         string goodL1 = panel.l1.Text; panel.l1.Text = "abc";
         panel.ShowBoardPathForSelfTest(1, [new(new(0, 0), 0), new(new(0.5, 1), 500), new(new(1, 2), 500), new(new(1, 2), 50)], "shape=3; L1=180; L2=176.38");
         if (!panel.ShowsBoardPath || panel.execution is not null || panel.upload.IsEnabled || !panel.recentNote.Text.Contains("不能执行") || panel.recentNote.Text.Contains(Lang.T("err.planRates"))) Fail("本机杆长无效时板上的计划只能看，原因应是杆长而不是速度：" + panel.recentNote.Text);
+        // And when no model at all can draw it (the board saved no lengths): the request ends with an explanation, not silently.
+        panel.l1.Text = "abd";   // (an edit takes any board view away)
+        panel.ShowBoardPathForSelfTest(1, nodes, "shape=3; L1=180");
+        if (panel.ShowsBoardPath || !panel.recentNote.Text.Contains("没有可用的杆长") || panel.boardPathWanted is not null) Fail("没有任何杆长能画时应说明，并结束这次请求：" + panel.recentNote.Text);
         panel.l1.Text = goodL1;
         // Showing the board's plan takes pending freehand work with it.
         int work = panel.freehandWorkVersion;
