@@ -12,10 +12,10 @@ public enum StoreOp : short { Query = 1, Save = 2, Erase = 3, Meta = 4, Nodes = 
 
 // One archive slot as the device reports it (TRAJ_SLOT line).  Crc is the CRC-32 of the node stream, the same value PlanCrc
 // computes for a plan on this side, so "is this plan already on the board" is a number comparison.  MetaLen is the size of the
-// description stored with the plan (0 = none; see BoardMeta).
+// description stored with the plan (0 = none; see BoardMeta): it comes on a TRAJ_SLOT_META line after the slot's own line, never on it.
 public sealed record BoardSlot(int Slot, bool Valid, uint Seq, int Nodes, int DurationMs, int Q1Cd, int Q2Cd, uint Crc, int MetaLen = 0)
 {
-    private static readonly Regex Pattern = new(@"^TRAJ_SLOT slot=(\d+) valid=([01])(?: seq=(\d+) nodes=(\d+) duration_ms=(\d+) q1=(-?\d+) q2=(-?\d+) crc=([0-9A-F]{8})(?: meta=(\d+))?)?$", RegexOptions.CultureInvariant);
+    private static readonly Regex Pattern = new(@"^TRAJ_SLOT slot=(\d+) valid=([01])(?: seq=(\d+) nodes=(\d+) duration_ms=(\d+) q1=(-?\d+) q2=(-?\d+) crc=([0-9A-F]{8}))?$", RegexOptions.CultureInvariant);
     public double Seconds => DurationMs / 1000.0;
     public static BoardSlot? Parse(string line)
     {
@@ -26,9 +26,8 @@ public sealed record BoardSlot(int Slot, bool Valid, uint Seq, int Nodes, int Du
             !int.TryParse(m.Groups[5].Value, out int duration) || !int.TryParse(m.Groups[6].Value, out int q1) || !int.TryParse(m.Groups[7].Value, out int q2) ||
             !uint.TryParse(m.Groups[8].Value, System.Globalization.NumberStyles.HexNumber, null, out uint crc) ||
             nodes is < 2 or > DeviceContract.TrajCapacity || duration <= 0 ||
-            !int.TryParse(m.Groups[9].Success ? m.Groups[9].Value : "0", out int metaLen) || metaLen is < 0 or > BoardMeta.MaxBytes ||
             q1 is < -DeviceContract.JointLimitCdMax or > DeviceContract.JointLimitCdMax || q2 is < -DeviceContract.JointLimitCdMax or > DeviceContract.JointLimitCdMax) return null;   // not Math.Abs: it throws for int.MinValue
-        return new BoardSlot(slot, true, seq, nodes, duration, q1, q2, crc, metaLen);
+        return new BoardSlot(slot, true, seq, nodes, duration, q1, q2, crc);
     }
 }
 
@@ -88,6 +87,19 @@ public sealed record StoreStatus(string State, int Slot, int RowsDone, int RowsT
             !uint.TryParse(m.Groups[5].Value, out uint seq) || !int.TryParse(m.Groups[7].Value, out int lastSlot) || !int.TryParse(m.Groups[8].Value, out int rowMax) ||
             slot >= DeviceContract.TrajStoreSlots || lastSlot >= DeviceContract.TrajStoreSlots || done > total) return null;
         return new StoreStatus(m.Groups[1].Value, slot, done, total, seq, m.Groups[6].Value, lastSlot, rowMax);
+    }
+}
+
+// The size of the description a slot carries, on a line of its own right after that slot's TRAJ_SLOT line: an older host parses
+// TRAJ_SLOT end-anchored, so nothing may be added to it.
+public sealed record BoardSlotMeta(int Slot, uint Seq, int Length)
+{
+    private static readonly Regex Pattern = new(@"^TRAJ_SLOT_META slot=(\d+) seq=(\d+) len=(\d+)$", RegexOptions.CultureInvariant);
+    public static BoardSlotMeta? Parse(string line)
+    {
+        var m = Pattern.Match(line);
+        return m.Success && int.TryParse(m.Groups[1].Value, out int slot) && slot is >= 0 and < DeviceContract.TrajStoreSlots && uint.TryParse(m.Groups[2].Value, out uint seq) &&
+            int.TryParse(m.Groups[3].Value, out int length) && length is >= 1 and <= BoardMeta.MaxBytes ? new BoardSlotMeta(slot, seq, length) : null;
     }
 }
 
@@ -217,8 +229,10 @@ public static class BoardLedger
         Check(Crc32("123456789"u8) == 0xCBF43926u, "CRC-32 of 123456789 must be CBF43926");
         Check(BoardSlot.Parse("TRAJ_SLOT slot=2 valid=0") is { Slot: 2, Valid: false }, "empty slot line");
         Check(BoardSlot.Parse("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=-5686 q2=5871 crc=BD3EB746") is { Valid: true, Seq: 3, Nodes: 485, DurationMs: 60480, Q1Cd: -5686, Q2Cd: 5871, Crc: 0xBD3EB746 }, "valid slot line");
-        Check(BoardSlot.Parse("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=-5686 q2=5871 crc=BD3EB746 meta=105") is { MetaLen: 105, Crc: 0xBD3EB746 } &&
-              BoardSlot.Parse("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=-5686 q2=5871 crc=BD3EB746") is { MetaLen: 0 }, "slot line with a description size");
+        // The size of the description is its own line, the slot line keeps its shape: nothing may follow the CRC.
+        Check(BoardSlotMeta.Parse("TRAJ_SLOT_META slot=1 seq=3 len=105") is { Slot: 1, Seq: 3, Length: 105 } && BoardSlotMeta.Parse("TRAJ_SLOT_META slot=3 seq=1 len=256") is { Length: 256 }, "slot description size line");
+        foreach (string bad in new[] { "TRAJ_SLOT_META slot=1 seq=3 len=0", "TRAJ_SLOT_META slot=1 seq=3 len=257", "TRAJ_SLOT_META slot=4 seq=3 len=5", "TRAJ_SLOT_META slot=1 len=5", "TRAJ_SLOT_META slot=1 seq=3 len=5 x" })
+            Check(BoardSlotMeta.Parse(bad) is null, "bad description size line accepted: " + bad);
         foreach (string bad in new[] { "TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746 meta=257", "TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746 meta=",
             "TRAJ_SLOT slot=1 valid=0 meta=5", "TRAJ_SLOT slot=4 valid=0", "TRAJ_SLOT slot=0 valid=1", "TRAJ_SLOT slot=0 valid=0 seq=1", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=1 duration_ms=5 q1=0 q2=0 crc=00000000",
             "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=2049 duration_ms=5 q1=0 q2=0 crc=00000000", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=18001 q2=0 crc=00000000",

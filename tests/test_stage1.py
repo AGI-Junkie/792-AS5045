@@ -2024,8 +2024,9 @@ static void store_test(const char *t) {
         assert(g_storeResult.last==1 && simFlashWrites-w==3u+(485u*6u+255u)/256u);   /* clear, data rows, description row, header */
         ts_active(1,&in);assert(in.valid && in.dataCrc==crcA && meta_is(1,textA));
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,0xFFFFu,1,0);txq_flush_blocking();
-        sprintf(want,"crc=%08lX meta=%u\r\n",(unsigned long)crcA,(unsigned)strlen(textA));
-        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=1") && strstr(simLog,want) && strstr(simLog,"TRAJ_SLOT slot=0 valid=0\r\n"));
+        /* the TRAJ_SLOT line itself ends at the CRC, as it always did (an older host parses it end-anchored); the size is its own line */
+        sprintf(want,"crc=%08lX\r\nTRAJ_SLOT_META slot=1 seq=1 len=%u\r\n",(unsigned long)crcA,(unsigned)strlen(textA));
+        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=1") && strstr(simLog,want) && strstr(simLog,"TRAJ_SLOT slot=0 valid=0\r\n") && !strstr(simLog," meta="));
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,4,0);txq_flush_blocking();
         sprintf(want,"TRAJ_META slot=1 seq=1 len=%u crc=%08lX hex=",(unsigned)strlen(textA),(unsigned long)ref_crc32((const uint8*)textA,(uint32)strlen(textA)));
         assert(strstr(simLog,want) && strstr(simLog,"73686170653D33") && strstr(simLog,"TRAJ_STORE state=idle"));   /* "shape=3" */
@@ -2034,7 +2035,7 @@ static void store_test(const char *t) {
         /* a description is used once: the next save without one carries none (and an old block is a plan without one) */
         store_save(1);ts_active(1,&in);assert(in.valid && in.seq==2u && in.metaLen==0u);
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,1,0);txq_flush_blocking();
-        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=2") && !strstr(simLog," meta="));
+        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=2") && !strstr(simLog,"TRAJ_SLOT_META"));
         /* an incomplete or damaged description refuses the save and writes nothing; the refusal forgets it */
         meta_send_chunks(textA,crcA,2,-1);w=simFlashWrites;simLogN=0;simLog[0]=0;
         store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
@@ -2058,6 +2059,14 @@ static void store_test(const char *t) {
         assert(!g_meta.touched && strstr(simLog,"TRAJ_META refused: arguments"));store_run();
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,TS_SLOTS,4,0);txq_flush_blocking();
         assert(!strstr(simLog,"TRAJ_META"));
+        /* a transfer a host walked away from (the reference epoch changed: stop, enable, new reference) is forgotten: a later save is not
+         * refused for the half description, and a complete one that was never saved is not attached to it */
+        meta_send_chunks(textA,crcA,2,-1);assert(g_meta.touched);g_ptp.epoch++;
+        simLogN=0;simLog[0]=0;store_save(1);ts_active(1,&in);
+        assert(g_storeResult.last==1 && in.valid && in.metaLen==0u && !strstr(simLog,"description incomplete") && !g_meta.touched);
+        meta_send_chunks(textA,crcA,-1,-1);assert(g_meta.touched);g_ptp.epoch++;
+        store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.valid && in.metaLen==0u);
+        meta_send_chunks(textA,crcA,-1,-1);store_save(1);ts_active(1,&in);assert(in.metaLen==(unsigned)strlen(textA) && meta_is(1,textA));   /* same epoch: kept */
         /* power lost at every write of a save that replaces a plan and its description: one whole pair or the other, never a mix */
         for(torn=0;torn<2;torn++) for(cut=0;cut<=15u;cut++) {
             sim_flash_reset();store_make_plan(485,0);crcA=store_plan_crc();meta_send_chunks(textA,crcA,-1,-1);store_save(0);

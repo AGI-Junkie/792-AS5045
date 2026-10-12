@@ -181,12 +181,13 @@ public sealed partial class XYPreviewPanel
     private void LoadFromBoard(BoardSlot slot, Dictionary<string, string>? values)
     {
         int number = slot.Slot + 1;
+        planFailure = null;
         if (values is not null) ApplyPreset(values);
-        string why = result.Text;   // taken now: the note must not change with later edits, only with the language
+        var why = planFailure;      // taken now, as the formatter that makes the reason: the note follows the language but not later edits
         bool none = values is null, failed = !none && execution is null, same = !none && !failed && PlanOnBoard()?.Slot == slot.Slot;
         bool fetch = !same && boardCanRead;
         if (fetch) { boardPathWanted = slot.Slot; BoardPathRequested?.Invoke(slot.Slot); }
-        Lang.Text(recentNote, () => (none ? Lang.T("recent.boardNoSettings", number) : failed ? Lang.T("recent.boardCheck", number) + why : same ? Lang.T("recent.boardLoaded", number) : Lang.T("recent.boardDiffers", number)) +
+        Lang.Text(recentNote, () => (none ? Lang.T("recent.boardNoSettings", number) : failed ? Lang.T("recent.boardCheck", number) + (why?.Invoke() ?? "") : same ? Lang.T("recent.boardLoaded", number) : Lang.T("recent.boardDiffers", number)) +
             (fetch ? Lang.T("recent.boardFetching") : ""));
     }
 

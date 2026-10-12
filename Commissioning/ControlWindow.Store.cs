@@ -43,6 +43,7 @@ public sealed partial class ControlWindow
     private readonly uint?[] metaFailSeq = new uint?[DeviceContract.TrajStoreSlots];           // ...and the one the failures below were counted for
     private readonly int[] metaFailures = new int[DeviceContract.TrajStoreSlots];
     private const int MetaRetries = 3;
+    private void ForgetMeta(int slot) { boardMeta[slot] = null; metaAsked[slot] = null; metaFailSeq[slot] = null; metaFailures[slot] = 0; }
     private byte[][] storeMetaChunks = [];                                // the description of the plan being saved: sent first, then the Save frame
     private int storeMetaNext;
     private bool boardKnown;                                              // a COMPLETE inventory (every slot reported) has arrived on this link
@@ -141,10 +142,12 @@ public sealed partial class ControlWindow
             if (metaFailSeq[i] != slot.Seq) { metaFailSeq[i] = slot.Seq; metaFailures[i] = 0; }
             lastBoardQueryAt = now; metaAsked[i] = slot.Seq; boardMeta[i] = null;
             int asked = i; uint askedSeq = slot.Seq;
-            // A read that failed (a lost line, a refusal) is tried again a few times, a little later; then the slot stays "saved elsewhere".
+            // A read that failed (a refusal), or ended with its status but without the description (the long line was lost), is tried again a
+            // few times, a little later; then the slot stays "saved elsewhere".
             StartStoreJob(StoreOp.Meta, i, (ok, _) =>
             {
-                if (ok || metaFailures[asked] >= MetaRetries || metaAsked[asked] != askedSeq) return;
+                bool got = boardMeta[asked] is { } meta && meta.Seq == askedSeq;
+                if ((ok && got) || metaFailures[asked] >= MetaRetries || metaAsked[asked] != askedSeq) return;
                 metaFailures[asked]++; metaAsked[asked] = null; lastBoardQueryAt = DateTime.UtcNow.AddSeconds(2);
             });
             return;
@@ -175,12 +178,21 @@ public sealed partial class ControlWindow
         {
             if (BoardSlot.Parse(line) is { } slot && slot.Slot < storeSlotCount)
             {
+                // The save counter alone does not name a plan: erasing a slot and saving into it starts it at 1 again.  An emptied slot, or one
+                // whose counter or plan changed, loses what was known about its description.
+                if (!slot.Valid || boardSlots[slot.Slot] is { } before && (before.Seq != slot.Seq || before.Crc != slot.Crc)) ForgetMeta(slot.Slot);
                 boardSlots[slot.Slot] = slot; boardSeen |= 1 << slot.Slot;
                 if (boardSeen == (1 << storeSlotCount) - 1) boardKnown = true;
                 if (storeJob is { } q) q.LastSeenAt = DateTime.UtcNow;
                 PublishBoard();
             }
             else Append("HOST malformed or unexpected archive slot line", LogLevel.Warning);
+            return;
+        }
+        if (line.StartsWith("TRAJ_SLOT_META ", StringComparison.Ordinal))
+        {
+            if (BoardSlotMeta.Parse(line) is { } size && size.Slot < storeSlotCount && boardSlots[size.Slot] is { Valid: true } held && held.Seq == size.Seq)
+            { boardSlots[size.Slot] = held with { MetaLen = size.Length }; PublishBoard(); }
             return;
         }
         if (line.StartsWith("TRAJ_NODES ", StringComparison.Ordinal)) { TakeNodes(line); return; }
@@ -539,7 +551,8 @@ public sealed partial class ControlWindow
             Check(w.storeJob is { Op: StoreOp.Query }, "no inventory query");
             Pump(); uint querySeq = w.storeJob!.Sequence;
             w.HandleLine("TRAJ_SLOT slot=0 valid=0");
-            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=2 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8} meta={text.Length}");
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=2 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8}");
+            w.HandleLine($"TRAJ_SLOT_META slot=1 seq=2 len={text.Length}");
             w.HandleLine("TRAJ_SLOT slot=2 valid=1 seq=1 nodes=9 duration_ms=900 q1=0 q2=0 crc=11111111");
             w.HandleLine("TRAJ_SLOT slot=3 valid=0");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={querySeq} last=none last_slot=0 row_max_us=0");
@@ -563,20 +576,42 @@ public sealed partial class ControlWindow
             w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(30));
             Check(w.storeJob is null, "a description was asked for twice");
             // The slot is saved again (its counter moves): the old description is not trusted and is asked for again.
-            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8} meta={text.Length}");
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8}");
+            w.HandleLine($"TRAJ_SLOT_META slot=1 seq=3 len={text.Length}");
             w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(40));
             Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 } && w.boardMeta[1] is null, "a slot saved again was not asked again");
-            // A read that fails (a refusal, a lost line) is tried again, a few times, and then given up: three retries after the first ask.
-            for (int attempt = 1; attempt <= 3; attempt++)
+            // A read whose long line was lost (the status arrives, the description does not) is not a read: tried again like a failed one.
+            Pump(); w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+            Check(w.storeJob is null && w.boardMeta[1] is null, "a read without its description was taken for done");
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(45));
+            Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 }, "a read that ended without its description was not tried again");
+            // A read that fails (a refusal, a timeout) is tried again, a few times, and then given up: three retries after the first ask.
+            for (int attempt = 1; attempt <= 2; attempt++)
             {
                 w.FinishStoreJob(false, () => "no answer");
                 Check(w.storeJob is null, "a failed description read left a job behind");
-                w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(40 + attempt * 5));
-                Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 }, $"a failed description read was not tried again (retry {attempt})");
+                w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(45 + attempt * 5));
+                Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 }, $"a failed description read was not tried again (retry {attempt + 1})");
             }
             w.FinishStoreJob(false, () => "no answer");
             w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(100));
             Check(w.storeJob is null, "a description read that kept failing was asked for forever");
+            // The slot is emptied and written anew: its save counter starts at 1 again (here it simply repeats), but nothing known about the
+            // old plan's description carries over, and the new one is read.
+            w.HandleLine("TRAJ_SLOT slot=1 valid=0");
+            Check(w.boardMeta[1] is null && w.metaAsked[1] is null && w.metaFailures[1] == 0, "an emptied slot kept what was known about its description");
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8}");
+            w.HandleLine($"TRAJ_SLOT_META slot=1 seq=3 len={text.Length}");
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(110));
+            Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 }, "a slot written anew (same save counter) was not asked for its description");
+            Pump();
+            w.HandleLine($"TRAJ_META slot=1 seq=3 len={body.Length} crc={TrajectoryArchive.Crc32(body):X8} hex={Convert.ToHexString(body)}");
+            w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+            Check(w.storeJob is null && w.boardMeta[1] is { Seq: 3 } && w.boardMeta[1]!.Text == text, "the description of the new plan was not read");
+            // The same counter with another plan, without the empty state ever being seen, also drops it.
+            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc=22222222");
+            Check(w.boardMeta[1] is null && w.metaAsked[1] is null, "a slot that came back as another plan kept the old description");
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8}");
 
             // A save carries its description: chunks first (type 14, consecutive numbers), the Save frame after the last one.
             frames.Clear();

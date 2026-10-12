@@ -588,8 +588,10 @@ public sealed partial class XYPreviewPanel : UserControl
         NotifyLimitsChanged();
         if (freehandNeedsProcessing && editingAllowed) QueueFreehandWork();
     }
+    private Func<string>? planFailure;         // why the plan was last refused, as the formatter that makes the text (it follows the language)
     private void InvalidPlan(Func<string> reason, JointRangeFailure? failure = null, bool cancelFreehandWork = true)
     {
+        planFailure = reason;
         if (cancelFreehandWork) CancelFreehandWork();
         rangeFailure = failure;
         PausePlayback(); trajectory = null; timing = null; ClearBoardView();

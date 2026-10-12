@@ -148,7 +148,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta1-read1-guards2"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta2-read1-guards2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -1539,7 +1539,7 @@ static struct { uint8 last, slot; uint32 rowMaxCy; } g_storeResult;   /* last: 0
  * chunk number in `value`.  The device never reads the text; it only stores it and gives it back (type 12 op 4). */
 #define META_HEAD   (12u)
 #define META_CHUNKS ((META_HEAD + TS_META_MAX + 3u) / 4u)
-static struct { uint8 raw[META_CHUNKS * 4u]; uint8 got[META_CHUNKS]; uint8 touched; } g_meta;
+static struct { uint8 raw[META_CHUNKS * 4u]; uint8 got[META_CHUNKS]; uint8 touched; uint32 epoch; } g_meta;
 static uint8 ts_write_row(uint32 offset, const uint8 *row)
 {
     cystatus status;
@@ -2164,15 +2164,11 @@ static void store_slot_line(uint8 slot)
     ts_info_t in;
     ts_active(slot,&in);
     if(!in.valid) { JLOGF("TRAJ_SLOT slot=%u valid=0\r\n",(unsigned)slot); return; }
-    if(in.metaLen) {
-        JLOGF("TRAJ_SLOT slot=%u valid=1 seq=%lu nodes=%u duration_ms=%lu q1=%d q2=%d crc=%08lX meta=%u\r\n",
-              (unsigned)slot,(unsigned long)in.seq,(unsigned)in.count,(unsigned long)in.durationMs,(int)in.q1,(int)in.q2,
-              (unsigned long)in.dataCrc,(unsigned)in.metaLen);
-        return;
-    }
     JLOGF("TRAJ_SLOT slot=%u valid=1 seq=%lu nodes=%u duration_ms=%lu q1=%d q2=%d crc=%08lX\r\n",
           (unsigned)slot,(unsigned long)in.seq,(unsigned)in.count,(unsigned long)in.durationMs,(int)in.q1,(int)in.q2,
           (unsigned long)in.dataCrc);
+    /* The size of the description is a separate line: a host that does not know it must still parse every TRAJ_SLOT line. */
+    if(in.metaLen) { JLOGF("TRAJ_SLOT_META slot=%u seq=%lu len=%u\r\n",(unsigned)slot,(unsigned long)in.seq,(unsigned)in.metaLen); }
 }
 /* Type 12 op 4: one slot's description as one hex line (one slot at a time: four of them would not fit the text queue). */
 static void store_meta_line(uint8 slot)
@@ -2220,10 +2216,13 @@ static void store_end(uint8 result)
     g_storeResult.last=result; g_storeResult.slot=g_store.slot; g_storeResult.rowMaxCy=g_store.rowMaxCy;
     g_store.busy=0u; memset(&g_meta,0,sizeof(g_meta)); store_status();
 }
-/* 0 = no description was sent, 1 = a complete one is held, 2 = one was started but is incomplete or damaged. */
+/* 0 = no description was sent, 1 = a complete one is held, 2 = one was started but is incomplete or damaged.  A description is
+ * only good in the reference epoch it was sent in: any stop, enable or new reference (a host that went away mid-transfer included)
+ * abandons it, so it can never reach a later save from another host or session. */
 static uint8 meta_state(void)
 {
     uint16 len, i;
+    if(g_meta.touched && g_meta.epoch!=g_ptp.epoch) { memset(&g_meta,0,sizeof(g_meta)); }
     if(!g_meta.touched) { return 0u; }
     len=ptp_u16(g_meta.raw);
     if(len<1u || len>TS_META_MAX || ptp_u16(g_meta.raw+2)!=0u) { return 2u; }
@@ -2244,9 +2243,9 @@ static void meta_accept(const uint8 *p)
         g_rxRejected++; JLOG("TRAJ_META refused: arguments\r\n"); return;
     }
     g_controlSequence=seq;
-    if(idx==0u) { memset(&g_meta,0,sizeof(g_meta)); }
+    if(idx==0u || (g_meta.touched && g_meta.epoch!=g_ptp.epoch)) { memset(&g_meta,0,sizeof(g_meta)); }
     memcpy(g_meta.raw+(uint16)(idx*4u),p+9,4u);
-    g_meta.got[idx]=1u; g_meta.touched=1u;
+    g_meta.got[idx]=1u; g_meta.touched=1u; g_meta.epoch=g_ptp.epoch;
 }
 /* One flash row per foreground pass.  The plan being saved is g_traj itself, so anything that changes it (a stop, an
  * enable, a new upload) ends the save, and the block under construction stays invalid. */

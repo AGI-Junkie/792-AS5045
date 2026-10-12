@@ -103,6 +103,13 @@ public sealed partial class ControlWindow
             Toggle(false); Check(p.RecentListText.Contains("板上图形 · 1/4") && p.RecentListText.Contains("槽1：矩形 · 69 点"), "board row not Chinese: " + p.RecentListText);
             Toggle(true); Check(p.RecentListText.Contains("On the board · 1/4") && p.RecentListText.Contains("slot 1: Rectangle · 69 points"), "board row not English: " + p.RecentListText);
             Toggle(false); Check(p.RecentListText.Contains("板上图形"), "board row stale after switching back");
+            // A board slot whose settings do not pass the checks here: the whole note, reason included, follows the language.
+            p.SetBoard(4, true, false, [new BoardSlot(0, true, 1, 69, 16584, 0, 0, 1), new BoardSlot(1, false, 0, 0, 0, 0, 0, 0), new BoardSlot(2, false, 0, 0, 0, 0, 0, 0), new BoardSlot(3, false, 0, 0, 0, 0, 0, 0)],
+                [new LedgerEntry(0, 1, "shape=4; branch=0; L1=180; L2=176.38; x=300; y=20; a=15; b=0; c=; rot=0; scale=1; dir=ccw; v1=4; v2=3; a1=8; a2=6")], null);
+            p.BoardRowLoadButton(0)!.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
+            Toggle(false); Check(p.RecentNoteText.Contains("没有通过检查") && p.RecentNoteText.Contains("椭圆"), "failed board preset not Chinese: " + p.RecentNoteText);
+            Toggle(true); Check(p.RecentNoteText.Contains("do not pass the checks") && !System.Text.RegularExpressions.Regex.IsMatch(p.RecentNoteText, "[\u4e00-\u9fff]"), "failed board preset keeps Chinese after the switch: " + p.RecentNoteText);
+            Toggle(false); Check(p.RecentNoteText.Contains("椭圆"), "failed board preset stale after switching back");
             // The plan read back from a slot is a read-only preview, described in either language (and drawn in the snapshots below).
             var boardNodes = new List<ExecutionNode> { new(new JointPose(-12, 55), 0) };
             for (int k = 1; k <= 60; k++) boardNodes.Add(new(new JointPose(Math.Round(-12 + 24 * k / 60.0 + 6 * Math.Sin(k / 6.0), 2), Math.Round(55 - 35 * Math.Sin(k * Math.PI / 60), 2)), 100));
