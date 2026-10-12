@@ -2084,10 +2084,15 @@ static void store_test(const char *t) {
         meta_send_chunks(textA,crcA,-1,-1);g_ptp.active=1u;simLogN=0;simLog[0]=0;
         store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();g_ptp.active=0u;
         assert(!g_store.busy && strstr(simLog,"stage not idle") && !g_meta.touched);
+        /* the same Save sent again once the stage is idle (the refusal was lost) is turned away too, whatever it was first refused for */
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
+        assert(!g_store.busy && strstr(simLog,"description incomplete"));
+        g_controlSequence+=1u;   /* (a fresh Save has a fresh sequence) */
         store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.valid && in.metaLen==0u);
         meta_send_chunks(textA,crcA,-1,-1);traj_discard();simLogN=0;simLog[0]=0;
         store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
         assert(!g_store.busy && strstr(simLog,"no complete plan") && !g_meta.touched);
+        g_controlSequence+=1u;   /* (a fresh Save has a fresh sequence) */
         store_make_plan(485,0);store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.valid && in.metaLen==0u);
         /* a command turned away while a save is writing its description (another host's query, another save) leaves that description alone:
          * the job reads it row by row, and it must reach the flash as it was sent */

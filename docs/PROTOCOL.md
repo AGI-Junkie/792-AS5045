@@ -1,4 +1,4 @@
-# 上位机 ↔ 固件 通信协议（stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta5-read1-guards2，proto=4）
+# 上位机 ↔ 固件 通信协议（stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta6-read1-guards2，proto=4）
 
 本页只写当前源码里**已经存在**的行为，均已对照 `DRV8825.cydsn/main.c` 与 `Commissioning/` 核对；有出入以源码为准。设计过程和现场日志分析见 `docs/history/WORKBENCH_HARDENING.md`。状态机见 [STATE_MODEL.md](STATE_MODEL.md)。
 
@@ -94,7 +94,7 @@
 
 ## 6. 版本与兼容
 
-- 固件标识 `FW_BUILD_ID`（现为 `stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta5-read1-guards2`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。历史上行为不变的结构性重构靠 `firmware.hex` 的 SHA-256 区分。主机字节间隔从 0.5 ms 改为 0.25 ms 不改帧格式或固件构建号。
+- 固件标识 `FW_BUILD_ID`（现为 `stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta6-read1-guards2`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。历史上行为不变的结构性重构靠 `firmware.hex` 的 SHA-256 区分。主机字节间隔从 0.5 ms 改为 0.25 ms 不改帧格式或固件构建号。
 - **proto=2（肘范围）**：type 9 新增轴 2（肘），`PTP_STATE` 末尾新增 `emin=<cd> emax=<cd>`，并把肘范围纳入 PTP/轨迹/点动的校验。固件开机默认 ∓155°（`PTP_ELBOW_DEFAULT_CD`，与 `DeviceContract.ElbowDefaultCd` 同值、由发布闸门核对）：这是暂定值，不是实测机械行程。上位机连接后把界面里的肘范围同步给固件，和 q1/q2 范围一样，确认一致才允许运动；proto=1 的固件会被拒绝运动并提示更新。
 - **能力位 `traj_read=1`（不改 proto）**：固件会把槽里的节点读回（type 12 op 5）；没有它，主机不发 op 5，没有描述的槽只能清除。出现在 `traj_meta=` 之后、`traj_store=` 之前。
 - **能力位 `traj_meta=<n>`（不改 proto）**：`n` 是每幅轨迹能带的描述字节数（现为 256），为 0 或不出现表示固件不保管描述；上位机据此决定是否发 type 14 和 type 12 op 4，没有它的固件只用本机的 `board-slots.json` 给槽起名。出现在 `traj_store=` 之前。

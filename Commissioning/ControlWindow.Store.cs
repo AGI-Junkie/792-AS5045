@@ -120,7 +120,8 @@ public sealed partial class ControlWindow
         Append($"HOST archive {job.Op} slot={(job.Slot < 0 ? "all" : job.Slot.ToString())} {(ok ? "done" : "failed")}", ok ? null : LogLevel.Warning);   // the raw log stays raw; the reason goes to the panel
         job.Done?.Invoke(ok, message);
         // A path asked for while this read-only job ran starts now (once the inventory is complete again, if it was the inventory).
-        if (wantedPathSlot is { } waiting && storeJob is null && job.Op is StoreOp.Query or StoreOp.Meta) { wantedPathSlot = null; RequestBoardPath(waiting); }
+        // It waits for a COMPLETE inventory: a status that arrived without all the slot lines leaves it queued for the next read.
+        if (wantedPathSlot is { } waiting && storeJob is null && (job.Op is StoreOp.Meta || job.Op is StoreOp.Query && boardKnown)) { wantedPathSlot = null; RequestBoardPath(waiting); }
         // A change on the board is read back, so the picture shown is the device's and not what was hoped for.  A FAILED save or erase
         // is read back too: it may have changed flash before it failed (erase clears block A before block B), or have finished with its
         // final status lost.  From the moment a save or erase ends, until the answer is complete, the old slot contents are not trusted:
@@ -137,6 +138,9 @@ public sealed partial class ControlWindow
     // Reads the archive once the link is up and the machine is still, and again after the device lost the answer.
     private void SynchronizeBoard(DateTime now)
     {
+        // A waiting path that no complete inventory ever came for is given up, with a reason, instead of leaving the panel "reading" for good.
+        if (wantedPathSlot is { } stale && (now - wantedPathSince).TotalSeconds > 15)
+        { wantedPathSlot = null; SetBoardMessage(() => Lang.T("board.readFailed", stale + 1, Lang.T("board.err.noAnswer"))); }
         if (!StoreAvailable || storeJob is not null || pendingBoardSave is not null || (now - lastBoardQueryAt).TotalSeconds < (boardKnown ? 0.3 : 3)) return;
         if (PointBusy || homing || keyboardMask != 0 || mouseMask != 0 || ptp is not { Active: 0 }) return;
         if (!boardKnown) { lastBoardQueryAt = now; StartStoreJob(StoreOp.Query, -1, null); return; }
@@ -303,12 +307,13 @@ public sealed partial class ControlWindow
     // What the board really holds, for the preview: the nodes come back forty at a time (one type 12 op 5 request each, retried like any
     // other), and only a complete stream that matches the slot's CRC, point count and duration is shown.  Nothing moves.
     private int? wantedPathSlot;   // a path asked for while a read-only archive job (the scan) was running: started when that ends, not dropped
+    private DateTime wantedPathSince;
 
     private void RequestBoardPath(int slot)
     {
         if (slot < 0 || slot >= storeSlotCount) return;
         if (!StoreAvailable || !storeReadSupported || nodeRead is not null || PointBusy) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
-        if (storeJob is { Op: StoreOp.Query or StoreOp.Meta }) { wantedPathSlot = slot; return; }   // the scan in flight: start it when that ends
+        if (storeJob is { Op: StoreOp.Query or StoreOp.Meta }) { wantedPathSlot = slot; wantedPathSince = DateTime.UtcNow; return; }   // the scan in flight: start it when that ends
         if (!boardKnown || storeJob is not null || boardSlots[slot] is not { Valid: true } held) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
         // The slot's description (the link lengths it was saved with) comes first: the periodic read may not have reached this slot yet, and
         // the node reads would keep it out until the whole path was in, so the view would be drawn with this computer's lengths.
@@ -871,6 +876,30 @@ public sealed partial class ControlWindow
             Check(w.wantedPathSlot == 1, "the second request was not kept");
             w.ResetControlTransport();
             Check(w.wantedPathSlot is null && w.nodeRead is null && w.storeJob is null, "STOP did not drop the waiting request");
+            // A path asked for while the inventory is being read again waits for a COMPLETE inventory: a status that comes without all the slot
+            // lines does not make one, and must not drop the request.
+            w.boardKnown = false; w.boardSeen = 0;
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(40)); Pump();
+            Check(w.storeJob is { Op: StoreOp.Query }, "the inventory was not read again");
+            w.RequestBoardPath(1);
+            Check(w.wantedPathSlot == 1, "a path asked for during the inventory was not queued");
+            w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");   // the slot lines were lost
+            Check(!w.boardKnown && w.wantedPathSlot == 1 && w.storeJob is null, "the waiting path was dropped by an inventory that did not complete");
+            w.lastBoardQueryAt = default; w.SynchronizeBoard(DateTime.UtcNow); Pump();   // (real time: the request has not been waiting long)
+            Check(w.storeJob is { Op: StoreOp.Query }, "the incomplete inventory was not read again");
+            w.HandleLine("TRAJ_SLOT slot=0 valid=0");
+            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=100 duration_ms=9900 q1=0 q2=3000 crc=0000ABCD");
+            w.HandleLine("TRAJ_SLOT slot=2 valid=0"); w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
+            Check(w.boardKnown && w.wantedPathSlot is null && w.storeJob is { Op: StoreOp.Meta or StoreOp.Nodes }, "the waiting path did not start once the inventory was complete: " + $"known={w.boardKnown} wanted={w.wantedPathSlot} job={w.storeJob?.Op} nodeRead={w.nodeRead is not null} busy={w.PointBusy} avail={w.StoreAvailable} msg={w.boardMessage?.Invoke()}");
+            w.ResetControlTransport();
+            // And one that no complete inventory ever comes for is given up, with a reason.
+            w.boardKnown = false; w.boardSeen = 0;
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(60)); Pump();
+            w.RequestBoardPath(1);
+            Check(w.wantedPathSlot == 1, "the request was not queued the last time");
+            w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(90));
+            Check(w.wantedPathSlot is null && w.boardMessage?.Invoke().Contains("设备没有回应") == true, "a path that never got a complete inventory was kept for ever: " + w.boardMessage?.Invoke());
             w.ResetBoard();
         }
         finally { w.Close(); Lang.Set(language, false); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }

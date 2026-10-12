@@ -148,7 +148,7 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta5-read1-guards2"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta6-read1-guards2"
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -2269,7 +2269,7 @@ static void store_service(void)
 }
 /* A save that is turned away takes the description staged for it with it: it must not wait for, and be attached to, a later save that
  * sends none (an older host, an oversized text) or is for another plan. */
-#define STORE_REFUSE(msg) do { if(op==2u && !g_store.busy) { memset(&g_meta,0,sizeof(g_meta)); } JLOG(msg); } while(0)
+#define STORE_REFUSE(msg) do { if(op==2u && !g_store.busy) { if(g_meta.touched) { memcpy(g_saveRefused,p,15u); g_saveRefusedOn=1u; } memset(&g_meta,0,sizeof(g_meta)); } JLOG(msg); } while(0)
 static void store_accept(const uint8 *p)
 {
     uint32 seq=ptp_u32(p+1);
@@ -2288,15 +2288,16 @@ static void store_accept(const uint8 *p)
     if((ptp_u16(p+13) && op!=5u) || op<1u || op>5u || (slot>=TS_SLOTS && !(op==1u && slot==0xFFFFu))) {
         g_rxRejected++; STORE_REFUSE("TRAJ_STORE refused: arguments\r\n"); return;
     }
-    /* The same Save sent again (its refusal was lost) gets the same answer: it must not succeed as a save without the description the host
-     * believes it sent.  A fresh transfer and a fresh Save (new sequence) are another matter. */
+    /* The same Save sent again (its refusal was lost) gets the same answer, whatever the first refusal was for (the description was dropped
+     * with it): it must not succeed as a save without the description the host believes it sent.  A fresh transfer and a fresh Save (new
+     * sequence) are another matter. */
     if(op==2u && g_saveRefusedOn && memcmp(g_saveRefused,p,15u)==0) { STORE_REFUSE("TRAJ_STORE refused: description incomplete\r\n"); return; }
     if(!retry) {
         if(g_home.phase!=HOME_IDLE || g_ptp.active || g_traj.state==TRAJ_RUNNING || !axes_idle()) {
             STORE_REFUSE("TRAJ_STORE refused: stage not idle\r\n"); return;
         }
         if(op==2u && !traj_runnable(&g_traj)) { STORE_REFUSE("TRAJ_STORE refused: no complete plan in RAM\r\n"); return; }
-        if(op==2u && meta_state()==2u) { memcpy(g_saveRefused,p,15u); g_saveRefusedOn=1u; STORE_REFUSE("TRAJ_STORE refused: description incomplete\r\n"); return; }
+        if(op==2u && meta_state()==2u) { STORE_REFUSE("TRAJ_STORE refused: description incomplete\r\n"); return; }
         if((op==2u || op==3u) && CySetTemp()!=CYRET_SUCCESS) { STORE_REFUSE("TRAJ_STORE refused: flash temperature setup\r\n"); return; }
         g_controlSequence=seq; g_storeSeq=seq; memcpy(g_storeAccepted,p,15u); g_saveRefusedOn=0u;
         if(op==2u) {

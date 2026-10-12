@@ -191,7 +191,12 @@ public static class BoardLedger
         if (settings is not null) entries.Add(new LedgerEntry(slot, crc, settings));
         Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
         File.WriteAllText(FilePath + ".tmp", JsonSerializer.Serialize(entries.OrderBy(e => e.Slot)), new UTF8Encoding(false));
-        File.Move(FilePath + ".tmp", FilePath, true);
+        // A virus scanner may still hold the file it has just seen written: the rename is tried a few times before it is given up.
+        for (int attempt = 1; ; attempt++)
+        {
+            try { File.Move(FilePath + ".tmp", FilePath, true); break; }
+            catch (Exception ex) when (attempt < 5 && ex is IOException or UnauthorizedAccessException) { Thread.Sleep(40 * attempt); }
+        }
     }
 
     // What is known about each slot: the description stored on the board wins (it belongs to the plan in that slot by
