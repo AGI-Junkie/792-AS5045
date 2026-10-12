@@ -30,6 +30,10 @@ public sealed partial class XYPreviewPanel
     private static void ShowMenu(ContextMenu menu) { LastMenu = menu; if (!SuppressMenus) menu.IsOpen = true; }
     internal string BoardNoteText => boardNote.Text;
     internal string ResultText => result.Text;
+    internal bool SaveBoardEnabled => saveBoard.IsEnabled;
+    internal string SaveBoardCaption => (string)saveBoard.Content;
+    internal string SaveBoardTip => saveBoard.ToolTip as string ?? "";
+    internal void ClickSaveBoardForSelfTest() => saveBoard.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
     internal string RecentNoteText => recentNote.Text;
     internal string ActionSummaryText => actionSummary.Text;
     internal void SetSpeedsForSelfTest(string first, string second) { v1.Text = first; v2.Text = second; }
@@ -116,19 +120,42 @@ public sealed partial class XYPreviewPanel
         });
     }
 
-    // ☆: the figure goes to the first free slot; with none free the operator chooses which one to replace.
-    private void StarClicked(Button star, ExperimentRun run, Dictionary<string, string> values)
+    // ☆ and Save To Board: the figure goes to the first free slot; with none free the operator chooses which one to replace.
+    private void StarClicked(Button star, ExperimentRun run, Dictionary<string, string> values) => ChooseBoardSlot(star, slot => SaveRunToBoard(run, values, slot));
+    private void ChooseBoardSlot(Button anchor, Action<int> save)
     {
-        if (TrajectoryArchive.FreeSlot(boardSlots, boardSlotCount) is { } free) { SaveRunToBoard(run, values, free); return; }
-        var menu = new ContextMenu { PlacementTarget = star };
+        if (TrajectoryArchive.FreeSlot(boardSlots, boardSlotCount) is { } free) { save(free); return; }
+        var menu = new ContextMenu { PlacementTarget = anchor };
         for (int i = 0; i < boardSlotCount; i++)
         {
             int slot = i;
             var item = new MenuItem { Header = Lang.T("board.replace", slot + 1, SlotLabel(boardSlots.ElementAtOrDefault(slot))) };
-            item.Click += (_, _) => SaveRunToBoard(run, values, slot);
+            item.Click += (_, _) => save(slot);
             menu.Items.Add(item);
         }
         ShowMenu(menu);
+    }
+
+    // The figure on screen, stored without having to run it first: the board keeps a plan the device holds (uploaded or run), so the
+    // window uploads it first when the device does not hold it yet, then saves.  Only a figure that passed its checks is offered, and
+    // one the board already has is not offered again.
+    private void SaveCurrentToBoard()
+    {
+        if (execution is not { } plan) return;
+        ChooseBoardSlot(saveBoard, slot =>
+        {
+            Lang.Text(recentNote, () => Lang.T("board.saveCurrentStarted", slot + 1));
+            SaveToBoardRequested?.Invoke(plan, slot);
+        });
+    }
+
+    private void UpdateSaveButton(bool held)
+    {
+        string? why = !boardSupported ? Lang.T("board.star.unavailable") : !boardKnown ? Lang.T("board.star.reading") : boardBusy ? Lang.T("board.err.busy") :
+            execution is null ? Lang.T("board.save.noPlan") : PlanOnBoard() is { } stored ? Lang.T("board.save.stored", stored.Slot + 1) :
+            !held && !upload.IsEnabled ? Lang.T("board.save.needStart") : null;   // a plan the device holds is saved as it is; any other must be uploaded first
+        saveBoard.IsEnabled = why is null;
+        SetTip(saveBoard, why ?? Lang.T("board.save.tip"));
     }
 
     // ★: one menu item, so a stray click clears nothing.
@@ -251,6 +278,56 @@ public sealed partial class XYPreviewPanel
         }
         var label = new TextBlock { Text = Lang.T("vp.boardPath"), Foreground = WorkbenchTheme.Teal, FontSize = 11, IsHitTestVisible = false };
         Canvas.SetLeft(label, finish.X + 9); Canvas.SetTop(label, finish.Y + 6); plot.Children.Add(label);
+    }
+
+    // The Save To Board button: when it is offered and why not, what a click asks the window for, and the slot choice when all are used.
+    private static void SaveButtonSelfTest()
+    {
+        static void Fail(string message) => throw new InvalidOperationException("存到板子按钮：" + message);
+        static BoardSlot Held(int slot, uint crc, int nodes = 20, int ms = 8200) => new(slot, true, 1, nodes, ms, 0, 0, crc);
+        static BoardSlot Free(int slot) => new(slot, false, 0, 0, 0, 0, 0, 0);
+        SuppressMenus = true;
+        try
+        {
+            var panel = new XYPreviewPanel();
+            panel.SelectShapeForSelfTest(3); panel.LoadExampleForSelfTest();
+            var plan = panel.execution ?? throw new InvalidOperationException("应有已检查的图形");
+            var saved = new List<(ExecutionTrajectory Plan, int Slot)>(); panel.SaveToBoardRequested += (p, slot) => saved.Add((p, slot));
+            // Why it is off, one reason at a time.
+            if (panel.SaveBoardEnabled || !panel.SaveBoardTip.Contains("板上存档")) Fail("固件不支持板上存档时应不可点并说明原因：" + panel.SaveBoardTip);
+            panel.SetBoard(4, false, false, [null, null, null, null], [], null);
+            if (panel.SaveBoardEnabled || !panel.SaveBoardTip.Contains("读取")) Fail("没读完板上存档时应不可点：" + panel.SaveBoardTip);
+            panel.SetBoard(4, true, true, [Free(0), Free(1), Free(2), Free(3)], [], null);
+            if (panel.SaveBoardEnabled) Fail("存档进行中应不可点");
+            panel.SetBoard(4, true, false, [Free(0), Free(1), Free(2), Free(3)], [], null);
+            if (panel.SaveBoardEnabled || !panel.SaveBoardTip.Contains("上传") || !panel.SaveBoardTip.Contains("手臂在起点")) Fail("设备上没有这个图形、手臂又不在起点时应不可点并说明要先上传：" + panel.SaveBoardTip);
+            // The arm at the start of an enabled, homed stage: the figure can be uploaded, so it can be saved -- without ever running.
+            panel.SetPointMoveState(true, panel.RequestedLimits, "ok", true, true, null, false);
+            panel.SetStartFeedback(new TelemetrySample(0, 1, 1, true, 2, ExecutionTrajectory.Counts(0, plan.Nodes[0].Pose), ExecutionTrajectory.Counts(1, plan.Nodes[0].Pose), 0, 0, 0, 0));
+            if (!panel.SaveBoardEnabled || panel.SaveBoardCaption != "存到板子" || !panel.SaveBoardTip.Contains("不需要先执行")) Fail("手臂在起点时应可点，并说明不需要先执行：" + panel.SaveBoardTip);
+            panel.ClickSaveBoardForSelfTest();
+            if (saved.Count != 1 || saved[0].Slot != 0 || !ReferenceEquals(saved[0].Plan, plan) || !panel.recentNote.Text.Contains("槽1")) Fail("应把屏幕上的图形交给第一个空槽");
+            // No free slot: the operator picks which one to replace.
+            saved.Clear();
+            panel.SetBoard(4, true, false, [Held(0, 1), Held(1, 2), Held(2, 3), Held(3, 4)], [], null);
+            panel.ClickSaveBoardForSelfTest();
+            if (saved.Count != 0 || LastMenu is not { Items.Count: 4 } menu || ((MenuItem)menu.Items[2]!).Header is not string pick || !pick.Contains("替换槽3")) Fail("槽都满了应让操作者选替换哪一个");
+            ((MenuItem)menu.Items[2]!).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            if (saved.Count != 1 || saved[0].Slot != 2) Fail("选了槽 3 就应请求存入槽 3");
+            // Already on the board: not offered again.
+            panel.SetBoard(4, true, false, [Free(0), Held(1, TrajectoryArchive.PlanCrc(plan.Nodes), plan.Nodes.Length, (int)plan.Nodes.Sum(n => (int)n.Milliseconds)), null, null], [], null);
+            if (panel.SaveBoardEnabled || !panel.SaveBoardTip.Contains("已经存在板子槽2")) Fail("板上已有这个图形时不该再存：" + panel.SaveBoardTip);
+            // A plan the device already holds is saved as it is: no start position needed.
+            panel.SetBoard(4, true, false, [Free(0), Free(1), Free(2), Free(3)], [], null);
+            panel.SetStartFeedback(new TelemetrySample(0, 1, 1, true, 2, ExecutionTrajectory.Counts(0, plan.Nodes[0].Pose) + 500, ExecutionTrajectory.Counts(1, plan.Nodes[0].Pose), 0, 0, 0, 0));
+            if (panel.SaveBoardEnabled) Fail("不在起点、设备上也没有这个图形时不该能存");
+            panel.SetPointMoveState(true, panel.RequestedLimits, "ok", true, true, plan, false);
+            if (!panel.SaveBoardEnabled) Fail("设备已经持有这个图形时，不在起点也应能存");
+            // No figure that passed its checks: nothing to save.
+            panel.x.Text = "9999";
+            if (panel.SaveBoardEnabled || !panel.SaveBoardTip.Contains("检查并预览")) Fail("没有检查通过的图形时应不可点：" + panel.SaveBoardTip);
+        }
+        finally { SuppressMenus = false; }
     }
 
     // The board's plan as a read-only picture: interpolation, what it switches off, playback, and what cancels it.

@@ -103,6 +103,10 @@ public sealed partial class ControlWindow
             Toggle(false); Check(p.RecentListText.Contains("板上图形 · 1/4") && p.RecentListText.Contains("槽1：矩形 · 69 点"), "board row not Chinese: " + p.RecentListText);
             Toggle(true); Check(p.RecentListText.Contains("On the board · 1/4") && p.RecentListText.Contains("slot 1: Rectangle · 69 points"), "board row not English: " + p.RecentListText);
             Toggle(false); Check(p.RecentListText.Contains("板上图形"), "board row stale after switching back");
+            // The Save To Board button and its reasons follow the language.
+            Toggle(false); Check(p.SaveBoardCaption == "存到板子" && p.SaveBoardTip.Length > 0, "save button not Chinese: " + p.SaveBoardCaption + " / " + p.SaveBoardTip);
+            Toggle(true); Check(p.SaveBoardCaption == "Save To Board" && !System.Text.RegularExpressions.Regex.IsMatch(p.SaveBoardTip, "[\u4e00-\u9fff]"), "save button not English: " + p.SaveBoardCaption + " / " + p.SaveBoardTip);
+            Toggle(false); Check(p.SaveBoardCaption == "存到板子" && System.Text.RegularExpressions.Regex.IsMatch(p.SaveBoardTip, "[\u4e00-\u9fff]"), "save button stale after switching back");
             // A board slot whose settings do not pass the checks here: the whole note, reason included, follows the language.
             p.SetBoard(4, true, false, [new BoardSlot(0, true, 1, 69, 16584, 0, 0, 1), new BoardSlot(1, false, 0, 0, 0, 0, 0, 0), new BoardSlot(2, false, 0, 0, 0, 0, 0, 0), new BoardSlot(3, false, 0, 0, 0, 0, 0, 0)],
                 [new LedgerEntry(0, 1, "shape=4; branch=0; L1=180; L2=176.38; x=300; y=20; a=15; b=0; c=; rot=0; scale=1; dir=ccw; v1=4; v2=3; a1=8; a2=6")], null);

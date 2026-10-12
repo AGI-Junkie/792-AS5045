@@ -249,6 +249,7 @@ public sealed partial class XYPreviewPanel : UserControl
     public event Action? ExecuteRequested;                            // start the plan the device already holds
     private readonly Button upload = new() { Content = Lang.T("btn.upload"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
     private readonly Button run = new() { Content = Lang.T("btn.run"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };
+    private readonly Button saveBoard = new() { Content = Lang.T("btn.saveBoard"), Margin = new Thickness(2), Padding = new Thickness(12, 3, 12, 3), IsEnabled = false };   // the figure on screen -> a board slot
     private ExecutionTrajectory? uploadedPlan;   // complete plan waiting on the device for 执行图形
     private bool uploadedRan;                    // ...and it has already been drawn: single moves are open again, 执行图形 repeats it
     private readonly TextBox executionInfo = new() { IsReadOnly = true, TextWrapping = TextWrapping.Wrap, Background = Brushes.Transparent, BorderThickness = new Thickness(0), Margin = new Thickness(4) };
@@ -271,6 +272,7 @@ public sealed partial class XYPreviewPanel : UserControl
         play.Content = playbackTimer.IsEnabled ? Lang.T("btn.playPause") : Lang.T("btn.play");
         rewind.Content = Lang.T("btn.rewind");
         run.Content = Lang.T("btn.run");
+        saveBoard.Content = Lang.T("btn.saveBoard");
         movePoint.Content = shape.SelectedIndex == 0 ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
         feed.ToolTip = Lang.T("xy.feed.tip");
         foreach (var (field, name, value) in new[] { (min1, Lang.T("xy.q1min"), -30), (max1, Lang.T("xy.q1max"), 30), (min2, Lang.T("xy.q2min"), -60), (max2, Lang.T("xy.q2max"), 60),
@@ -377,15 +379,17 @@ public sealed partial class XYPreviewPanel : UserControl
         sampleInfo.FontSize = 11; Grid.SetRow(sampleInfo,3); visual.Children.Add(sampleInfo);
         InitializeViewport();
         var actions = new StackPanel { Margin = new Thickness(6,2,6,4) }; var actionBar = WorkbenchTheme.Edge(actions, edge: new Thickness(0,1,0,0)); Grid.SetRow(actionBar,2); shell.Children.Add(actionBar);
-        var motion = new WrapPanel(); motion.Children.Add(movePoint); motion.Children.Add(upload); motion.Children.Add(run);
+        var motion = new WrapPanel(); motion.Children.Add(movePoint); motion.Children.Add(upload); motion.Children.Add(run); motion.Children.Add(saveBoard);
         actionStatus.Child=actionSummary; motion.Children.Add(actionStatus); actions.Children.Add(motion); actions.Children.Add(actionProgress);
         actionSummary.ToolTip = new ToolTip { Content = actionDetails };
         ToolTipService.SetShowDuration(actionSummary, 60000);
         executionInfo.FontSize=12; executionInfo.Padding=new Thickness(0);
         foreach(var b in new[] { movePoint, upload, run }) { WorkbenchTheme.Primary(b); ToolTipService.SetShowOnDisabled(b, true); }
+        ToolTipService.SetShowOnDisabled(saveBoard, true);
         movePoint.Click += (_,_) => { if(movePoint.IsEnabled && pointTarget is {} p) PointMoveRequested?.Invoke(PtpProtocol.Quantize(p)); };
         upload.Click += (_,_) => { if(upload.IsEnabled && execution is {} plan) { RememberUploaded(); TrajectoryRequested?.Invoke(plan); } };
         run.Click += (_,_) => { if(run.IsEnabled) ExecuteRequested?.Invoke(); };
+        saveBoard.Click += (_,_) => { if(saveBoard.IsEnabled) SaveCurrentToBoard(); };
         moveState.FontSize = 12;
         foreach(var control in new Control[] { l1,l2,x,y,a,b,c,rotation,scale,custom,direction,min1,max1,min2,max2,elbowMin,elbowMax,v1,v2,acc1,acc2,shape,branch,play,rewind,cursor }) editControls.Add(control);
         foreach (var field in new[] { l1, l2, x, y, a, b, c, rotation, scale, custom, min1, max1, min2, max2, elbowMin, elbowMax, v1, v2, acc1, acc2 }) field.TextChanged += (_, _) => ParametersChanged();
@@ -678,6 +682,7 @@ public sealed partial class XYPreviewPanel : UserControl
         SetTip(upload, move + Lang.T(planOnBoard is null ? "move.uploadTip" : "board.loadTip"));
         SetTip(run, move);
         SetTip(movePoint, move);
+        UpdateSaveButton(held);
     }
     public void SetDeviceStatus(string? message, bool fault, bool busy, double percent, bool indeterminate)
     {
@@ -1000,6 +1005,7 @@ public sealed partial class XYPreviewPanel : UserControl
         ShapeFieldsSelfTest();
         RecentRunsSelfTest();
         BoardPathSelfTest();
+        SaveButtonSelfTest();
         ShapeDefaultsSelfTest();
         FreehandSelfTest(snapshotPath);
         var panel = new XYPreviewPanel();
