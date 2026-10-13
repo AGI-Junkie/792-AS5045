@@ -74,7 +74,7 @@
 
 - **type 12**（控制序号）：q1 = 槽位（查询可用 -1 = 全部），q2 = 1 查询 / 2 保存 RAM 里的轨迹 / 3 清空。保存/清空要求静止；保存期间 PTP、点动、回零、范围/速度配置都被拒；任何停止、使能、新上传会丢掉 RAM 轨迹，保存随即中止，旧存档不动。
 - **type 13**（PTP 序号）：加载。要求已使能、已回零或人工参考、静止，且**两轴正好在存档轨迹的起点**；节点逐个过 `traj_begin`/`traj_push` 和**当前**的关节范围、速度、加速度，任何一项不满足就拒绝并清空 RAM 轨迹。**CRC 对只说明字节没坏，不说明轨迹符合当前设置。**
-- 回执行：`TRAJ_SLOT …`、`TRAJ_STORE state=… rows=… seq=… last=… row_max_us=…`、`TRAJ_LOAD …`。LINK 里 `traj_store=<n>`。
+- 回执行：`TRAJ_SLOT …`、`TRAJ_STORE state=… rows=… seq=… last=… row_max_us=…`、`TRAJ_LOAD slot=… seq=… nodes=… duration_ms=… crc=…`。加载回执的 CRC 是实际加载节点流的 CRC-32/IEEE（8 位大写十六进制），必须与预览计划一致；擦除重存会复用 seq，即使节点数和时长也相同仍不能省略 CRC。缺失或不符时，上位机改为上传预览计划。主机与固件须配套 `proto=5`。LINK 里 `traj_store=<n>`。
 
 ## 5a. 描述（type 14 和 type 12 op 4）
 

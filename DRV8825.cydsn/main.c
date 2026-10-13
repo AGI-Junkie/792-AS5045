@@ -155,7 +155,7 @@
  * above can change freely.  Bump it (and the host constant) whenever a frame format, a field's meaning,
  * the sequence/epoch rules or the coordinate convention changes.  2: PTP_STATE carries emin/emax and type 9
  * accepts axis 2, the elbow range (q2 - q1, i.e. motor 2's own travel). */
-#define PROTO_VERSION               (4u)
+#define PROTO_VERSION               (5u)
 
 /* The software UART only accepts odd bytes.  jog.ps1 maps physical R to this
  * otherwise-unused wire byte, because ASCII 'r' (0x72) is even. */
@@ -2345,7 +2345,7 @@ static uint8 store_load(uint16 slot)
     if(!ok || g_traj.state!=TRAJ_READY || g_traj.durationMs!=in.durationMs) {
         traj_discard(); JLOG("PTP refused: archived plan does not fit the current limits\r\n"); return 0u;
     }
-    JLOGF("TRAJ_LOAD slot=%u seq=%lu nodes=%u duration_ms=%lu\r\n",(unsigned)slot,(unsigned long)in.seq,(unsigned)in.count,(unsigned long)in.durationMs);
+    JLOGF("TRAJ_LOAD slot=%u seq=%lu nodes=%u duration_ms=%lu crc=%08lX\r\n",(unsigned)slot,(unsigned long)in.seq,(unsigned)in.count,(unsigned long)in.durationMs,(unsigned long)in.dataCrc);
     return 1u;
 }
 

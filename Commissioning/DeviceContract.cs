@@ -54,7 +54,7 @@ public static class DeviceContract
     // Version of the wire contract (docs/PROTOCOL.md).  The firmware reports it as proto=<n> in the LINK line and
     // the host refuses to move a machine whose number differs.  Bump both sides when a frame format, a field's
     // meaning, the sequence/epoch rules or the coordinate convention changes.
-    public const int ProtocolVersion = 4;           // PROTO_VERSION
+    public const int ProtocolVersion = 5;           // PROTO_VERSION
 
     // Every constant above as NAME=value lines, for the release gate.
     public static string[] Lines() => typeof(DeviceContract)

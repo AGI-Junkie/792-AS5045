@@ -25,7 +25,7 @@ public sealed class App : Application
                 int snapshot = Array.IndexOf(args, "--snapshot");
                 string? path = snapshot >= 0 && snapshot + 1 < args.Length ? args[snapshot + 1] : null;
                 if (args.Contains("--freehand-self-test")) { Lang.Set(false, false); FreehandTrajectory.SelfTest(); XYPreviewPanel.FreehandSelfTest(path); }
-                else if (args.Contains("--store-self-test")) { Lang.Set(false, false); BoardLedger.SelfTest(); ControlWindow.StoreSelfTest(); ControlWindow.BoardSaveFlowSelfTest(); ControlWindow.BoardMetaFlowSelfTest(); ControlWindow.BoardNodesFlowSelfTest(); ControlWindow.BoardRunFlowSelfTest(); ControlWindow.BoardPathQueueSelfTest(); }
+                else if (args.Contains("--store-self-test")) { Lang.Set(false, false); BoardLedger.SelfTest(); ControlWindow.BoardLoadIdentitySelfTest(); ControlWindow.StoreSelfTest(); ControlWindow.BoardSaveFlowSelfTest(); ControlWindow.BoardMetaFlowSelfTest(); ControlWindow.BoardNodesFlowSelfTest(); ControlWindow.BoardRunFlowSelfTest(); ControlWindow.BoardPathQueueSelfTest(); }
                 else if (args.Contains("--log-level-self-test")) ControlWindow.LoggingSelfTest();
                 else if (args.Contains("--upload-language-test")) ControlWindow.UploadLanguageTest();
                 else if (args.Contains("--language-self-test")) { Lang.SelfTest(); ControlWindow.LanguageSelfTest(path); }
@@ -553,7 +553,7 @@ public sealed partial class ControlWindow : Window
             xyPreview.PausePlayback();
             if (allowBoard && StoreAvailable && boardKnown && TrajectoryArchive.SlotFor(boardSlots, plan.Nodes) is { } stored)
             {
-                loadingSlot = stored.Slot; loadingExpect = (stored.Seq, stored.DurationMs); loadedSlot = null;
+                loadingSlot = stored.Slot; loadingExpect = (stored.Seq, stored.DurationMs, stored.Crc); loadedSlot = null;
                 Append($"HOST trajectory load from board slot {stored.Slot} nodes={plan.Nodes.Length} duration={plan.Duration:F3}s; no automatic approach");
                 SendLoadPacket();
                 return;
@@ -853,6 +853,7 @@ public sealed partial class ControlWindow : Window
         FlickerSelfTest();
         LoggingSelfTest();
         DiagnosticsSelfTest();
+        BoardLoadIdentitySelfTest();
         StoreSelfTest();
         BoardSaveFlowSelfTest();
         BoardMetaFlowSelfTest();

@@ -26,6 +26,8 @@ public sealed partial class ControlWindow
             Check(!w.LimitsReady && !w.enable.IsEnabled, "old global1 firmware silently accepted relative q2");
             w.HandleLine($"LINK fw=stage2-v7-absolute-q2 joint_limits=1 motion_rates=1 short_hb=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion + 1}");
             Check(!w.LimitsReady && !w.enable.IsEnabled && w.LimitsStatus.Contains("proto"), "a firmware with another protocol version was accepted");
+            w.HandleLine($"LINK fw=stage2-v11-old joint_limits=1 motion_rates=1 short_hb=1 q2_absolute=1 proto={DeviceContract.ProtocolVersion - 1}");
+            Check(!w.LimitsReady && !w.enable.IsEnabled, "firmware without the load CRC contract was accepted");
             // Only the protocol version decides compatibility; a different build id with the same contract is fine.
             w.HandleLine($"LINK fw=stage2-v7-other-build joint_limits=1 motion_rates=1 short_hb=1 proto={DeviceContract.ProtocolVersion}");
             var wanted=w.xyPreview.RequestedProfile!.Value;

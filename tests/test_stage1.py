@@ -1852,6 +1852,22 @@ static void store_test(const char *t) {
         assert(g_ptp.active && g_traj.state==TRAJ_RUNNING);
         return;
     }
+    if(!strcmp(t,"store_load_identity")) {
+        char receipt[160];uint32 duration;uint16 count;
+        store_make_plan(20,0);crcA=store_plan_crc();store_save(0);
+        ts_active(0,&in);assert(in.valid && in.seq==1u && in.dataCrc==crcA);
+        duration=in.durationMs;count=in.count;
+        store_send(12,g_controlSequence+1u,0,3,0);store_run();
+        ts_active(0,&in);assert(!in.valid);
+        store_make_plan(20,1);crcB=store_plan_crc();assert(crcB!=crcA);store_save(0);
+        ts_active(0,&in);
+        assert(in.valid && in.seq==1u && in.count==count && in.durationMs==duration && in.q1==0 && in.q2==0 && in.dataCrc==crcB);
+        traj_discard();simLogN=0;simLog[0]=0;
+        seq=g_ptp.sequence+1u;store_send(13,seq,0,0,0);txq_flush_blocking();
+        sprintf(receipt,"TRAJ_LOAD slot=0 seq=1 nodes=%u duration_ms=%lu crc=%08lX\r\n",(unsigned)count,(unsigned long)duration,(unsigned long)crcB);
+        assert(strstr(simLog,receipt) && g_ptp.sequence==seq && g_traj.state==TRAJ_READY && !g_ptp.active && store_plan_crc()==crcB);
+        return;
+    }
     if(!strcmp(t,"store_ab")) {
         store_make_plan(485,0);crcA=store_plan_crc();store_save(0);
         ts_active(0,&in);assert(in.valid && in.seq==1u && in.which==0u && in.dataCrc==crcA);
@@ -3483,7 +3499,7 @@ ptp_cases += ['ptp_zero','ptp_axis1','ptp_axis2']
 ptp_cases += ['ptp_power_stable','ptp_fast_stall']
 ptp_cases += ['limits_ptp','limits_jog','limits_elbow','limits_elbow_traj','limits_elbow_jog']
 ptp_cases += ['rates_ptp','rates_traj','rates_live']
-ptp_cases += ['store_'+n for n in ['roundtrip','capacity','ab','power_loss','write_error','corrupt','load_checks','commands','hold','abort','unlinked','write_guard','meta','nodes']]
+ptp_cases += ['store_'+n for n in ['roundtrip','capacity','ab','power_loss','write_error','corrupt','load_checks','load_identity','commands','hold','abort','unlinked','write_guard','meta','nodes']]
 ptp_cases += ['ptp_final_'+name for name in ['positive','negative','boundary','over_limit','following','counts']]
 ptp_cases += ['ptp_logged_retry']
 ptp_cases += ['traj_rx_'+name for name in ['retry','ready_retry','repeated','stop','timeout','overrun','overflow','break','parity','mixed','heartbeat','holding','fault','encoder','motion']]
