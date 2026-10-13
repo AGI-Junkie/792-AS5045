@@ -263,6 +263,23 @@ public sealed partial class XYPreviewPanel
         UpdatePointButton(); DrawBoardSample();
     }
 
+    // Every node, and between two nodes the poses at most 2° of joint travel apart: the executor moves each joint in a straight line from
+    // node to node, and the elbow or tip can swing far outside both end points in between (q1 from -170° to 170° passes through 0°).
+    internal static IEnumerable<JointPose> PosesAlong(ExecutionNode[] nodes)
+    {
+        if (nodes.Length > 0) yield return nodes[0].Pose;
+        for (int i = 1; i < nodes.Length; i++)
+        {
+            var from = nodes[i - 1].Pose; var to = nodes[i].Pose;
+            int steps = Math.Clamp((int)Math.Ceiling(Math.Max(Math.Abs(to.Q1 - from.Q1), Math.Abs(to.Q2 - from.Q2)) / 2), 1, 360);
+            for (int step = 1; step <= steps; step++)
+            {
+                double u = (double)step / steps;
+                yield return new JointPose(from.Q1 + (to.Q1 - from.Q1) * u, from.Q2 + (to.Q2 - from.Q2) * u);
+            }
+        }
+    }
+
     // The pose of the plan `seconds` in: the executor moves each joint in a straight line between consecutive nodes.
     internal static JointPose NodePoseAt(ExecutionNode[] nodes, double seconds)
     {
@@ -413,6 +430,20 @@ public sealed partial class XYPreviewPanel
             var joints = folded.Model.Forward(node.Pose);
             if (!panel.Plot.Contains(panel.ToScreen(joints.Elbow)) || !panel.Plot.Contains(panel.ToScreen(joints.Tip)))
                 Fail("详细视图应把板上轨迹每个节点的肘和末端都放进画面：" + node.Pose + " 肘 " + joints.Elbow + " 末端 " + joints.Tip);
+        }
+        // Sparse nodes: one joint-linear segment swings the elbow through 0° while both end points are on the left, so the view must reach
+        // the poses between the nodes as well, which is where playback draws the arm.  A panel with no device pose: the view follows the
+        // device's arm while there is one, and that pose alone would already cover this elbow.
+        var sparse = new XYPreviewPanel();
+        sparse.Measure(new Size(900, 720)); sparse.Arrange(new Rect(0, 0, 900, 720)); sparse.UpdateLayout();
+        sparse.detailView = true;
+        sparse.ShowBoardPathForSelfTest(1, [new(new(-170, 10), 0), new(new(170, 350), 500), new(new(170, 350), 50)], "shape=3; L1=180; L2=176.38");
+        var sweep = sparse.boardView!.Value;
+        for (int step = 0; step <= 20; step++)
+        {
+            var between = NodePoseAt(sweep.Nodes, 0.5 * step / 20); var joints = sweep.Model.Forward(between);
+            if (!sparse.Plot.Contains(sparse.ToScreen(joints.Elbow)) || !sparse.Plot.Contains(sparse.ToScreen(joints.Tip)))
+                Fail("详细视图应把两个节点之间走过的姿态也放进画面：" + between + " 肘 " + joints.Elbow + " 末端 " + joints.Tip);
         }
         panel.detailView = false;
         // The joint ranges in the boxes are not valid numbers (no overlay limits): the board's plan is still drawn, and stays after a redraw.
