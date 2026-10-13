@@ -417,16 +417,17 @@ public sealed partial class ControlWindow
     }
 
     // The device holds the plan now: the same state as after a complete upload, and still no automatic run.
-    // The device says which plan a load put in its RAM: slot, save counter, size and duration.  Another host may have rewritten the slot
+    // The device says which plan a load put in its RAM: slot, save counter, size, duration and node CRC. Another host may have rewritten the slot
     // since the plan was previewed, and the load takes what is in it NOW, so the acknowledgment alone (a node count) proves nothing.
-    private (int Slot, uint Seq, int Nodes, int DurationMs)? loadedSlot;
-    private (uint Seq, int DurationMs)? loadingExpect;
-    private static readonly System.Text.RegularExpressions.Regex LoadPattern = new(@"^TRAJ_LOAD slot=(\d+) seq=(\d+) nodes=(\d+) duration_ms=(\d+)$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    private (int Slot, uint Seq, int Nodes, int DurationMs, uint Crc)? loadedSlot;
+    private (uint Seq, int DurationMs, uint Crc)? loadingExpect;
+    private static readonly System.Text.RegularExpressions.Regex LoadPattern = new(@"^TRAJ_LOAD slot=(\d+) seq=(\d+) nodes=(\d+) duration_ms=(\d+) crc=([0-9A-F]{8})$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
     private void ObserveLoadLine(string line)
     {
         var m = LoadPattern.Match(line);
         loadedSlot = m.Success && int.TryParse(m.Groups[1].Value, out int slot) && uint.TryParse(m.Groups[2].Value, out uint seq) && int.TryParse(m.Groups[3].Value, out int nodes) &&
-            int.TryParse(m.Groups[4].Value, out int duration) ? (slot, seq, nodes, duration) : null;
+            int.TryParse(m.Groups[4].Value, out int duration) && uint.TryParse(m.Groups[5].Value, System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out uint crc) ? (slot, seq, nodes, duration, crc) : null;
     }
 
     private bool CompleteBoardLoad(uint seq, uint epoch, uint mode, uint count, uint total)
@@ -434,10 +435,11 @@ public sealed partial class ControlWindow
         if (loadingSlot is not { } slot || uploading is not { } plan || seq != pendingPoint || epoch != trajectoryEpoch) return false;
         if (mode != 2 || count != total) { Append("HOST archive load acknowledgement mismatch", LogLevel.Error); Stop(); return true; }
         // Only the plan that was previewed may be held: the load line must name this slot, the save counter and the duration it had when the
-        // plan was matched to it, and the device must hold as many nodes as the plan has.  Anything else (the slot rewritten meanwhile,
+        // plan was matched to it, and the device must hold as many nodes as the plan has with the same CRC. Erase/re-save can reuse the counter.
+        // Anything else (the slot rewritten meanwhile,
         // possibly with another size, or the line lost) is not trusted: the plan is uploaded instead, which replaces whatever the load put
         // in the device.
-        if (loadedSlot is not { } got || got.Slot != slot || loadingExpect is not { } want || got.Seq != want.Seq || got.DurationMs != want.DurationMs ||
+        if (loadedSlot is not { } got || got.Slot != slot || loadingExpect is not { } want || got.Seq != want.Seq || got.DurationMs != want.DurationMs || got.Crc != want.Crc ||
             got.Nodes != plan.Nodes.Length || count != plan.Nodes.Length)
         {
             FallBackToUpload("it is not the plan that was previewed: the slot was rewritten meanwhile, or its load line was lost", "board.loadChanged");
@@ -461,6 +463,34 @@ public sealed partial class ControlWindow
         boardKnown = false; boardSeen = 0; uploadNext = 0;
         SetBoardMessage(() => Lang.T(message, slot + 1));
         SendNextTrajectoryPacket();
+    }
+
+    // An erased/re-saved slot may reuse every old load-reply field while holding different nodes.
+    internal static void BoardLoadIdentitySelfTest()
+    {
+        var w = new ControlWindow { selfTesting = true, ShowActivated = false, ShowInTaskbar = false };
+        try
+        {
+            var limits = new JointLimits(-30, 30, -60, 60);
+            var plan = ExecutionTrajectory.FromNodes([new(new(0, 0), 0), new(new(0.1, 0.1), 500), new(new(0, 0), 500)], limits, new MotionProfile(5000, 5000, 3000, 3000));
+            var other = ExecutionTrajectory.FromNodes([new(new(0, 0), 0), new(new(-0.1, -0.1), 500), new(new(0, 0), 500)], limits, new MotionProfile(5000, 5000, 3000, 3000));
+            uint crc = TrajectoryArchive.PlanCrc(plan.Nodes), otherCrc = TrajectoryArchive.PlanCrc(other.Nodes);
+            if (crc == otherCrc) throw new InvalidOperationException("Archive identity: replacement fixture has the same CRC");
+            w.enabled = true; w.ptp = new PtpState(false, true, 0, 4, 1, limits);
+            const string receipt = "TRAJ_LOAD slot=0 seq=1 nodes=3 duration_ms=1000";
+            foreach (string suffix in new[] { $" crc={crc:X8}", $" crc={otherCrc:X8}", "", " crc=408FB2C", " crc=ZZZZZZZZ" })
+            {
+                w.uploaded = null; w.uploading = plan; w.loadingSlot = 0; w.loadingExpect = (1u, 1000, crc);
+                w.pendingPoint = w.pointSequence = 123; w.trajectoryEpoch = 4;
+                // A valid prior reply must not survive a missing or malformed identity in the current reply.
+                w.ObserveLoadLine(receipt + $" crc={crc:X8}"); w.ObserveLoadLine(receipt + suffix);
+                bool accepted = suffix == $" crc={crc:X8}";
+                if (!w.CompleteBoardLoad(123, 4, 2, 3, 3) || w.loadingSlot is not null || w.executing ||
+                    (accepted ? w.uploaded != plan || w.uploading is not null : w.uploaded is not null || w.uploading != plan || w.boardKnown))
+                    throw new InvalidOperationException("Archive identity: wrong load/fallback for receipt" + suffix);
+            }
+        }
+        finally { w.Close(); }
     }
 
     // The plan is on the device and a save was waiting for it.
@@ -1056,7 +1086,7 @@ public sealed partial class ControlWindow
             w.uploaded = null; w.uploadedRan = false;
             w.RequestTrajectory(plan);
             Check(w.loadingSlot == 0 && w.uploading is not null && Type(w.pointPacket) == 13 && (short)(Field(w.pointPacket, 9) | Field(w.pointPacket, 10) << 8) == 0 && !w.executing, "the stored plan was not loaded from its slot");
-            w.TestLine($"TRAJ_LOAD slot=0 seq=1 nodes={plan.Nodes.Length} duration_ms={ms}");
+            w.TestLine($"TRAJ_LOAD slot=0 seq=1 nodes={plan.Nodes.Length} duration_ms={ms} crc={TrajectoryArchive.PlanCrc(plan.Nodes):X8}");
             w.TestLine($"TRAJ_STATE state=2 count={plan.Nodes.Length} total={plan.Nodes.Length} index=0 seq={w.pendingPoint} epoch=4");
             Check(w.uploaded == plan && w.uploading is null && w.loadingSlot is null && !w.executing && w.pendingPoint == 0, "the load was not completed as a held plan");
 
@@ -1082,7 +1112,7 @@ public sealed partial class ControlWindow
                 w.RequestTrajectory(plan);
                 Check(w.loadingSlot == 0, "the load did not start");
                 int heldNodes = plan.Nodes.Length + moreNodes;
-                if (!lineLost) w.TestLine($"TRAJ_LOAD slot=0 seq={otherSeq} nodes={heldNodes} duration_ms={otherMs}");
+                if (!lineLost) w.TestLine($"TRAJ_LOAD slot=0 seq={otherSeq} nodes={heldNodes} duration_ms={otherMs} crc={TrajectoryArchive.PlanCrc(plan.Nodes):X8}");
                 w.TestLine($"TRAJ_STATE state=2 count={heldNodes} total={heldNodes} index=0 seq={w.pendingPoint} epoch=4");
                 string why = $"(seq {otherSeq}, {otherMs} ms, line lost {lineLost}, {moreNodes} more nodes)";
                 Check(w.loadingSlot is null && w.uploading is not null && w.uploaded is null && Type(w.pointPacket) == 2 && !w.executing, "a load of another plan was accepted " + why);

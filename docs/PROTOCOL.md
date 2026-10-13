@@ -1,4 +1,4 @@
-# 上位机 ↔ 固件 通信协议（stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta6-read1-guards2，proto=4）
+# 上位机 ↔ 固件 通信协议（stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta6-read1-guards2，proto=5）
 
 本页只写当前源码里**已经存在**的行为，均已对照 `DRV8825.cydsn/main.c` 与 `Commissioning/` 核对；有出入以源码为准。设计过程和现场日志分析见 `docs/history/WORKBENCH_HARDENING.md`。状态机见 [STATE_MODEL.md](STATE_MODEL.md)。
 
@@ -83,7 +83,7 @@
 | `TRAJ_META slot=<n> seq=<u32> len=<n> crc=<8位大写十六进制> hex=<大写十六进制>` / `TRAJ_META slot=<n> len=0` | type 12 op 4 的结果：`seq` 是该槽的保存次数（主机据此判断描述是不是当前这次保存的），`crc` 是文本的 CRC-32，`hex` 是文本的字节。没有描述时只有 `len=0` |
 | `TRAJ_NODES slot=<n> seq=<u32> total=<n> first=<i> count=<k> hex=<大写十六进制>` / `TRAJ_NODES slot=<n> count=0` | type 12 op 5 的结果：从第 `first` 个节点起的 `k` 个节点（原样的字节）；`total` 是该槽的点数 |
 | `TRAJ_STORE state=<idle、saving 或 erasing> slot rows=<done>/<total> seq last=<none、saved、erased、failed 或 aborted> last_slot row_max_us` | type 12 的回执与进度：`seq` 是最近一条被接受的存档命令的控制序号；`rows` 是已写数据行/总数据行；`row_max_us` 是最慢一次写行的微秒数（实板上必须看它）。另有失败原因行 `TRAJ_STORE failed: …`、`TRAJ_STORE aborted: …`、`TRAJ_STORE refused: …` |
-| `TRAJ_LOAD slot seq nodes duration_ms` | type 13 加载成功；上位机用它核对加载的就是预览过的那一份（slot、seq、duration_ms、nodes 都对得上），对不上或没收到就改走上传 |
+| `TRAJ_LOAD slot seq nodes duration_ms crc` | type 13 加载成功；`crc` 是实际加载节点流的 CRC-32/IEEE（8 位大写十六进制）。上位机核对 slot、seq、duration_ms、nodes 和预期节点 CRC；擦除重存会复用 seq，不能只凭计数认定计划相同。任一项不符、CRC 缺失或回执没收到就改走上传 |
 | `TELEM_DIAG hz sent skipped max_us` | 流式遥测的代价：已发送行数、因发送队列过半而跳过的行数、一次格式化最长耗时（微秒）。**跳过而不是丢弃**：流式行从不占用发送队列的后一半，ACK 和停止信息保有余量 |
 | `FAULT_SNAPSHOT t epoch seq phase home traj idx ref p1 p2 e1 err inputs hb_age_ms hb_max_gap_ms drv reason="…"` | 每次停止的第一行（在任何状态被清除之前）：停机时的阶段（`home/ptp/traj_run/traj_upload/jog/idle/disabled`）、位置（同 `TELEM`）、输入掩码、心跳年龄。`drv=nfault_undetermined` 表示驱动器 nFAULT 有效，**原因待诊断**：该引脚可由过流、过热或欠压触发，不能据此认定过热；否则 `drv=ok` |
 | `CONTROL seq=<n>` | 控制序号（重连同步用） |
@@ -104,7 +104,8 @@
 
 - **proto=4（arm2 反馈可选）**：STATE 增加 `arm2fb=0/1`。当前默认 `ARM2_ENCODER_FEEDBACK=1`，启用双编码器强制检查和失效停机；人工参考在 arm2 方向未知时使用 `MANUAL_ENC2_INC_DIR` 的台架标定方向，仍要求编码器有效。显式构建为 0 时，arm2 不要求编码器连接或方向识别，TELEM/FAULT_SNAPSHOT 省略 e2/err2，上位机显示缺测。
 
-- **协议版本号**：`LINK` 行末尾的 `proto=<n>`（固件 `PROTO_VERSION`，上位机 `DeviceContract.ProtocolVersion`）。上位机只在两者相等时解锁运动，与 `fw=` 构建号无关，所以构建号可以随时改。**帧格式、字段含义、序号/代次规则或坐标约定一变，两边一起加一**；发布闸门会核对两边的数字。当前为 `proto=4`（即本页描述的协议，含 absolute-q2 坐标和肘范围）。`q2_absolute=1` 保留坐标说明；proto=2 上位机不能控制本版固件。
+- **proto=5（加载内容身份）**：`TRAJ_LOAD` 必须包含实际加载节点流的 `crc`。主机要求它与预览时匹配的槽位 CRC 一致；保存计数在擦除重存后可能重复，不再单凭计数、节点数和时长认定计划相同。
+- **协议版本号**：`LINK` 行末尾的 `proto=<n>`（固件 `PROTO_VERSION`，上位机 `DeviceContract.ProtocolVersion`）。上位机只在两者相等时解锁运动，与 `fw=` 构建号无关，所以构建号可以随时改。**帧格式、字段含义、序号/代次规则或坐标约定一变，两边一起加一**；发布闸门会核对两边的数字。当前为 `proto=5`（含 absolute-q2 坐标、肘范围和加载回执的节点 CRC）。`q2_absolute=1` 保留坐标说明；proto=4 及更早上位机不能控制本版固件，本版上位机也拒绝旧协议固件。
 - 上位机对旧固件的处理：`LINK` 里没有 `short_hb` 就用 36 字节完整心跳；没有声明 `joint_limits`、`motion_rates` 或 `q2_absolute` 的能力，相应功能保持锁定并提示更新固件（不会静默忽略）。没有 `rates_live=1` 时，已使能下改速度不下发，仍要先总停止、禁用后自动同步、再使能。`rates_live` 是新增的能力位，不改帧格式，所以 `proto` 没有变。
 
 ## 停机锁存（v10，proto=4 可选诊断扩展）
@@ -117,4 +118,4 @@ FAULT_SNAPSHOT 新增 elapsed_us / plan_us / late_us / done / total。停止后�
 
 `TRAJ_UPLOADING` 期间，周期状态块保留 `STATE`、`CONTROL`、`PTP_STATE`、`TRAJ_STATE`、`TELEM`；`LINK`、`TIMING`、`ENC_DIAG` 等完整诊断等上传结束或停止后恢复。已有文本等待发送时不追加周期状态行，减少 ACK 后的积压；接收节点后的直接 `TRAJ_STATE` ACK、独立流式 `TELEM` 和故障/STOP 输出不受该筛选影响。上传中的重复状态请求合并，保留未完成块；新参考代次仍从 `STATE` 重启。周期 `TRAJ_STATE` 仍能补偿失落的 ACK。
 
-`TIMING.status_max_us` 是单条状态行格式化与入队的历史最大耗时，不表示串口传输时间。20/40 ms 心跳间隔、200 ms 主机租约、250 ms 固件 deadman、`proto=4` 和全部运动保护阈值不变。
+`TIMING.status_max_us` 是单条状态行格式化与入队的历史最大耗时，不表示串口传输时间。20/40 ms 心跳间隔、200 ms 主机租约、250 ms 固件 deadman 和全部运动保护阈值不变；当前协议为 `proto=5`，加载身份变更见上节。
