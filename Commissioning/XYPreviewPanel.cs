@@ -655,12 +655,12 @@ public sealed partial class XYPreviewPanel : UserControl
     private static void SetTip(FrameworkElement element, string tip) { if (!Equals(element.ToolTip, tip)) element.ToolTip = tip; }
     private void UpdatePointButton()
     {
-        movePoint.Content = shape.SelectedIndex == 0 && execFromBoard is null ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
+        movePoint.Content = IsPointMode ? Lang.T("btn.movePoint") : Lang.T("btn.moveToStart");
         bool limitsMatch = deviceLimitsConfirmed && RequestedLimits is { } requested && requested == firmwareLimits && requested == planningLimits;
         // While the device holds a plan it has not drawn yet it refuses every other move; only 执行图形 or 总停止 leaves that state.
         // After a run the plan stays on the device, so the move back to the start is allowed.
         movePoint.IsEnabled = !ProcessingFreehand && pointMoveAllowed && limitsMatch && (uploadedPlan is null || uploadedRan) && pointTarget is { } p && firmwareLimits is { } range && range.Contains(PtpProtocol.Quantize(p)) && (planningLimits is not { } local || local.Contains(p)) &&
-            (shape.SelectedIndex == 0 || (execution is not null && trajectorySupported));
+            (IsPointMode || (execution is not null && trajectorySupported));
         bool atStart = execution is not null && startFeedback is { Referenced: true, Inputs: 0 } &&
             startFeedback.Steps1 == ExecutionTrajectory.Counts(0,execution.Nodes[0].Pose) && startFeedback.Steps2 == ExecutionTrajectory.Counts(1,execution.Nodes[0].Pose);
         upload.IsEnabled = !ProcessingFreehand && pointMoveAllowed && limitsMatch && trajectorySupported && execution is not null && atStart;
@@ -674,12 +674,12 @@ public sealed partial class XYPreviewPanel : UserControl
         if (firmwareLimits is not null && !limitsMatch) move += Lang.T("move.locked");
         if (pointTarget is { } target && firmwareLimits is { } bounds) {
             target = PtpProtocol.Quantize(target);
-            string label = bounds.Contains(target) ? Lang.T("move.inFw") : shape.SelectedIndex == 0 ? Lang.T("move.outFw") : Lang.T("move.outFwStart");
+            string label = bounds.Contains(target) ? Lang.T("move.inFw") : IsPointMode ? Lang.T("move.outFw") : Lang.T("move.outFwStart");
             move += Lang.T("move.fwBounds", label, target.Q1, target.Q2, bounds.Min1, bounds.Max1, bounds.Min2, bounds.Max2, JointLimits.Elbow(target), bounds.ElbowMin, bounds.ElbowMax);
         } else if (pointTarget is null) move += boardView is not null ? Lang.T("act.boardPreview") : Lang.T("move.planFail") + result.Text;
         if (execution is not null) move += held ? (uploadedRan ? Lang.T("move.ran") : Lang.T("move.uploaded")) : atStart ? Lang.T("move.atStart") : Lang.T("move.needStart");
         if (uploadedPlan is not null && !held) move += uploadedRan ? Lang.T("move.nextPlan") : Lang.T("move.otherPlan");
-        if (execution is null && shape.SelectedIndex > 0 && boardView is null) move += "\n" + (executionInfo.Text.Length > 0 ? executionInfo.Text : Lang.T("move.needCheck"));
+        if (execution is null && !IsPointMode && boardView is null) move += "\n" + (executionInfo.Text.Length > 0 ? executionInfo.Text : Lang.T("move.needCheck"));
         SetText(moveState, move);
         UpdateActionStatus();
         SetTip(upload, move + Lang.T(planOnBoard is null ? "move.uploadTip" : "board.loadTip"));
@@ -709,14 +709,14 @@ public sealed partial class XYPreviewPanel : UserControl
         else if(planningLimits is {} local && !local.Contains(pointTarget.Value)) { text=Lang.T("act.outOfRange"); severity=2; }
         // While the device has not confirmed, its own reason says what to do (enabled: STOP ALL first; disabled: wait for the sync).
         else if(firmwareLimits is not null && (!deviceLimitsConfirmed || firmwareLimits != RequestedLimits)) { text=deviceLimitsConfirmed ? Lang.T("act.unsynced") : Lang.T("act.waiting")+deviceMoveReason; severity=1; }
-        else if(shape.SelectedIndex>0 && firmwareLimits is not null && execution is null) { text=Lang.T("act.trajFail"); severity=2; }
+        else if(!IsPointMode && firmwareLimits is not null && execution is null) { text=Lang.T("act.trajFail"); severity=2; }
         else if(!pointMoveAllowed) { text=Lang.T("act.waiting")+(deviceStatusMessage??deviceMoveReason); severity=1; }
         else if(run.IsEnabled) { text=uploadedRan?Lang.T("act.runAgain"):Lang.T("act.runNow"); severity=0; }
         // An undrawn plan blocks every other move; a drawn one does not, the next shape just goes to its own start.
         else if(uploadedPlan is not null && !uploadedRan) { text=Lang.T("act.planOnDevice"); severity=1; }
         else if(upload.IsEnabled) { text=Lang.T("act.uploadReady"); severity=0; }
-        else if(uploadedPlan is not null && shape.SelectedIndex>0) { text=Lang.T("act.nextShape"); severity=1; }
-        else if(shape.SelectedIndex==0 && movePoint.IsEnabled) { text=Lang.T("act.pointReady"); severity=0; }
+        else if(uploadedPlan is not null && !IsPointMode) { text=Lang.T("act.nextShape"); severity=1; }
+        else if(IsPointMode && movePoint.IsEnabled) { text=Lang.T("act.pointReady"); severity=0; }
         else if(!trajectorySupported) { text=Lang.T("act.noTraj"); severity=1; }
         else { text=Lang.T("act.needPen"); severity=1; }
         SetText(actionSummary,text);

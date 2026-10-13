@@ -30,7 +30,17 @@ public sealed partial class XYPreviewPanel
     private static void ShowMenu(ContextMenu menu) { LastMenu = menu; if (!SuppressMenus) menu.IsOpen = true; }
     internal string BoardNoteText => boardNote.Text;
     internal string ResultText => result.Text;
+    // A single point to move to, as opposed to a trajectory: what the shape box says, unless the plan on screen came from the board (then
+    // it is a trajectory whatever the box says, e.g. an undescribed slot opened while the editor is in point mode).
+    internal bool IsPointMode => shape.SelectedIndex == 0 && boardView is null;
     internal bool BoardCanRead => boardCanRead;
+    // A read for this slot ended without a plan: the note says why instead of "reading", and nothing is pending any more.
+    public void EndBoardPath(int slot, Func<string> note)
+    {
+        if (boardPathWanted != slot) return;
+        boardPathWanted = null;
+        Lang.Text(recentNote, note);
+    }
     internal bool SaveBoardEnabled => saveBoard.IsEnabled;
     internal string SaveBoardCaption => (string)saveBoard.Content;
     internal string SaveBoardTip => saveBoard.ToolTip as string ?? "";
@@ -214,6 +224,7 @@ public sealed partial class XYPreviewPanel
             return;
         }
         PausePlayback(); trajectory = null; timing = null; execution = null; pointTarget = null; execFromBoard = null; movePoint.IsEnabled = false; upload.IsEnabled = false;
+        parametersDirty = false;   // what is on screen is the board's plan now, not the boxes (the next edit sets it again and takes the view away)
         rangeFailure = null; operationError = null; Lang.Text(executionInfo, () => ""); Lang.Text(notice, () => ""); sampleInfo.Clear();
         // Does this machine accept it?  The checks a planned figure passes: the joint ranges and speeds in the boxes.  A slot saved under
         // other settings is shown but not offered; the device checks it again when it takes the plan.
@@ -250,6 +261,23 @@ public sealed partial class XYPreviewPanel
         cursor.Maximum = duration; cursor.Value = 0; offlineSim = false; cameraReady = false; autoFit = true;
         export.IsEnabled = false; cursor.IsEnabled = play.IsEnabled = rewind.IsEnabled = editingAllowed;
         UpdatePointButton(); DrawBoardSample();
+    }
+
+    // Every node, and between two nodes the poses at most 2° of joint travel apart: the executor moves each joint in a straight line from
+    // node to node, and the elbow or tip can swing far outside both end points in between (q1 from -170° to 170° passes through 0°).
+    internal static IEnumerable<JointPose> PosesAlong(ExecutionNode[] nodes)
+    {
+        if (nodes.Length > 0) yield return nodes[0].Pose;
+        for (int i = 1; i < nodes.Length; i++)
+        {
+            var from = nodes[i - 1].Pose; var to = nodes[i].Pose;
+            int steps = Math.Clamp((int)Math.Ceiling(Math.Max(Math.Abs(to.Q1 - from.Q1), Math.Abs(to.Q2 - from.Q2)) / 2), 1, 360);
+            for (int step = 1; step <= steps; step++)
+            {
+                double u = (double)step / steps;
+                yield return new JointPose(from.Q1 + (to.Q1 - from.Q1) * u, from.Q2 + (to.Q2 - from.Q2) * u);
+            }
+        }
     }
 
     // The pose of the plan `seconds` in: the executor moves each joint in a straight line between consecutive nodes.
@@ -383,6 +411,41 @@ public sealed partial class XYPreviewPanel
             panel.ShowBoardPathForSelfTest(1, nodes, partial);
             if (!panel.ShowsBoardPath || !panel.ResultText.Contains("没有保存杆长")) Fail("只有一个杆长时应按没有保存杆长处理：" + partial + " / " + panel.ResultText);
         }
+        // A board plan opened while the editor is in single-point mode is a trajectory for the workflow and the checks.
+        panel.SelectShapeForSelfTest(0);
+        panel.ShowBoardPathForSelfTest(1, slow, null);
+        if (panel.IsPointMode || panel.PlanCheck() != (true, Lang.T("flow.check.ok"))) Fail("点模式下打开的板上计划应按轨迹分类：" + panel.PlanCheck());
+        panel.SelectShapeForSelfTest(3); panel.LoadExampleForSelfTest();
+        // Detail view fits the board's whole path, not just the start: every point of a wide plan lands inside the plot.
+        panel.Measure(new Size(900, 720)); panel.Arrange(new Rect(0, 0, 900, 720)); panel.UpdateLayout();
+        panel.detailView = true;
+        panel.ShowBoardPathForSelfTest(1, [new(new(0, 0), 0), new(new(30, 50), 500), new(new(30, 50), 50)], "shape=3; L1=180; L2=176.38");
+        foreach (var point in panel.boardView!.Value.Path)
+            if (!panel.Plot.Contains(panel.ToScreen(point))) Fail("详细视图应把板上轨迹的所有点都放进画面：" + point);
+        // A folded arm: the tip hardly moves while the elbow swings a quarter turn, so the elbow decides how far the view must reach.
+        panel.ShowBoardPathForSelfTest(1, [new(new(0, 180), 0), new(new(90, 270), 500), new(new(90, 270), 50)], "shape=3; L1=180; L2=176.38");
+        var folded = panel.boardView!.Value;
+        foreach (var node in folded.Nodes)
+        {
+            var joints = folded.Model.Forward(node.Pose);
+            if (!panel.Plot.Contains(panel.ToScreen(joints.Elbow)) || !panel.Plot.Contains(panel.ToScreen(joints.Tip)))
+                Fail("详细视图应把板上轨迹每个节点的肘和末端都放进画面：" + node.Pose + " 肘 " + joints.Elbow + " 末端 " + joints.Tip);
+        }
+        // Sparse nodes: one joint-linear segment swings the elbow through 0° while both end points are on the left, so the view must reach
+        // the poses between the nodes as well, which is where playback draws the arm.  A panel with no device pose: the view follows the
+        // device's arm while there is one, and that pose alone would already cover this elbow.
+        var sparse = new XYPreviewPanel();
+        sparse.Measure(new Size(900, 720)); sparse.Arrange(new Rect(0, 0, 900, 720)); sparse.UpdateLayout();
+        sparse.detailView = true;
+        sparse.ShowBoardPathForSelfTest(1, [new(new(-170, 10), 0), new(new(170, 350), 500), new(new(170, 350), 50)], "shape=3; L1=180; L2=176.38");
+        var sweep = sparse.boardView!.Value;
+        for (int step = 0; step <= 20; step++)
+        {
+            var between = NodePoseAt(sweep.Nodes, 0.5 * step / 20); var joints = sweep.Model.Forward(between);
+            if (!sparse.Plot.Contains(sparse.ToScreen(joints.Elbow)) || !sparse.Plot.Contains(sparse.ToScreen(joints.Tip)))
+                Fail("详细视图应把两个节点之间走过的姿态也放进画面：" + between + " 肘 " + joints.Elbow + " 末端 " + joints.Tip);
+        }
+        panel.detailView = false;
         // The joint ranges in the boxes are not valid numbers (no overlay limits): the board's plan is still drawn, and stays after a redraw.
         string goodMin = panel.min1.Text; panel.min1.Text = "abc";
         panel.ShowBoardPathForSelfTest(1, nodes, "shape=3; L1=180; L2=176.38");

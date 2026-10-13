@@ -195,9 +195,11 @@ public sealed partial class XYPreviewPanel
         var why = planFailure;      // taken now, as the formatter that makes the reason: the note follows the language but not later edits
         bool none = values is null, failed = !none && execution is null, same = !none && !failed && PlanOnBoard()?.Slot == slot.Slot;
         bool fetch = !same && boardCanRead;
-        if (fetch) { boardPathWanted = slot.Slot; BoardPathRequested?.Invoke(slot.Slot); }
+        if (fetch) boardPathWanted = slot.Slot;
         Lang.Text(recentNote, () => (none ? Lang.T("recent.boardNoSettings", number) : failed ? Lang.T("recent.boardCheck", number) + (why?.Invoke() ?? "") : same ? Lang.T("recent.boardLoaded", number) : Lang.T("recent.boardDiffers", number)) +
             (fetch ? Lang.T("recent.boardFetching") : ""));
+        // After the note: a request the window refuses on the spot ends the wait (EndBoardPath) with its own note, which must be the last word.
+        if (fetch) BoardPathRequested?.Invoke(slot.Slot);
     }
 
     private UIElement BuildRecentRuns()
@@ -460,6 +462,14 @@ public sealed partial class XYPreviewPanel
             star.recentRows[0].Load.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
             if (!fetches.SequenceEqual([1]) || star.shape.SelectedIndex != shapeBefore || (int)Number(star.v1) != speedBefore || !star.recentNote.Text.Contains("没有保存可恢复的参数"))
                 Fail("缺字段的板上描述不能恢复成混合参数，应改读板上的节点：" + star.recentNote.Text);
+            // The window refuses the request on the spot (busy): the wait ends inside the click, and the note keeps the refusal instead of
+            // going back to "reading".
+            Action<int> refuse = slot => star.EndBoardPath(slot, () => "板上忙，稍后再点");
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0x66666666), null, null], [new LedgerEntry(1, 0x66666666, "shape=2; v1=4; v2=3; a1=8; a2=6")], null, canReadNodes: true);
+            star.BoardPathRequested += refuse;
+            star.recentRows[0].Load.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            star.BoardPathRequested -= refuse;
+            if (star.recentNote.Text != "板上忙，稍后再点" || star.boardPathWanted is not null) Fail("请求当场被拒绝时，提示应留着拒绝的原因，不能又变回“正在读取”：" + star.recentNote.Text);
             SuppressMenus = false;
             var broken = new XYPreviewPanel(); broken.RefreshRecentRuns();
             if (broken.recentRows.Count != 3 || broken.recentRows.Any(r => (string)r.Star.Content == "★")) Fail("没有板上记录时不应有 ★");

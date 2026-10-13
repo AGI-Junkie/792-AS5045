@@ -140,7 +140,10 @@ public sealed partial class ControlWindow
     {
         // A waiting path that no complete inventory ever came for is given up, with a reason, instead of leaving the panel "reading" for good.
         if (wantedPathSlot is { } stale && (now - wantedPathSince).TotalSeconds > 15)
-        { wantedPathSlot = null; SetBoardMessage(() => Lang.T("board.readFailed", stale + 1, Lang.T("board.err.noAnswer"))); }
+        {
+            wantedPathSlot = null; Func<string> gone = () => Lang.T("board.readFailed", stale + 1, Lang.T("board.err.noAnswer"));
+            SetBoardMessage(gone); xyPreview.EndBoardPath(stale, gone);
+        }
         if (!StoreAvailable || storeJob is not null || pendingBoardSave is not null || (now - lastBoardQueryAt).TotalSeconds < (boardKnown ? 0.3 : 3)) return;
         if (PointBusy || homing || keyboardMask != 0 || mouseMask != 0 || ptp is not { Active: 0 }) return;
         if (!boardKnown) { lastBoardQueryAt = now; StartStoreJob(StoreOp.Query, -1, null); return; }
@@ -312,19 +315,29 @@ public sealed partial class ControlWindow
     private void RequestBoardPath(int slot)
     {
         if (slot < 0 || slot >= storeSlotCount) return;
-        if (!StoreAvailable || !storeReadSupported || nodeRead is not null || PointBusy) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
+        // This slot's nodes are being read already (the row was clicked again): that is the request the panel is waiting on, and it gets its
+        // path when the read ends.  Refusing it would end the panel's request, and the finished read would then be thrown away.
+        if (nodeRead is { } active && active.Slot == slot) return;
+        if (!StoreAvailable || !storeReadSupported || nodeRead is not null || PointBusy) { RefuseBoardPath(slot); return; }
         if (storeJob is { Op: StoreOp.Query or StoreOp.Meta }) { wantedPathSlot = slot; wantedPathSince = DateTime.UtcNow; return; }   // the scan in flight: start it when that ends
-        if (!boardKnown || storeJob is not null || boardSlots[slot] is not { Valid: true } held) { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
+        if (!boardKnown || storeJob is not null || boardSlots[slot] is not { Valid: true } held) { RefuseBoardPath(slot); return; }
         // The slot's description (the link lengths it was saved with) comes first: the periodic read may not have reached this slot yet, and
         // the node reads would keep it out until the whole path was in, so the view would be drawn with this computer's lengths.
         if (storeMetaMax > 0 && metaAsked[slot] != held.Seq && StartMetaRead(slot, held, DateTime.UtcNow, () => BeginNodeRead(slot, held.Seq))) return;
         BeginNodeRead(slot, held.Seq);
     }
 
+    private void RefuseBoardPath(int slot)
+    {
+        Func<string> busy = () => Lang.T("board.err.busy");
+        SetBoardMessage(busy);
+        xyPreview.EndBoardPath(slot, busy);
+    }
+
     private void BeginNodeRead(int slot, uint seq)
     {
         if (boardSlots[slot] is not { Valid: true } held || held.Seq != seq || !StoreAvailable || !storeReadSupported || !boardKnown || storeJob is not null || nodeRead is not null || PointBusy)
-        { SetBoardMessage(() => Lang.T("board.err.busy")); return; }
+        { RefuseBoardPath(slot); return; }
         string? settings = BoardLedger.For(held, BoardLedger.Merge(boardSlots, boardMeta, boardLedger))?.Settings;
         nodeRead = new NodeRead(slot, held.Seq, held.Nodes, held.DurationMs, held.Crc, settings);
         ReadNextNodes();
@@ -343,6 +356,7 @@ public sealed partial class ControlWindow
     {
         if (ReferenceEquals(nodeRead, read)) nodeRead = null;
         SetBoardMessage(message);
+        xyPreview.EndBoardPath(read.Slot, message);   // the panel's note must not keep saying "reading" for a read that is over
     }
 
     // One run of nodes: taken only when it is the next one of the slot being read, with the same save counter and size.
@@ -403,10 +417,32 @@ public sealed partial class ControlWindow
     }
 
     // The device holds the plan now: the same state as after a complete upload, and still no automatic run.
+    // The device says which plan a load put in its RAM: slot, save counter, size and duration.  Another host may have rewritten the slot
+    // since the plan was previewed, and the load takes what is in it NOW, so the acknowledgment alone (a node count) proves nothing.
+    private (int Slot, uint Seq, int Nodes, int DurationMs)? loadedSlot;
+    private (uint Seq, int DurationMs)? loadingExpect;
+    private static readonly System.Text.RegularExpressions.Regex LoadPattern = new(@"^TRAJ_LOAD slot=(\d+) seq=(\d+) nodes=(\d+) duration_ms=(\d+)$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    private void ObserveLoadLine(string line)
+    {
+        var m = LoadPattern.Match(line);
+        loadedSlot = m.Success && int.TryParse(m.Groups[1].Value, out int slot) && uint.TryParse(m.Groups[2].Value, out uint seq) && int.TryParse(m.Groups[3].Value, out int nodes) &&
+            int.TryParse(m.Groups[4].Value, out int duration) ? (slot, seq, nodes, duration) : null;
+    }
+
     private bool CompleteBoardLoad(uint seq, uint epoch, uint mode, uint count, uint total)
     {
         if (loadingSlot is not { } slot || uploading is not { } plan || seq != pendingPoint || epoch != trajectoryEpoch) return false;
-        if (mode != 2 || count != plan.Nodes.Length || total != plan.Nodes.Length) { Append("HOST archive load acknowledgement mismatch", LogLevel.Error); Stop(); return true; }
+        if (mode != 2 || count != total) { Append("HOST archive load acknowledgement mismatch", LogLevel.Error); Stop(); return true; }
+        // Only the plan that was previewed may be held: the load line must name this slot, the save counter and the duration it had when the
+        // plan was matched to it, and the device must hold as many nodes as the plan has.  Anything else (the slot rewritten meanwhile,
+        // possibly with another size, or the line lost) is not trusted: the plan is uploaded instead, which replaces whatever the load put
+        // in the device.
+        if (loadedSlot is not { } got || got.Slot != slot || loadingExpect is not { } want || got.Seq != want.Seq || got.DurationMs != want.DurationMs ||
+            got.Nodes != plan.Nodes.Length || count != plan.Nodes.Length)
+        {
+            FallBackToUpload("it is not the plan that was previewed: the slot was rewritten meanwhile, or its load line was lost", "board.loadChanged");
+            return true;
+        }
         pendingPoint = 0; lock (wireSync) { pointWire.Clear(); }
         uploading = null; uploaded = plan; uploadedRan = false; loadingSlot = null;
         Append($"HOST plan loaded from board slot {slot}; waiting for the operator to start it (no automatic run)");
@@ -417,13 +453,13 @@ public sealed partial class ControlWindow
 
     // The device would not take the stored plan (changed limits or speeds, damaged slot): fall back to the normal upload of the
     // same plan.  The refused load did not use up a device sequence number, so the next frames simply continue from ours.
-    private void FallBackToUpload(string reason)
+    private void FallBackToUpload(string reason, string message = "board.loadFallback")
     {
         if (loadingSlot is not { } slot || uploading is null) return;
         Append($"HOST board slot {slot} could not be loaded ({reason}); uploading the plan instead", LogLevel.Warning);
         loadingSlot = null; pendingPoint = 0; lock (wireSync) { pointWire.Clear(); }
         boardKnown = false; boardSeen = 0; uploadNext = 0;
-        SetBoardMessage(() => Lang.T("board.loadFallback", slot + 1));
+        SetBoardMessage(() => Lang.T(message, slot + 1));
         SendNextTrajectoryPacket();
     }
 
@@ -771,6 +807,10 @@ public sealed partial class ControlWindow
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
             frames.Clear();
             Check(w.nodeRead is { Slot: 1, Next: 0 } && w.storeJob is { Op: StoreOp.Nodes, Slot: 1 } && w.pendingControlType == 12, "the click did not start a read");
+            // The same row clicked again while its nodes are being read: that read goes on, and it is still the panel's pending request (the
+            // path is shown when it ends, see below) -- the repeated click is not a "busy" refusal that ends the request.
+            Click();
+            Check(w.nodeRead is { Slot: 1, Next: 0 } && w.xyPreview.RecentNoteText.Contains("正在读取"), "a repeated click on the slot being read ended its request: " + w.xyPreview.RecentNoteText);
             Pump();
             var f0 = frames.Last(f => f.Length == 36 && Type(f) == 12);
             Check((short)(Field(f0, 9) | Field(f0, 10) << 8) == 1 && Field(f0, 11) == 5 && (Field(f0, 13) | Field(f0, 14) << 8) == 0, "first request (slot 1, op 5, from node 0)");
@@ -802,6 +842,7 @@ public sealed partial class ControlWindow
             w.HandleLine(Run(40, bytes: damaged)); w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0"); Pump();
             w.HandleLine(Run(80, bytes: damaged)); w.HandleLine($"TRAJ_STORE state=idle slot=1 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
             Check(w.nodeRead is null && w.boardMessage?.Invoke().Contains("没有通过校验") == true, "a damaged stream was accepted: " + w.boardMessage?.Invoke());
+            Check(!w.xyPreview.RecentNoteText.Contains("正在读取") && w.xyPreview.RecentNoteText.Contains("没有通过校验"), "the panel still says it is reading after the read failed: " + w.xyPreview.RecentNoteText);
 
             // A device that ends the request without sending anything, and one that refuses.
             Click(); Pump();
@@ -1015,6 +1056,7 @@ public sealed partial class ControlWindow
             w.uploaded = null; w.uploadedRan = false;
             w.RequestTrajectory(plan);
             Check(w.loadingSlot == 0 && w.uploading is not null && Type(w.pointPacket) == 13 && (short)(Field(w.pointPacket, 9) | Field(w.pointPacket, 10) << 8) == 0 && !w.executing, "the stored plan was not loaded from its slot");
+            w.TestLine($"TRAJ_LOAD slot=0 seq=1 nodes={plan.Nodes.Length} duration_ms={ms}");
             w.TestLine($"TRAJ_STATE state=2 count={plan.Nodes.Length} total={plan.Nodes.Length} index=0 seq={w.pendingPoint} epoch=4");
             Check(w.uploaded == plan && w.uploading is null && w.loadingSlot is null && !w.executing && w.pendingPoint == 0, "the load was not completed as a held plan");
 
@@ -1024,6 +1066,30 @@ public sealed partial class ControlWindow
             Check(w.loadingSlot == 0, "second load did not start");
             w.TestLine("PTP refused: archived plan does not fit the current limits");
             Check(w.loadingSlot is null && w.uploading is not null && Type(w.pointPacket) == 2 && !w.boardKnown, "a refused load did not fall back to the upload");
+            // The slot is rewritten between the preview and the load (another host): the device loads what is in it now.  Its load line names
+            // that plan; unless it is the one that was previewed (same save counter and duration) the plan is uploaded instead.
+            void FinishUpload()
+            {
+                for (int i = 0; i < plan.Nodes.Length; i++)
+                    w.TestLine($"TRAJ_STATE state={(i + 1 == plan.Nodes.Length ? 2 : 1)} count={i + 1} total={plan.Nodes.Length} index=0 seq={w.pendingPoint} epoch=4");
+                Check(w.uploaded == plan, "the upload did not complete");
+            }
+            FinishUpload();
+            // The last case is a slot rewritten with a plan of another size: its status line is complete and consistent, only not ours.
+            foreach (var (otherSeq, otherMs, lineLost, moreNodes) in new[] { (1u, ms, true, 0), (9u, ms, false, 0), (1u, ms + 50, false, 0), (1u, ms, false, 7) })
+            {
+                w.boardKnown = true; w.uploaded = null; w.uploadedRan = false;
+                w.RequestTrajectory(plan);
+                Check(w.loadingSlot == 0, "the load did not start");
+                int heldNodes = plan.Nodes.Length + moreNodes;
+                if (!lineLost) w.TestLine($"TRAJ_LOAD slot=0 seq={otherSeq} nodes={heldNodes} duration_ms={otherMs}");
+                w.TestLine($"TRAJ_STATE state=2 count={heldNodes} total={heldNodes} index=0 seq={w.pendingPoint} epoch=4");
+                string why = $"(seq {otherSeq}, {otherMs} ms, line lost {lineLost}, {moreNodes} more nodes)";
+                Check(w.loadingSlot is null && w.uploading is not null && w.uploaded is null && Type(w.pointPacket) == 2 && !w.executing, "a load of another plan was accepted " + why);
+                // The visible status names the real reason, not the refused-load one (limits or speeds changed, damaged data).
+                Check(w.boardMessage?.Invoke() is { } shown && shown.Contains("被改写") && !shown.Contains("限制或速度"), "the fallback did not say that the slot changed " + why + ": " + w.boardMessage?.Invoke());
+                FinishUpload();
+            }
         }
         finally { w.Close(); Lang.Set(language, false); BoardLedger.PathOverride = null; if (File.Exists(ledger)) File.Delete(ledger); }
     }

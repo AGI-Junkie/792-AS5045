@@ -199,6 +199,9 @@ public sealed partial class XYPreviewPanel
                 if(trajectory is {} motion) foreach(var sample in motion.Samples) {
                     var joints=model.Forward(sample.Pose); bounds.Union(joints.Elbow); bounds.Union(joints.Tip);
                 }
+                if(boardView is {} board) foreach(var along in PosesAlong(board.Nodes)) {   // (its plan must fit like the planned path above: elbow as well as tip, also between the nodes)
+                    var joints=board.Model.Forward(along); bounds.Union(joints.Elbow); bounds.Union(joints.Tip);
+                }
                 bounds.Union(elbow); bounds.Union(tip);
             }
             cameraCenter=new Point(bounds.Left+bounds.Width/2,bounds.Top+bounds.Height/2);

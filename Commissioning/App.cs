@@ -451,6 +451,7 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("LAST_STOP ")) { HandleLatchedStop(line); }
         else if (line.StartsWith("PTP_LIMITS ") || line.StartsWith("PTP_RATES ")) { HandleLimitsAck(line); UpdateControls(); }
         else if (line.StartsWith("TRAJ_SLOT ") || line.StartsWith("TRAJ_STORE ") || line.StartsWith("TRAJ_META ") || line.StartsWith("TRAJ_NODES ")) ObserveStoreLine(line);
+        else if (line.StartsWith("TRAJ_LOAD ")) ObserveLoadLine(line);
         else if (line.StartsWith("TRAJ_STATE ")) HandleTrajectoryState(line);
         else if (line.StartsWith("TELEM ")) HandleTelemetry(line);
         else if (line.StartsWith("LINK ")) {
@@ -552,7 +553,7 @@ public sealed partial class ControlWindow : Window
             xyPreview.PausePlayback();
             if (allowBoard && StoreAvailable && boardKnown && TrajectoryArchive.SlotFor(boardSlots, plan.Nodes) is { } stored)
             {
-                loadingSlot = stored.Slot;
+                loadingSlot = stored.Slot; loadingExpect = (stored.Seq, stored.DurationMs); loadedSlot = null;
                 Append($"HOST trajectory load from board slot {stored.Slot} nodes={plan.Nodes.Length} duration={plan.Duration:F3}s; no automatic approach");
                 SendLoadPacket();
                 return;

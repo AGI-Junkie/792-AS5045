@@ -83,7 +83,7 @@
 | `TRAJ_META slot=<n> seq=<u32> len=<n> crc=<8位大写十六进制> hex=<大写十六进制>` / `TRAJ_META slot=<n> len=0` | type 12 op 4 的结果：`seq` 是该槽的保存次数（主机据此判断描述是不是当前这次保存的），`crc` 是文本的 CRC-32，`hex` 是文本的字节。没有描述时只有 `len=0` |
 | `TRAJ_NODES slot=<n> seq=<u32> total=<n> first=<i> count=<k> hex=<大写十六进制>` / `TRAJ_NODES slot=<n> count=0` | type 12 op 5 的结果：从第 `first` 个节点起的 `k` 个节点（原样的字节）；`total` 是该槽的点数 |
 | `TRAJ_STORE state=<idle、saving 或 erasing> slot rows=<done>/<total> seq last=<none、saved、erased、failed 或 aborted> last_slot row_max_us` | type 12 的回执与进度：`seq` 是最近一条被接受的存档命令的控制序号；`rows` 是已写数据行/总数据行；`row_max_us` 是最慢一次写行的微秒数（实板上必须看它）。另有失败原因行 `TRAJ_STORE failed: …`、`TRAJ_STORE aborted: …`、`TRAJ_STORE refused: …` |
-| `TRAJ_LOAD slot seq nodes duration_ms` | type 13 加载成功 |
+| `TRAJ_LOAD slot seq nodes duration_ms` | type 13 加载成功；上位机用它核对加载的就是预览过的那一份（slot、seq、duration_ms、nodes 都对得上），对不上或没收到就改走上传 |
 | `TELEM_DIAG hz sent skipped max_us` | 流式遥测的代价：已发送行数、因发送队列过半而跳过的行数、一次格式化最长耗时（微秒）。**跳过而不是丢弃**：流式行从不占用发送队列的后一半，ACK 和停止信息保有余量 |
 | `FAULT_SNAPSHOT t epoch seq phase home traj idx ref p1 p2 e1 err inputs hb_age_ms hb_max_gap_ms drv reason="…"` | 每次停止的第一行（在任何状态被清除之前）：停机时的阶段（`home/ptp/traj_run/traj_upload/jog/idle/disabled`）、位置（同 `TELEM`）、输入掩码、心跳年龄。`drv=nfault_undetermined` 表示驱动器 nFAULT 有效，**原因待诊断**：该引脚可由过流、过热或欠压触发，不能据此认定过热；否则 `drv=ok` |
 | `CONTROL seq=<n>` | 控制序号（重连同步用） |
