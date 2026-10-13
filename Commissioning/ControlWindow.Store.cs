@@ -315,6 +315,9 @@ public sealed partial class ControlWindow
     private void RequestBoardPath(int slot)
     {
         if (slot < 0 || slot >= storeSlotCount) return;
+        // This slot's nodes are being read already (the row was clicked again): that is the request the panel is waiting on, and it gets its
+        // path when the read ends.  Refusing it would end the panel's request, and the finished read would then be thrown away.
+        if (nodeRead is { } active && active.Slot == slot) return;
         if (!StoreAvailable || !storeReadSupported || nodeRead is not null || PointBusy) { RefuseBoardPath(slot); return; }
         if (storeJob is { Op: StoreOp.Query or StoreOp.Meta }) { wantedPathSlot = slot; wantedPathSince = DateTime.UtcNow; return; }   // the scan in flight: start it when that ends
         if (!boardKnown || storeJob is not null || boardSlots[slot] is not { Valid: true } held) { RefuseBoardPath(slot); return; }
@@ -804,6 +807,10 @@ public sealed partial class ControlWindow
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
             frames.Clear();
             Check(w.nodeRead is { Slot: 1, Next: 0 } && w.storeJob is { Op: StoreOp.Nodes, Slot: 1 } && w.pendingControlType == 12, "the click did not start a read");
+            // The same row clicked again while its nodes are being read: that read goes on, and it is still the panel's pending request (the
+            // path is shown when it ends, see below) -- the repeated click is not a "busy" refusal that ends the request.
+            Click();
+            Check(w.nodeRead is { Slot: 1, Next: 0 } && w.xyPreview.RecentNoteText.Contains("正在读取"), "a repeated click on the slot being read ended its request: " + w.xyPreview.RecentNoteText);
             Pump();
             var f0 = frames.Last(f => f.Length == 36 && Type(f) == 12);
             Check((short)(Field(f0, 9) | Field(f0, 10) << 8) == 1 && Field(f0, 11) == 5 && (Field(f0, 13) | Field(f0, 14) << 8) == 0, "first request (slot 1, op 5, from node 0)");
