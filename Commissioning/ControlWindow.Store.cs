@@ -429,14 +429,15 @@ public sealed partial class ControlWindow
     private bool CompleteBoardLoad(uint seq, uint epoch, uint mode, uint count, uint total)
     {
         if (loadingSlot is not { } slot || uploading is not { } plan || seq != pendingPoint || epoch != trajectoryEpoch) return false;
-        if (mode != 2 || count != plan.Nodes.Length || total != plan.Nodes.Length) { Append("HOST archive load acknowledgement mismatch", LogLevel.Error); Stop(); return true; }
+        if (mode != 2 || count != total) { Append("HOST archive load acknowledgement mismatch", LogLevel.Error); Stop(); return true; }
         // Only the plan that was previewed may be held: the load line must name this slot, the save counter and the duration it had when the
-        // plan was matched to it.  Anything else (the slot rewritten meanwhile, or the line lost) is not trusted: the plan is uploaded instead,
-        // which replaces whatever the load put in the device.
-        if (loadedSlot is not { } got || got.Slot != slot || loadingExpect is not { } want || got.Seq != want.Seq || got.DurationMs != want.DurationMs || got.Nodes != plan.Nodes.Length)
+        // plan was matched to it, and the device must hold as many nodes as the plan has.  Anything else (the slot rewritten meanwhile,
+        // possibly with another size, or the line lost) is not trusted: the plan is uploaded instead, which replaces whatever the load put
+        // in the device.
+        if (loadedSlot is not { } got || got.Slot != slot || loadingExpect is not { } want || got.Seq != want.Seq || got.DurationMs != want.DurationMs ||
+            got.Nodes != plan.Nodes.Length || count != plan.Nodes.Length)
         {
-            Append($"HOST board slot {slot} is not the plan that was previewed (rewritten meanwhile, or its load line was lost); uploading the plan instead", LogLevel.Warning);
-            FallBackToUpload("the slot changed after it was read");
+            FallBackToUpload("it is not the plan that was previewed: the slot was rewritten meanwhile, or its load line was lost", "board.loadChanged");
             return true;
         }
         pendingPoint = 0; lock (wireSync) { pointWire.Clear(); }
@@ -449,13 +450,13 @@ public sealed partial class ControlWindow
 
     // The device would not take the stored plan (changed limits or speeds, damaged slot): fall back to the normal upload of the
     // same plan.  The refused load did not use up a device sequence number, so the next frames simply continue from ours.
-    private void FallBackToUpload(string reason)
+    private void FallBackToUpload(string reason, string message = "board.loadFallback")
     {
         if (loadingSlot is not { } slot || uploading is null) return;
         Append($"HOST board slot {slot} could not be loaded ({reason}); uploading the plan instead", LogLevel.Warning);
         loadingSlot = null; pendingPoint = 0; lock (wireSync) { pointWire.Clear(); }
         boardKnown = false; boardSeen = 0; uploadNext = 0;
-        SetBoardMessage(() => Lang.T("board.loadFallback", slot + 1));
+        SetBoardMessage(() => Lang.T(message, slot + 1));
         SendNextTrajectoryPacket();
     }
 
@@ -1067,14 +1068,19 @@ public sealed partial class ControlWindow
                 Check(w.uploaded == plan, "the upload did not complete");
             }
             FinishUpload();
-            foreach (var (otherSeq, otherMs, lineLost) in new[] { (1u, ms, true), (9u, ms, false), (1u, ms + 50, false) })
+            // The last case is a slot rewritten with a plan of another size: its status line is complete and consistent, only not ours.
+            foreach (var (otherSeq, otherMs, lineLost, moreNodes) in new[] { (1u, ms, true, 0), (9u, ms, false, 0), (1u, ms + 50, false, 0), (1u, ms, false, 7) })
             {
                 w.boardKnown = true; w.uploaded = null; w.uploadedRan = false;
                 w.RequestTrajectory(plan);
                 Check(w.loadingSlot == 0, "the load did not start");
-                if (!lineLost) w.TestLine($"TRAJ_LOAD slot=0 seq={otherSeq} nodes={plan.Nodes.Length} duration_ms={otherMs}");
-                w.TestLine($"TRAJ_STATE state=2 count={plan.Nodes.Length} total={plan.Nodes.Length} index=0 seq={w.pendingPoint} epoch=4");
-                Check(w.loadingSlot is null && w.uploading is not null && w.uploaded is null && Type(w.pointPacket) == 2, $"a load of another plan was accepted (seq {otherSeq}, {otherMs} ms, line lost {lineLost})");
+                int heldNodes = plan.Nodes.Length + moreNodes;
+                if (!lineLost) w.TestLine($"TRAJ_LOAD slot=0 seq={otherSeq} nodes={heldNodes} duration_ms={otherMs}");
+                w.TestLine($"TRAJ_STATE state=2 count={heldNodes} total={heldNodes} index=0 seq={w.pendingPoint} epoch=4");
+                string why = $"(seq {otherSeq}, {otherMs} ms, line lost {lineLost}, {moreNodes} more nodes)";
+                Check(w.loadingSlot is null && w.uploading is not null && w.uploaded is null && Type(w.pointPacket) == 2 && !w.executing, "a load of another plan was accepted " + why);
+                // The visible status names the real reason, not the refused-load one (limits or speeds changed, damaged data).
+                Check(w.boardMessage?.Invoke() is { } shown && shown.Contains("被改写") && !shown.Contains("限制或速度"), "the fallback did not say that the slot changed " + why + ": " + w.boardMessage?.Invoke());
                 FinishUpload();
             }
         }

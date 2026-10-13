@@ -330,6 +330,7 @@ internal static class Lang
         ["board.err.noNodes"] = ("设备没有给出节点", "the device sent no nodes"),
         ["board.loaded"] = ("已从板上槽{0}加载，设备里有了这条图形；点“执行图形”开始。", "Loaded from board slot {0}; the device holds the figure. Click Run Shape to start."),
         ["board.loadFallback"] = ("槽{0}没能加载（限制或速度改过，或数据损坏），改为普通上传。", "Slot {0} could not be loaded (limits or speeds changed, or the data is damaged); uploading normally."),
+        ["board.loadChanged"] = ("槽{0}里的图形在预览之后被改写了（或设备的加载确认丢了），没有采用，改为普通上传。", "The plan in slot {0} changed after it was previewed (or the device's load confirmation was lost), so it was not used; uploading normally."),
         ["board.loadTip"] = ("\n这个图形已存在板子上：点此直接从板上加载（秒级），不用逐点上传；加载后仍要点“执行图形”才会运动。", "\nThis figure is already stored on the board: click to load it from its slot (seconds) instead of uploading it; it only moves when you click Run Shape."),
         ["lamp.saved"] = ("● 已保存到电脑", "● Saved on this computer"),
         ["lamp.unsaved"] = ("○ 未保存（只在本窗口）", "○ Not saved (this window only)"),

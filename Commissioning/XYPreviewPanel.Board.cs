@@ -405,6 +405,15 @@ public sealed partial class XYPreviewPanel
         panel.ShowBoardPathForSelfTest(1, [new(new(0, 0), 0), new(new(30, 50), 500), new(new(30, 50), 50)], "shape=3; L1=180; L2=176.38");
         foreach (var point in panel.boardView!.Value.Path)
             if (!panel.Plot.Contains(panel.ToScreen(point))) Fail("详细视图应把板上轨迹的所有点都放进画面：" + point);
+        // A folded arm: the tip hardly moves while the elbow swings a quarter turn, so the elbow decides how far the view must reach.
+        panel.ShowBoardPathForSelfTest(1, [new(new(0, 180), 0), new(new(90, 270), 500), new(new(90, 270), 50)], "shape=3; L1=180; L2=176.38");
+        var folded = panel.boardView!.Value;
+        foreach (var node in folded.Nodes)
+        {
+            var joints = folded.Model.Forward(node.Pose);
+            if (!panel.Plot.Contains(panel.ToScreen(joints.Elbow)) || !panel.Plot.Contains(panel.ToScreen(joints.Tip)))
+                Fail("详细视图应把板上轨迹每个节点的肘和末端都放进画面：" + node.Pose + " 肘 " + joints.Elbow + " 末端 " + joints.Tip);
+        }
         panel.detailView = false;
         // The joint ranges in the boxes are not valid numbers (no overlay limits): the board's plan is still drawn, and stays after a redraw.
         string goodMin = panel.min1.Text; panel.min1.Text = "abc";
