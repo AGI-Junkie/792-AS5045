@@ -39,7 +39,7 @@ internal sealed partial class ExperimentWindow
             // The seconds before the stop: two samples inside the recording (must not be drawn twice) and three after its last sample.
             double lastMs = double.Parse(lines[^1].Split(',')[1], CultureInfo.InvariantCulture);
             File.WriteAllLines(Path.Combine(rect, "pre_fault.csv"), [
-                "host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_encoder_deg,q2_error_deg,slip_motor_lsb,inputs_active_mask,slip2_motor_lsb",
+                "host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_encoder_deg,elbow_error_deg,slip_motor_lsb,inputs_active_mask,slip2_motor_lsb",
                 .. new[] { lastMs - 200, lastMs - 100 }.Select(ms => $"{baseUtc:O},{ms:F0},5,1,10,10,0,0,0,0,0,0,0"),
                 .. new[] { lastMs + 500, lastMs + 1000, lastMs + 1500 }.Select(ms => $"{baseUtc:O},{ms:F0},5,1,10,10.5,0.5,0,0,0,0,0,0"), "garbage"], new UTF8Encoding(true));
             // The log of that session: a marker line every second, and status-block noise between them.
@@ -165,7 +165,7 @@ internal sealed partial class ExperimentWindow
             var stopAt = baseUtc.AddSeconds(25);
             File.WriteAllText(Path.Combine(faultDir, "fault.json"), JsonSerializer.Serialize(new { schema = 1, host_utc = stopAt, pre_fault_samples = 4, snapshot = new { Milliseconds = 50300, Phase = "traj_run", Reason = "trajectory timing overrun", Driver = "ok" } }));
             File.WriteAllLines(Path.Combine(faultDir, "pre_fault.csv"), [
-                "host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_encoder_deg,q2_error_deg,slip_motor_lsb,inputs_active_mask,slip2_motor_lsb",
+                "host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_encoder_deg,elbow_error_deg,slip_motor_lsb,inputs_active_mask,slip2_motor_lsb",
                 .. Enumerable.Range(0, 4).Select(k => $"{stopAt.AddMilliseconds(k * 100 - 400):O},{50000 + k * 100},5,1,{10 + k},{10 + k + 0.1:F1},0.1,0,0,0,0,0,0")], new UTF8Encoding(true));
             Check(ExperimentArchive.List(root).Runs.Count == 2, "stop-only bundles stay out of the plain list (the recent-runs panel)");
             w.Reload2();

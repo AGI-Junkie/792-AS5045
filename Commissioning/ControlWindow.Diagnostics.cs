@@ -21,7 +21,7 @@ public sealed record FaultSnapshot(uint Milliseconds, uint Epoch, uint Sequence,
     // Joint angles as the host computes them from commanded steps (arm2 has no encoder), and arm1's encoder error.
     public JointPose Command => AsSample.Command;
     public double EncoderErrorDegrees => AsSample.Error1;
-    public double? EncoderError2Degrees => AsSample.Error2;
+    public double? EncoderError2Degrees => AsSample.ElbowError;
     public static FaultSnapshot? Parse(string line)
     {
         if (!line.StartsWith("FAULT_SNAPSHOT ", StringComparison.Ordinal)) return null;
@@ -168,9 +168,9 @@ public sealed partial class ControlWindow
             note = f.DriverFault ? "nFAULT can be over-current, over-temperature or under-voltage; the pin does not say which. Cause not determined." : "see snapshot.reason",
             pre_fault_seconds = PreFaultSeconds, pre_fault_samples = recentTelemetry.Count
         }, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
-        var csv = new StringBuilder("host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_encoder_deg,q2_error_deg,slip_motor_lsb,inputs_active_mask,slip2_motor_lsb\n");
+        var csv = new StringBuilder("host_utc,device_ms,epoch,seq,q1_command_deg,q1_encoder_deg,q1_error_deg,q2_command_deg,q2_encoder_deg,elbow_error_deg,slip_motor_lsb,inputs_active_mask,slip2_motor_lsb\n");
         foreach (var (at, s) in recentTelemetry)
-            csv.AppendLine(FormattableString.Invariant($"{at:O},{s.Milliseconds},{s.Epoch},{s.Sequence},{s.Command.Q1:F6},{s.Measured1:F6},{s.Error1:F6},{s.Command.Q2:F6},{s.Measured2:F6},{s.Error2:F6},{s.Slip},{s.Inputs},{s.Slip2}"));
+            csv.AppendLine(FormattableString.Invariant($"{at:O},{s.Milliseconds},{s.Epoch},{s.Sequence},{s.Command.Q1:F6},{s.Measured1:F6},{s.Error1:F6},{s.Command.Q2:F6},{s.Measured2:F6},{s.ElbowError:F6},{s.Slip},{s.Inputs},{s.Slip2}"));
         File.WriteAllText(Path.Combine(directory, "pre_fault.csv"), csv.ToString(), new UTF8Encoding(true));
         return directory;
     }
