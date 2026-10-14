@@ -1779,7 +1779,14 @@ static uint32 ref_crc32(const uint8 *d,uint32 n) { /* bitwise IEEE CRC-32, indep
     for(i=0;i<n;i++){crc^=d[i];for(b=0;b<8;b++)crc=(crc&1u)?(crc>>1)^0xEDB88320u:crc>>1;}
     return ~crc;
 }
-static void sim_flash_reset(void){memset(simFlash,0xFF,sizeof(simFlash));simFlashWrites=0;simFlashCut=simFlashFail=-1;simFlashCutTorn=0;simPowerLost=0;memset(&g_store,0,sizeof(g_store));}
+static void sim_flash_reset(void){memset(simFlash,0xFF,sizeof(simFlash));simFlashWrites=0;simFlashCut=simFlashFail=-1;simFlashCutTorn=0;simPowerLost=0;memset(&g_store,0,sizeof(g_store));g_listNext=0xFFu;ts_mount();}
+/* "Reboot": nothing but the flash survives; the directory is rebuilt from it and must come out the same every time. */
+static void store_reboot(void){
+    static ts_info_t before[TS_SLOTS];
+    simPowerLost=0;simFlashCut=simFlashFail=-1;
+    ts_mount();memcpy(before,g_tsDir,sizeof(before));
+    ts_mount();assert(!memcmp(before,g_tsDir,sizeof(before)));
+}
 /* A legal plan straight into g_traj through the same traj_push() an upload uses: a triangular speed profile, 100 ms nodes.
  * variant 0 moves both joints together (elbow stays 0), variant 1 moves them apart, so the two are distinguishable. */
 static void store_make_plan(unsigned n,int variant) {
@@ -1798,8 +1805,17 @@ static uint32 store_plan_crc(void){uint32 k,total=(uint32)g_traj.count*TS_NODE_B
 static void store_send(uint8 type,uint32 seq,uint16 slot,uint16 op,uint16 value){
     uint8 saved=packetType;packetType=type;ptp_send(seq,g_ptp.epoch,(int16)slot,(int16)op,value,0);packetType=saved;
 }
-static void store_run(void){unsigned i;for(i=0;i<400 && g_store.busy;i++){cycle(1);store_service();}assert(!g_store.busy);}
+static void store_run(void){unsigned i;for(i=0;i<600 && g_store.busy;i++){cycle(1);store_service();}assert(!g_store.busy);}
 static void store_save(uint16 slot){store_send(12,g_controlSequence+1u,slot,2,0);assert(g_store.busy);store_run();}
+static void store_erase(uint16 slot){store_send(12,g_controlSequence+1u,slot,3,0);store_run();}
+/* The whole inventory (op 1, all slots): the TRAJ_DIR line at once, then the slot lines one foreground pass at a time. */
+static void store_list(void){
+    unsigned i;
+    txq_flush_blocking();simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,0xFFFFu,1,0);
+    for(i=0;i<100 && g_listNext!=0xFFu;i++){txq_flush_blocking();store_list_service();}
+    txq_flush_blocking();assert(g_listNext==0xFFu);
+}
+static unsigned log_count(const char *what){unsigned n=0;const char *p=simLog;while((p=strstr(p,what))!=0){n++;p++;}return n;}
 /* The description as the host sends it: type 14 frames of four bytes each.  `skip` drops one chunk, `flip` damages one text bit. */
 static void meta_send_chunks(const char *text,uint32 planCrc,int skip,int flip){
     uint8 raw[META_CHUNKS*4u];unsigned len=(unsigned)strlen(text),n,i;
@@ -1814,8 +1830,16 @@ static void meta_send_chunks(const char *text,uint32 planCrc,int skip,int flip){
     }
 }
 static int meta_is(uint8 slot,const char *text){
-    ts_info_t in;ts_active(slot,&in);
-    return in.valid && in.metaLen==strlen(text) && !memcmp(ts_flash(ts_block_offset(slot,in.which))+TS_META_ROW0*TS_ROW_BYTES,text,in.metaLen);
+    const ts_info_t *in=&g_tsDir[slot];
+    return in->valid && in->metaLen==strlen(text) && !memcmp(ts_record(slot)+TS_REC_HEAD,text,in->metaLen);
+}
+/* After a fixture edits a bank by hand: make its commit row (and, with a record row, that record's header) consistent again, so
+ * only the check under test can turn the bank away. */
+static void bank_reseal(uint8 bank,uint16 recordRow){
+    uint8 *b=simFlash+ts_bank_offset(bank);
+    if(recordRow){uint8 *h=b+(uint32)recordRow*TS_ROW_BYTES;ts_put32(h+24,ts_crc32(0,h,24));}
+    ts_put32(b+16,ts_crc32(0,b+TS_ROW_BYTES,(uint32)ts_get16(b+14)*TS_ROW_BYTES));
+    ts_put32(b+20,ts_crc32(0,b,20));
 }
 static void store_reference(void){
     g_enc2.directionKnown=1u;g_enc2.incDir=simPolarity2>0?1u:0u;
@@ -1823,6 +1847,38 @@ static void store_reference(void){
     if(!g_ptp.reference){txq_flush_blocking();fprintf(stderr,"%s",simLog);}
     assert(g_ptp.reference);
 }
+/* Power lost (whole row lost, or torn in half) or a write error at every single flash write of one change: after a reboot the
+ * archive is the old one whole or the new one whole, never anything else.  `setup` builds the old archive and leaves the RAM plan
+ * the change saves; `change` starts it.  `old`/`now` describe slot crc per slot (0 = empty) before and after. */
+typedef void (*store_fixture_t)(void);
+static void store_expect(const uint32 *want){
+    unsigned s;
+    for(s=0;s<TS_SLOTS;s++) assert(want[s] ? (g_tsDir[s].valid && g_tsDir[s].dataCrc==want[s]) : !g_tsDir[s].valid);
+}
+static void store_snapshot(uint32 *out){unsigned s;for(s=0;s<TS_SLOTS;s++)out[s]=g_tsDir[s].valid?g_tsDir[s].dataCrc:0u;}
+static void store_every_write(store_fixture_t setup,store_fixture_t change){
+    static uint32 before[TS_SLOTS],after[TS_SLOTS];unsigned writes,cut,mode;
+    sim_flash_reset();setup();store_snapshot(before);
+    simFlashWrites=0;change();store_run();assert(g_storeResult.last==1 || g_storeResult.last==2);writes=simFlashWrites;store_snapshot(after);
+    assert(writes>=2u && memcmp(before,after,sizeof(before)));
+    for(mode=0;mode<3;mode++) for(cut=0;cut<=writes;cut++) {
+        sim_flash_reset();setup();
+        simFlashWrites=0;
+        if(mode==2)simFlashFail=(int)cut;else{simFlashCut=(int)cut;simFlashCutTorn=(int)mode;}
+        change();store_run();
+        if(cut==writes){assert(g_storeResult.last==1 || g_storeResult.last==2);}
+        else{assert(g_storeResult.last==3 && axes_idle());if(mode==2)store_expect(before);}   /* a write error: the old archive stays in RAM too */
+        store_reboot();
+        /* the commit row is the last write: until it lands the old archive stands; if its first half landed it is complete (every
+         * field and its CRC sit there) and commits rows that were all read back */
+        if(cut<writes-1u || (cut==writes-1u && mode!=1)) store_expect(before);
+        else store_expect(after);
+    }
+}
+static void fx_one_old(void){store_make_plan(485,0);store_save(0);store_make_plan(100,1);store_save(3);store_make_plan(485,1);}
+static void fx_replace(void){store_send(12,g_controlSequence+1u,0,2,0);}
+static void fx_add(void){store_send(12,g_controlSequence+1u,5,2,0);}
+static void fx_erase(void){store_send(12,g_controlSequence+1u,0,3,0);}
 static void store_test(const char *t) {
     ts_info_t in;static traj_node_t keep[TRAJ_CAPACITY];unsigned i,cut,torn;uint32 seq,crcA,crcB;uint8 *blk;
     assert(ref_crc32((const uint8*)"123456789",9)==0xCBF43926u && ts_crc32(0,(const uint8*)"123456789",9)==0xCBF43926u);
@@ -1830,18 +1886,20 @@ static void store_test(const char *t) {
     store_reference();
     if(!strcmp(t,"store_roundtrip")||!strcmp(t,"store_capacity")) {
         unsigned n=!strcmp(t,"store_capacity")?TRAJ_CAPACITY:485u;
-        simLogN=0;simLog[0]=0;
-        store_send(12,g_controlSequence+1u,0xFFFFu,1,0);txq_flush_blocking();   /* empty archive: four invalid slots */
-        assert(strstr(simLog,"TRAJ_SLOT slot=0 valid=0") && strstr(simLog,"TRAJ_SLOT slot=3 valid=0") && strstr(simLog,"TRAJ_STORE state=idle") && simFlashWrites==0);
+        store_list();   /* empty archive: no slot lines, nothing written */
+        assert(strstr(simLog,"TRAJ_DIR gen=0 records=0 max=32 used_rows=0 free_rows=255 data_rows=255 row_bytes=256 mask=00000000\r\n") &&
+               !strstr(simLog,"TRAJ_SLOT") && strstr(simLog,"TRAJ_STORE state=idle") && simFlashWrites==0);
         store_make_plan(n,0);memcpy(keep,g_traj.nodes,sizeof(traj_node_t)*n);
         store_save(2);
-        assert(simFlashWrites==2u+(n*6u+255u)/256u && g_storeResult.last==1 && g_storeResult.slot==2);
-        ts_active(2,&in);
+        /* clear the commit row, the record's rows, commit: no row more than the record needs */
+        assert(simFlashWrites==2u+TS_REC_ROWS(n,0) && g_storeResult.last==1 && g_storeResult.slot==2);
+        in=g_tsDir[2];
         assert(in.valid && in.count==n && in.seq==1u && in.q1==0 && in.q2==0 && in.durationMs==g_traj.durationMs);
-        assert(in.dataCrc==store_plan_crc() && in.dataCrc==ref_crc32(ts_flash(ts_block_offset(2,in.which))+TS_ROW_BYTES,n*6u));
-        ts_active(1,&in);assert(!in.valid);
+        assert(in.dataCrc==store_plan_crc() && in.dataCrc==ref_crc32(ts_nodes(2),n*6u) && !g_tsDir[1].valid);
+        store_reboot();assert(!memcmp(&in,&g_tsDir[2],sizeof(in)));
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,2,1,0);txq_flush_blocking();
         assert(strstr(simLog,"TRAJ_SLOT slot=2 valid=1 seq=1 nodes=") && strstr(simLog,"TRAJ_STORE state=idle") && strstr(simLog,"last=saved"));
+        {char want[64];sprintf(want," rows=%u\r\n",(unsigned)TS_REC_ROWS(n,0));assert(strstr(simLog,want));}
         /* power cycle: RAM plan gone, load it back over the wire and check every node */
         traj_discard();assert(!g_traj.state);
         seq=g_ptp.sequence+1u;
@@ -1853,85 +1911,105 @@ static void store_test(const char *t) {
         return;
     }
     if(!strcmp(t,"store_load_identity")) {
-        char receipt[160];uint32 duration;uint16 count;
+        /* Erasing a slot and saving another plan of the same size into it gives a new save counter: seq never repeats. */
+        char receipt[160];uint32 duration,first;uint16 count;
         store_make_plan(20,0);crcA=store_plan_crc();store_save(0);
-        ts_active(0,&in);assert(in.valid && in.seq==1u && in.dataCrc==crcA);
-        duration=in.durationMs;count=in.count;
-        store_send(12,g_controlSequence+1u,0,3,0);store_run();
-        ts_active(0,&in);assert(!in.valid);
+        in=g_tsDir[0];assert(in.valid && in.dataCrc==crcA);
+        first=in.seq;duration=in.durationMs;count=in.count;
+        store_erase(0);assert(!g_tsDir[0].valid);
         store_make_plan(20,1);crcB=store_plan_crc();assert(crcB!=crcA);store_save(0);
-        ts_active(0,&in);
-        assert(in.valid && in.seq==1u && in.count==count && in.durationMs==duration && in.q1==0 && in.q2==0 && in.dataCrc==crcB);
+        in=g_tsDir[0];
+        assert(in.valid && in.seq!=first && in.count==count && in.durationMs==duration && in.q1==0 && in.q2==0 && in.dataCrc==crcB);
         traj_discard();simLogN=0;simLog[0]=0;
         seq=g_ptp.sequence+1u;store_send(13,seq,0,0,0);txq_flush_blocking();
-        sprintf(receipt,"TRAJ_LOAD slot=0 seq=1 nodes=%u duration_ms=%lu crc=%08lX\r\n",(unsigned)count,(unsigned long)duration,(unsigned long)crcB);
+        sprintf(receipt,"TRAJ_LOAD slot=0 seq=%lu nodes=%u duration_ms=%lu crc=%08lX\r\n",(unsigned long)in.seq,(unsigned)count,(unsigned long)duration,(unsigned long)crcB);
         assert(strstr(simLog,receipt) && g_ptp.sequence==seq && g_traj.state==TRAJ_READY && !g_ptp.active && store_plan_crc()==crcB);
         return;
     }
     if(!strcmp(t,"store_ab")) {
+        /* Each change builds the next archive in the other bank; the bank it came from is the one before, whole. */
+        uint32 crcC;
         store_make_plan(485,0);crcA=store_plan_crc();store_save(0);
-        ts_active(0,&in);assert(in.valid && in.seq==1u && in.which==0u && in.dataCrc==crcA);
+        assert(g_tsBank.valid && g_tsBank.bank==0u && g_tsBank.gen==1u && g_tsDir[0].seq==1u);
         store_make_plan(485,1);crcB=store_plan_crc();assert(crcA!=crcB);store_save(0);
-        ts_active(0,&in);assert(in.valid && in.seq==2u && in.which==1u && in.dataCrc==crcB);
-        assert(ts_check_block(ts_flash(ts_block_offset(0,0)),0,&in) && in.dataCrc==crcA);   /* the old block is still intact */
-        store_make_plan(485,0);store_save(0);
-        ts_active(0,&in);assert(in.valid && in.seq==3u && in.which==0u && in.dataCrc==crcA);
-        ts_active(1,&in);assert(!in.valid);                                                    /* other slots untouched */
+        assert(g_tsBank.bank==1u && g_tsBank.gen==2u && g_tsDir[0].seq==2u && g_tsDir[0].dataCrc==crcB);
+        assert(ts_check_bank(0u,1u,0u));                                  /* the old bank is still intact */
+        store_make_plan(100,0);crcC=store_plan_crc();store_save(1);
+        /* an untouched record keeps its counter; the new one gets the new generation */
+        assert(g_tsBank.bank==0u && g_tsBank.gen==3u && g_tsDir[0].seq==2u && g_tsDir[0].dataCrc==crcB && g_tsDir[1].seq==3u && g_tsDir[1].dataCrc==crcC);
+        assert(ts_rows(&g_tsDir[0])+ts_rows(&g_tsDir[1])==g_tsBank.usedRows && g_tsBank.records==2u);
+        store_reboot();assert(g_tsBank.bank==0u && g_tsBank.gen==3u && g_tsDir[1].dataCrc==crcC && !g_tsDir[2].valid);
+        /* the generation is compared modulo 2^32: 0 is newer than 0xFFFFFFFF */
+        ts_put32(simFlash+ts_bank_offset(1u)+8,0xFFFFFFFFu);bank_reseal(1u,0);
+        ts_put32(simFlash+ts_bank_offset(0u)+8,0u);bank_reseal(0u,0);
+        store_reboot();assert(g_tsBank.bank==0u && g_tsDir[1].valid);
+        ts_put32(simFlash+ts_bank_offset(1u)+8,1u);bank_reseal(1u,0);
+        store_reboot();assert(g_tsBank.bank==1u && !g_tsDir[1].valid && g_tsDir[0].dataCrc==crcB);
         return;
     }
     if(!strcmp(t,"store_power_loss")) {
-        /* Power lost (or a row torn in half) at every single flash write of a save over a good plan: the slot must come back
-         * as the old plan, whole, or as the new plan, whole -- never anything else. */
-        store_make_plan(485,0);crcA=store_plan_crc();
-        for(torn=0;torn<2;torn++) for(cut=0;cut<=14u;cut++) {
-            sim_flash_reset();store_make_plan(485,0);store_save(0);
-            store_make_plan(485,1);crcB=store_plan_crc();
-            simFlashWrites=0;simFlashCut=(int)cut;simFlashCutTorn=(int)torn;
-            store_send(12,g_controlSequence+1u,0,2,0);store_run();
-            ts_active(0,&in);   /* "reboot": nothing but flash survives */
-            assert(in.valid);
-            /* 14 writes in all, the header is the last.  Until it lands the old plan stands; if its first 128 bytes landed the new
-             * header is complete (every field and the CRC sit in them) and the plan it commits was verified row by row. */
-            if(cut<=12u) assert(in.dataCrc==crcA && in.seq==1u && g_storeResult.last==3);
-            else if(cut==13u) assert(g_storeResult.last==3 && ((in.dataCrc==crcA && in.seq==1u) || (torn && in.dataCrc==crcB && in.seq==2u)));
-            else         assert(in.dataCrc==crcB && in.seq==2u && g_storeResult.last==1);
-        }
+        store_every_write(fx_one_old,fx_replace);   /* a plan replaced, another one kept */
+        store_every_write(fx_one_old,fx_add);       /* a plan added beside two */
+        store_every_write(fx_one_old,fx_erase);     /* a plan erased, another one kept */
         return;
     }
     if(!strcmp(t,"store_write_error")) {
+        /* (every write of each change also fails once in store_power_loss); a failed change leaves a bank the next one reuses */
         store_make_plan(485,0);crcA=store_plan_crc();store_save(0);
-        store_make_plan(485,1);
-        for(cut=0;cut<=13u;cut++) {
+        store_make_plan(485,1);crcB=store_plan_crc();
+        for(cut=0;cut<=TS_REC_ROWS(485,0)+1u;cut++) {
             simFlashWrites=0;simFlashFail=(int)cut;
             store_send(12,g_controlSequence+1u,0,2,0);store_run();
-            ts_active(0,&in);assert(in.valid && in.dataCrc==crcA && g_storeResult.last==3);
-            assert(g_store.busy==0 && axes_idle());
+            assert(g_tsDir[0].valid && g_tsDir[0].dataCrc==crcA && g_storeResult.last==3 && g_store.busy==0 && axes_idle());
         }
+        simFlashFail=-1;store_save(0);assert(g_storeResult.last==1 && g_tsDir[0].dataCrc==crcB);
+        store_reboot();assert(g_tsDir[0].dataCrc==crcB);
         return;
     }
     if(!strcmp(t,"store_corrupt")) {
+        /* Two generations: gen 1 holds slot 1 = A, gen 2 holds slot 1 = A and slot 2 = B.  Damage to gen 2 makes gen 1 the archive. */
+        uint8 bank;uint16 row2;uint32 save;
         store_make_plan(485,0);crcA=store_plan_crc();store_save(1);
-        store_make_plan(485,1);crcB=store_plan_crc();store_save(1);
-        ts_active(1,&in);assert(in.valid && in.dataCrc==crcB);
-        blk=simFlash+ts_block_offset(1,in.which);
-        blk[TS_ROW_BYTES+100]^=0x10;                                   /* one flipped data bit */
-        ts_active(1,&in);assert(in.valid && in.dataCrc==crcA);        /* falls back to the older, intact block */
-        blk[TS_ROW_BYTES+100]^=0x10;ts_active(1,&in);assert(in.dataCrc==crcB);
-        blk[0]^=1;ts_active(1,&in);assert(in.dataCrc==crcA);          /* magic */
-        blk[0]^=1;blk[12]^=1;ts_active(1,&in);assert(in.dataCrc==crcA);   /* seq: header CRC no longer matches */
-        blk[12]^=1;ts_active(1,&in);assert(in.dataCrc==crcB);
-        /* a block copied into another slot is not that slot's plan; a plan under another joint convention is nobody's */
-        memcpy(simFlash+ts_block_offset(3,0),blk,TS_BLOCK_BYTES);ts_active(3,&in);assert(!in.valid);
-        memcpy(simFlash+ts_block_offset(3,0),blk,TS_BLOCK_BYTES);ts_put16(simFlash+ts_block_offset(3,0)+8,3);
-        ts_put32(simFlash+ts_block_offset(3,0)+28,ts_crc32(0,simFlash+ts_block_offset(3,0),28));ts_active(3,&in);assert(in.valid);
-        ts_put16(simFlash+ts_block_offset(3,0)+6,TS_CONTRACT+1u);
-        ts_put32(simFlash+ts_block_offset(3,0)+28,ts_crc32(0,simFlash+ts_block_offset(3,0),28));ts_active(3,&in);assert(!in.valid);
-        /* both blocks damaged: empty, and loading says so without touching the RAM plan */
-        simFlash[ts_block_offset(1,0)+TS_ROW_BYTES+7]^=1;simFlash[ts_block_offset(1,1)+TS_ROW_BYTES+7]^=1;
-        ts_active(1,&in);assert(!in.valid);
+        store_make_plan(300,1);crcB=store_plan_crc();store_save(2);
+        bank=g_tsBank.bank;row2=g_tsDir[2].row;blk=simFlash+ts_bank_offset(bank);
+#define GEN2() do{store_reboot();assert(g_tsBank.gen==2u && g_tsDir[1].dataCrc==crcA && g_tsDir[2].valid && g_tsDir[2].dataCrc==crcB);}while(0)
+#define GEN1() do{store_reboot();assert(g_tsBank.gen==1u && g_tsDir[1].dataCrc==crcA && !g_tsDir[2].valid);}while(0)
+        GEN2();
+        blk[(uint32)row2*TS_ROW_BYTES+100]^=0x10;GEN1();                  /* one flipped data bit */
+        blk[(uint32)row2*TS_ROW_BYTES+100]^=0x10;GEN2();
+        blk[0]^=1;GEN1();blk[0]^=1;GEN2();                                 /* commit magic */
+        blk[8]^=1;GEN1();blk[8]^=1;GEN2();                                 /* gen: the commit CRC no longer matches */
+        /* each of these is sealed again (record and commit CRCs right), so only the check it is about can refuse it */
+        save=ts_get16(blk+6);ts_put16(blk+6,TS_CONTRACT+1u);bank_reseal(bank,0);GEN1();          /* another joint convention */
+        ts_put16(blk+6,(uint16)save);bank_reseal(bank,0);GEN2();
+        ts_put16(blk+4,TS_VERSION-1u);bank_reseal(bank,0);GEN1();ts_put16(blk+4,TS_VERSION);bank_reseal(bank,0);GEN2();
+        ts_put16(blk+(uint32)row2*TS_ROW_BYTES,1u);bank_reseal(bank,row2);GEN1();              /* two records for slot 1 */
+        ts_put16(blk+(uint32)row2*TS_ROW_BYTES,2u);bank_reseal(bank,row2);GEN2();
+        ts_put16(blk+(uint32)row2*TS_ROW_BYTES,TS_SLOTS);bank_reseal(bank,row2);GEN1();        /* no such slot */
+        ts_put16(blk+(uint32)row2*TS_ROW_BYTES,2u);bank_reseal(bank,row2);GEN2();
+        ts_put16(blk+(uint32)row2*TS_ROW_BYTES+2,TRAJ_CAPACITY);bank_reseal(bank,row2);GEN1();  /* longer than the rows it has */
+        ts_put16(blk+(uint32)row2*TS_ROW_BYTES+2,300u);bank_reseal(bank,row2);GEN2();
+        ts_put16(blk+(uint32)row2*TS_ROW_BYTES+2,1u);bank_reseal(bank,row2);GEN1();             /* too short to be a plan */
+        ts_put16(blk+(uint32)row2*TS_ROW_BYTES+2,300u);bank_reseal(bank,row2);GEN2();
+        ts_put16(blk+(uint32)row2*TS_ROW_BYTES+16,TS_META_MAX+1u);bank_reseal(bank,row2);GEN1(); /* description too long */
+        ts_put16(blk+(uint32)row2*TS_ROW_BYTES+16,0u);bank_reseal(bank,row2);GEN2();
+        blk[(uint32)row2*TS_ROW_BYTES+4]^=1;bank_reseal(bank,0);GEN1();   /* record header CRC (the bank CRC made to fit) */
+        blk[(uint32)row2*TS_ROW_BYTES+4]^=1;bank_reseal(bank,0);GEN2();
+        ts_put16(blk+12,3u);bank_reseal(bank,0);GEN1();ts_put16(blk+12,2u);bank_reseal(bank,0);GEN2();     /* record count */
+        ts_put16(blk+14,(uint16)(ts_get16(blk+14)+1u));bank_reseal(bank,0);GEN1();                        /* used rows */
+        ts_put16(blk+14,(uint16)(ts_get16(blk+14)-1u));bank_reseal(bank,0);GEN2();
+        ts_put16(blk+14,TS_DATA_ROWS+1u);ts_put32(blk+20,ts_crc32(0,blk,20));GEN1();   /* (no row CRC: it would run past the bank) */
+#undef GEN1
+#undef GEN2
+        /* both banks damaged: empty, and loading says so without touching the RAM plan */
+        simFlash[ts_bank_offset(bank^1u)+TS_ROW_BYTES+7]^=1;
+        store_reboot();assert(!g_tsBank.valid && !g_tsDir[1].valid);
         store_make_plan(485,0);simLogN=0;simLog[0]=0;
         store_send(13,g_ptp.sequence+1u,1,0,0);txq_flush_blocking();
         assert(strstr(simLog,"archive slot empty or damaged") && g_traj.state==TRAJ_READY && g_traj.count==485);
+        /* and the next save starts a new archive from there */
+        store_save(4);assert(g_storeResult.last==1 && g_tsDir[4].valid && g_tsBank.records==1u);
+        store_reboot();assert(g_tsDir[4].valid && !g_tsDir[1].valid);
         return;
     }
     if(!strcmp(t,"store_load_checks")) {
@@ -1956,6 +2034,25 @@ static void store_test(const char *t) {
         store_send(13,g_ptp.sequence+1u,TS_SLOTS,0,0);store_send(13,g_ptp.sequence+1u,0,1,0);store_send(13,g_ptp.sequence+1u,0,0,1);txq_flush_blocking();
         assert(strstr(simLog,"archive slot") && strstr(simLog,"archive load arguments"));
         store_send(13,g_ptp.sequence+1u,0,0,0);assert(g_traj.state==TRAJ_READY && g_traj.count==485);   /* the good load still works */
+        /* A bit that flips after the boot check.  In the nodes: the plan is not loaded.  Anywhere in the bank (nodes, description,
+         * padding): a change, which would copy it into a new bank, writes nothing and drops the bank, as a reboot would; the next change
+         * starts from the previous bank and takes a generation above both. */
+        {uint32 gen;unsigned w,k;uint8 *bad;
+         for(k=0;k<2;k++){
+            sim_flash_reset();store_make_plan(485,0);store_save(0);
+            store_make_plan(100,1);store_save(1);gen=g_tsBank.gen;
+            bad=simFlash+ts_bank_offset(g_tsBank.bank)+(uint32)g_tsDir[0].row*TS_ROW_BYTES+
+                (k==0 ? TS_REC_HEAD+40u : (uint32)ts_rows(&g_tsDir[0])*TS_ROW_BYTES-1u);   /* a node byte / the record's last padding byte */
+            *bad^=0x04;simLogN=0;simLog[0]=0;
+            store_send(13,g_ptp.sequence+1u,0,0,0);txq_flush_blocking();
+            if(k==0) assert(strstr(simLog,"archive slot empty or damaged") && g_traj.state==TRAJ_READY && g_traj.count==100);
+            else assert(strstr(simLog,"TRAJ_LOAD slot=0") && g_traj.count==485);          /* the plan itself is intact */
+            w=simFlashWrites;simLogN=0;simLog[0]=0;store_make_plan(50,0);store_send(12,g_controlSequence+1u,2,2,0);store_run();txq_flush_blocking();
+            assert(g_storeResult.last==3 && strstr(simLog,"the archive is damaged") && simFlashWrites==w);
+            assert(g_tsBank.valid && g_tsDir[0].valid && !g_tsDir[1].valid && !g_tsDir[2].valid);   /* the generation before slot 1 */
+            store_save(2);assert(g_storeResult.last==1 && g_tsDir[2].valid && g_tsDir[2].seq==gen+1u && g_tsBank.gen==gen+1u);
+            store_reboot();assert(g_tsBank.gen==gen+1u && g_tsDir[0].valid && g_tsDir[2].valid && !g_tsDir[1].valid);
+         }}
         return;
     }
     if(!strcmp(t,"store_commands")) {
@@ -1980,10 +2077,12 @@ static void store_test(const char *t) {
         assert(!axes_idle());
         packetType=1;ptp_send(g_ptp.sequence+1u,g_ptp.epoch,100,100,600,0);assert(!g_ptp.active);
         store_run();assert(g_storeResult.last==1 && axes_idle());
-        /* erase */
-        ts_active(1,&in);assert(in.valid);
+        /* erase; erasing an empty slot succeeds without writing */
+        assert(g_tsDir[1].valid);
         store_send(12,g_controlSequence+1u,1,3,0);assert(g_store.busy);store_run();
-        ts_active(1,&in);assert(!in.valid && g_storeResult.last==2);
+        assert(!g_tsDir[1].valid && g_storeResult.last==2);
+        {unsigned w=simFlashWrites;simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,7,3,0);txq_flush_blocking();
+         assert(!g_store.busy && simFlashWrites==w && strstr(simLog,"last=erased last_slot=7"));}
         return;
     }
     if(!strcmp(t,"store_hold")) {
@@ -2012,7 +2111,8 @@ static void store_test(const char *t) {
         stage_stop("fixture stop",0u);                                    /* any stop discards the plan the save is reading */
         cycle(1);store_service();
         assert(!g_store.busy && g_storeResult.last==4);
-        ts_active(0,&in);assert(in.valid && in.dataCrc==crcA && in.seq==1u);   /* the old plan is untouched, the new one never committed */
+        assert(g_tsDir[0].valid && g_tsDir[0].dataCrc==crcA && g_tsDir[0].seq==1u);   /* the old plan is untouched, the new one never committed */
+        store_reboot();assert(g_tsDir[0].valid && g_tsDir[0].dataCrc==crcA && g_tsDir[0].seq==1u);
         /* saving needs a complete plan */
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,0,2,0);txq_flush_blocking();
         assert(!g_store.busy);
@@ -2021,37 +2121,38 @@ static void store_test(const char *t) {
     if(!strcmp(t,"store_unlinked")) {
         /* an image linked with the stock script (no reserved region): every archive operation is refused and nothing is written */
         uint8 row[TS_ROW_BYTES];memset(row,0,sizeof(row));
-        store_make_plan(485,0);store_save(0);ts_active(0,&in);assert(in.valid);
-        simStoreLinked=0;simLogN=0;simLog[0]=0;simFlashWrites=0;
+        store_make_plan(485,0);store_save(0);assert(g_tsDir[0].valid);
+        simStoreLinked=0;store_reboot();assert(!g_tsDir[0].valid && !g_tsBank.valid);
+        simLogN=0;simLog[0]=0;simFlashWrites=0;
         store_send(12,g_controlSequence+1u,0,2,0);store_send(12,g_controlSequence+1u,0,3,0);store_send(12,g_controlSequence+1u,0xFFFFu,1,0);
         store_send(13,g_ptp.sequence+1u,0,0,0);txq_flush_blocking();
-        assert(!g_store.busy && simFlashWrites==0 && strstr(simLog,"archive region not reserved") && !strstr(simLog,"TRAJ_SLOT") && !ts_write_row(TS_REGION_OFFSET,row));
+        assert(!g_store.busy && simFlashWrites==0 && strstr(simLog,"archive region not reserved") && !strstr(simLog,"TRAJ_SLOT") && !strstr(simLog,"TRAJ_DIR") && !ts_write_row(TS_REGION_OFFSET,row));
         simLogN=0;simLog[0]=0;stage_status();status_drain();
         assert(strstr(simLog," traj_store=0 telem_hz="));
         return;
     }
     if(!strcmp(t,"store_meta")) {
-        /* The description a host keeps with a plan: stored in the spare row, committed with the header, given back on request. */
+        /* The description a host keeps with a plan: stored between the record header and the nodes, given back on request. */
         const char *textA="shape=3;branch=0;x=340;rot=20",*textB="shape=2;x=300";
-        char big[TS_META_MAX+1],want[96];unsigned w;uint32 sq;
+        char big[TS_META_MAX+1],want[96];unsigned w,writes;uint32 sq;
         store_make_plan(485,0);crcA=store_plan_crc();
         meta_send_chunks(textA,crcA,-1,-1);
         w=simFlashWrites;store_save(1);
-        assert(g_storeResult.last==1 && simFlashWrites-w==3u+(485u*6u+255u)/256u);   /* clear, data rows, description row, header */
-        ts_active(1,&in);assert(in.valid && in.dataCrc==crcA && meta_is(1,textA));
-        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,0xFFFFu,1,0);txq_flush_blocking();
-        /* the TRAJ_SLOT line ends at the CRC, as it always did (an older host parses it end-anchored); nothing about the description rides on it */
-        sprintf(want,"crc=%08lX\r\n",(unsigned long)crcA);
-        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=1") && strstr(simLog,want) && strstr(simLog,"TRAJ_SLOT slot=0 valid=0\r\n") && !strstr(simLog," meta=") && !strstr(simLog,"TRAJ_SLOT_META"));
+        assert(g_storeResult.last==1 && simFlashWrites-w==2u+TS_REC_ROWS(485,strlen(textA)));   /* clear, the record (description inside), commit */
+        assert(g_tsDir[1].valid && g_tsDir[1].dataCrc==crcA && meta_is(1,textA));
+        store_list();
+        /* the TRAJ_SLOT line ends with the rows the record takes; nothing about the description rides on it, and empty slots are not listed */
+        sprintf(want,"crc=%08lX rows=%u\r\n",(unsigned long)crcA,(unsigned)TS_REC_ROWS(485,strlen(textA)));
+        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=1") && strstr(simLog,want) && !strstr(simLog,"TRAJ_SLOT slot=0") && !strstr(simLog," meta="));
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,4,0);txq_flush_blocking();
         sprintf(want,"TRAJ_META slot=1 seq=1 len=%u crc=%08lX hex=",(unsigned)strlen(textA),(unsigned long)ref_crc32((const uint8*)textA,(uint32)strlen(textA)));
         assert(strstr(simLog,want) && strstr(simLog,"73686170653D33") && strstr(simLog,"TRAJ_STORE state=idle"));   /* "shape=3" */
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,3,4,0);txq_flush_blocking();
         assert(strstr(simLog,"TRAJ_META slot=3 len=0"));
-        /* a description is used once: the next save without one carries none (and an old block is a plan without one) */
-        store_save(1);ts_active(1,&in);assert(in.valid && in.seq==2u && in.metaLen==0u);
+        /* a description is used once: the next save without one carries none */
+        store_save(1);in=g_tsDir[1];assert(in.valid && in.seq==2u && in.metaLen==0u);
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,1,0);txq_flush_blocking();
-        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=2") && !strstr(simLog,"TRAJ_SLOT_META"));
+        assert(strstr(simLog,"TRAJ_SLOT slot=1 valid=1 seq=2"));
         /* a slot without a description answers an op 4 query with len=0 (the host asks every valid slot) */
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,4,0);txq_flush_blocking();
         assert(strstr(simLog,"TRAJ_META slot=1 len=0"));
@@ -2063,19 +2164,19 @@ static void store_test(const char *t) {
         store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
         assert(!g_store.busy && simFlashWrites==w && strstr(simLog,"description incomplete"));
         g_controlSequence+=1u;   /* (the host's heartbeats move its sequence on; a refused frame does not move the device's, and an identical Save is a resend) */
-        store_save(1);ts_active(1,&in);assert(in.seq==3u && in.metaLen==0u);
+        store_save(1);assert(g_tsDir[1].seq==3u && g_tsDir[1].metaLen==0u);
         /* the same Save sent again (its refusal was lost) is turned away again, not accepted as a save without the description */
         meta_send_chunks(textA,crcA,2,-1);sq=g_controlSequence+1u;simLogN=0;simLog[0]=0;
         store_send(12,sq,3,2,0);txq_flush_blocking();
         assert(strstr(simLog,"description incomplete") && !g_store.busy);
         w=simFlashWrites;simLogN=0;simLog[0]=0;store_send(12,sq,3,2,0);txq_flush_blocking();
         assert(strstr(simLog,"description incomplete") && !g_store.busy && simFlashWrites==w);
-        meta_send_chunks(textA,crcA,-1,-1);store_save(3);ts_active(3,&in);assert(g_storeResult.last==1 && meta_is(3,textA));   /* a fresh transfer and Save work */
-        /* a description made for another plan is never committed: the save fails and the slot stays as it was */
-        meta_send_chunks(textB,crcA^1u,-1,-1);simLogN=0;simLog[0]=0;
+        meta_send_chunks(textA,crcA,-1,-1);store_save(3);assert(g_storeResult.last==1 && meta_is(3,textA));   /* a fresh transfer and Save work */
+        /* a description made for another plan is never committed: the save fails before writing anything, the archive stays as it was */
+        meta_send_chunks(textB,crcA^1u,-1,-1);simLogN=0;simLog[0]=0;w=simFlashWrites;
         store_send(12,g_controlSequence+1u,1,2,0);store_run();txq_flush_blocking();
-        assert(g_storeResult.last==3 && strstr(simLog,"description is not for this plan") && !g_meta.touched);
-        ts_active(1,&in);assert(in.valid && in.seq==3u && in.metaLen==0u);
+        assert(g_storeResult.last==3 && strstr(simLog,"description is not for this plan") && !g_meta.touched && simFlashWrites==w);
+        assert(g_tsDir[1].valid && g_tsDir[1].seq==3u && g_tsDir[1].metaLen==0u && meta_is(3,textA));
         /* chunks are checked like any control frame, and none is taken while a save runs */
         sq=g_controlSequence;packetType=14;
         ptp_send(sq+1u,g_ptp.epoch-1u,0,0,0,0);ptp_send(sq,g_ptp.epoch,0,0,0,0);ptp_send(sq+1u,g_ptp.epoch,0,0,(uint16)META_CHUNKS,0);
@@ -2089,11 +2190,11 @@ static void store_test(const char *t) {
         /* a transfer a host walked away from (the reference epoch changed: stop, enable, new reference) is forgotten: a later save is not
          * refused for the half description, and a complete one that was never saved is not attached to it */
         meta_send_chunks(textA,crcA,2,-1);assert(g_meta.touched);g_ptp.epoch++;
-        simLogN=0;simLog[0]=0;store_save(1);ts_active(1,&in);
-        assert(g_storeResult.last==1 && in.valid && in.metaLen==0u && !strstr(simLog,"description incomplete") && !g_meta.touched);
+        simLogN=0;simLog[0]=0;store_save(1);
+        assert(g_storeResult.last==1 && g_tsDir[1].valid && g_tsDir[1].metaLen==0u && !strstr(simLog,"description incomplete") && !g_meta.touched);
         meta_send_chunks(textA,crcA,-1,-1);assert(g_meta.touched);g_ptp.epoch++;
-        store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.valid && in.metaLen==0u);
-        meta_send_chunks(textA,crcA,-1,-1);store_save(1);ts_active(1,&in);assert(in.metaLen==(unsigned)strlen(textA) && meta_is(1,textA));   /* same epoch: kept */
+        store_save(1);assert(g_storeResult.last==1 && g_tsDir[1].valid && g_tsDir[1].metaLen==0u);
+        meta_send_chunks(textA,crcA,-1,-1);store_save(1);assert(meta_is(1,textA));   /* same epoch: kept */
         /* a save that is refused (the same epoch, so not the epoch rule) takes its description with it: the next save, which sends none, is
          * neither refused for it nor given it */
         store_make_plan(485,0);crcA=store_plan_crc();
@@ -2104,59 +2205,68 @@ static void store_test(const char *t) {
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
         assert(!g_store.busy && strstr(simLog,"description incomplete"));
         g_controlSequence+=1u;   /* (a fresh Save has a fresh sequence) */
-        store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.valid && in.metaLen==0u);
+        store_save(1);assert(g_storeResult.last==1 && g_tsDir[1].valid && g_tsDir[1].metaLen==0u);
         meta_send_chunks(textA,crcA,-1,-1);traj_discard();simLogN=0;simLog[0]=0;
         store_send(12,g_controlSequence+1u,1,2,0);txq_flush_blocking();
         assert(!g_store.busy && strstr(simLog,"no complete plan") && !g_meta.touched);
         g_controlSequence+=1u;   /* (a fresh Save has a fresh sequence) */
-        store_make_plan(485,0);store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.valid && in.metaLen==0u);
+        store_make_plan(485,0);store_save(1);assert(g_storeResult.last==1 && g_tsDir[1].valid && g_tsDir[1].metaLen==0u);
         /* a command turned away while a save is writing its description (another host's query, another save) leaves that description alone:
          * the job reads it row by row, and it must reach the flash as it was sent */
         meta_send_chunks(textA,crcA,-1,-1);store_send(12,g_controlSequence+1u,1,2,0);assert(g_store.busy);
         for(i=0;i<3;i++){cycle(1);store_service();}
         simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,2,1,0);store_send(12,g_controlSequence+1u,2,2,0);store_send(12,g_controlSequence+1u,2,3,0);txq_flush_blocking();
         assert(strstr(simLog,"stage not idle") && g_store.busy && g_meta.touched);
-        store_run();assert(g_storeResult.last==1);ts_active(1,&in);assert(in.valid && meta_is(1,textA));
+        store_run();assert(g_storeResult.last==1 && meta_is(1,textA));
         /* a description whose Save never arrived (the host gave up and asked something else, or simply went quiet) is not kept for a later
          * save that sends none */
         meta_send_chunks(textA,crcA,-1,-1);assert(g_meta.touched);
         store_send(12,g_controlSequence+1u,1,1,0);assert(!g_meta.touched);             /* the host went on to a query */
-        store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.metaLen==0u);
+        store_save(1);assert(g_storeResult.last==1 && g_tsDir[1].metaLen==0u);
         meta_send_chunks(textA,crcA,-1,-1);g_jogMs+=META_TTL_MS+1u;                       /* or went quiet for a long time */
-        store_save(1);ts_active(1,&in);assert(g_storeResult.last==1 && in.metaLen==0u && !g_meta.touched);
+        store_save(1);assert(g_storeResult.last==1 && g_tsDir[1].metaLen==0u && !g_meta.touched);
         meta_send_chunks(textA,crcA,-1,-1);store_send(12,g_controlSequence+1u,1,4,0);assert(!g_meta.touched);   /* any other archive command */
-        meta_send_chunks(textA,crcA,-1,-1);g_jogMs+=1000u;store_save(1);ts_active(1,&in);assert(meta_is(1,textA));   /* a prompt save keeps it */
+        meta_send_chunks(textA,crcA,-1,-1);g_jogMs+=1000u;store_save(1);assert(meta_is(1,textA));   /* a prompt save keeps it */
         /* power lost at every write of a save that replaces a plan and its description: one whole pair or the other, never a mix */
-        for(torn=0;torn<2;torn++) for(cut=0;cut<=15u;cut++) {
-            sim_flash_reset();store_make_plan(485,0);crcA=store_plan_crc();meta_send_chunks(textA,crcA,-1,-1);store_save(0);
-            store_make_plan(485,1);crcB=store_plan_crc();meta_send_chunks(textB,crcB,-1,-1);
+        sim_flash_reset();store_make_plan(485,0);crcA=store_plan_crc();meta_send_chunks(textA,crcA,-1,-1);store_save(0);
+        store_make_plan(485,1);crcB=store_plan_crc();meta_send_chunks(textB,crcB,-1,-1);store_save(0);
+        writes=2u+TS_REC_ROWS(485,strlen(textB));
+        for(torn=0;torn<2;torn++) for(cut=0;cut<=writes;cut++) {
+            sim_flash_reset();store_make_plan(485,0);meta_send_chunks(textA,crcA,-1,-1);store_save(0);
+            store_make_plan(485,1);meta_send_chunks(textB,crcB,-1,-1);
             simFlashWrites=0;simFlashCut=(int)cut;simFlashCutTorn=(int)torn;
             store_send(12,g_controlSequence+1u,0,2,0);store_run();
-            ts_active(0,&in);assert(in.valid);
+            store_reboot();in=g_tsDir[0];assert(in.valid);
             assert((in.dataCrc==crcA && in.seq==1u && meta_is(0,textA)) || (in.dataCrc==crcB && in.seq==2u && meta_is(0,textB)));
-            if(cut<=13u) assert(in.dataCrc==crcA && g_storeResult.last==3);
-            else if(cut==14u) assert(g_storeResult.last==3);
+            if(cut<writes-1u || (cut==writes-1u && !torn)) assert(in.dataCrc==crcA && g_storeResult.last==3);
+            else if(cut==writes-1u) assert(in.dataCrc==crcB && g_storeResult.last==3);
             else assert(in.dataCrc==crcB && g_storeResult.last==1);
         }
-        /* the largest description beside the largest plan; a damaged description costs the label, not the plan */
+        /* the largest description beside the largest plan */
         sim_flash_reset();store_make_plan(TRAJ_CAPACITY,0);crcA=store_plan_crc();
         memset(big,'A',TS_META_MAX);big[TS_META_MAX]=0;
         meta_send_chunks(big,crcA,-1,-1);store_save(2);
-        assert(g_storeResult.last==1);ts_active(2,&in);assert(in.valid && in.count==TRAJ_CAPACITY && meta_is(2,big));
-        simFlash[ts_block_offset(2,in.which)+TS_META_ROW0*TS_ROW_BYTES+5]^=1;
-        ts_active(2,&in);assert(in.valid && in.dataCrc==crcA && in.metaLen==0u);
+        assert(g_storeResult.last==1 && g_tsDir[2].valid && g_tsDir[2].count==TRAJ_CAPACITY && meta_is(2,big) && ts_rows(&g_tsDir[2])==TS_REC_ROWS(TRAJ_CAPACITY,TS_META_MAX));
+        store_reboot();assert(meta_is(2,big) && g_tsDir[2].dataCrc==crcA);
+        /* a damaged description is damage to the bank: the archive falls back to the generation before (here: none) */
+        simFlash[ts_bank_offset(g_tsBank.bank)+(uint32)g_tsDir[2].row*TS_ROW_BYTES+TS_REC_HEAD+5]^=1;
+        /* before any reboot: the changed text is not given out as genuine (it reads as "no description") */
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,2,4,0);txq_flush_blocking();
+        assert(strstr(simLog,"TRAJ_META slot=2 len=0") && !strstr(simLog,"TRAJ_META slot=2 seq="));
+        store_reboot();assert(!g_tsDir[2].valid && !g_tsBank.valid);
         return;
     }
     if(!strcmp(t,"store_nodes")) {
         /* The nodes of a slot, read back forty at a time: the bytes as stored, in order, checked against the slot's CRC. */
         static uint8 got[TRAJ_CAPACITY*TS_NODE_BYTES];
-        unsigned n,first,count,total,lines;char want[64];uint32 sq;const char *line;
+        unsigned n,first,count,total=0,lines;char want[64];uint32 sq;const char *line;
         for(n=0;n<2;n++) {
-            sim_flash_reset();store_make_plan(n?TRAJ_CAPACITY:485u,0);crcA=store_plan_crc();store_save(1);ts_active(1,&in);
+            sim_flash_reset();store_make_plan(n?TRAJ_CAPACITY:485u,0);crcA=store_plan_crc();
+            meta_send_chunks("shape=1",crcA,-1,-1);store_save(1);in=g_tsDir[1];   /* nodes behind a description */
             total=g_traj.count;memset(got,0,sizeof(got));lines=0;first=0;
             while(first<total) {
                 simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,1,5,(uint16)first);txq_flush_blocking();
-                sprintf(want,"TRAJ_NODES slot=1 seq=1 total=%u first=%u count=",total,first);
+                sprintf(want,"TRAJ_NODES slot=1 seq=%lu total=%u first=%u count=",(unsigned long)in.seq,total,first);
                 line=strstr(simLog,want);assert(line && strstr(simLog,"TRAJ_STORE state=idle"));
                 count=(unsigned)atoi(line+strlen(want));assert(count>=1 && count<=STORE_NODES_LINE && (first+count==total || count==STORE_NODES_LINE));
                 line=strstr(line," hex=")+5;
@@ -2182,6 +2292,61 @@ static void store_test(const char *t) {
         assert(!ts_write_row(0,row) && !ts_write_row(0x10000u,row) && !ts_write_row(TS_REGION_OFFSET-TS_ROW_BYTES,row));
         assert(!ts_write_row(TS_REGION_OFFSET+TS_REGION_BYTES,row) && !ts_write_row(TS_REGION_OFFSET+1u,row) && simFlashWrites==0);
         assert(ts_write_row(TS_REGION_OFFSET,row) && ts_write_row(TS_REGION_OFFSET+TS_REGION_BYTES-TS_ROW_BYTES,row) && simFlashWrites==2);
+        return;
+    }
+    if(!strcmp(t,"store_many")) {
+        /* 32 short plans, each with its description: every slot used, the inventory sent line by line, all of them loadable. */
+        static uint32 crcs[TS_SLOTS];char text[32],want[160];unsigned s;
+        for(s=0;s<TS_SLOTS;s++){
+            store_make_plan(10u+s,(int)(s&1u));crcs[s]=store_plan_crc();
+            sprintf(text,"shape=%u;x=%u",s%10u,300u+s);meta_send_chunks(text,crcs[s],-1,-1);store_save((uint16)s);
+            assert(g_storeResult.last==1 && g_tsBank.records==s+1u && meta_is((uint8)s,text));
+        }
+        store_reboot();
+        for(s=0;s<TS_SLOTS;s++){sprintf(text,"shape=%u;x=%u",s%10u,300u+s);assert(g_tsDir[s].dataCrc==crcs[s] && g_tsDir[s].count==10u+s && meta_is((uint8)s,text));}
+        store_list();
+        sprintf(want,"TRAJ_DIR gen=32 records=32 max=32 used_rows=%u free_rows=%u data_rows=255 row_bytes=256 mask=FFFFFFFF\r\n",(unsigned)g_tsBank.usedRows,(unsigned)(TS_DATA_ROWS-g_tsBank.usedRows));
+        assert(strstr(simLog,want) && log_count("TRAJ_SLOT slot=")==TS_SLOTS && log_count("TRAJ_STORE state=idle")==1u);
+        assert(strstr(simLog,"TRAJ_SLOT slot=31 valid=1 seq=32") && strstr(strstr(simLog,"TRAJ_SLOT slot=31"),"TRAJ_STORE state=idle"));   /* the status comes last */
+        for(s=0;s<TS_SLOTS;s++){sprintf(want,"TRAJ_SLOT slot=%u valid=1 seq=%u nodes=%u ",s,s+1u,10u+s);assert(strstr(simLog,want));}
+        /* load one back */
+        traj_discard();seq=g_ptp.sequence+1u;store_send(13,seq,31,0,0);assert(g_traj.state==TRAJ_READY && g_traj.count==41u && store_plan_crc()==crcs[31]);
+        /* erase one, save another into it: the others keep their counters */
+        store_erase(5);assert(!g_tsDir[5].valid && g_tsBank.records==31u && g_tsDir[6].seq==7u);
+        store_make_plan(60,0);crcA=store_plan_crc();store_save(5);
+        assert(g_tsDir[5].dataCrc==crcA && g_tsDir[5].seq==34u && g_tsDir[6].seq==7u && g_tsDir[31].dataCrc==crcs[31]);
+        store_reboot();assert(g_tsDir[5].dataCrc==crcA && g_tsBank.records==32u);
+        /* a save cuts an inventory that is still being sent short: its lines would mix the old archive with the new */
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,0xFFFFu,1,0);store_list_service();store_list_service();
+        store_make_plan(60,1);store_send(12,g_controlSequence+1u,9,2,0);assert(g_store.busy && g_listNext==0xFFu);store_run();
+        assert(g_tsDir[9].dataCrc==store_plan_crc());
+        return;
+    }
+    if(!strcmp(t,"store_full")) {
+        /* The room is rows, not slots: full-size plans take 49 rows each, five fit, the sixth is refused without a write, and the
+         * room left still takes a short plan.  Replacing a plan frees its rows for the new one. */
+        uint16 big=TS_REC_ROWS(TRAJ_CAPACITY,0),w;unsigned s;uint32 crcs[6];
+        assert(big==49u);
+        for(s=0;s<5;s++){store_make_plan(TRAJ_CAPACITY,(int)(s&1u));crcs[s]=store_plan_crc();store_save((uint16)s);assert(g_storeResult.last==1);}
+        assert(g_tsBank.usedRows==5u*big && ts_free_rows(5)==TS_DATA_ROWS-5u*big);
+        store_make_plan(TRAJ_CAPACITY,0);w=(uint16)simFlashWrites;simLogN=0;simLog[0]=0;
+        store_send(12,g_controlSequence+1u,5,2,0);txq_flush_blocking();
+        assert(!g_store.busy && simFlashWrites==w && strstr(simLog,"TRAJ_STORE refused: archive full") && !g_tsDir[5].valid);
+        /* the same plan replacing slot 2 fits: its old rows are given back */
+        g_controlSequence+=1u;store_save(2);assert(g_storeResult.last==1 && g_tsDir[2].count==TRAJ_CAPACITY && g_tsDir[0].dataCrc==crcs[0]);
+        /* a short plan in the rows left */
+        store_make_plan(200,0);crcA=store_plan_crc();store_save(5);assert(g_storeResult.last==1 && g_tsDir[5].dataCrc==crcA);
+        store_list();
+        {char want[96];sprintf(want,"used_rows=%u free_rows=%u ",(unsigned)(5u*big+TS_REC_ROWS(200,0)),(unsigned)(TS_DATA_ROWS-5u*big-TS_REC_ROWS(200,0)));assert(strstr(simLog,want) && strstr(simLog,"records=6 "));}
+        /* growing the short plan beyond the room left is refused and keeps it; shrinking a big one makes room */
+        store_make_plan(TRAJ_CAPACITY,1);w=(uint16)simFlashWrites;simLogN=0;simLog[0]=0;
+        store_send(12,g_controlSequence+1u,5,2,0);txq_flush_blocking();
+        assert(!g_store.busy && simFlashWrites==w && strstr(simLog,"archive full") && g_tsDir[5].dataCrc==crcA);
+        g_controlSequence+=1u;store_make_plan(100,1);crcB=store_plan_crc();store_save(0);
+        assert(g_storeResult.last==1 && g_tsDir[0].dataCrc==crcB && ts_free_rows(5)>=big);
+        store_make_plan(TRAJ_CAPACITY,1);crcB=store_plan_crc();store_save(5);assert(g_storeResult.last==1 && g_tsDir[5].dataCrc==crcB);
+        store_reboot();assert(g_tsBank.records==6u && g_tsDir[5].dataCrc==crcB && g_tsDir[4].dataCrc==crcs[4]);
+        for(s=0;s<6;s++){traj_discard();store_send(13,g_ptp.sequence+1u,(uint16)s,0,0);assert(g_traj.state==TRAJ_READY && g_traj.count==g_tsDir[s].count);}
         return;
     }
     assert(0);
@@ -2993,7 +3158,7 @@ int main(int argc,char **argv) {
         sprintf(proto," proto=%u\r\n",(unsigned)PROTO_VERSION); /* with its end of line: the debug buffer must not cut the LINK line short */
         assert(strstr(simLog,"STATE fw=stage2-v11 ") && strstr(simLog,"LINK uart=hw") && strstr(simLog,"fw=" FW_BUILD_ID) && strstr(simLog,proto));
         assert(strstr(simLog," short_hb=1") && strstr(simLog," joint_limits=1") && strstr(simLog," motion_rates=1") && strstr(simLog," rates_live=1") && strstr(simLog," q2_absolute=1"));
-        assert(strstr(simLog," traj_repeat=1") && strstr(simLog," fault_snapshot=1") && strstr(simLog," traj_store=4 telem_hz=0 proto="));
+        assert(strstr(simLog," traj_repeat=1") && strstr(simLog," fault_snapshot=1") && strstr(simLog," traj_store=32 telem_hz=0 proto="));
         puts(t);return 0;
     }
     if(!strncmp(t,"limits_",7)){limits_test(t);puts(t);return 0;}
@@ -3499,7 +3664,7 @@ ptp_cases += ['ptp_zero','ptp_axis1','ptp_axis2']
 ptp_cases += ['ptp_power_stable','ptp_fast_stall']
 ptp_cases += ['limits_ptp','limits_jog','limits_elbow','limits_elbow_traj','limits_elbow_jog']
 ptp_cases += ['rates_ptp','rates_traj','rates_live']
-ptp_cases += ['store_'+n for n in ['roundtrip','capacity','ab','power_loss','write_error','corrupt','load_checks','load_identity','commands','hold','abort','unlinked','write_guard','meta','nodes']]
+ptp_cases += ['store_'+n for n in ['roundtrip','capacity','ab','power_loss','write_error','corrupt','load_checks','load_identity','commands','hold','abort','unlinked','write_guard','meta','nodes','many','full']]
 ptp_cases += ['ptp_final_'+name for name in ['positive','negative','boundary','over_limit','following','counts']]
 ptp_cases += ['ptp_logged_retry']
 ptp_cases += ['traj_rx_'+name for name in ['retry','ready_retry','repeated','stop','timeout','overrun','overflow','break','parity','mixed','heartbeat','holding','fault','encoder','motion']]

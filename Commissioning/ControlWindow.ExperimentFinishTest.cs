@@ -61,7 +61,10 @@ public sealed partial class ControlWindow
         finally {
             beat.Stop(); window.Close(); XYPreviewPanel.RunsRootOverride=previousRoot;
             if (Directory.Exists(root) && Path.GetDirectoryName(Path.GetFullPath(root)) == Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) &&
-                Path.GetFileName(root).StartsWith("arm-finish-heartbeat-",StringComparison.Ordinal)) Directory.Delete(root,true);
+                Path.GetFileName(root).StartsWith("arm-finish-heartbeat-",StringComparison.Ordinal)) {
+                // Best effort: a virus scanner may still hold one of the 5000 files; a leftover temp folder must not fail a passing test.
+                try { Directory.Delete(root,true); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            }
         }
     }
 }

@@ -50,7 +50,9 @@ public sealed partial class ControlWindow
     private byte[][] storeMetaChunks = [];                                // the description of the plan being saved: sent first, then the Save frame
     private int storeMetaNext;
     private bool boardKnown;                                              // a COMPLETE inventory (every slot reported) has arrived on this link
-    private int boardSeen;                                                // bit per slot reported by the query in flight
+    private uint boardSeen;                                               // bit per slot reported by the query in flight (an empty one by TRAJ_DIR)
+    private BoardDir? boardDir;                                           // the archive's size and room, from the last TRAJ_DIR line
+    private uint AllSlots => storeSlotCount >= 32 ? uint.MaxValue : (1u << storeSlotCount) - 1;
     private (ExecutionTrajectory Plan, int Slot, DateTime Since, string Settings)? deferredBoardSave;   // asked while the device was still confirming new speeds
     private StoreStatus? storeStatus;
     private StoreJob? storeJob;
@@ -76,7 +78,7 @@ public sealed partial class ControlWindow
         string? meta = words.FirstOrDefault(w => w.StartsWith("traj_meta=", StringComparison.Ordinal));
         storeMetaMax = storeSlotCount > 0 && meta is not null && int.TryParse(meta.AsSpan(10), out int m) && m > 0 ? Math.Min(m, BoardMeta.MaxBytes) : 0;
         storeReadSupported = storeSlotCount > 0 && words.Contains("traj_read=1");
-        if (storeSlotCount == 0) { boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); Array.Clear(metaFailSeq); Array.Clear(metaFailures); Array.Clear(metaEmpty); }
+        if (storeSlotCount == 0) { boardKnown = false; boardSeen = 0; boardDir = null; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); Array.Clear(metaFailSeq); Array.Clear(metaFailures); Array.Clear(metaEmpty); }
         // The LINK line comes every 500 ms; the panel is only told when what it shows depends on changes (a repeated line that finally
         // carries a token an earlier one lost must reach it too).
         if (storeSlotCount != before || storeMetaMax != metaBefore || storeReadSupported != readBefore) PublishBoard();
@@ -84,14 +86,14 @@ public sealed partial class ControlWindow
 
     private void ResetBoard()
     {
-        storeSlotCount = 0; storeMetaMax = 0; storeReadSupported = false; nodeRead = null; wantedPathSlot = null; boardKnown = false; boardSeen = 0; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); Array.Clear(metaFailSeq); Array.Clear(metaFailures); Array.Clear(metaEmpty); storeStatus = null; storeJob = null; storePacket = []; storeResend = false;
+        storeSlotCount = 0; storeMetaMax = 0; storeReadSupported = false; nodeRead = null; wantedPathSlot = null; boardKnown = false; boardSeen = 0; boardDir = null; Array.Clear(boardSlots); Array.Clear(boardMeta); Array.Clear(metaAsked); Array.Clear(metaFailSeq); Array.Clear(metaFailures); Array.Clear(metaEmpty); storeStatus = null; storeJob = null; storePacket = []; storeResend = false;
         pendingBoardSave = null; deferredBoardSave = null; loadingSlot = null; boardMessage = null; lastBoardQueryAt = default;
         lock (wireSync) { if (pendingControlType is 12 or 14) pendingControlType = 0; storeMetaChunks = []; storeMetaNext = 0; }
         PublishBoard();
     }
 
     private void PublishBoard() => xyPreview.SetBoard(storeSlotCount, boardKnown, storeJob is { Op: StoreOp.Save or StoreOp.Erase } || pendingBoardSave is not null || deferredBoardSave is not null,
-        boardSlots, BoardLedger.Merge(boardSlots, boardMeta, boardLedger), boardMessage, storeReadSupported);
+        boardSlots, BoardLedger.Merge(boardSlots, boardMeta, boardLedger), boardMessage, storeReadSupported, boardDir, storeMetaMax);
     private void SetBoardMessage(Func<string>? message) { boardMessage = message; PublishBoard(); }
 
     private bool StartStoreJob(StoreOp op, int slot, Action<bool, Func<string>>? done, int first = 0)
@@ -105,7 +107,9 @@ public sealed partial class ControlWindow
             // A save that carries a description sends it first (type 14, one chunk per frame); the Save frame follows the last chunk.
             storeRequestOp = op; storeRequestSlot = slot; storeRequestFirst = first; storePacket = []; storeResend = false; storeMetaNext = 0;
             pendingControlType = storeMetaChunks.Length > 0 ? (byte)14 : (byte)12;
-            if (op == StoreOp.Query) boardSeen = 0;   // only a query that reports every slot completes the inventory
+            // Only a query that reports every slot (the empty ones through its own TRAJ_DIR) completes the inventory: an older directory line
+            // must not complete it when this one is lost.
+            if (op == StoreOp.Query) { boardSeen = 0; boardDir = null; }
         }
         Append($"HOST archive request {op} slot={(slot < 0 ? "all" : slot.ToString())}");
         PublishBoard();
@@ -147,7 +151,7 @@ public sealed partial class ControlWindow
         if (!StoreAvailable || storeJob is not null || pendingBoardSave is not null || (now - lastBoardQueryAt).TotalSeconds < (boardKnown ? 0.3 : 3)) return;
         if (PointBusy || homing || keyboardMask != 0 || mouseMask != 0 || ptp is not { Active: 0 }) return;
         if (!boardKnown) { lastBoardQueryAt = now; StartStoreJob(StoreOp.Query, -1, null); return; }
-        // Then the descriptions the slots carry, one slot per query (four at once would not fit the device's text queue), every valid slot:
+        // Then the descriptions the slots carry, one slot per query (several at once would not fit the device's text queue), every valid slot:
         // nothing on the slot line says whether it has one, and a line that is lost must not hide a description.  Each is asked for once
         // per save counter, so a slot that cannot be read does not keep the link busy.
         if (storeMetaMax == 0) return;
@@ -212,12 +216,31 @@ public sealed partial class ControlWindow
                 // The save counter alone does not name a plan: erasing a slot and saving into it starts it at 1 again.  An emptied slot, or one
                 // whose counter or plan changed, loses what was known about its description.
                 if (!slot.Valid || boardSlots[slot.Slot] is { } before && (before.Seq != slot.Seq || before.Crc != slot.Crc)) ForgetMeta(slot.Slot);
-                boardSlots[slot.Slot] = slot; boardSeen |= 1 << slot.Slot;
-                if (boardSeen == (1 << storeSlotCount) - 1) boardKnown = true;
+                boardSlots[slot.Slot] = slot; boardSeen |= 1u << slot.Slot;
+                if (boardDir is not null && boardSeen == AllSlots) boardKnown = true;
                 if (storeJob is { } q) q.LastSeenAt = DateTime.UtcNow;
                 PublishBoard();
             }
             else Append("HOST malformed or unexpected archive slot line", LogLevel.Warning);
+            return;
+        }
+        // The answer to a query for all slots starts with the archive's size and the slots that hold a plan; only those send a TRAJ_SLOT line,
+        // so the others are known to be empty from here.
+        if (line.StartsWith("TRAJ_DIR ", StringComparison.Ordinal))
+        {
+            if (BoardDir.Parse(line) is { } dir && dir.Max == storeSlotCount && storeJob is { Op: StoreOp.Query } query)
+            {
+                boardDir = dir; query.LastSeenAt = DateTime.UtcNow;
+                for (int i = 0; i < storeSlotCount; i++)
+                {
+                    if ((dir.Mask >> i & 1) != 0) continue;
+                    if (boardSlots[i] is { Valid: true }) ForgetMeta(i);
+                    boardSlots[i] = new BoardSlot(i, false, 0, 0, 0, 0, 0, 0); boardSeen |= 1u << i;
+                }
+                if (boardSeen == AllSlots) boardKnown = true;
+                PublishBoard();
+            }
+            else Append("HOST malformed or unexpected archive inventory line", LogLevel.Warning);
             return;
         }
         if (line.StartsWith("TRAJ_NODES ", StringComparison.Ordinal)) { TakeNodes(line); return; }
@@ -244,7 +267,7 @@ public sealed partial class ControlWindow
             FinishStoreJob(ok, () => ok ? "" : Lang.T("board.err.device", status.Last));
         }
         else if (line.StartsWith("TRAJ_STORE refused:", StringComparison.Ordinal) && !job.Acked)
-            FinishStoreJob(false, () => Lang.T("board.err.refused", line[19..].Trim()));
+            FinishStoreJob(false, line.EndsWith("archive full", StringComparison.Ordinal) ? () => Lang.T("board.err.full") : () => Lang.T("board.err.refused", line[19..].Trim()));
     }
 
     // ---- what the panel asks for ----------------------------------------------------------------------------------------
@@ -552,16 +575,19 @@ public sealed partial class ControlWindow
             var again = Next(12);
             Check(sent12 == before + writesPerFrame && writesPerFrame > 0 && again is not null && again.AsSpan().SequenceEqual(frame) && w.storeJob.Sequence == seq,
                 $"the retry must be the identical packet, sent once (sent {sent12 - before} write calls for {writesPerFrame}, same bytes {again is not null && again.AsSpan().SequenceEqual(frame)}, seq {w.storeJob.Sequence}/{seq})");
-            // The slots, then the status that ends it.  A status for another sequence is not ours.
-            w.HandleLine("TRAJ_SLOT slot=0 valid=0");
-            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=2 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746");
-            w.HandleLine("TRAJ_SLOT slot=2 valid=0");
-            Check(!w.boardKnown && TrajectoryArchive.FreeSlot(w.boardSlots, w.storeSlotCount) == 0, "a partial inventory was taken as complete");
-            w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            // The archive's size and the held slots, then their lines, then the status that ends it.  A status for another sequence is not ours.
+            w.HandleLine("TRAJ_DIR gen=5 records=1 max=4 used_rows=12 free_rows=243 data_rows=255 row_bytes=256 mask=00000003");
+            Check(w.boardDir is null, "an inventory line that does not add up was taken");
+            w.HandleLine("TRAJ_DIR gen=5 records=1 max=4 used_rows=12 free_rows=243 data_rows=255 row_bytes=256 mask=00000002");
+            Check(!w.boardKnown && w.boardDir is { FreeRows: 243 } && TrajectoryArchive.FreeSlot(w.boardSlots, w.storeSlotCount) == 0, "a partial inventory was taken as complete");
+            Check(w.xyPreview.BoardNoteText.Contains("读取"), "the panel showed a half-read inventory: " + w.xyPreview.BoardNoteText);
+            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=2 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746 rows=12");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={seq + 5} last=none last_slot=0 row_max_us=0");
             Check(w.storeJob is not null, "a status for another command ended the job");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={seq} last=none last_slot=0 row_max_us=0");
-            Check(w.storeJob is null && w.boardKnown && w.boardSlots[1] is { Valid: true, Crc: 0xBD3EB746 } && w.boardSlots[0] is { Valid: false }, "the query answer was not taken");
+            Check(w.storeJob is null && w.boardKnown && w.boardSlots[1] is { Valid: true, Crc: 0xBD3EB746, Rows: 12 } && w.boardSlots[0] is { Valid: false } && w.boardSlots[3] is { Valid: false }, "the query answer was not taken");
+            // The panel lists only the held slots, then how much of the flash they take.
+            Check(w.xyPreview.BoardNoteText.Contains("槽2：") && !w.xyPreview.BoardNoteText.Contains("槽1：") && w.xyPreview.BoardNoteText.Contains("板上图形 1/4 · 已用 3 KB / 63.8 KB"), "the panel's archive summary: " + w.xyPreview.BoardNoteText);
             // The LINK line repeats every 500 ms: with nothing changed the panel's controls are not rebuilt.
             int rebuilds = w.xyPreview.BoardRebuilds;
             w.HandleLine(Link(" traj_store=4 telem_hz=0")); w.HandleLine(Link(" traj_store=4 telem_hz=0"));
@@ -619,8 +645,15 @@ public sealed partial class ControlWindow
             w.HandleLine(Link(" traj_store=2 telem_hz=0"));
             Check(w.storeSlotCount == 2, "a smaller slot count was not read");
             w.StartStoreJob(StoreOp.Query, -1, null); Next(12);
-            w.HandleLine("TRAJ_SLOT slot=0 valid=0"); w.HandleLine("TRAJ_SLOT slot=1 valid=0"); w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            w.HandleLine("TRAJ_DIR gen=5 records=0 max=4 used_rows=0 free_rows=255 data_rows=255 row_bytes=256 mask=00000000");
+            Check(!w.boardKnown && w.boardDir is null, "an inventory for another slot count was taken");
+            w.HandleLine("TRAJ_DIR gen=5 records=0 max=2 used_rows=0 free_rows=255 data_rows=255 row_bytes=256 mask=00000000"); w.HandleLine("TRAJ_SLOT slot=3 valid=0");
             Check(w.boardKnown && w.boardSlots[3] is null, "the advertised slot count was not honoured");
+            // The next inventory needs its own directory line: slot lines for every slot do not complete it with the old one.
+            w.FinishStoreJob(true, () => ""); w.FinishStoreJob(true, () => "");
+            w.boardKnown = false; w.StartStoreJob(StoreOp.Query, -1, null); Next(12);
+            w.HandleLine("TRAJ_SLOT slot=0 valid=0"); w.HandleLine("TRAJ_SLOT slot=1 valid=0");
+            Check(!w.boardKnown && w.boardDir is null, "an inventory whose directory line was lost was completed with the previous one");
             w.ResetBoard();
             Check(w.storeSlotCount == 0 && !w.boardKnown && w.boardSlots.All(s => s is null) && w.pendingBoardSave is null && w.pendingControlType == 0, "the board state survived a reset");
         }
@@ -661,10 +694,9 @@ public sealed partial class ControlWindow
             w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(10));
             Check(w.storeJob is { Op: StoreOp.Query }, "no inventory query");
             Pump(); uint querySeq = w.storeJob!.Sequence;
-            w.HandleLine("TRAJ_SLOT slot=0 valid=0");
-            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=2 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8}");
-            w.HandleLine("TRAJ_SLOT slot=2 valid=1 seq=1 nodes=9 duration_ms=900 q1=0 q2=0 crc=11111111");
-            w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            w.HandleLine("TRAJ_DIR gen=5 records=2 max=4 used_rows=2 free_rows=253 data_rows=255 row_bytes=256 mask=00000006");
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=2 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8} rows=1");
+            w.HandleLine("TRAJ_SLOT slot=2 valid=1 seq=1 nodes=9 duration_ms=900 q1=0 q2=0 crc=11111111 rows=1");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={querySeq} last=none last_slot=0 row_max_us=0");
             Check(w.boardKnown && w.storeJob is null, "the inventory was not taken");
             frames.Clear();
@@ -692,7 +724,7 @@ public sealed partial class ControlWindow
             w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(35));
             Check(w.storeJob is null, "a description was asked for twice");
             // The slot is saved again (its counter moves): the old description is not trusted and is asked for again.
-            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8}");
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8} rows=1");
             w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(40));
             Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 } && w.boardMeta[1] is null, "a slot saved again was not asked again");
             // A read whose long line was lost (the status arrives, the description does not) is not a read: tried again like a failed one.
@@ -715,7 +747,7 @@ public sealed partial class ControlWindow
             // old plan's description carries over, and the new one is read.
             w.HandleLine("TRAJ_SLOT slot=1 valid=0");
             Check(w.boardMeta[1] is null && w.metaAsked[1] is null && w.metaFailures[1] == 0, "an emptied slot kept what was known about its description");
-            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8}");
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8} rows=1");
             w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(110));
             Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 }, "a slot written anew (same save counter) was not asked for its description");
             Pump();
@@ -723,9 +755,9 @@ public sealed partial class ControlWindow
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
             Check(w.storeJob is null && w.boardMeta[1] is { Seq: 3 } && w.boardMeta[1]!.Text == text, "the description of the new plan was not read");
             // The same counter with another plan, without the empty state ever being seen, also drops it.
-            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc=22222222");
+            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc=22222222 rows=1");
             Check(w.boardMeta[1] is null && w.metaAsked[1] is null, "a slot that came back as another plan kept the old description");
-            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8}");
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=3 nodes=4 duration_ms=250 q1=0 q2=0 crc={planCrc:X8} rows=1");
 
             // A save carries its description: chunks first (type 14, consecutive numbers), the Save frame after the last one.
             frames.Clear();
@@ -816,9 +848,8 @@ public sealed partial class ControlWindow
             Check(w.xyPreview.BoardCanRead, "a capability that arrived on a repeated LINK line (same slot count) did not reach the panel");
             Pump();
             w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(10)); Pump(); uint query = w.storeJob!.Sequence;
-            w.HandleLine("TRAJ_SLOT slot=0 valid=0");
-            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=2 nodes={total} duration_ms={ms} q1=0 q2=3000 crc={crc:X8}");
-            w.HandleLine("TRAJ_SLOT slot=2 valid=0"); w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            w.HandleLine($"TRAJ_DIR gen=5 records=1 max=4 used_rows={TrajectoryArchive.RowsFor(total, 0)} free_rows={255 - TrajectoryArchive.RowsFor(total, 0)} data_rows=255 row_bytes=256 mask=00000002");
+            w.HandleLine($"TRAJ_SLOT slot=1 valid=1 seq=2 nodes={total} duration_ms={ms} q1=0 q2=3000 crc={crc:X8} rows={TrajectoryArchive.RowsFor(total, 0)}");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={query} last=none last_slot=0 row_max_us=0");
             Check(w.boardKnown && w.storeJob is null, "the inventory was not taken");
             Check(w.xyPreview.RecentListText.Contains("槽2：别处存的图形"), "the undescribed slot is not a row: " + w.xyPreview.RecentListText);
@@ -924,9 +955,8 @@ public sealed partial class ControlWindow
             w.HandleLine(Link(" traj_meta=256 traj_read=1 traj_store=4 telem_hz=0"));
             Pump();
             w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(10)); Pump(); uint query = w.storeJob!.Sequence;
-            w.HandleLine("TRAJ_SLOT slot=0 valid=0");
-            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=2 nodes=100 duration_ms=9900 q1=0 q2=3000 crc=0000ABCD");
-            w.HandleLine("TRAJ_SLOT slot=2 valid=0"); w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            w.HandleLine("TRAJ_DIR gen=5 records=1 max=4 used_rows=3 free_rows=252 data_rows=255 row_bytes=256 mask=00000002");
+            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=2 nodes=100 duration_ms=9900 q1=0 q2=3000 crc=0000ABCD rows=3");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={query} last=none last_slot=0 row_max_us=0");
             Check(w.boardKnown && w.storeJob is null, "the inventory was not taken");
             // The periodic description read is running when the click comes: the request waits, and runs when the read has ended.
@@ -940,7 +970,7 @@ public sealed partial class ControlWindow
             w.ResetControlTransport();   // STOP ends the read
             Check(w.nodeRead is null && w.storeJob is null, "STOP left the read");
             // The slot is written again (its counter moves); the description read starts, the request waits, and STOP drops the request.
-            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=100 duration_ms=9900 q1=0 q2=3000 crc=0000ABCD");
+            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=100 duration_ms=9900 q1=0 q2=3000 crc=0000ABCD rows=3");
             w.SynchronizeBoard(DateTime.UtcNow.AddSeconds(30)); Pump();
             Check(w.storeJob is { Op: StoreOp.Meta, Slot: 1 }, "the description read of the rewritten slot did not start");
             w.RequestBoardPath(1);
@@ -958,9 +988,8 @@ public sealed partial class ControlWindow
             Check(!w.boardKnown && w.wantedPathSlot == 1 && w.storeJob is null, "the waiting path was dropped by an inventory that did not complete");
             w.lastBoardQueryAt = default; w.SynchronizeBoard(DateTime.UtcNow); Pump();   // (real time: the request has not been waiting long)
             Check(w.storeJob is { Op: StoreOp.Query }, "the incomplete inventory was not read again");
-            w.HandleLine("TRAJ_SLOT slot=0 valid=0");
-            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=100 duration_ms=9900 q1=0 q2=3000 crc=0000ABCD");
-            w.HandleLine("TRAJ_SLOT slot=2 valid=0"); w.HandleLine("TRAJ_SLOT slot=3 valid=0");
+            w.HandleLine("TRAJ_DIR gen=5 records=1 max=4 used_rows=3 free_rows=252 data_rows=255 row_bytes=256 mask=00000002");
+            w.HandleLine("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=100 duration_ms=9900 q1=0 q2=3000 crc=0000ABCD rows=3");
             w.HandleLine($"TRAJ_STORE state=idle slot=0 rows=0/0 seq={w.storeJob!.Sequence} last=none last_slot=0 row_max_us=0");
             Check(w.boardKnown && w.wantedPathSlot is null && w.storeJob is { Op: StoreOp.Meta or StoreOp.Nodes }, "the waiting path did not start once the inventory was complete: " + $"known={w.boardKnown} wanted={w.wantedPathSlot} job={w.storeJob?.Op} nodeRead={w.nodeRead is not null} busy={w.PointBusy} avail={w.StoreAvailable} msg={w.boardMessage?.Invoke()}");
             w.ResetControlTransport();
@@ -1000,9 +1029,8 @@ public sealed partial class ControlWindow
             w.TestLine($"LINK fw=stage2-v7-absolute-q2 proto={DeviceContract.ProtocolVersion} motion_rates=1 joint_limits=1 traj_read=1 traj_store=4");
             w.TestLine($"TELEM t=10 epoch=4 seq=1 ref=1 source=2 p1={ExecutionTrajectory.Counts(0, start)} p2={ExecutionTrajectory.Counts(1, start)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
             w.TestLine("INPUTS: J4-1/P0[4]=1 J4-2/P0[3]=1 NPN/P1[0]=1 nFAULT=1");
-            w.TestLine("TRAJ_SLOT slot=0 valid=0");
-            w.TestLine($"TRAJ_SLOT slot=1 valid=1 seq=2 nodes={total} duration_ms={ms} q1=0 q2=0 crc={crc:X8}");
-            w.TestLine("TRAJ_SLOT slot=2 valid=0"); w.TestLine("TRAJ_SLOT slot=3 valid=0");
+            w.TestLine($"TRAJ_DIR gen=5 records=1 max=4 used_rows={TrajectoryArchive.RowsFor(total, 0)} free_rows={255 - TrajectoryArchive.RowsFor(total, 0)} data_rows=255 row_bytes=256 mask=00000002");
+            w.TestLine($"TRAJ_SLOT slot=1 valid=1 seq=2 nodes={total} duration_ms={ms} q1=0 q2=0 crc={crc:X8} rows={TrajectoryArchive.RowsFor(total, 0)}");
             if (w.storeJob is { } initial) { initial.Sequence = 30; w.TestLine("TRAJ_STORE state=idle slot=0 rows=0/0 seq=30 last=none last_slot=0 row_max_us=0"); }
             Check(w.boardKnown && w.storeJob is null && w.storeReadSupported, "the inventory was not taken");
             uint fake = 40;
@@ -1056,7 +1084,7 @@ public sealed partial class ControlWindow
             w.TestLine($"TELEM t=10 epoch=4 seq=1 ref=1 source=2 p1={ExecutionTrajectory.Counts(0, start)} p2={ExecutionTrajectory.Counts(1, start)} e1=0 err=0 e2=0 err2=0 inputs=0 drops=0");
             w.TestLine("INPUTS: J4-1/P0[4]=1 J4-2/P0[3]=1 NPN/P1[0]=1 nFAULT=1");
             Check(p.UploadButton.IsEnabled && w.CanPoint, "the fixture is not ready to upload");
-            for (int slot = 0; slot < 4; slot++) w.TestLine($"TRAJ_SLOT slot={slot} valid=0");
+            w.TestLine("TRAJ_DIR gen=5 records=0 max=4 used_rows=0 free_rows=255 data_rows=255 row_bytes=256 mask=00000000");
             // The first LINK line already started the initial query (as it does on a real link); let it finish.
             if (w.storeJob is { } initial) { initial.Sequence = 30; w.TestLine("TRAJ_STORE state=idle slot=0 rows=0/0 seq=30 last=none last_slot=0 row_max_us=0"); }
             Check(w.storeJob is null, "the initial query did not finish");
@@ -1072,12 +1100,12 @@ public sealed partial class ControlWindow
             w.TestLine("TRAJ_STORE state=idle slot=0 rows=1/1 seq=40 last=saved last_slot=0 row_max_us=4000");
             Check(BoardLedger.Load().Any(e => e.Slot == 0 && e.Crc == TrajectoryArchive.PlanCrc(plan.Nodes)) && w.storeJob is { Op: StoreOp.Query } && !w.boardKnown, "the save was not recorded and read back");
             // Until the read-back arrives the old slot contents are not used: no load from a stale entry, no stars, no saves.
-            w.TestLine("TRAJ_SLOT slot=0 valid=1 seq=9 nodes=" + plan.Nodes.Length + " duration_ms=" + plan.Nodes.Sum(n => (int)n.Milliseconds) + " q1=0 q2=0 crc=" + TrajectoryArchive.PlanCrc(plan.Nodes).ToString("X8"));
+            w.TestLine("TRAJ_SLOT slot=0 valid=1 seq=9 nodes=" + plan.Nodes.Length + " duration_ms=" + plan.Nodes.Sum(n => (int)n.Milliseconds) + " q1=0 q2=0 crc=" + TrajectoryArchive.PlanCrc(plan.Nodes).ToString("X8") + " rows=" + TrajectoryArchive.RowsFor(plan.Nodes.Length, 0));
             Check(!w.boardKnown && (string)p.UploadButton.Content == "上传图形", "a half-read inventory was trusted: " + p.UploadButton.Content);
             // The read-back: the device reports the plan in slot 0, and the screen then offers to load it.
             int ms = plan.Nodes.Sum(n => (int)n.Milliseconds);
-            w.TestLine($"TRAJ_SLOT slot=0 valid=1 seq=1 nodes={plan.Nodes.Length} duration_ms={ms} q1={(int)Math.Round(start.Q1 * 100)} q2={(int)Math.Round(start.Q2 * 100)} crc={TrajectoryArchive.PlanCrc(plan.Nodes):X8}");
-            for (int slot = 1; slot < 4; slot++) w.TestLine($"TRAJ_SLOT slot={slot} valid=0");
+            w.TestLine($"TRAJ_DIR gen=6 records=1 max=4 used_rows={TrajectoryArchive.RowsFor(plan.Nodes.Length, 0)} free_rows={255 - TrajectoryArchive.RowsFor(plan.Nodes.Length, 0)} data_rows=255 row_bytes=256 mask=00000001");
+            w.TestLine($"TRAJ_SLOT slot=0 valid=1 seq=1 nodes={plan.Nodes.Length} duration_ms={ms} q1={(int)Math.Round(start.Q1 * 100)} q2={(int)Math.Round(start.Q2 * 100)} crc={TrajectoryArchive.PlanCrc(plan.Nodes):X8} rows={TrajectoryArchive.RowsFor(plan.Nodes.Length, 0)}");
             w.storeJob!.Sequence = 41;
             w.TestLine("TRAJ_STORE state=idle slot=0 rows=0/0 seq=41 last=saved last_slot=0 row_max_us=4000");
             Check(w.storeJob is null && TrajectoryArchive.SlotFor(w.boardSlots, plan.Nodes) is { Slot: 0 } && (string)p.UploadButton.Content == "从板上加载", "the plan on the board was not recognised: " + p.UploadButton.Content);

@@ -50,7 +50,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Firmware build failed; see $dest\firmware-build.log" }
     # The archive lives in flash that only cm3gcc_trajstore.ld keeps free of program code: prove this image was linked with it.
     $map = Get-Content -LiteralPath 'DRV8825.cydsn\CortexM3\ARM_GCC_541\Debug\DRV8825.map' -Raw
-    if ($map -notmatch '0x00020000\s+__trajstore_start' -or $map -notmatch '(?m)^store\s+0x00020000\s+0x0001a000') { throw 'Firmware was not linked with cm3gcc_trajstore.ld (Project > Build Settings > Linker > Custom Linker Script); see docs\TRAJ_STORE.md.' }
+    if ($map -notmatch '0x00020000\s+__trajstore_start' -or $map -notmatch '(?m)^store\s+0x00020000\s+0x00020000') { throw 'Firmware was not linked with cm3gcc_trajstore.ld (Project > Build Settings > Linker > Custom Linker Script); see docs\TRAJ_STORE.md.' }
     & (Join-Path $repo 'verify-creator-pins.ps1') -NamedInstances -HardwareUart *> (Join-Path $dest 'pin-checks.log')
     python -B tests/test_verify_creator_pins.py *> (Join-Path $dest 'pin-regression-tests.log')
     if ($LASTEXITCODE -ne 0) { throw 'Pin rejection regression failed.' }
@@ -71,7 +71,7 @@ try {
         Arm1AccelMax = 'CFG_ACCEL_MAX_AXIS1'; Arm2AccelMax = 'CFG_ACCEL_MAX_AXIS2'
         PlanRateMax = 'PTP_RATE_MAX', 'TRAJ_RATE_MAX'; PlanAccelMax = 'PTP_ACCEL', 'TRAJ_ACCEL_MAX'; HomeSlowRate = 'HOME_SLOW_RATE_USTEP_S'
         TrajCapacity = 'TRAJ_CAPACITY'; TrajNodeMinMs = 'TRAJ_NODE_MIN_MS'; TrajNodeMaxMs = 'TRAJ_NODE_MAX_MS'
-        TrajTotalMaxMs = 'TRAJ_TOTAL_MAX_MS'; TrajStoreSlots = 'TS_SLOTS'; JointLimitCdMax = 'CFG_JOINT_CD_MAX'; ElbowDefaultCd = 'PTP_ELBOW_DEFAULT_CD'; TelemRateMin = 'TELEM_HZ_MIN'; TelemRateMax = 'TELEM_HZ_MAX'; DeadmanMs = 'JOG_DEADMAN_MS'; ProtocolVersion = 'PROTO_VERSION'
+        TrajTotalMaxMs = 'TRAJ_TOTAL_MAX_MS'; TrajStoreSlots = 'TS_SLOTS'; TrajRecordHeadBytes = 'TS_REC_HEAD'; JointLimitCdMax = 'CFG_JOINT_CD_MAX'; ElbowDefaultCd = 'PTP_ELBOW_DEFAULT_CD'; TelemRateMin = 'TELEM_HZ_MIN'; TelemRateMax = 'TELEM_HZ_MAX'; DeadmanMs = 'JOG_DEADMAN_MS'; ProtocolVersion = 'PROTO_VERSION'
     }
     $hostValues = @{}
     foreach ($line in Get-Content -LiteralPath $contractFile) { $name, $value = $line -split '=', 2; $hostValues[$name] = [int]$value }

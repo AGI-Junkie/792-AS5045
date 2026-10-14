@@ -1,4 +1,4 @@
-# 上位机 ↔ 固件 通信协议（stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta6-read1-guards2，proto=5）
+# 上位机 ↔ 固件 通信协议（stage2-v11-r5000-slip-mref2-ssififo-upstat1-store32v2-meta6-read1-guards2，proto=6）
 
 本页只写当前源码里**已经存在**的行为，均已对照 `DRV8825.cydsn/main.c` 与 `Commissioning/` 核对；有出入以源码为准。设计过程和现场日志分析见 `docs/history/WORKBENCH_HARDENING.md`。状态机见 [STATE_MODEL.md](STATE_MODEL.md)。
 
@@ -27,8 +27,8 @@
 | 9 | 关节范围 | q1 = 最小，q2 = 最大（0.01°，−18000…0…18000，最小 < 最大）；value = 轴号：0 = q1，1 = q2，**2 = 肘（q2 − q1，即电机 2 自己的转角）** | 控制 |
 | 10 | 速度/加速度 | q1 = 最大速度（两轴均为 20…4000 微步/秒）；q2 = 加速度（轴 0：100…20000，轴 1：100…12000 微步/秒²）；value = 轴号 | 控制 |
 | 11 | 遥测速率 | q1 = q2 = 0；value = 每秒流式 `TELEM` 行数：0（只在状态块里带）或 5…20 | 控制 |
-| 12 | 轨迹存档（Flash） | q1 = 槽位 0…3（只有查询可用 `-1` = 全部）；q2 = 操作：1 查询、2 把 RAM 里的完整轨迹存入该槽、3 清空该槽、4 读回该槽的描述、5 读回该槽的节点（这两个操作只能指定一个槽）；value 只有操作 5 可以非 0：从第几个节点起 | 控制 |
-| 13 | 从存档加载轨迹 | q1 = 槽位 0…3；q2 = value = 0 | PTP |
+| 12 | 轨迹存档（Flash） | q1 = 槽位 0…31（只有查询可用 `-1` = 全部）；q2 = 操作：1 查询、2 把 RAM 里的完整轨迹存入该槽、3 清空该槽、4 读回该槽的描述、5 读回该槽的节点（这两个操作只能指定一个槽）；value 只有操作 5 可以非 0：从第几个节点起 | 控制 |
+| 13 | 从存档加载轨迹 | q1 = 槽位 0…31；q2 = value = 0 | PTP |
 | 14 | 轨迹描述分块（随后的保存带走它） | q1、q2 = 4 个数据字节（小端）；value = 块号 0…66 | 控制 |
 
 规则（`ptp_accept`、`control_accept`、`joint_limits_accept`、`telem_rate_accept`）：
@@ -37,8 +37,8 @@
 - type 1…5 用 PTP 序号，type 6…11 用控制序号；两组序号各自递增，所以心跳不会打断轨迹节点的连续性。
 - 代次每次作废参考时加一（见 STATE_MODEL）。**唯一的例外**：type 6 心跳只要结构和 CRC 合法，即使代次过期也会续租约——但不应用按键、不接受序号、不执行任何命令；固件随后按 250 ms 节流补发一行 `PTP_EPOCH <n>`。
 - type 11（遥测速率）只改变打印什么，**任何时候都接受**（已使能、运动中、上传中也行），代次、序号、幂等规则同 type 9/10；值非 0 且不在 5…20、角度字段非 0、序号为 0 或过期都拒绝（`TELEM_RATE refused: …`）。接受后回执 `TELEM_RATE epoch seq hz`。
-- type 12/13（轨迹存档，详见 [TRAJ_STORE.md](TRAJ_STORE.md)；LINK 里 `traj_store=<n>` 非 0 才可用）：12 的代次、控制序号、幂等规则同 type 11，但**重发按字节判断**（心跳会不断推进控制序号）；查询、保存、清空都要求静止（无回零、无 PTP、无运行、两轴不动、没有另一个存档任务），保存还要求 RAM 里有一条完整轨迹（`TRAJ_STATE` 为 2 或 4）和一次成功的 `CySetTemp()`，否则 `TRAJ_STORE refused: …`。保存/清空接受后立刻回一行 `TRAJ_STORE state=saving|erasing …`，之后每 8 行写入再报一次，结束时 `state=idle … last=<saved、erased、failed 或 aborted> seq=<该命令的控制序号>`——主机用 `seq` 对上自己的命令。保存期间 `axes_idle()` 为假：PTP、点动、回零、范围/速度配置都被拒；任何停止、使能、换参考、新上传会丢掉 RAM 轨迹，保存随即 `aborted`，正在写的块保持无效，旧存档不动。type 13 走 PTP 序号和全部 PTP 前置条件（已使能、已回零或人工参考、静止），**还要求两轴正好在存档轨迹的起点**；它只用来填 `g_traj`：节点逐个过 `traj_begin`/`traj_push` 和当前的关节范围、速度、加速度，任何一项不满足就 `PTP refused: archived plan does not fit the current limits` 并清空 RAM 轨迹。成功后回 `TRAJ_LOAD …` 和 `TRAJ_STATE state=2 …`，之后和上传完成一样等 type 4 RUN（序号 = 加载命令的序号 + 1）。
-- type 14（轨迹描述，`LINK` 里 `traj_meta=<n>` 非 0 才可用；格式见 [TRAJ_STORE.md](TRAJ_STORE.md) 第 5a 节）：上位机在保存前发来最多 256 字节的文本（它做这幅图用的设置），设备**不解读、只保管**，随后的 type 12 保存把它和轨迹一起写进同一个存档块。描述按 4 字节一块发送，块号在 `value`；流是 `长度 u16, 0 u16, 文本 CRC-32 u32, 轨迹节点流 CRC-32 u32, 文本`。控制序号、代次规则同 type 11；**每块没有回执**（丢了也不要紧：保存时设备核对），出错只回 `TRAJ_META refused: stale epoch|arguments`（保存进行中不收）。块 0 开始一份新描述。保存时：从没发过描述就照旧保存（没有描述）；发了但不全、CRC 不对，回 `TRAJ_STORE refused: description incomplete` 且什么都不写（同时丢掉这份描述；字节完全相同的保存再发一次——比如拒绝的回执丢了——得到同样的拒绝，不会变成一次没有描述的成功保存，要先重发整份描述、再用新的序号保存）；描述里的轨迹 CRC 与实际写入的节点流不符，保存失败（`TRAJ_STORE failed: the description is not for this plan`），旧槽不动。描述只用一次：任何一次存档任务结束（成功、失败、中止）就丢掉；任何一次被拒绝的保存（不论原因）也会把它带走；它属于紧跟其后的那次保存（中间只有心跳）：之后来的是别的存档命令（上位机等不到保存的回执而放弃、改发查询），或 15 秒内没有保存到达，它就作废；它也只在发送它的那个参考代次里有效，停止、使能、新参考或上位机中途离开（代次一变）就作废，所以不会混进别的会话或别的上位机之后的保存。type 12 的 q2 = 4 读回一个槽的描述，回一行 `TRAJ_META …`（没有描述回 `TRAJ_META slot=<n> len=0`），之后照例跟一行 `TRAJ_STORE`；一次只读一个槽，四个槽的十六进制行放不进 2 KB 的文本发送队列。
+- type 12/13（轨迹存档，详见 [TRAJ_STORE.md](TRAJ_STORE.md)；LINK 里 `traj_store=<n>` 非 0 才可用）：12 的代次、控制序号、幂等规则同 type 11，但**重发按字节判断**（心跳会不断推进控制序号）；查询、保存、清空都要求静止（无回零、无 PTP、无运行、两轴不动、没有另一个存档任务），保存还要求 RAM 里有一条完整轨迹（`TRAJ_STATE` 为 2 或 4）、存档里放得下它（按行计，替换同一槽时它原来的行算可用；放不下回 `TRAJ_STORE refused: archive full`，什么都不写）和一次成功的 `CySetTemp()`，否则 `TRAJ_STORE refused: …`。清空一个本来就空的槽不写 Flash，直接回 `last=erased`。查询全部槽（q1 = -1）先回一行 `TRAJ_DIR …`，再**每个前台循环发一行**有图形的槽的 `TRAJ_SLOT`（32 行一次放不进 2 KB 的文本队列），最后才是 `TRAJ_STORE` 回执；空槽不发行，由 `TRAJ_DIR` 的 `mask` 说明。保存/清空都把整个存档在另一个区重写一遍（见 TRAJ_STORE.md），接受后立刻回一行 `TRAJ_STORE state=saving|erasing …`，之后每 8 行写入再报一次，结束时 `state=idle … last=<saved、erased、failed 或 aborted> seq=<该命令的控制序号>`——主机用 `seq` 对上自己的命令。保存期间 `axes_idle()` 为假：PTP、点动、回零、范围/速度配置都被拒；任何停止、使能、换参考、新上传会丢掉 RAM 轨迹，保存随即 `aborted`，正在写的区不提交，旧存档不动；正在发送的全部槽清单被保存/清空打断（主机会重新查询）。type 13 走 PTP 序号和全部 PTP 前置条件（已使能、已回零或人工参考、静止），**还要求两轴正好在存档轨迹的起点**；它只用来填 `g_traj`：节点逐个过 `traj_begin`/`traj_push` 和当前的关节范围、速度、加速度，任何一项不满足就 `PTP refused: archived plan does not fit the current limits` 并清空 RAM 轨迹。成功后回 `TRAJ_LOAD …` 和 `TRAJ_STATE state=2 …`，之后和上传完成一样等 type 4 RUN（序号 = 加载命令的序号 + 1）。
+- type 14（轨迹描述，`LINK` 里 `traj_meta=<n>` 非 0 才可用；格式见 [TRAJ_STORE.md](TRAJ_STORE.md) 第 5a 节）：上位机在保存前发来最多 256 字节的文本（它做这幅图用的设置），设备**不解读、只保管**，随后的 type 12 保存把它和轨迹一起写进同一个存档块。描述按 4 字节一块发送，块号在 `value`；流是 `长度 u16, 0 u16, 文本 CRC-32 u32, 轨迹节点流 CRC-32 u32, 文本`。控制序号、代次规则同 type 11；**每块没有回执**（丢了也不要紧：保存时设备核对），出错只回 `TRAJ_META refused: stale epoch|arguments`（保存进行中不收）。块 0 开始一份新描述。保存时：从没发过描述就照旧保存（没有描述）；发了但不全、CRC 不对，回 `TRAJ_STORE refused: description incomplete` 且什么都不写（同时丢掉这份描述；字节完全相同的保存再发一次——比如拒绝的回执丢了——得到同样的拒绝，不会变成一次没有描述的成功保存，要先重发整份描述、再用新的序号保存）；描述里的轨迹 CRC 与实际写入的节点流不符，保存失败（`TRAJ_STORE failed: the description is not for this plan`），旧槽不动。描述只用一次：任何一次存档任务结束（成功、失败、中止）就丢掉；任何一次被拒绝的保存（不论原因）也会把它带走；它属于紧跟其后的那次保存（中间只有心跳）：之后来的是别的存档命令（上位机等不到保存的回执而放弃、改发查询），或 15 秒内没有保存到达，它就作废；它也只在发送它的那个参考代次里有效，停止、使能、新参考或上位机中途离开（代次一变）就作废，所以不会混进别的会话或别的上位机之后的保存。type 12 的 q2 = 4 读回一个槽的描述，回一行 `TRAJ_META …`（没有描述回 `TRAJ_META slot=<n> len=0`），之后照例跟一行 `TRAJ_STORE`；一次只读一个槽，几个槽的十六进制行就放不进 2 KB 的文本发送队列。
 - type 12 的 q2 = 5（`LINK` 里 `traj_read=1` 才可用）读回一个槽的轨迹节点，用来在别的电脑上画出板上真实存的路径，不运动：`value` 是起始节点号，设备回一行 `TRAJ_NODES slot=<n> seq=<u32> total=<n> first=<i> count=<k> hex=<…>`（`k` 最多 40，即最多 480 个十六进制字符；`hex` 是 `k` 个节点按存的原样，每点 q1、q2、ms 各 16 位小端，共 6 字节），之后照例跟一行 `TRAJ_STORE`；起始号不小于点数或槽无效回 `TRAJ_NODES slot=<n> count=0`。要求和查询一样静止；除操作 5 外 `value` 非 0 仍被拒绝；一次要求只回一行，所以 2048 点要 52 次请求，主机逐个发、逐个等回执（重发同样的字节只是再答一次）。`seq` 是该槽的保存次数：主机读到一半发现它变了就放弃，读完后用整个节点流对槽的 CRC、点数和总时长核对，不符不显示。
 - type 9（范围；三个轴同一规则）只在未使能、无参考、无运动、无缓存轨迹时接受。**肘范围另外作用于运动**：PTP 单点、轨迹 BEGIN/NODE 的目标 q2 − q1 必须在肘范围内（否则 `PTP refused: joint range/rate`），当前位置不在范围内时拒绝新的 PTP，运动中越界则 `STOP: PTP time/joint limit`，点动在肘边界上拒绝继续向外的步进（只能退回）。肘范围是电机 2 的行程，不受 q1 影响，所以 arm1 点动不受它限制。type 10（速度/加速度）在此之外，**已使能、有参考、静止时也接受**（`LINK` 含 `rates_live=1`）；回零、两轴任何一轴在动或在稳定、PTP/轨迹运行或上传中、上传隔离期间一律拒绝（`PTP_LIMITS refused: moving, homing or uploading`）。设备已缓存的轨迹是按旧速度检查过的：type 10 的数值有变化时丢弃它（日志 `TRAJ held plan dropped`，随后 `TRAJ_STATE state=0`），数值没变则保留；上位机据此要重新上传。写入后由 `PTP_LIMITS`/`PTP_RATES` 回执和 `PTP_STATE`/`MOTION_RATES` 确认。
 
@@ -79,10 +79,11 @@
 | `PTP_RX short_ok drop_crc drop_short drop_timeout rejected epoch_rejected last_rejected_byte` | 协议层丢帧/拒绝计数；`rx_error` 只统计 UART 级故障 |
 | `TELEM t epoch seq ref source p1 p2 e1 err e2 err2 inputs drops` | 位置遥测：`p1/p2` 指令微步，`e1/e2` 两路相对参考的电机轴累计 LSB（逆时针正）；`e2` 是肘而不是绝对 q2，q2=q1+e2×360/(4096×51.06)。`err/err2` 两路原始编码器方向的跟随误差。`ref=1` 要求两路都有效且方向已识别。默认只随 500 ms 状态块出现（约 2 Hz）；type 11 设为 5…20 Hz 后，**已使能期间**另外按该速率单独发送，格式不变。`seq` 是设备最后接受的序号，**收下一条指令（上传的每个节点、RUN）就立刻前进**，而 `PTP_STATE` 仍是每 500 ms 一条：所以流式 `TELEM` 的 `seq` 可以领先主机最近一条 `PTP_STATE`。主机把“`seq` 大于 `PTP_STATE` 的、但不超过自己已发出的最大序号”当作正常（照常使用，只是还不算“已稳定”，`AtStart` 等要等 `PTP_STATE` 追上）；`seq` 落后、超过自己发出过的、或 `epoch` 不同才按“设备反馈无效”处理并停止 |
 | `TELEM_RATE epoch seq hz` | type 11 的回执；`LINK` 里的 `telem_hz=` 是当前值 |
-| `TRAJ_SLOT slot=<n> valid=0` / `TRAJ_SLOT slot=<n> valid=1 seq=<u32> nodes=<n> duration_ms=<n> q1=<cd> q2=<cd> crc=<8位大写十六进制>` | type 12 查询的结果（每槽一行，之后跟一行 `TRAJ_STORE`）。`valid=1` 表示头和数据 CRC 都过；`seq` 是该槽的保存次数；`q1/q2` 是起点；`crc` 是节点字节流（每点 q1、q2、ms 各 16 位小端，共 6 字节）的 CRC-32/IEEE，主机对自己的计划算同一个值就能认出“这条图形已经存在板上” |
+| `TRAJ_DIR gen=<u32> records=<n> max=<n> used_rows=<n> free_rows=<n> data_rows=<n> row_bytes=256 mask=<8位大写十六进制>` | 查询全部槽的第一行：存档代次、有效份数、最多份数（= `traj_store`）、已用/剩余/总共的记录行（每行 256 字节）、哪些槽有图形（第 n 位 = 槽 n）。之后只有 `mask` 里的槽各发一行 `TRAJ_SLOT` |
+| `TRAJ_SLOT slot=<n> valid=0` / `TRAJ_SLOT slot=<n> valid=1 seq=<u32> nodes=<n> duration_ms=<n> q1=<cd> q2=<cd> crc=<8位大写十六进制> rows=<n>` | type 12 查询的结果（单槽查询一行加一行 `TRAJ_STORE`；全部槽查询见 `TRAJ_DIR`）。`seq` 是这幅图写入时的存档代次，换了图就变、不会重复；`rows` 是它占的 Flash 行数；`q1/q2` 是起点；`crc` 是节点字节流（每点 q1、q2、ms 各 16 位小端，共 6 字节）的 CRC-32/IEEE，主机对自己的计划算同一个值就能认出“这条图形已经存在板上” |
 | `TRAJ_META slot=<n> seq=<u32> len=<n> crc=<8位大写十六进制> hex=<大写十六进制>` / `TRAJ_META slot=<n> len=0` | type 12 op 4 的结果：`seq` 是该槽的保存次数（主机据此判断描述是不是当前这次保存的），`crc` 是文本的 CRC-32，`hex` 是文本的字节。没有描述时只有 `len=0` |
 | `TRAJ_NODES slot=<n> seq=<u32> total=<n> first=<i> count=<k> hex=<大写十六进制>` / `TRAJ_NODES slot=<n> count=0` | type 12 op 5 的结果：从第 `first` 个节点起的 `k` 个节点（原样的字节）；`total` 是该槽的点数 |
-| `TRAJ_STORE state=<idle、saving 或 erasing> slot rows=<done>/<total> seq last=<none、saved、erased、failed 或 aborted> last_slot row_max_us` | type 12 的回执与进度：`seq` 是最近一条被接受的存档命令的控制序号；`rows` 是已写数据行/总数据行；`row_max_us` 是最慢一次写行的微秒数（实板上必须看它）。另有失败原因行 `TRAJ_STORE failed: …`、`TRAJ_STORE aborted: …`、`TRAJ_STORE refused: …` |
+| `TRAJ_STORE state=<idle、saving 或 erasing> slot rows=<done>/<total> seq last=<none、saved、erased、failed 或 aborted> last_slot row_max_us` | type 12 的回执与进度：`seq` 是最近一条被接受的存档命令的控制序号；`rows` 是这次重写已写/要写的行数（含提交行）；`row_max_us` 是最慢一次写行的微秒数（实板上必须看它）。另有失败原因行 `TRAJ_STORE failed: …`、`TRAJ_STORE aborted: …`、`TRAJ_STORE refused: …` |
 | `TRAJ_LOAD slot seq nodes duration_ms crc` | type 13 加载成功；`crc` 是实际加载节点流的 CRC-32/IEEE（8 位大写十六进制）。上位机核对 slot、seq、duration_ms、nodes 和预期节点 CRC；擦除重存会复用 seq，不能只凭计数认定计划相同。任一项不符、CRC 缺失或回执没收到就改走上传 |
 | `TELEM_DIAG hz sent skipped max_us` | 流式遥测的代价：已发送行数、因发送队列过半而跳过的行数、一次格式化最长耗时（微秒）。**跳过而不是丢弃**：流式行从不占用发送队列的后一半，ACK 和停止信息保有余量 |
 | `FAULT_SNAPSHOT t epoch seq phase home traj idx ref p1 p2 e1 err inputs hb_age_ms hb_max_gap_ms drv reason="…"` | 每次停止的第一行（在任何状态被清除之前）：停机时的阶段（`home/ptp/traj_run/traj_upload/jog/idle/disabled`）、位置（同 `TELEM`）、输入掩码、心跳年龄。`drv=nfault_undetermined` 表示驱动器 nFAULT 有效，**原因待诊断**：该引脚可由过流、过热或欠压触发，不能据此认定过热；否则 `drv=ok` |
@@ -94,18 +95,19 @@
 
 ## 6. 版本与兼容
 
-- 固件标识 `FW_BUILD_ID`（现为 `stage2-v11-r5000-slip-mref2-ssififo-upstat1-store4-meta6-read1-guards2`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。历史上行为不变的结构性重构靠 `firmware.hex` 的 SHA-256 区分。主机字节间隔从 0.5 ms 改为 0.25 ms 不改帧格式或固件构建号。
+- 固件标识 `FW_BUILD_ID`（现为 `stage2-v11-r5000-slip-mref2-ssififo-upstat1-store32v2-meta6-read1-guards2`）出现在 `LINK` 行和启动横幅里；每次改固件行为应改它，方便日志回答“这次烧的到底是哪个包”。历史上行为不变的结构性重构靠 `firmware.hex` 的 SHA-256 区分。主机字节间隔从 0.5 ms 改为 0.25 ms 不改帧格式或固件构建号。
 - **proto=2（肘范围）**：type 9 新增轴 2（肘），`PTP_STATE` 末尾新增 `emin=<cd> emax=<cd>`，并把肘范围纳入 PTP/轨迹/点动的校验。固件开机默认 ∓155°（`PTP_ELBOW_DEFAULT_CD`，与 `DeviceContract.ElbowDefaultCd` 同值、由发布闸门核对）：这是暂定值，不是实测机械行程。上位机连接后把界面里的肘范围同步给固件，和 q1/q2 范围一样，确认一致才允许运动；proto=1 的固件会被拒绝运动并提示更新。
 - **能力位 `traj_read=1`（不改 proto）**：固件会把槽里的节点读回（type 12 op 5）；没有它，主机不发 op 5，没有描述的槽只能清除。出现在 `traj_meta=` 之后、`traj_store=` 之前。
 - **能力位 `traj_meta=<n>`（不改 proto）**：`n` 是每幅轨迹能带的描述字节数（现为 256），为 0 或不出现表示固件不保管描述；上位机据此决定是否发 type 14 和 type 12 op 4，没有它的固件只用本机的 `board-slots.json` 给槽起名。出现在 `traj_store=` 之前。
-- **能力位 `traj_store=<n>`（不改 proto）**：`n` 是 Flash 存档的槽位数（现为 4），为 0 或不出现表示不能用（旧固件，或镜像没有用 `cm3gcc_trajstore.ld` 链接，见 TRAJ_STORE.md）；上位机据此决定是否显示存档按钮，不发 type 12/13。
+- **能力位 `traj_store=<n>`（不改 proto）**：`n` 是 Flash 存档的槽位数（现为 32，实际能存多少还受空间限制，见 `TRAJ_DIR`），为 0 或不出现表示不能用（旧固件，或镜像没有用 `cm3gcc_trajstore.ld` 链接，见 TRAJ_STORE.md）；上位机据此决定是否显示存档按钮，不发 type 12/13。
 - **能力位（不改 proto）**：`traj_repeat=1` 已运行过的已缓存图形接受再次 RUN，没有它的固件第二次 RUN 会被拒绝并停止，上位机据此在运行一次后要求重新上传；`fault_snapshot=1` 每次停止先打印 `FAULT_SNAPSHOT`；`telem_hz=<n>` 出现表示支持 type 11，值是当前速率。上位机对没声明的固件不发 type 11、不指望快照。
 - **proto=3（双编码器历史版本）**：STATE 新增 enc2/dir2；TELEM 与 FAULT_SNAPSHOT 新增 e2/err2；同次 SSI 读取更新两路，任一路失效都会保护停机。人工参考要求 arm2 方向已由本次使能后的回零识别。
 
 - **proto=4（arm2 反馈可选）**：STATE 增加 `arm2fb=0/1`。当前默认 `ARM2_ENCODER_FEEDBACK=1`，启用双编码器强制检查和失效停机；人工参考在 arm2 方向未知时使用 `MANUAL_ENC2_INC_DIR` 的台架标定方向，仍要求编码器有效。显式构建为 0 时，arm2 不要求编码器连接或方向识别，TELEM/FAULT_SNAPSHOT 省略 e2/err2，上位机显示缺测。
 
+- **proto=6（按实际大小存储，32 份）**：存档格式 version 2（两个 64 KB 区轮流重写，每幅图只占所需的行），槽位 0…31；全部槽查询改为 `TRAJ_DIR` 加有图形的槽各一行（分步发送），`TRAJ_SLOT` 行末尾加 `rows=`；空间不够回 `TRAJ_STORE refused: archive full`。旧格式的存档不迁移（烧录本来就会清空存档）。
 - **proto=5（加载内容身份）**：`TRAJ_LOAD` 必须包含实际加载节点流的 `crc`。主机要求它与预览时匹配的槽位 CRC 一致；保存计数在擦除重存后可能重复，不再单凭计数、节点数和时长认定计划相同。
-- **协议版本号**：`LINK` 行末尾的 `proto=<n>`（固件 `PROTO_VERSION`，上位机 `DeviceContract.ProtocolVersion`）。上位机只在两者相等时解锁运动，与 `fw=` 构建号无关，所以构建号可以随时改。**帧格式、字段含义、序号/代次规则或坐标约定一变，两边一起加一**；发布闸门会核对两边的数字。当前为 `proto=5`（含 absolute-q2 坐标、肘范围和加载回执的节点 CRC）。`q2_absolute=1` 保留坐标说明；proto=4 及更早上位机不能控制本版固件，本版上位机也拒绝旧协议固件。
+- **协议版本号**：`LINK` 行末尾的 `proto=<n>`（固件 `PROTO_VERSION`，上位机 `DeviceContract.ProtocolVersion`）。上位机只在两者相等时解锁运动，与 `fw=` 构建号无关，所以构建号可以随时改。**帧格式、字段含义、序号/代次规则或坐标约定一变，两边一起加一**；发布闸门会核对两边的数字。当前为 `proto=6`（含 absolute-q2 坐标、肘范围、加载回执的节点 CRC 和 32 份按实际大小存储的存档）。`q2_absolute=1` 保留坐标说明；proto=5 及更早上位机不能控制本版固件，本版上位机也拒绝旧协议固件。
 - 上位机对旧固件的处理：`LINK` 里没有 `short_hb` 就用 36 字节完整心跳；没有声明 `joint_limits`、`motion_rates` 或 `q2_absolute` 的能力，相应功能保持锁定并提示更新固件（不会静默忽略）。没有 `rates_live=1` 时，已使能下改速度不下发，仍要先总停止、禁用后自动同步、再使能。`rates_live` 是新增的能力位，不改帧格式，所以 `proto` 没有变。
 
 ## 停机锁存（v10，proto=4 可选诊断扩展）
@@ -118,4 +120,4 @@ FAULT_SNAPSHOT 新增 elapsed_us / plan_us / late_us / done / total。停止后�
 
 `TRAJ_UPLOADING` 期间，周期状态块保留 `STATE`、`CONTROL`、`PTP_STATE`、`TRAJ_STATE`、`TELEM`；`LINK`、`TIMING`、`ENC_DIAG` 等完整诊断等上传结束或停止后恢复。已有文本等待发送时不追加周期状态行，减少 ACK 后的积压；接收节点后的直接 `TRAJ_STATE` ACK、独立流式 `TELEM` 和故障/STOP 输出不受该筛选影响。上传中的重复状态请求合并，保留未完成块；新参考代次仍从 `STATE` 重启。周期 `TRAJ_STATE` 仍能补偿失落的 ACK。
 
-`TIMING.status_max_us` 是单条状态行格式化与入队的历史最大耗时，不表示串口传输时间。20/40 ms 心跳间隔、200 ms 主机租约、250 ms 固件 deadman 和全部运动保护阈值不变；当前协议为 `proto=5`，加载身份变更见上节。
+`TIMING.status_max_us` 是单条状态行格式化与入队的历史最大耗时，不表示串口传输时间。20/40 ms 心跳间隔、200 ms 主机租约、250 ms 固件 deadman 和全部运动保护阈值不变；当前协议为 `proto=6`，变更见上节。

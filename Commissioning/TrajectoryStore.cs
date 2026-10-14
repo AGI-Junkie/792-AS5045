@@ -11,10 +11,10 @@ namespace TwoLinkCommissioning;
 public enum StoreOp : short { Query = 1, Save = 2, Erase = 3, Meta = 4, Nodes = 5 }   // Meta: read back one slot's description; Nodes: its nodes
 
 // One archive slot as the device reports it (TRAJ_SLOT line).  Crc is the CRC-32 of the node stream, the same value PlanCrc
-// computes for a plan on this side, so "is this plan already on the board" is a number comparison.
-public sealed record BoardSlot(int Slot, bool Valid, uint Seq, int Nodes, int DurationMs, int Q1Cd, int Q2Cd, uint Crc)
+// computes for a plan on this side, so "is this plan already on the board" is a number comparison.  Rows: the flash rows it takes.
+public sealed record BoardSlot(int Slot, bool Valid, uint Seq, int Nodes, int DurationMs, int Q1Cd, int Q2Cd, uint Crc, int Rows = 0)
 {
-    private static readonly Regex Pattern = new(@"^TRAJ_SLOT slot=(\d+) valid=([01])(?: seq=(\d+) nodes=(\d+) duration_ms=(\d+) q1=(-?\d+) q2=(-?\d+) crc=([0-9A-F]{8}))?$", RegexOptions.CultureInvariant);
+    private static readonly Regex Pattern = new(@"^TRAJ_SLOT slot=(\d+) valid=([01])(?: seq=(\d+) nodes=(\d+) duration_ms=(\d+) q1=(-?\d+) q2=(-?\d+) crc=([0-9A-F]{8}) rows=(\d+))?$", RegexOptions.CultureInvariant);
     public double Seconds => DurationMs / 1000.0;
     public static BoardSlot? Parse(string line)
     {
@@ -23,10 +23,30 @@ public sealed record BoardSlot(int Slot, bool Valid, uint Seq, int Nodes, int Du
         if (m.Groups[2].Value == "0") return m.Groups[3].Success ? null : new BoardSlot(slot, false, 0, 0, 0, 0, 0, 0);
         if (!m.Groups[3].Success || !uint.TryParse(m.Groups[3].Value, out uint seq) || !int.TryParse(m.Groups[4].Value, out int nodes) ||
             !int.TryParse(m.Groups[5].Value, out int duration) || !int.TryParse(m.Groups[6].Value, out int q1) || !int.TryParse(m.Groups[7].Value, out int q2) ||
-            !uint.TryParse(m.Groups[8].Value, System.Globalization.NumberStyles.HexNumber, null, out uint crc) ||
+            !uint.TryParse(m.Groups[8].Value, System.Globalization.NumberStyles.HexNumber, null, out uint crc) || !int.TryParse(m.Groups[9].Value, out int rows) ||
             nodes is < 2 or > DeviceContract.TrajCapacity || duration <= 0 ||
             q1 is < -DeviceContract.JointLimitCdMax or > DeviceContract.JointLimitCdMax || q2 is < -DeviceContract.JointLimitCdMax or > DeviceContract.JointLimitCdMax) return null;   // not Math.Abs: it throws for int.MinValue
-        return new BoardSlot(slot, true, seq, nodes, duration, q1, q2, crc);
+        if (rows < TrajectoryArchive.RowsFor(nodes, 0) || rows > TrajectoryArchive.RowsFor(nodes, BoardMeta.MaxBytes)) return null;   // the nodes and at most the largest description
+        return new BoardSlot(slot, true, seq, nodes, duration, q1, q2, crc, rows);
+    }
+}
+
+// The archive as a whole (TRAJ_DIR line, the first answer to a query for all slots): its generation, how many records and rows it
+// holds and has room for, and which slots hold a plan (bit n = slot n).  Only the slots in Mask send a TRAJ_SLOT line after it.
+public sealed record BoardDir(uint Gen, int Records, int Max, int UsedRows, int FreeRows, int DataRows, int RowBytes, uint Mask)
+{
+    private static readonly Regex Pattern = new(@"^TRAJ_DIR gen=(\d+) records=(\d+) max=(\d+) used_rows=(\d+) free_rows=(\d+) data_rows=(\d+) row_bytes=(\d+) mask=([0-9A-F]{8})$", RegexOptions.CultureInvariant);
+    public int UsedBytes => UsedRows * RowBytes;
+    public int TotalBytes => DataRows * RowBytes;
+    public static BoardDir? Parse(string line)
+    {
+        var m = Pattern.Match(line);
+        if (!m.Success || !uint.TryParse(m.Groups[1].Value, out uint gen) || !int.TryParse(m.Groups[2].Value, out int records) || !int.TryParse(m.Groups[3].Value, out int max) ||
+            !int.TryParse(m.Groups[4].Value, out int used) || !int.TryParse(m.Groups[5].Value, out int free) || !int.TryParse(m.Groups[6].Value, out int data) ||
+            !int.TryParse(m.Groups[7].Value, out int rowBytes) || !uint.TryParse(m.Groups[8].Value, System.Globalization.NumberStyles.HexNumber, null, out uint mask) ||
+            max is < 1 or > DeviceContract.TrajStoreSlots || records > max || data is < 1 or > 4096 || used > data || used + free != data || rowBytes != 256 ||
+            System.Numerics.BitOperations.PopCount(mask) != records || max < 32 && mask >> max != 0) return null;
+        return new BoardDir(gen, records, max, used, free, data, rowBytes, mask);
     }
 }
 
@@ -134,6 +154,8 @@ public static class TrajectoryArchive
         return bytes;
     }
     public static uint PlanCrc(IReadOnlyList<ExecutionNode> nodes) => Crc32(Stream(nodes));
+    // The flash rows a plan takes on the board: its record header, its description and its nodes, rounded up to whole rows.
+    public static int RowsFor(int nodes, int descriptionBytes) => (DeviceContract.TrajRecordHeadBytes + descriptionBytes + nodes * 6 + 255) / 256;
     // The inverse of Stream: the nodes a stored plan holds (0.01 degree and ms, as the device keeps them).
     public static ExecutionNode[] Nodes(ReadOnlySpan<byte> stream)
     {
@@ -219,17 +241,26 @@ public static class BoardLedger
         static void Check(bool ok, string what) { if (!ok) throw new InvalidOperationException("Trajectory archive: " + what); }
         Check(Crc32("123456789"u8) == 0xCBF43926u, "CRC-32 of 123456789 must be CBF43926");
         Check(BoardSlot.Parse("TRAJ_SLOT slot=2 valid=0") is { Slot: 2, Valid: false }, "empty slot line");
-        Check(BoardSlot.Parse("TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=-5686 q2=5871 crc=BD3EB746") is { Valid: true, Seq: 3, Nodes: 485, DurationMs: 60480, Q1Cd: -5686, Q2Cd: 5871, Crc: 0xBD3EB746 }, "valid slot line");
+        Check(BoardSlot.Parse("TRAJ_SLOT slot=31 valid=1 seq=3 nodes=485 duration_ms=60480 q1=-5686 q2=5871 crc=BD3EB746 rows=12") is { Slot: 31, Valid: true, Seq: 3, Nodes: 485, DurationMs: 60480, Q1Cd: -5686, Q2Cd: 5871, Crc: 0xBD3EB746, Rows: 12 }, "valid slot line");
+        // A plan takes its nodes and its description (up to 256 bytes) behind a 28-byte header, in whole 256-byte rows.
+        Check(RowsFor(485, 0) == 12 && RowsFor(485, 256) == 13 && RowsFor(2048, 0) == 49 && RowsFor(2048, 256) == 50 && RowsFor(2, 0) == 1 && RowsFor(38, 0) == 1 && RowsFor(39, 0) == 2, "rows of a stored plan");
         // Nothing follows the CRC on a slot line (an older host parses it end-anchored); the description is asked for slot by slot.
         foreach (string bad in new[] { "TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746 meta=257", "TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746 meta=",
-            "TRAJ_SLOT slot=1 valid=0 meta=5", "TRAJ_SLOT slot=4 valid=0", "TRAJ_SLOT slot=0 valid=1", "TRAJ_SLOT slot=0 valid=0 seq=1", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=1 duration_ms=5 q1=0 q2=0 crc=00000000",
+            "TRAJ_SLOT slot=1 valid=0 meta=5", "TRAJ_SLOT slot=32 valid=0", "TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746",
+            "TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746 rows=11", "TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746 rows=14", "TRAJ_SLOT slot=0 valid=1", "TRAJ_SLOT slot=0 valid=0 seq=1", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=1 duration_ms=5 q1=0 q2=0 crc=00000000",
             "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=2049 duration_ms=5 q1=0 q2=0 crc=00000000", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=18001 q2=0 crc=00000000",
             "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=0 q2=0 crc=bd3eb746", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=0 q1=0 q2=0 crc=BD3EB746",
             "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=-2147483648 q2=0 crc=BD3EB746", "TRAJ_SLOT slot=0 valid=1 seq=1 nodes=9 duration_ms=5 q1=0 q2=-2147483648 crc=BD3EB746" })
             Check(BoardSlot.Parse(bad) is null, "bad slot line accepted: " + bad);
+        Check(BoardDir.Parse("TRAJ_DIR gen=7 records=2 max=32 used_rows=14 free_rows=241 data_rows=255 row_bytes=256 mask=80000004") is { Gen: 7, Records: 2, Max: 32, UsedRows: 14, FreeRows: 241, DataRows: 255, Mask: 0x80000004u, UsedBytes: 3584, TotalBytes: 65280 }, "inventory line");
+        Check(BoardDir.Parse("TRAJ_DIR gen=0 records=0 max=32 used_rows=0 free_rows=255 data_rows=255 row_bytes=256 mask=00000000") is { Records: 0, Mask: 0 }, "empty inventory line");
+        foreach (string bad in new[] { "TRAJ_DIR gen=7 records=3 max=32 used_rows=14 free_rows=241 data_rows=255 row_bytes=256 mask=80000004", "TRAJ_DIR gen=7 records=2 max=32 used_rows=14 free_rows=240 data_rows=255 row_bytes=256 mask=80000004",
+            "TRAJ_DIR gen=7 records=2 max=4 used_rows=14 free_rows=241 data_rows=255 row_bytes=256 mask=80000004", "TRAJ_DIR gen=7 records=2 max=32 used_rows=14 free_rows=241 data_rows=255 row_bytes=256 mask=80000004 x=1",
+            "TRAJ_DIR gen=7 records=2 max=33 used_rows=14 free_rows=241 data_rows=255 row_bytes=256 mask=80000004", "TRAJ_DIR gen=7 records=2 max=32 used_rows=14 free_rows=241 data_rows=255 row_bytes=512 mask=80000004" })
+            Check(BoardDir.Parse(bad) is null, "bad inventory line accepted: " + bad);
         Check(StoreStatus.Parse("TRAJ_STORE state=saving slot=2 rows=8/12 seq=74 last=failed last_slot=0 row_max_us=7000") is { Busy: true, Slot: 2, RowsDone: 8, RowsTotal: 12, Seq: 74, Last: "failed", RowMaxUs: 7000 }, "status line");
         Check(StoreStatus.Parse("TRAJ_STORE state=idle slot=0 rows=0/0 seq=1 last=none last_slot=0 row_max_us=0") is { Busy: false }, "idle status line");
-        Check(StoreStatus.Parse("TRAJ_STORE state=idle slot=0 rows=9/3 seq=1 last=saved last_slot=0 row_max_us=0") is null && StoreStatus.Parse("TRAJ_STORE state=idle slot=7 rows=0/0 seq=1 last=saved last_slot=0 row_max_us=0") is null &&
+        Check(StoreStatus.Parse("TRAJ_STORE state=idle slot=0 rows=9/3 seq=1 last=saved last_slot=0 row_max_us=0") is null && StoreStatus.Parse("TRAJ_STORE state=idle slot=32 rows=0/0 seq=1 last=saved last_slot=0 row_max_us=0") is null &&
               StoreStatus.Parse("TRAJ_STORE state=busy slot=0 rows=0/0 seq=1 last=saved last_slot=0 row_max_us=0") is null && StoreStatus.Parse("TRAJ_STORE refused: stage not idle") is null, "bad status line accepted");
         // The stream is the device's node format: 6 bytes per node, little endian, node 0 first.
         var nodes = new[] { new ExecutionNode(new JointPose(-1.25, 2.5), 0), new ExecutionNode(new JointPose(0.01, -180), 500) };
@@ -249,9 +280,9 @@ public static class BoardLedger
         Check(save[0] == 12 && BitConverter.ToInt16(save, 9) == 3 && BitConverter.ToInt16(save, 11) == 2 && BitConverter.ToUInt32(save, 1) == 6 && BitConverter.ToUInt32(save, 5) == 7, "save packet");
         var load = Decode(PtpProtocol.EncodeLoad(9, 7, 1));
         Check(load[0] == 13 && BitConverter.ToInt16(load, 9) == 1 && BitConverter.ToInt16(load, 11) == 0 && BitConverter.ToUInt16(load, 13) == 0, "load packet");
-        foreach (var refused in new Action[] { () => PtpProtocol.EncodeStore(0, 7, 0, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 0, 0, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 7, 4, StoreOp.Save),
-            () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Erase), () => PtpProtocol.EncodeStore(1, 7, 0, (StoreOp)6), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Nodes, 2048), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Nodes, -1), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Save, 1), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Nodes), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Meta), () => PtpProtocol.EncodeStore(1, 7, 4, StoreOp.Meta),
-            () => PtpProtocol.EncodeMeta(1, 7, 0, new byte[3]), () => PtpProtocol.EncodeMeta(1, 7, 67, new byte[4]), () => PtpProtocol.EncodeMeta(1, 7, -1, new byte[4]), () => PtpProtocol.EncodeMeta(0, 7, 0, new byte[4]), () => PtpProtocol.EncodeLoad(1, 7, 4), () => PtpProtocol.EncodeLoad(1, 7, -1) })
+        foreach (var refused in new Action[] { () => PtpProtocol.EncodeStore(0, 7, 0, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 0, 0, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 7, 32, StoreOp.Save),
+            () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Save), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Erase), () => PtpProtocol.EncodeStore(1, 7, 0, (StoreOp)6), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Nodes, 2048), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Nodes, -1), () => PtpProtocol.EncodeStore(1, 7, 0, StoreOp.Save, 1), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Nodes), () => PtpProtocol.EncodeStore(1, 7, -1, StoreOp.Meta), () => PtpProtocol.EncodeStore(1, 7, 32, StoreOp.Meta),
+            () => PtpProtocol.EncodeMeta(1, 7, 0, new byte[3]), () => PtpProtocol.EncodeMeta(1, 7, 67, new byte[4]), () => PtpProtocol.EncodeMeta(1, 7, -1, new byte[4]), () => PtpProtocol.EncodeMeta(0, 7, 0, new byte[4]), () => PtpProtocol.EncodeLoad(1, 7, 32), () => PtpProtocol.EncodeLoad(1, 7, -1) })
         {
             bool threw = false;
             try { refused(); } catch (ArgumentException) { threw = true; }
@@ -280,7 +311,7 @@ public static class BoardLedger
         string NodeLine(int slot = 1, uint seq = 4, int total = 3, int first = 0, int count = 3, string? hex = null) =>
             $"TRAJ_NODES slot={slot} seq={seq} total={total} first={first} count={count} hex={hex ?? Convert.ToHexString(Stream(plan))}";
         Check(BoardNodes.Parse(NodeLine()) is { Slot: 1, Seq: 4, Total: 3, First: 0, Count: 3 } run && run.Bytes.SequenceEqual(Stream(plan)), "node line");
-        foreach (string bad in new[] { NodeLine(count: 2), NodeLine(first: 1), NodeLine(total: 1), NodeLine(total: 2049), NodeLine(slot: 4), NodeLine(count: 0, hex: "00"), NodeLine(hex: Convert.ToHexString(Stream(plan)).ToLowerInvariant()),
+        foreach (string bad in new[] { NodeLine(count: 2), NodeLine(first: 1), NodeLine(total: 1), NodeLine(total: 2049), NodeLine(slot: 32), NodeLine(count: 0, hex: "00"), NodeLine(hex: Convert.ToHexString(Stream(plan)).ToLowerInvariant()),
             NodeLine(count: 41, total: 100, hex: new string('0', 41 * 12)), "TRAJ_NODES slot=1 count=0" })
             Check(BoardNodes.Parse(bad) is null, "bad node line accepted: " + bad);
         // What the device answers (type 12 op 4): one hex line, checked for length, CRC and plain text.
@@ -290,7 +321,7 @@ public static class BoardLedger
             return $"TRAJ_META slot={slot} seq=3 len={len ?? b.Length} crc={crc ?? Crc32(b):X8} hex={Convert.ToHexString(b)}";
         }
         Check(BoardMeta.Parse(Answer(text)) is { Slot: 1, Seq: 3 } meta && meta.Text == text, "description answer");
-        foreach (string bad in new[] { Answer(text, len: text.Length + 1), Answer(text, crc: 5), Answer("a\u0001b"), Answer(text, slot: 4), Answer(text).ToLowerInvariant(), "TRAJ_META slot=1 len=0", Answer(new string('A', BoardMeta.MaxBytes + 1)) })
+        foreach (string bad in new[] { Answer(text, len: text.Length + 1), Answer(text, crc: 5), Answer("a\u0001b"), Answer(text, slot: 32), Answer(text).ToLowerInvariant(), "TRAJ_META slot=1 len=0", Answer(new string('A', BoardMeta.MaxBytes + 1)) })
             Check(BoardMeta.Parse(bad) is null, "bad description answer accepted: " + bad);
         // What is known about a slot: the board's own description (for the plan it holds), else the file of this computer.
         var held = new BoardSlot(1, true, 3, 2, 500, 0, 0, 0xBD3EB746);

@@ -352,7 +352,10 @@ public sealed partial class XYPreviewPanel
             string[] stars = star.recentRows.Select(r => (string)r.Star.Content).ToArray();
             if (!stars.SequenceEqual(["★", "☆", "☆"]) || !star.recentRows[0].Star.IsEnabled || !((string)star.recentRows[0].Star.ToolTip).Contains("槽2")) Fail("存在板上的图形应排在最前并标 ★：" + string.Join("", stars));
             if (!star.recentRows[1].Star.IsEnabled || star.recentRows[2].Star.IsEnabled) Fail("可载入的图形能存，自定义轮廓不能存");
-            if (!star.boardNote.Text.Contains("槽2：矩形") || !star.boardNote.Text.Contains("槽1：空")) Fail("应列出每个槽：" + star.boardNote.Text);
+            if (!star.boardNote.Text.Contains("槽2：矩形") || star.boardNote.Text.Contains("槽1：")) Fail("应只列出存有图形的槽：" + star.boardNote.Text);
+            star.SetBoard(4, true, false, [Free(0), Free(1), null, null], ledger, null, false, new BoardDir(3, 0, 4, 0, 255, 255, 256, 0));
+            if (!star.boardNote.Text.Contains("没有图形") || !star.boardNote.Text.Contains("板上图形 0/4 · 已用 0 KB / 63.8 KB")) Fail("空的存档应说明没有图形和容量：" + star.boardNote.Text);
+            star.SetBoard(4, true, false, [Free(0), Held(1, 0xABCD1234), null, null], ledger, null);
             // A stale record (the device now reports another plan in that slot) is not a star.
             star.SetBoard(4, true, false, [Free(0), Held(1, 0x11111111), null, null], ledger, null);
             if (star.recentRows.Any(r => (string)r.Star.Content == "★") || !star.boardNote.Text.Contains("别处存的图形")) Fail("设备上的计划与记录不符时不应标 ★，而应说明是别处存的");
