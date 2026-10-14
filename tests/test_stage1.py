@@ -2034,20 +2034,25 @@ static void store_test(const char *t) {
         store_send(13,g_ptp.sequence+1u,TS_SLOTS,0,0);store_send(13,g_ptp.sequence+1u,0,1,0);store_send(13,g_ptp.sequence+1u,0,0,1);txq_flush_blocking();
         assert(strstr(simLog,"archive slot") && strstr(simLog,"archive load arguments"));
         store_send(13,g_ptp.sequence+1u,0,0,0);assert(g_traj.state==TRAJ_READY && g_traj.count==485);   /* the good load still works */
-        /* a bit that flips after the boot check: the plan is not loaded, and a change that would copy it into a new bank fails
-         * without committing; clearing the slot is the way out */
-        {uint32 gen;uint8 *node;
-         store_make_plan(100,1);store_save(1);gen=g_tsBank.gen;
-         node=simFlash+ts_bank_offset(g_tsBank.bank)+(uint32)g_tsDir[0].row*TS_ROW_BYTES+TS_REC_HEAD+40;
-         *node^=0x04;simLogN=0;simLog[0]=0;
-         store_send(13,g_ptp.sequence+1u,0,0,0);txq_flush_blocking();
-         assert(strstr(simLog,"archive slot empty or damaged") && g_traj.state==TRAJ_READY && g_traj.count==100);
-         simLogN=0;simLog[0]=0;store_make_plan(50,0);store_send(12,g_controlSequence+1u,2,2,0);store_run();txq_flush_blocking();
-         assert(g_storeResult.last==3 && strstr(simLog,"slot 0 is damaged") && g_tsBank.gen==gen && !g_tsDir[2].valid);
-         store_reboot();assert(g_tsBank.gen==gen-1u && !g_tsDir[1].valid);   /* (the damaged bank itself falls back at boot) */
-         *node^=0x04;store_reboot();assert(g_tsBank.gen==gen);*node^=0x04;
-         store_erase(0);assert(g_storeResult.last==2 && !g_tsDir[0].valid);
-         store_make_plan(50,0);store_save(2);assert(g_storeResult.last==1 && g_tsDir[2].valid && g_tsDir[1].valid);}
+        /* A bit that flips after the boot check.  In the nodes: the plan is not loaded.  Anywhere in the bank (nodes, description,
+         * padding): a change, which would copy it into a new bank, writes nothing and drops the bank, as a reboot would; the next change
+         * starts from the previous bank and takes a generation above both. */
+        {uint32 gen;unsigned w,k;uint8 *bad;
+         for(k=0;k<2;k++){
+            sim_flash_reset();store_make_plan(485,0);store_save(0);
+            store_make_plan(100,1);store_save(1);gen=g_tsBank.gen;
+            bad=simFlash+ts_bank_offset(g_tsBank.bank)+(uint32)g_tsDir[0].row*TS_ROW_BYTES+
+                (k==0 ? TS_REC_HEAD+40u : (uint32)ts_rows(&g_tsDir[0])*TS_ROW_BYTES-1u);   /* a node byte / the record's last padding byte */
+            *bad^=0x04;simLogN=0;simLog[0]=0;
+            store_send(13,g_ptp.sequence+1u,0,0,0);txq_flush_blocking();
+            if(k==0) assert(strstr(simLog,"archive slot empty or damaged") && g_traj.state==TRAJ_READY && g_traj.count==100);
+            else assert(strstr(simLog,"TRAJ_LOAD slot=0") && g_traj.count==485);          /* the plan itself is intact */
+            w=simFlashWrites;simLogN=0;simLog[0]=0;store_make_plan(50,0);store_send(12,g_controlSequence+1u,2,2,0);store_run();txq_flush_blocking();
+            assert(g_storeResult.last==3 && strstr(simLog,"the archive is damaged") && simFlashWrites==w);
+            assert(g_tsBank.valid && g_tsDir[0].valid && !g_tsDir[1].valid && !g_tsDir[2].valid);   /* the generation before slot 1 */
+            store_save(2);assert(g_storeResult.last==1 && g_tsDir[2].valid && g_tsDir[2].seq==gen+1u && g_tsBank.gen==gen+1u);
+            store_reboot();assert(g_tsBank.gen==gen+1u && g_tsDir[0].valid && g_tsDir[2].valid && !g_tsDir[1].valid);
+         }}
         return;
     }
     if(!strcmp(t,"store_commands")) {

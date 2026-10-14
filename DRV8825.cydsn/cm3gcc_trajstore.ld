@@ -4,6 +4,7 @@
  *   2. store is the archive region, 0x20000-0x3FFFF (TS_REGION_OFFSET, TS_REGION_BYTES in trajstore.h); no section is put
  *      there, and __trajstore_start lets the firmware prove it was linked with this script.
  *   3. CY_FLASH_TOP (the real 256 KB end) replaces the generated script's use of LENGTH(rom) as "end of flash".
+ *   4. .cyloadermeta (bootloader metadata, placed in the last flash row) must stay empty: that row is archive data.
  * Select it in Project > Build Settings > Linker > General > Custom Linker Script (Debug and Release), see
  * docs/TRAJ_STORE.md.  Compare with a freshly generated cm3gcc.ld after a PSoC Creator upgrade.
  *
@@ -353,6 +354,8 @@ SECTIONS
 	{
 	  KEEP(*(.cyloadermeta))
 	} :NONE
+	/* The last flash row belongs to the archive (trajstore.h writes it): a bootloader's metadata there would be overwritten. */
+	ASSERT(SIZEOF(.cyloadermeta) == 0, "cm3gcc_trajstore.ld: loader metadata would sit in the trajectory archive (0x3FFC0); a bootloader needs a smaller archive region")
 
 	.cyloadablemeta (CY_FLASH_TOP - CY_FLASH_ROW_SIZE * (CY_APPL_NUM - 1) - CY_METADATA_SIZE) :
 	{

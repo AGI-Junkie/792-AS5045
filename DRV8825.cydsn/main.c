@@ -2276,7 +2276,7 @@ static void store_service(void)
     r=ts_step(&g_store);
     if(r==TS_STEP_FAIL) {
         if(g_store.mismatch) { JLOG("TRAJ_STORE failed: the description is not for this plan\r\n"); }
-        else if(g_store.damaged) { JLOGF("TRAJ_STORE failed: slot %u is damaged (clear it)\r\n",(unsigned)g_store.src); }
+        else if(g_store.damaged) { JLOG("TRAJ_STORE failed: the archive is damaged; using the previous one (as after a reboot)\r\n"); }
         else { JLOGF("TRAJ_STORE failed: flash write/verify at row %lu\r\n",(unsigned long)g_store.rowsWritten); }
         store_end(3u);
     }

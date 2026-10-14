@@ -158,6 +158,17 @@ static void ts_mount(void)
     else if (okB) { (void)ts_use(1u); }
 }
 
+/* The archive's bank no longer matches its CRC (the flash changed after the boot check): use what a reboot would find, the
+ * other bank if it is whole, else an empty archive. */
+static void ts_drop_active(void)
+{
+    uint8 other = (uint8)(g_tsBank.bank ^ 1u);
+    uint32 gen = g_tsBank.gen;
+    memset(g_tsDir, 0, sizeof(g_tsDir)); memset(&g_tsBank, 0, sizeof(g_tsBank));
+    if (ts_check_bank(other, 1u, 0u)) { (void)ts_use(other); }
+    g_tsBank.gen = gen;                   /* the next bank still outranks the dropped one, so its new records get unused seq values */
+}
+
 /* Rows left for a record in `slot` (its present record, if any, would be replaced). */
 static uint16 ts_free_rows(uint8 slot)
 {
@@ -175,7 +186,8 @@ typedef struct {
     uint8  busy, kind, slot, bank;        /* bank: the one being built */
     uint8  phase;                         /* 4 check the records that stay, 0 clear its commit row, 1 copy them, 2 the new record, 3 commit */
     uint8  mismatch;                      /* the description was made for another plan: nothing is written */
-    uint8  damaged;                       /* a record to keep (slot `src`) no longer matches its CRC: not committed */
+    uint8  damaged;                       /* the bank to copy from no longer matches its CRC: nothing written, it was dropped */
+    uint32 check;                         /* phase 4: CRC of the active bank's rows so far */
     uint8  src;                           /* phase 1: the slot being copied */
     uint16 part;                          /* row within the record being written */
     uint16 next;                          /* next record row of the bank */
@@ -248,14 +260,20 @@ static ts_step_t ts_step(ts_job_t *j)
     uint32 start = SU_NOW(), took;
     uint8 ok;
     if (j->mismatch) { j->busy = 0u; return TS_STEP_FAIL; }
-    if (j->phase == 4u) {                 /* first, before any write: every record to keep still matches its CRC, one per pass */
-        while (j->src < TS_SLOTS && (!g_tsDir[j->src].valid || j->src == j->slot)) { j->src++; }
-        if (j->src < TS_SLOTS) {
-            if (!ts_nodes_ok(j->src)) { j->damaged = 1u; j->busy = 0u; return TS_STEP_FAIL; }   /* never sealed into a new bank */
-            j->src++;
+    if (j->phase == 4u) {                 /* first, before any write: the bank copied from still matches its CRCs, 16 rows per pass */
+        const uint8 *b = ts_flash(ts_bank_offset(g_tsBank.bank));
+        if (g_tsBank.valid && j->part < g_tsBank.usedRows) {
+            uint16 n = (uint16)(g_tsBank.usedRows - j->part < 16u ? g_tsBank.usedRows - j->part : 16u);
+            j->check = ts_crc32(j->check, b + (uint32)(1u + j->part) * TS_ROW_BYTES, (uint32)n * TS_ROW_BYTES);
+            j->part = (uint16)(j->part + n);
             return TS_STEP_MORE;
         }
-        j->phase = 0u; j->src = 0u;
+        if (g_tsBank.valid && (j->check != ts_get32(b + 16) || ts_crc32(0u, b, 20u) != ts_get32(b + 20))) {
+            j->damaged = 1u; j->busy = 0u;
+            ts_drop_active();             /* never sealed into a new bank: what a reboot would find instead */
+            return TS_STEP_FAIL;
+        }
+        j->phase = 0u; j->part = 0u;
     }
     while (j->phase == 1u && j->src < TS_SLOTS && (!g_tsDir[j->src].valid || j->src == j->slot)) { j->src++; }
     if (j->phase == 1u && j->src == TS_SLOTS) { j->phase = j->kind == TS_JOB_SAVE ? 2u : 3u; }
