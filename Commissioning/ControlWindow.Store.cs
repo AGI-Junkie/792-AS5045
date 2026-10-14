@@ -93,7 +93,7 @@ public sealed partial class ControlWindow
     }
 
     private void PublishBoard() => xyPreview.SetBoard(storeSlotCount, boardKnown, storeJob is { Op: StoreOp.Save or StoreOp.Erase } || pendingBoardSave is not null || deferredBoardSave is not null,
-        boardSlots, BoardLedger.Merge(boardSlots, boardMeta, boardLedger), boardMessage, storeReadSupported, boardDir);
+        boardSlots, BoardLedger.Merge(boardSlots, boardMeta, boardLedger), boardMessage, storeReadSupported, boardDir, storeMetaMax);
     private void SetBoardMessage(Func<string>? message) { boardMessage = message; PublishBoard(); }
 
     private bool StartStoreJob(StoreOp op, int slot, Action<bool, Func<string>>? done, int first = 0)
@@ -107,7 +107,9 @@ public sealed partial class ControlWindow
             // A save that carries a description sends it first (type 14, one chunk per frame); the Save frame follows the last chunk.
             storeRequestOp = op; storeRequestSlot = slot; storeRequestFirst = first; storePacket = []; storeResend = false; storeMetaNext = 0;
             pendingControlType = storeMetaChunks.Length > 0 ? (byte)14 : (byte)12;
-            if (op == StoreOp.Query) boardSeen = 0;   // only a query that reports every slot (the empty ones through TRAJ_DIR) completes the inventory
+            // Only a query that reports every slot (the empty ones through its own TRAJ_DIR) completes the inventory: an older directory line
+            // must not complete it when this one is lost.
+            if (op == StoreOp.Query) { boardSeen = 0; boardDir = null; }
         }
         Append($"HOST archive request {op} slot={(slot < 0 ? "all" : slot.ToString())}");
         PublishBoard();
@@ -647,6 +649,11 @@ public sealed partial class ControlWindow
             Check(!w.boardKnown && w.boardDir is null, "an inventory for another slot count was taken");
             w.HandleLine("TRAJ_DIR gen=5 records=0 max=2 used_rows=0 free_rows=255 data_rows=255 row_bytes=256 mask=00000000"); w.HandleLine("TRAJ_SLOT slot=3 valid=0");
             Check(w.boardKnown && w.boardSlots[3] is null, "the advertised slot count was not honoured");
+            // The next inventory needs its own directory line: slot lines for every slot do not complete it with the old one.
+            w.FinishStoreJob(true, () => ""); w.FinishStoreJob(true, () => "");
+            w.boardKnown = false; w.StartStoreJob(StoreOp.Query, -1, null); Next(12);
+            w.HandleLine("TRAJ_SLOT slot=0 valid=0"); w.HandleLine("TRAJ_SLOT slot=1 valid=0");
+            Check(!w.boardKnown && w.boardDir is null, "an inventory whose directory line was lost was completed with the previous one");
             w.ResetBoard();
             Check(w.storeSlotCount == 0 && !w.boardKnown && w.boardSlots.All(s => s is null) && w.pendingBoardSave is null && w.pendingControlType == 0, "the board state survived a reset");
         }

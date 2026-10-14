@@ -103,6 +103,8 @@ static uint16 ts_rows(const ts_info_t *r) { return TS_REC_ROWS(r->count, r->meta
 /* A valid slot's record: header, then the description, then the nodes. */
 static const uint8 *ts_record(uint8 slot) { return ts_flash(ts_bank_offset(g_tsBank.bank) + (uint32)g_tsDir[slot].row * TS_ROW_BYTES); }
 static const uint8 *ts_nodes(uint8 slot) { return ts_record(slot) + TS_REC_HEAD + g_tsDir[slot].metaLen; }
+/* The flash may change after the boot check (a flipped bit): a plan is loaded or copied only while its nodes still match its CRC. */
+static uint8 ts_nodes_ok(uint8 slot) { return (uint8)(ts_crc32(0u, ts_nodes(slot), (uint32)g_tsDir[slot].count * TS_NODE_BYTES) == g_tsDir[slot].dataCrc); }
 
 /* Is `bank` a complete, committed archive?  `full` also checks the CRC of every used row (at boot; a bank just written was read
  * back row by row).  `fill` (only for a bank that already passed) loads g_tsDir from it. */
@@ -171,8 +173,9 @@ typedef enum { TS_STEP_MORE = 0, TS_STEP_DONE = 1, TS_STEP_FAIL = 2 } ts_step_t;
 
 typedef struct {
     uint8  busy, kind, slot, bank;        /* bank: the one being built */
-    uint8  phase;                         /* 0 clear its commit row, 1 copy the records that stay, 2 the new record, 3 commit */
+    uint8  phase;                         /* 4 check the records that stay, 0 clear its commit row, 1 copy them, 2 the new record, 3 commit */
     uint8  mismatch;                      /* the description was made for another plan: nothing is written */
+    uint8  damaged;                       /* a record to keep (slot `src`) no longer matches its CRC: not committed */
     uint8  src;                           /* phase 1: the slot being copied */
     uint16 part;                          /* row within the record being written */
     uint16 next;                          /* next record row of the bank */
@@ -194,7 +197,7 @@ static void ts_job_begin(ts_job_t *j, uint8 kind, uint8 slot)
 {
     uint8 i;
     memset(j, 0, sizeof(*j));
-    j->busy = 1u; j->kind = kind; j->slot = slot; j->next = 1u;
+    j->busy = 1u; j->kind = kind; j->slot = slot; j->next = 1u; j->phase = 4u;
     j->bank = g_tsBank.valid ? (uint8)(g_tsBank.bank ^ 1u) : 0u;
     j->gen = g_tsBank.gen + 1u;
     for (i = 0u; i < TS_SLOTS; i++) {
@@ -245,6 +248,15 @@ static ts_step_t ts_step(ts_job_t *j)
     uint32 start = SU_NOW(), took;
     uint8 ok;
     if (j->mismatch) { j->busy = 0u; return TS_STEP_FAIL; }
+    if (j->phase == 4u) {                 /* first, before any write: every record to keep still matches its CRC, one per pass */
+        while (j->src < TS_SLOTS && (!g_tsDir[j->src].valid || j->src == j->slot)) { j->src++; }
+        if (j->src < TS_SLOTS) {
+            if (!ts_nodes_ok(j->src)) { j->damaged = 1u; j->busy = 0u; return TS_STEP_FAIL; }   /* never sealed into a new bank */
+            j->src++;
+            return TS_STEP_MORE;
+        }
+        j->phase = 0u; j->src = 0u;
+    }
     while (j->phase == 1u && j->src < TS_SLOTS && (!g_tsDir[j->src].valid || j->src == j->slot)) { j->src++; }
     if (j->phase == 1u && j->src == TS_SLOTS) { j->phase = j->kind == TS_JOB_SAVE ? 2u : 3u; }
     memset(j->buf, 0xFF, TS_ROW_BYTES);

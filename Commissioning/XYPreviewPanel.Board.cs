@@ -24,6 +24,7 @@ public sealed partial class XYPreviewPanel
     private bool boardSupported => boardSlotCount > 0;
     private IReadOnlyList<BoardSlot?> boardSlots = new BoardSlot?[DeviceContract.TrajStoreSlots];
     private BoardDir? boardDir;                    // the archive's size and room (null: not reported, the device decides)
+    private int boardMetaMax = BoardMeta.MaxBytes; // description bytes the firmware keeps (traj_meta=<n>); 0 = it keeps none
     private IReadOnlyList<LedgerEntry> boardLedger = [];
     private Func<string>? boardMessage;
     private BoardSlot? planOnBoard;                    // the slot that holds exactly the plan on screen
@@ -61,15 +62,15 @@ public sealed partial class XYPreviewPanel
 
     // known: every slot has been reported on this link.  Until then no slot is assumed empty, and saving stays off.
     internal int BoardRebuilds;                    // how often the board state really changed (the controls are rebuilt only then)
-    public void SetBoard(int slotCount, bool known, bool busy, IReadOnlyList<BoardSlot?> slots, IReadOnlyList<LedgerEntry> ledger, Func<string>? message, bool canReadNodes = false, BoardDir? dir = null)
+    public void SetBoard(int slotCount, bool known, bool busy, IReadOnlyList<BoardSlot?> slots, IReadOnlyList<LedgerEntry> ledger, Func<string>? message, bool canReadNodes = false, BoardDir? dir = null, int metaMax = BoardMeta.MaxBytes)
     {
         // The device repeats its LINK line every 500 ms: unchanged state must not tear down the buttons the operator is using
         // (a confirmation menu opened from one of them would be lost).
         slotCount = Math.Clamp(slotCount, 0, DeviceContract.TrajStoreSlots);
         var newSlots = slots.ToArray(); var newLedger = ledger.ToList();
-        if (slotCount == boardSlotCount && canReadNodes == boardCanRead && known == boardKnown && busy == boardBusy && newSlots.SequenceEqual(boardSlots) && newLedger.SequenceEqual(boardLedger) && ReferenceEquals(message, boardMessage) && Equals(dir, boardDir)) return;
+        if (slotCount == boardSlotCount && canReadNodes == boardCanRead && known == boardKnown && busy == boardBusy && newSlots.SequenceEqual(boardSlots) && newLedger.SequenceEqual(boardLedger) && ReferenceEquals(message, boardMessage) && Equals(dir, boardDir) && metaMax == boardMetaMax) return;
         BoardRebuilds++;
-        boardSlotCount = slotCount; boardCanRead = canReadNodes; boardKnown = known; boardBusy = busy; boardSlots = newSlots; boardLedger = newLedger; boardMessage = message; boardDir = dir;
+        boardSlotCount = slotCount; boardCanRead = canReadNodes; boardKnown = known; boardBusy = busy; boardSlots = newSlots; boardLedger = newLedger; boardMessage = message; boardDir = dir; boardMetaMax = metaMax;
         ShowRecentRuns();
         UpdateBoardNote();
         UpdateBoardClear();
@@ -146,7 +147,8 @@ public sealed partial class XYPreviewPanel
     }
     private void ChooseBoardSlot(Button anchor, ExecutionTrajectory plan, Action<int> save)
     {
-        int need = TrajectoryArchive.RowsFor(plan.Nodes.Length, BoardMeta.TextFor(SettingsDescription)?.Length ?? 0);
+        // The description the save will really send (BeginBoardSave): none when the firmware keeps none or it does not fit its limit.
+        int need = TrajectoryArchive.RowsFor(plan.Nodes.Length, boardMetaMax > 0 ? BoardMeta.TextFor(SettingsDescription, boardMetaMax)?.Length ?? 0 : 0);
         long room = boardDir?.FreeRows ?? int.MaxValue;
         int? free = TrajectoryArchive.FreeSlot(boardSlots, boardSlotCount);
         if (free is { } slotFree && need <= room) { save(slotFree); return; }
@@ -388,6 +390,12 @@ public sealed partial class XYPreviewPanel
             panel.SetBoard(4, true, false, [Free(0), Held(1, 1) with { Rows = need - 1 }, Held(2, 2) with { Rows = need - 1 }, Free(3)], [], null, false, tight with { UsedRows = 2 * need - 2, DataRows = 2 * need - 2 });
             panel.ClickSaveBoardForSelfTest();
             if (saved.Count != 0 || LastMenu is not null || !panel.recentNote.Text.Contains("不会自动删除")) Fail("替换哪一个都放不下时不应存，也不应清除任何图形：" + panel.recentNote.Text);
+            // A firmware that keeps no description: the save sends none, so only the nodes need room.
+            int bare = TrajectoryArchive.RowsFor(plan.Nodes.Length, 0);
+            panel.SetBoard(4, true, false, [Free(0), Held(1, 1) with { Rows = 1 }, Free(2), Free(3)], [], null, false, new BoardDir(9, 1, 4, 1, bare, 1 + bare, 256, 2), 0);
+            panel.ClickSaveBoardForSelfTest();
+            if (saved.Count != 1 || saved[0].Slot != 0) Fail("固件不存描述时，按不带描述的大小判断空间：应直接存进空槽");
+            saved.Clear();
             // Already on the board: not offered again.
             panel.SetBoard(4, true, false, [Free(0), Held(1, TrajectoryArchive.PlanCrc(plan.Nodes), plan.Nodes.Length, (int)plan.Nodes.Sum(n => (int)n.Milliseconds)), null, null], [], null);
             if (panel.SaveBoardEnabled || !panel.SaveBoardTip.Contains("已经存在板子槽2")) Fail("板上已有这个图形时不该再存：" + panel.SaveBoardTip);

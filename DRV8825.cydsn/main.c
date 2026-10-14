@@ -2276,11 +2276,12 @@ static void store_service(void)
     r=ts_step(&g_store);
     if(r==TS_STEP_FAIL) {
         if(g_store.mismatch) { JLOG("TRAJ_STORE failed: the description is not for this plan\r\n"); }
+        else if(g_store.damaged) { JLOGF("TRAJ_STORE failed: slot %u is damaged (clear it)\r\n",(unsigned)g_store.src); }
         else { JLOGF("TRAJ_STORE failed: flash write/verify at row %lu\r\n",(unsigned long)g_store.rowsWritten); }
         store_end(3u);
     }
     else if(r==TS_STEP_DONE) { store_end(g_store.kind==TS_JOB_SAVE ? 1u : 2u); }
-    else if((g_store.row&7u)==0u) { store_status(); }
+    else if(g_store.row && (g_store.row&7u)==0u) { store_status(); }   /* (row 0: still checking, nothing written) */
 }
 /* A save that is turned away takes the description staged for it with it: it must not wait for, and be attached to, a later save that
  * sends none (an older host, an oversized text) or is for another plan. */
@@ -2343,7 +2344,7 @@ static uint8 store_load(uint16 slot)
     uint8 ok=1u;
     if(slot>=TS_SLOTS || !TS_LINKED()) { JLOG("PTP refused: archive slot\r\n"); return 0u; }
     in=g_tsDir[slot];
-    if(!in.valid) { JLOG("PTP refused: archive slot empty or damaged\r\n"); return 0u; }
+    if(!in.valid || !ts_nodes_ok((uint8)slot)) { JLOG("PTP refused: archive slot empty or damaged\r\n"); return 0u; }
     if(g_arm1.usteps!=g_ptp.origin[0]-ptp_offset(0u,in.q1) || g_arm2.usteps!=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,in.q1,in.q2))) {
         JLOG("PTP refused: move to trajectory start first\r\n"); return 0u;
     }
