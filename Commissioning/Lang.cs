@@ -248,7 +248,7 @@ internal static class Lang
         ["joint.q1enc"] = ("q1 编码器", "q1 encoder"),
         ["joint.q1err"] = ("q1 误差", "q1 error"),
         ["joint.q2enc"] = ("q2 编码器 / °", "q2 encoder / °"),
-        ["joint.q2err"] = ("q2 姿态误差 / °", "q2 pose error / °"),
+        ["joint.q2err"] = ("q2 肘误差 / °", "q2 elbow error / °"),
         ["exp.rmse2"] = ("；arm2 跟随 RMSE {0:F3}°", "; arm2 follow RMSE {0:F3}°"),
         ["joint.q2cmd"] = ("q2 命令", "q2 cmd"),
         ["joint.tip"] = ("末端 (x, y)", "Tip (x, y)"),

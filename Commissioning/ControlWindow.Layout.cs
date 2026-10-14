@@ -251,7 +251,7 @@ public sealed partial class ControlWindow
         var v = Enumerable.Repeat("—", JointNames.Length).ToArray();
         if (sample is { Referenced: true }) {
             v[0] = $"{sample.Command.Q1:F3}"; v[1] = $"{sample.Measured1:F3}"; v[2] = $"{sample.Error1:+0.000;-0.000;0.000}"; v[3] = $"{sample.Command.Q2:F3}";
-            if(sample.Measured2 is double q2 && sample.Error2 is double error2) { v[4] = $"{q2:F3}"; v[5] = $"{error2:+0.000;-0.000;0.000}"; }
+            if(sample.Measured2 is double q2 && sample.ElbowError is double elbowError) { v[4] = $"{q2:F3}"; v[5] = $"{elbowError:+0.000;-0.000;0.000}"; }
             try {
                 var tip = xyPreview.Model.Forward(new(sample.Measured1, (sample.Measured2 ?? sample.Measured1 + sample.Command.Q2 - sample.Command.Q1))).Tip;
                 v[6] = $"({tip.X:F2}, {tip.Y:F2})";
