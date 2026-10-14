@@ -23,6 +23,8 @@ internal static class FreehandTrajectory
             throw Lang.Error("err.freehandPoints");
     }
 
+    // Total smoothing + fitting budget (mm) for Low / Medium / High.
+    internal static double Budget(int level) => level switch { 1 => 2, 2 => 4, 3 => 8, _ => 0 };
     internal static double FitTolerance(int level) => level switch { 1 => 0.75, 2 => 1, 3 => 1.25, _ => Tolerance };
     private static double Simplification(int level) => level switch { 1 or 2 => 0.5, 3 => 0.75, _ => SimplifyTolerance };
 
@@ -90,7 +92,7 @@ internal static class FreehandTrajectory
         }
     }
 
-    // Reserve fitting error from the 2/3/4 mm total budget; reject an over-budget filter, never clamp individual passes.
+    // Reserve fitting error from the 2/4/8 mm total budget; reject an over-budget filter, never clamp individual passes.
     internal static FreehandPoint[] Smooth(IReadOnlyList<FreehandPoint> input, int level)
     {
         Validate(input);
@@ -104,10 +106,11 @@ internal static class FreehandTrajectory
             var samples = Resample(from.ToList(), 0.25);
             return MaximumDistance(samples, to) + length / (2 * (samples.Length - 1));
         }
-        foreach (int passes in new[] { level switch { 1 => 2, 2 => 8, _ => 32 }, 1, 0 }.Distinct()) {
+        // Halve the passes until the filter fits the budget, so a sharp corner keeps as much smoothing as it can.
+        for (int passes = level switch { 1 => 2, 2 => 16, _ => 128 }; passes >= 0; passes = passes == 0 ? -1 : passes / 2) {
             var candidate = Resample(Filter(raw, passes).ToList());
             double shift = Math.Max(Away(raw.ToArray(), candidate), Away(candidate, raw.ToArray()));
-            if (candidate.Zip(candidate.Skip(1)).Sum(s => (s.Second - s.First).Length) >= 1 && shift + FitTolerance(level) <= level + 1)
+            if (candidate.Zip(candidate.Skip(1)).Sum(s => (s.Second - s.First).Length) >= 1 && shift + FitTolerance(level) <= Budget(level))
                 return candidate.Select(p => new FreehandPoint(p.X, p.Y)).ToArray();
         }
         return input.ToArray(); // Sharp excursions must survive when no 1 mm resampling meets the budget.
@@ -420,9 +423,9 @@ internal static class FreehandTrajectory
             var processed = Smooth(noisy, level); var fit = Create(processed, level);
             Check(processed[0] == noisy[0] && processed[^1] == noisy[^1], "level endpoints");
             foreach (double s in fit.Checks!)
-                Check(noisy.Zip(noisy.Skip(1)).Min(v => Distance(fit.At(s).P, v.First.Point, v.Second.Point)) <= level + 1 + 1e-8, "total smoothing + fitting budget");
+                Check(noisy.Zip(noisy.Skip(1)).Min(v => Distance(fit.At(s).P, v.First.Point, v.Second.Point)) <= Budget(level) + 1e-8, "total smoothing + fitting budget");
             foreach (var p in noisy)
-                Check(fit.Checks!.Zip(fit.Checks.Skip(1)).Min(v => Distance(p.Point, fit.At(v.First).P, fit.At(v.Second).P)) <= level + 1 + CaptureSpacing, "smoothing lost an excursion");
+                Check(fit.Checks!.Zip(fit.Checks.Skip(1)).Min(v => Distance(p.Point, fit.At(v.First).P, fit.At(v.Second).P)) <= Budget(level) + CaptureSpacing, "smoothing lost an excursion");
         }
         var legal = Repair(raw.Select(p => new FreehandPoint(320 + p.X, p.Y)).ToArray(), model, range, 0, rates);
         Check(legal.Shift == 0, "repair touched a legal draft");
