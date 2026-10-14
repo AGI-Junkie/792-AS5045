@@ -4,47 +4,46 @@
  * reserved flash region so they survive power-off; loading one just refills g_traj node by node through the same
  * traj_begin()/traj_push() checks an upload goes through (main.c).
  *
- * Layout.  The region starts at TS_REGION_OFFSET (reserved for it by cm3gcc_trajstore.ld, nothing else may link there).
- * Each slot owns two blocks, A and B, of TS_BLOCK_ROWS flash rows.  A block is one header row followed by the nodes:
- * 6 bytes each, little endian, q1 (cdeg, int16) q2 (cdeg, int16) ms (uint16), TS_NODE_BYTES * count bytes.
+ * Layout.  The region starts at TS_REGION_OFFSET (reserved for it by cm3gcc_trajstore.ld, nothing else may link there) and is
+ * two banks of TS_BANK_ROWS flash rows.  One bank holds the archive.  Every change (save, replace, erase) builds the whole next
+ * archive in the other bank, the records that stay copied row by row, and commits it last; the old bank is not touched, so power
+ * lost at any point leaves the old archive whole or the new one whole.  Each record takes only the rows it needs.
  *
- * Header row (little endian; the rest of the row stays 0xFF):
- *    0 magic u32   4 version u16   6 contract u16   8 slot u16   10 count u16
- *   12 seq u32    16 durationMs u32   20 q1 s16   22 q2 s16   24 dataCrc u32   28 headerCrc u32 (bytes 0..27)
- * `contract` says which joint-angle convention the nodes use; raise TS_CONTRACT when that changes and every old slot
- * becomes invalid instead of being drawn wrong.  A block is valid only when the header and the data both check out.
+ * Commit row, the first row of a bank (little endian; the rest of the row stays 0xFF):
+ *    0 magic u32   4 version u16   6 contract u16   8 gen u32   12 records u16   14 usedRows u16
+ *   16 bankCrc u32 (record rows 1..usedRows, whole rows)   20 headCrc u32 (bytes 0..19)
+ * The records follow it back to back, each starting on a row boundary: a TS_REC_HEAD byte header, the description (metaLen
+ * bytes), the nodes, then 0xFF up to the next row.
+ *    0 slot u16   2 count u16   4 seq u32   8 durationMs u32   12 dataCrc u32 (node stream)   16 metaLen u16   18 0xFFFF
+ *   20 headCrc u32 (bytes 0..19)
+ * Nodes are 6 bytes each, little endian: q1 (cdeg, int16) q2 (cdeg, int16) ms (uint16).  The description (optional) is up to
+ * TS_META_MAX opaque bytes the host keeps with the plan; the device never reads it.  A record's seq is the generation of the
+ * bank it was first written in: a slot that gets another plan gets a new seq, and seq values never repeat.  `contract` says
+ * which joint-angle convention the nodes use; raise TS_CONTRACT when that changes and the archive becomes empty instead of
+ * drawn wrong.  The newer valid bank (gen compared modulo 2^32) is the archive; its records are listed in g_tsDir (RAM).
  *
- * Description (optional).  The host may keep a short text with a plan (which figure and settings made it, so another computer
- * can show and restore it).  The device never reads it: it stores up to TS_META_MAX opaque bytes in row TS_META_ROW0, the first
- * row after the largest plan, and records them in the header row after the old fields:
- *   32 metaLen u16   34 0xFFFF   36 metaCrc u32 (of the text)   40 extCrc u32 (bytes 32..39)
- * Older firmware never looks past byte 31 and leaves 0xFF there, so a block without a description (or one written by older
- * firmware) reads as "no description", and a block with one is still a good plan to older firmware.  The text row is written
- * before the header, so the header row commits plan and description together.
- *
- * Saving never touches the newest valid block of the slot: the other block is invalidated, filled row by row (each row
- * read back), and only then given its header, with seq one higher.  Power lost at any point leaves the old block (or an
- * invalid new one), never a half plan.  Nothing here is called from an interrupt; the save runs one row per foreground
- * pass because a row write blocks for milliseconds (the measured worst case is reported, see ts_job_t.rowMaxCy).
+ * Nothing here is called from an interrupt; a change runs one row per foreground pass because a row write blocks for
+ * milliseconds (the measured worst case is reported, see ts_job_t.rowMaxCy).
  *
  * The hardware is behind one hook, ts_write_row(), defined by main.c; the simulation backs it with an array.
  */
 #ifndef TRAJSTORE_H
 #define TRAJSTORE_H
 
-#define TS_SLOTS            (4u)
+#define TS_SLOTS            (32u)
 #define TS_ROW_BYTES        (256u)               /* one flash row (CYDEV_FLS_ROW_SIZE) */
-#define TS_BLOCK_ROWS       (52u)                /* 13 KB: header row + up to 48 data rows + spare */
-#define TS_BLOCK_BYTES      (TS_BLOCK_ROWS * TS_ROW_BYTES)
+#define TS_BANK_ROWS        (256u)               /* 64 KB: the commit row and TS_DATA_ROWS rows of records */
+#define TS_DATA_ROWS        (TS_BANK_ROWS - 1u)
+#define TS_BANK_BYTES       (TS_BANK_ROWS * TS_ROW_BYTES)
 #define TS_REGION_OFFSET    (0x20000u)           /* second half of the 256 KB flash */
-#define TS_REGION_BYTES     (TS_SLOTS * 2u * TS_BLOCK_BYTES)
+#define TS_REGION_BYTES     (2u * TS_BANK_BYTES)
 #define TS_NODE_BYTES       (6u)
-#define TS_DATA_ROWS_MAX    ((TRAJ_CAPACITY * TS_NODE_BYTES + TS_ROW_BYTES - 1u) / TS_ROW_BYTES)
-#define TS_META_ROW0        (1u + TS_DATA_ROWS_MAX)   /* the description sits in the spare row after a full plan */
+#define TS_REC_HEAD         (24u)
 #define TS_META_MAX         (TS_ROW_BYTES)
 #define TS_MAGIC            (0x534A5254u)        /* "TRJS" */
-#define TS_VERSION          (1u)
+#define TS_VERSION          (2u)
 #define TS_CONTRACT         (1u)
+#define TS_REC_ROWS(count, metaLen) ((uint16)((TS_REC_HEAD + (uint32)(metaLen) + (uint32)(count) * TS_NODE_BYTES + TS_ROW_BYTES - 1u) / TS_ROW_BYTES))
 /* Proof that this image was linked with cm3gcc_trajstore.ld, which reserves the region.  With the stock script the symbol
  * is undefined (weak, so 0), TS_LINKED() is false and every archive operation is refused: the archive can then never be
  * written over program code, whatever the linker settings of the project happen to be. */
@@ -52,8 +51,8 @@
 extern const uint8 __trajstore_start[] __attribute__((weak));
 #define TS_LINKED() ((uint32)__trajstore_start == (uint32)(CYDEV_FLASH_BASE + TS_REGION_OFFSET))
 #endif
-_Static_assert(TS_DATA_ROWS_MAX + 1u <= TS_BLOCK_ROWS, "a full plan must fit in one block");
-_Static_assert(TS_META_ROW0 + 1u <= TS_BLOCK_ROWS, "the description row must fit in one block");
+_Static_assert(TS_REC_ROWS(TRAJ_CAPACITY, TS_META_MAX) <= TS_DATA_ROWS, "a full plan with the largest description must fit in a bank");
+_Static_assert(TS_SLOTS <= 32u, "the inventory reports the slots as a 32-bit mask");
 _Static_assert(TS_REGION_OFFSET + TS_REGION_BYTES <= 0x40000u, "the archive must fit in the 256 KB flash");
 
 /* ---- little-endian helpers and CRC-32 (IEEE, reflected, the same as zlib/.NET callers compute) ----------------------- */
@@ -86,49 +85,83 @@ static uint8 ts_stream_byte(const traj_node_t *nodes, uint32 k)
     return (uint8)((k & 1u) ? (v >> 8) : v);
 }
 
-/* ---- reading ------------------------------------------------------------------------------------------------------ */
+/* ---- the archive in RAM: which bank, and where each slot's record is ---------------------------------------------- */
 
 typedef struct {
-    uint8  valid, which;          /* which = 0 (A) / 1 (B): the block these values came from */
-    uint16 count;
+    uint8  valid;
+    uint16 count, metaLen;        /* metaLen 0 = no description */
+    uint16 row;                   /* the record's first row in the active bank */
     uint32 seq, durationMs, dataCrc;
     int16  q1, q2;                /* start pose, cdeg: node 0 */
-    uint16 metaLen;               /* 0 = no (valid) description */
 } ts_info_t;
 
-static uint32 ts_block_offset(uint8 slot, uint8 which) { return TS_REGION_OFFSET + ((uint32)slot * 2u + which) * TS_BLOCK_BYTES; }
+static ts_info_t g_tsDir[TS_SLOTS];
+static struct { uint8 valid, bank; uint16 records, usedRows; uint32 gen; } g_tsBank;
 
-/* Full check of one block: header fields and CRC, count, and the CRC of the node bytes.  Fills *info when valid. */
-static uint8 ts_check_block(const uint8 *blk, uint8 slot, ts_info_t *info)
+static uint32 ts_bank_offset(uint8 bank) { return TS_REGION_OFFSET + (uint32)bank * TS_BANK_BYTES; }
+static uint16 ts_rows(const ts_info_t *r) { return TS_REC_ROWS(r->count, r->metaLen); }
+/* A valid slot's record: header, then the description, then the nodes. */
+static const uint8 *ts_record(uint8 slot) { return ts_flash(ts_bank_offset(g_tsBank.bank) + (uint32)g_tsDir[slot].row * TS_ROW_BYTES); }
+static const uint8 *ts_nodes(uint8 slot) { return ts_record(slot) + TS_REC_HEAD + g_tsDir[slot].metaLen; }
+
+/* Is `bank` a complete, committed archive?  `full` also checks the CRC of every used row (at boot; a bank just written was read
+ * back row by row).  `fill` (only for a bank that already passed) loads g_tsDir from it. */
+static uint8 ts_check_bank(uint8 bank, uint8 full, uint8 fill)
 {
-    uint16 count = ts_get16(blk + 10);
-    if (ts_get32(blk) != TS_MAGIC || ts_get16(blk + 4) != TS_VERSION || ts_get16(blk + 6) != TS_CONTRACT ||
-        ts_get16(blk + 8) != slot || count < 2u || count > TRAJ_CAPACITY ||
-        ts_crc32(0u, blk, 28u) != ts_get32(blk + 28) ||
-        ts_crc32(0u, blk + TS_ROW_BYTES, (uint32)count * TS_NODE_BYTES) != ts_get32(blk + 24)) { return 0u; }
-    info->valid = 1u; info->count = count; info->seq = ts_get32(blk + 12); info->durationMs = ts_get32(blk + 16);
-    info->q1 = (int16)ts_get16(blk + 20); info->q2 = (int16)ts_get16(blk + 22); info->dataCrc = ts_get32(blk + 24);
-    info->metaLen = 0u;
-    {
-        uint16 len = ts_get16(blk + 32);
-        if (len >= 1u && len <= TS_META_MAX && ts_crc32(0u, blk + 32, 8u) == ts_get32(blk + 40) &&
-            ts_crc32(0u, blk + TS_META_ROW0 * TS_ROW_BYTES, len) == ts_get32(blk + 36)) { info->metaLen = len; }
+    const uint8 *b = ts_flash(ts_bank_offset(bank));
+    uint16 records = ts_get16(b + 12), used = ts_get16(b + 14), row = 1u, i;
+    uint32 seen = 0u;
+    if (ts_get32(b) != TS_MAGIC || ts_get16(b + 4) != TS_VERSION || ts_get16(b + 6) != TS_CONTRACT || records > TS_SLOTS ||
+        used > TS_DATA_ROWS || ts_crc32(0u, b, 20u) != ts_get32(b + 20) ||
+        (full && ts_crc32(0u, b + TS_ROW_BYTES, (uint32)used * TS_ROW_BYTES) != ts_get32(b + 16))) { return 0u; }
+    if (fill) { memset(g_tsDir, 0, sizeof(g_tsDir)); }
+    for (i = 0u; i < records; i++) {
+        const uint8 *h = b + (uint32)row * TS_ROW_BYTES;
+        uint16 slot, count, metaLen;
+        if (row > used || ts_crc32(0u, h, 20u) != ts_get32(h + 20)) { return 0u; }
+        slot = ts_get16(h); count = ts_get16(h + 2); metaLen = ts_get16(h + 16);
+        if (slot >= TS_SLOTS || (seen & (1ul << slot)) || count < 2u || count > TRAJ_CAPACITY || metaLen > TS_META_MAX ||
+            (uint32)row + TS_REC_ROWS(count, metaLen) > (uint32)used + 1u) { return 0u; }
+        seen |= 1ul << slot;
+        if (fill) {
+            ts_info_t *r = &g_tsDir[slot];
+            const uint8 *n = h + TS_REC_HEAD + metaLen;
+            r->valid = 1u; r->count = count; r->metaLen = metaLen; r->row = row;
+            r->seq = ts_get32(h + 4); r->durationMs = ts_get32(h + 8); r->dataCrc = ts_get32(h + 12);
+            r->q1 = (int16)ts_get16(n); r->q2 = (int16)ts_get16(n + 2);
+        }
+        row = (uint16)(row + TS_REC_ROWS(count, metaLen));
     }
+    return (uint8)(row == used + 1u);
+}
+
+/* Make `bank` the archive (it is checked first, without the row CRC). */
+static uint8 ts_use(uint8 bank)
+{
+    const uint8 *b = ts_flash(ts_bank_offset(bank));
+    if (!ts_check_bank(bank, 0u, 1u)) { return 0u; }
+    g_tsBank.valid = 1u; g_tsBank.bank = bank; g_tsBank.gen = ts_get32(b + 8);
+    g_tsBank.records = ts_get16(b + 12); g_tsBank.usedRows = ts_get16(b + 14);
     return 1u;
 }
 
-/* The newest valid block of a slot (seq compared modulo 2^32).  info->valid = 0 when neither block is good. */
-static void ts_active(uint8 slot, ts_info_t *info)
+/* At boot: the newer of the two fully checked banks, or an empty archive. */
+static void ts_mount(void)
 {
-    ts_info_t a, b;
     uint8 okA, okB;
-    a.valid = b.valid = 0u;
-    okA = ts_check_block(ts_flash(ts_block_offset(slot, 0u)), slot, &a);
-    okB = ts_check_block(ts_flash(ts_block_offset(slot, 1u)), slot, &b);
-    a.which = 0u; b.which = 1u;
-    info->valid = 0u; info->which = 0u;
-    if (okA && (!okB || (int32)(a.seq - b.seq) > 0)) { *info = a; }
-    else if (okB) { *info = b; }
+    memset(g_tsDir, 0, sizeof(g_tsDir)); memset(&g_tsBank, 0, sizeof(g_tsBank));
+    if (!TS_LINKED()) { return; }
+    okA = ts_check_bank(0u, 1u, 0u); okB = ts_check_bank(1u, 1u, 0u);
+    if (okA && (!okB || (int32)(ts_get32(ts_flash(ts_bank_offset(0u)) + 8) - ts_get32(ts_flash(ts_bank_offset(1u)) + 8)) > 0)) { (void)ts_use(0u); }
+    else if (okB) { (void)ts_use(1u); }
+}
+
+/* Rows left for a record in `slot` (its present record, if any, would be replaced). */
+static uint16 ts_free_rows(uint8 slot)
+{
+    uint16 used = 0u; uint8 i;
+    for (i = 0u; i < TS_SLOTS; i++) { if (g_tsDir[i].valid && i != slot) { used = (uint16)(used + ts_rows(&g_tsDir[i])); } }
+    return (uint16)(TS_DATA_ROWS - used);
 }
 
 /* ---- writing: one row per ts_step() ------------------------------------------------------------------------------- */
@@ -137,91 +170,109 @@ typedef enum { TS_JOB_NONE = 0, TS_JOB_SAVE = 1, TS_JOB_ERASE = 2 } ts_kind_t;
 typedef enum { TS_STEP_MORE = 0, TS_STEP_DONE = 1, TS_STEP_FAIL = 2 } ts_step_t;
 
 typedef struct {
-    uint8  busy, kind, slot, which;       /* which: the block being written (erase: the one being cleared) */
-    uint8  phase;                         /* 0 clear the header, 1 data rows, 3 description row (if any), 2 commit the header */
-    uint8  mismatch;                      /* the description was made for another plan: nothing was committed */
-    uint16 row, rows;                     /* next data row (1-based) / how many there are */
-    uint16 count, metaLen;
-    uint32 seq, crc, durationMs, planCrc;
+    uint8  busy, kind, slot, bank;        /* bank: the one being built */
+    uint8  phase;                         /* 0 clear its commit row, 1 copy the records that stay, 2 the new record, 3 commit */
+    uint8  mismatch;                      /* the description was made for another plan: nothing is written */
+    uint8  src;                           /* phase 1: the slot being copied */
+    uint16 part;                          /* row within the record being written */
+    uint16 next;                          /* next record row of the bank */
+    uint16 row, rows;                     /* rows written / to write in all */
+    uint16 count, metaLen, records;
+    uint32 gen, crc, durationMs, dataCrc;
     const traj_node_t *nodes;             /* the RAM plan; the caller keeps it unchanged while busy */
     const uint8 *meta;                    /* the description (metaLen bytes, 0 = none); also kept unchanged while busy */
     uint32 rowMaxCy;                      /* slowest row write, SysTick cycles */
     uint32 rowsWritten;
+    uint8  head[TS_REC_HEAD];             /* the new record's header */
     uint8  buf[TS_ROW_BYTES];
 } ts_job_t;
 
 static uint8 ts_write_row(uint32 offset, const uint8 *row);   /* main.c: program one row at offset and read it back; 1 = ok */
 
-/* `meta` (metaLen > 0) is written with the plan, but only if planCrc is the CRC of the node stream actually written: a
- * description made for another plan is never committed. */
+/* The next archive is the present one without `slot`, plus (a save) the new record. */
+static void ts_job_begin(ts_job_t *j, uint8 kind, uint8 slot)
+{
+    uint8 i;
+    memset(j, 0, sizeof(*j));
+    j->busy = 1u; j->kind = kind; j->slot = slot; j->next = 1u;
+    j->bank = g_tsBank.valid ? (uint8)(g_tsBank.bank ^ 1u) : 0u;
+    j->gen = g_tsBank.gen + 1u;
+    for (i = 0u; i < TS_SLOTS; i++) {
+        if (g_tsDir[i].valid && i != slot) { j->records++; j->rows = (uint16)(j->rows + ts_rows(&g_tsDir[i])); }
+    }
+    j->rows += 2u;                        /* the commit row, cleared first and written last */
+}
+
+/* The caller checked the room (ts_free_rows).  `meta` (metaLen > 0) is written with the plan, but only if planCrc is the CRC of
+ * the node stream: a description made for another plan is never committed. */
 static void ts_job_save(ts_job_t *j, uint8 slot, const traj_node_t *nodes, uint16 count, uint32 durationMs,
                         const uint8 *meta, uint16 metaLen, uint32 planCrc)
 {
-    ts_info_t cur;
-    ts_active(slot, &cur);
-    memset(j, 0, sizeof(*j));
-    j->busy = 1u; j->kind = TS_JOB_SAVE; j->slot = slot;
-    j->which = cur.valid ? (uint8)(cur.which ^ 1u) : 0u;
-    j->seq = cur.valid ? cur.seq + 1u : 1u;
+    uint32 k, i, total = (uint32)count * TS_NODE_BYTES;
+    ts_job_begin(j, TS_JOB_SAVE, slot);
     j->nodes = nodes; j->count = count; j->durationMs = durationMs;
-    j->meta = meta; j->metaLen = meta ? metaLen : 0u; j->planCrc = planCrc;
-    j->rows = (uint16)(((uint32)count * TS_NODE_BYTES + TS_ROW_BYTES - 1u) / TS_ROW_BYTES);
-    j->row = 1u;
+    j->meta = meta; j->metaLen = meta ? metaLen : 0u;
+    for (k = 0u; k < total; k += i) {
+        for (i = 0u; i < TS_ROW_BYTES && k + i < total; i++) { j->buf[i] = ts_stream_byte(nodes, k + i); }
+        j->dataCrc = ts_crc32(j->dataCrc, j->buf, i);
+    }
+    j->mismatch = (uint8)(j->metaLen && planCrc != j->dataCrc);
+    memset(j->head, 0xFF, TS_REC_HEAD);
+    ts_put16(j->head, slot); ts_put16(j->head + 2, count); ts_put32(j->head + 4, j->gen); ts_put32(j->head + 8, durationMs);
+    ts_put32(j->head + 12, j->dataCrc); ts_put16(j->head + 16, j->metaLen); ts_put32(j->head + 20, ts_crc32(0u, j->head, 20u));
+    j->records++; j->rows = (uint16)(j->rows + TS_REC_ROWS(count, j->metaLen));
 }
 
-static void ts_job_erase(ts_job_t *j, uint8 slot)
+/* 0: the slot is empty already and nothing is to be written. */
+static uint8 ts_job_erase(ts_job_t *j, uint8 slot)
 {
-    memset(j, 0, sizeof(*j));
-    j->busy = 1u; j->kind = TS_JOB_ERASE; j->slot = slot; j->which = 0u;
+    if (!g_tsDir[slot].valid) { memset(j, 0, sizeof(*j)); j->kind = TS_JOB_ERASE; j->slot = slot; return 0u; }
+    ts_job_begin(j, TS_JOB_ERASE, slot);
+    return 1u;
+}
+
+static uint8 ts_new_byte(const ts_job_t *j, uint32 k)
+{
+    if (k < TS_REC_HEAD) { return j->head[k]; }
+    k -= TS_REC_HEAD;
+    return k < j->metaLen ? j->meta[k] : ts_stream_byte(j->nodes, k - j->metaLen);
 }
 
 static ts_step_t ts_step(ts_job_t *j)
 {
-    uint32 base = ts_block_offset(j->slot, j->which);
-    uint32 start = SU_NOW();
-    uint32 took;
+    uint32 base = ts_bank_offset(j->bank), at = 0u, k, first = (uint32)j->part * TS_ROW_BYTES;
+    uint32 size = TS_REC_HEAD + j->metaLen + (uint32)j->count * TS_NODE_BYTES;
+    uint32 start = SU_NOW(), took;
     uint8 ok;
-    if (j->kind == TS_JOB_ERASE || j->phase == 0u) {
-        memset(j->buf, 0xFF, TS_ROW_BYTES);
-        ok = ts_write_row(base, j->buf);
-        j->rowsWritten++;
-        if (ok && j->kind == TS_JOB_ERASE && j->which == 0u) { j->which = 1u; }
-        else if (ok && j->kind == TS_JOB_ERASE) { j->busy = 0u; }
-        else if (ok) { j->phase = 1u; }
-    } else if (j->phase == 1u) {
-        uint32 first = (uint32)(j->row - 1u) * TS_ROW_BYTES, total = (uint32)j->count * TS_NODE_BYTES, n, i;
-        n = total - first < TS_ROW_BYTES ? total - first : TS_ROW_BYTES;
-        for (i = 0u; i < n; i++) { j->buf[i] = ts_stream_byte(j->nodes, first + i); }
-        for (; i < TS_ROW_BYTES; i++) { j->buf[i] = 0xFFu; }
-        j->crc = ts_crc32(j->crc, j->buf, n);
-        ok = ts_write_row(base + (uint32)j->row * TS_ROW_BYTES, j->buf);
-        j->rowsWritten++;
-        if (ok && ++j->row > j->rows) {
-            if (j->metaLen && j->planCrc != j->crc) { ok = 0u; j->mismatch = 1u; }
-            else { j->phase = j->metaLen ? 3u : 2u; }
-        }
+    if (j->mismatch) { j->busy = 0u; return TS_STEP_FAIL; }
+    while (j->phase == 1u && j->src < TS_SLOTS && (!g_tsDir[j->src].valid || j->src == j->slot)) { j->src++; }
+    if (j->phase == 1u && j->src == TS_SLOTS) { j->phase = j->kind == TS_JOB_SAVE ? 2u : 3u; }
+    memset(j->buf, 0xFF, TS_ROW_BYTES);
+    if (j->phase == 1u) {
+        memcpy(j->buf, ts_record(j->src) + first, TS_ROW_BYTES);
+        at = j->next;
+    } else if (j->phase == 2u) {
+        for (k = 0u; k < TS_ROW_BYTES && first + k < size; k++) { j->buf[k] = ts_new_byte(j, first + k); }
+        at = j->next;
     } else if (j->phase == 3u) {
-        memset(j->buf, 0xFF, TS_ROW_BYTES);
-        memcpy(j->buf, j->meta, j->metaLen);
-        ok = ts_write_row(base + TS_META_ROW0 * TS_ROW_BYTES, j->buf);
-        j->rowsWritten++;
-        if (ok) { j->phase = 2u; }
-    } else {
-        memset(j->buf, 0xFF, TS_ROW_BYTES);
-        ts_put32(j->buf, TS_MAGIC); ts_put16(j->buf + 4, TS_VERSION); ts_put16(j->buf + 6, TS_CONTRACT);
-        ts_put16(j->buf + 8, j->slot); ts_put16(j->buf + 10, j->count); ts_put32(j->buf + 12, j->seq);
-        ts_put32(j->buf + 16, j->durationMs);
-        ts_put16(j->buf + 20, (uint16)j->nodes[0].q1); ts_put16(j->buf + 22, (uint16)j->nodes[0].q2);
-        ts_put32(j->buf + 24, j->crc);
-        ts_put32(j->buf + 28, ts_crc32(0u, j->buf, 28u));
-        if (j->metaLen) {
-            ts_put16(j->buf + 32, j->metaLen);
-            ts_put32(j->buf + 36, ts_crc32(0u, j->meta, j->metaLen));
-            ts_put32(j->buf + 40, ts_crc32(0u, j->buf + 32, 8u));
+        ts_put32(j->buf, TS_MAGIC); ts_put16(j->buf + 4, TS_VERSION); ts_put16(j->buf + 6, TS_CONTRACT); ts_put32(j->buf + 8, j->gen);
+        ts_put16(j->buf + 12, j->records); ts_put16(j->buf + 14, (uint16)(j->next - 1u)); ts_put32(j->buf + 16, j->crc);
+        ts_put32(j->buf + 20, ts_crc32(0u, j->buf, 20u));
+    }
+    ok = ts_write_row(base + at * TS_ROW_BYTES, j->buf);
+    j->rowsWritten++;
+    if (ok) {
+        j->row++;
+        if (j->phase == 0u) { j->phase = 1u; }
+        else if (j->phase == 3u) {
+            j->busy = 0u;
+            ok = ts_use(j->bank);
+            if (!ok) { ts_mount(); }      /* cannot happen with rows that read back right; the flash decides, as after a reboot */
+        } else {
+            j->crc = ts_crc32(j->crc, j->buf, TS_ROW_BYTES); j->next++; j->part++;
+            if (j->phase == 1u && j->part == ts_rows(&g_tsDir[j->src])) { j->src++; j->part = 0u; }
+            else if (j->phase == 2u && (uint32)j->part * TS_ROW_BYTES >= size) { j->phase = 3u; }
         }
-        ok = ts_write_row(base, j->buf);
-        j->rowsWritten++;
-        if (ok) { j->busy = 0u; }
     }
     took = SU_ELAPSED(start);
     if (took > j->rowMaxCy) { j->rowMaxCy = took; }

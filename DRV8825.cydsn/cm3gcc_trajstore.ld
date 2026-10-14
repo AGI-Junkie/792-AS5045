@@ -1,7 +1,7 @@
 /* cm3gcc_trajstore.ld -- the PSoC Creator generated cm3gcc.ld with the second half of the flash reserved for the
  * trajectory archive (trajstore.h).  Differences from the generated script, and nothing else:
  *   1. rom is 128 KB (0x00000-0x1FFFF); a program that grows past it is a link error, not silent corruption of the archive.
- *   2. store is the archive region, 0x20000-0x39FFF (TS_REGION_OFFSET, TS_REGION_BYTES in trajstore.h); no section is put
+ *   2. store is the archive region, 0x20000-0x3FFFF (TS_REGION_OFFSET, TS_REGION_BYTES in trajstore.h); no section is put
  *      there, and __trajstore_start lets the firmware prove it was linked with this script.
  *   3. CY_FLASH_TOP (the real 256 KB end) replaces the generated script's use of LENGTH(rom) as "end of flash".
  * Select it in Project > Build Settings > Linker > General > Custom Linker Script (Debug and Release), see
@@ -37,7 +37,7 @@ INCLUDE cycodeshareimport.ld
 MEMORY
 {
 	rom (rx) : ORIGIN = 0x0, LENGTH = 131072
-	store (r) : ORIGIN = 0x20000, LENGTH = 0x1A000
+	store (r) : ORIGIN = 0x20000, LENGTH = 0x20000
 	ram (rwx) : ORIGIN = 0x20000000 - (65536 / 2), LENGTH = 65536
 }
 

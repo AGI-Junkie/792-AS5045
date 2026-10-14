@@ -8,7 +8,8 @@ using System.Windows.Shapes;
 namespace TwoLinkCommissioning;
 
 // The board's flash archive in the panel: a star on a recent run means "this figure is stored on the board".  ☆ puts the
-// run's figure there (load it, upload it, save it into a free slot, or into the slot the operator picks when all are used);
+// run's figure there (load it, upload it, save it into a free slot, or into the slot the operator picks when all are used or the
+// room left is too small);
 // ★ takes it off again.  A figure on the board is loaded from its slot instead of uploaded: the Upload button says so.
 // Nothing here moves the arm or talks to the device; the window does that and reports the slots back through SetBoard.
 public sealed partial class XYPreviewPanel
@@ -22,6 +23,7 @@ public sealed partial class XYPreviewPanel
     private bool boardKnown, boardBusy;            // the inventory is complete; a save/erase/upload-then-save is in progress
     private bool boardSupported => boardSlotCount > 0;
     private IReadOnlyList<BoardSlot?> boardSlots = new BoardSlot?[DeviceContract.TrajStoreSlots];
+    private BoardDir? boardDir;                    // the archive's size and room (null: not reported, the device decides)
     private IReadOnlyList<LedgerEntry> boardLedger = [];
     private Func<string>? boardMessage;
     private BoardSlot? planOnBoard;                    // the slot that holds exactly the plan on screen
@@ -59,15 +61,15 @@ public sealed partial class XYPreviewPanel
 
     // known: every slot has been reported on this link.  Until then no slot is assumed empty, and saving stays off.
     internal int BoardRebuilds;                    // how often the board state really changed (the controls are rebuilt only then)
-    public void SetBoard(int slotCount, bool known, bool busy, IReadOnlyList<BoardSlot?> slots, IReadOnlyList<LedgerEntry> ledger, Func<string>? message, bool canReadNodes = false)
+    public void SetBoard(int slotCount, bool known, bool busy, IReadOnlyList<BoardSlot?> slots, IReadOnlyList<LedgerEntry> ledger, Func<string>? message, bool canReadNodes = false, BoardDir? dir = null)
     {
         // The device repeats its LINK line every 500 ms: unchanged state must not tear down the buttons the operator is using
         // (a confirmation menu opened from one of them would be lost).
         slotCount = Math.Clamp(slotCount, 0, DeviceContract.TrajStoreSlots);
         var newSlots = slots.ToArray(); var newLedger = ledger.ToList();
-        if (slotCount == boardSlotCount && canReadNodes == boardCanRead && known == boardKnown && busy == boardBusy && newSlots.SequenceEqual(boardSlots) && newLedger.SequenceEqual(boardLedger) && ReferenceEquals(message, boardMessage)) return;
+        if (slotCount == boardSlotCount && canReadNodes == boardCanRead && known == boardKnown && busy == boardBusy && newSlots.SequenceEqual(boardSlots) && newLedger.SequenceEqual(boardLedger) && ReferenceEquals(message, boardMessage) && Equals(dir, boardDir)) return;
         BoardRebuilds++;
-        boardSlotCount = slotCount; boardCanRead = canReadNodes; boardKnown = known; boardBusy = busy; boardSlots = newSlots; boardLedger = newLedger; boardMessage = message;
+        boardSlotCount = slotCount; boardCanRead = canReadNodes; boardKnown = known; boardBusy = busy; boardSlots = newSlots; boardLedger = newLedger; boardMessage = message; boardDir = dir;
         ShowRecentRuns();
         UpdateBoardNote();
         UpdateBoardClear();
@@ -126,22 +128,38 @@ public sealed partial class XYPreviewPanel
         {
             if (!boardSupported) return Lang.T("board.unsupported");
             if (!boardKnown) return Lang.T("board.reading") + (boardMessage is { } pending ? "\n" + pending() : "");
-            string slots = string.Join("\n", Enumerable.Range(0, boardSlotCount).Select(i => Lang.T("board.slot", i + 1, SlotLabel(boardSlots.ElementAtOrDefault(i)))));
-            return Lang.T("board.summary", slots) + (boardMessage is { } message ? "\n" + message() : "");
+            // Only the slots that hold a figure (up to 32), then how much of the flash they use.
+            var held = boardSlots.Take(boardSlotCount).OfType<BoardSlot>().Where(s => s.Valid).ToList();
+            string slots = held.Count == 0 ? Lang.T("board.none") : string.Join("\n", held.Select(s => Lang.T("board.slot", s.Slot + 1, SlotLabel(s))));
+            string room = boardDir is { } dir ? "\n" + Lang.T("board.capacity", held.Count, boardSlotCount, dir.UsedBytes / 1024.0, dir.TotalBytes / 1024.0) : "";
+            return Lang.T("board.summary", slots) + room + (boardMessage is { } message ? "\n" + message() : "");
         });
     }
 
-    // ☆ and Save To Board: the figure goes to the first free slot; with none free the operator chooses which one to replace.
-    private void StarClicked(Button star, ExperimentRun run, Dictionary<string, string> values) => ChooseBoardSlot(star, slot => SaveRunToBoard(run, values, slot));
-    private void ChooseBoardSlot(Button anchor, Action<int> save)
+    // ☆ and Save To Board: the figure goes to the first free slot if the room left takes it; otherwise the operator chooses which figure
+    // to replace, among those whose rows would make enough room.  Nothing is cleared without being picked.
+    private void StarClicked(Button star, ExperimentRun run, Dictionary<string, string> values)
     {
-        if (TrajectoryArchive.FreeSlot(boardSlots, boardSlotCount) is { } free) { save(free); return; }
-        var menu = new ContextMenu { PlacementTarget = anchor };
-        for (int i = 0; i < boardSlotCount; i++)
+        ApplyPreset(values);   // the size of the figure decides where it can go
+        if (execution is not { } plan) { Lang.Text(recentNote, () => Lang.T("board.err.plan") + result.Text); return; }
+        ChooseBoardSlot(star, plan, slot => SaveRunToBoard(run, values, slot));
+    }
+    private void ChooseBoardSlot(Button anchor, ExecutionTrajectory plan, Action<int> save)
+    {
+        int need = TrajectoryArchive.RowsFor(plan.Nodes.Length, BoardMeta.TextFor(SettingsDescription)?.Length ?? 0);
+        long room = boardDir?.FreeRows ?? int.MaxValue;
+        int? free = TrajectoryArchive.FreeSlot(boardSlots, boardSlotCount);
+        if (free is { } slotFree && need <= room) { save(slotFree); return; }
+        var choices = boardSlots.Take(boardSlotCount).OfType<BoardSlot>().Where(s => s.Valid && need <= room + s.Rows).ToList();
+        double needKb = need * 256 / 1024.0, roomKb = Math.Min(room, int.MaxValue / 256) * 256 / 1024.0;
+        if (choices.Count == 0) { Lang.Text(recentNote, () => Lang.T("board.err.noRoom", needKb, roomKb)); return; }
+        if (free is not null) Lang.Text(recentNote, () => Lang.T("board.replaceForRoom", needKb, roomKb));
+        var menu = new ContextMenu { PlacementTarget = anchor, MaxHeight = 420 };   // up to 32 items: the menu scrolls
+        foreach (var slot in choices)
         {
-            int slot = i;
-            var item = new MenuItem { Header = Lang.T("board.replace", slot + 1, SlotLabel(boardSlots.ElementAtOrDefault(slot))) };
-            item.Click += (_, _) => save(slot);
+            int number = slot.Slot;
+            var item = new MenuItem { Header = Lang.T("board.replace", number + 1, SlotLabel(slot)) };
+            item.Click += (_, _) => save(number);
             menu.Items.Add(item);
         }
         ShowMenu(menu);
@@ -153,7 +171,7 @@ public sealed partial class XYPreviewPanel
     private void SaveCurrentToBoard()
     {
         if (execution is not { } plan) return;
-        ChooseBoardSlot(saveBoard, slot =>
+        ChooseBoardSlot(saveBoard, plan, slot =>
         {
             Lang.Text(recentNote, () => Lang.T("board.saveCurrentStarted", slot + 1));
             SaveToBoardRequested?.Invoke(plan, slot);
@@ -356,6 +374,20 @@ public sealed partial class XYPreviewPanel
             if (saved.Count != 0 || LastMenu is not { Items.Count: 4 } menu || ((MenuItem)menu.Items[2]!).Header is not string pick || !pick.Contains("替换槽3")) Fail("槽都满了应让操作者选替换哪一个");
             ((MenuItem)menu.Items[2]!).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
             if (saved.Count != 1 || saved[0].Slot != 2) Fail("选了槽 3 就应请求存入槽 3");
+            // Room, not slot numbers: with a free slot but too little room left, only the figures whose rows would make room are offered;
+            // when none would, nothing is saved or cleared and the note says why.
+            saved.Clear(); LastMenu = null;
+            int need = TrajectoryArchive.RowsFor(plan.Nodes.Length, BoardMeta.TextFor(panel.SettingsDescription)?.Length ?? 0);
+            if (need < 2) Fail("夹具的图形应至少占两行：" + need);
+            var tight = new BoardDir(9, 2, 4, 2 * need - 1, 0, 2 * need - 1, 256, 6);
+            panel.SetBoard(4, true, false, [Free(0), Held(1, 1) with { Rows = need - 1 }, Held(2, 2) with { Rows = need }, Free(3)], [], null, false, tight);
+            panel.ClickSaveBoardForSelfTest();
+            if (saved.Count != 0 || LastMenu is not { Items.Count: 1 } roomMenu || ((MenuItem)roomMenu.Items[0]!).Header is not string only || !only.Contains("替换槽3") || !panel.recentNote.Text.Contains("空间不足"))
+                Fail("空间不够时应只列出替换后放得下的图形：" + panel.recentNote.Text);
+            LastMenu = null;
+            panel.SetBoard(4, true, false, [Free(0), Held(1, 1) with { Rows = need - 1 }, Held(2, 2) with { Rows = need - 1 }, Free(3)], [], null, false, tight with { UsedRows = 2 * need - 2, DataRows = 2 * need - 2 });
+            panel.ClickSaveBoardForSelfTest();
+            if (saved.Count != 0 || LastMenu is not null || !panel.recentNote.Text.Contains("不会自动删除")) Fail("替换哪一个都放不下时不应存，也不应清除任何图形：" + panel.recentNote.Text);
             // Already on the board: not offered again.
             panel.SetBoard(4, true, false, [Free(0), Held(1, TrajectoryArchive.PlanCrc(plan.Nodes), plan.Nodes.Length, (int)plan.Nodes.Sum(n => (int)n.Milliseconds)), null, null], [], null);
             if (panel.SaveBoardEnabled || !panel.SaveBoardTip.Contains("已经存在板子槽2")) Fail("板上已有这个图形时不该再存：" + panel.SaveBoardTip);

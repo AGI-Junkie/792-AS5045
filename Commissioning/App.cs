@@ -450,7 +450,7 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("FAULT_SNAPSHOT ")) { HandleFaultSnapshot(line); }
         else if (line.StartsWith("LAST_STOP ")) { HandleLatchedStop(line); }
         else if (line.StartsWith("PTP_LIMITS ") || line.StartsWith("PTP_RATES ")) { HandleLimitsAck(line); UpdateControls(); }
-        else if (line.StartsWith("TRAJ_SLOT ") || line.StartsWith("TRAJ_STORE ") || line.StartsWith("TRAJ_META ") || line.StartsWith("TRAJ_NODES ")) ObserveStoreLine(line);
+        else if (line.StartsWith("TRAJ_SLOT ") || line.StartsWith("TRAJ_DIR ") || line.StartsWith("TRAJ_STORE ") || line.StartsWith("TRAJ_META ") || line.StartsWith("TRAJ_NODES ")) ObserveStoreLine(line);
         else if (line.StartsWith("TRAJ_LOAD ")) ObserveLoadLine(line);
         else if (line.StartsWith("TRAJ_STATE ")) HandleTrajectoryState(line);
         else if (line.StartsWith("TELEM ")) HandleTelemetry(line);
