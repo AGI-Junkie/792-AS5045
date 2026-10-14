@@ -1837,7 +1837,7 @@ static int meta_is(uint8 slot,const char *text){
  * only the check under test can turn the bank away. */
 static void bank_reseal(uint8 bank,uint16 recordRow){
     uint8 *b=simFlash+ts_bank_offset(bank);
-    if(recordRow){uint8 *h=b+(uint32)recordRow*TS_ROW_BYTES;ts_put32(h+20,ts_crc32(0,h,20));}
+    if(recordRow){uint8 *h=b+(uint32)recordRow*TS_ROW_BYTES;ts_put32(h+24,ts_crc32(0,h,24));}
     ts_put32(b+16,ts_crc32(0,b+TS_ROW_BYTES,(uint32)ts_get16(b+14)*TS_ROW_BYTES));
     ts_put32(b+20,ts_crc32(0,b,20));
 }
@@ -2250,6 +2250,9 @@ static void store_test(const char *t) {
         store_reboot();assert(meta_is(2,big) && g_tsDir[2].dataCrc==crcA);
         /* a damaged description is damage to the bank: the archive falls back to the generation before (here: none) */
         simFlash[ts_bank_offset(g_tsBank.bank)+(uint32)g_tsDir[2].row*TS_ROW_BYTES+TS_REC_HEAD+5]^=1;
+        /* before any reboot: the changed text is not given out as genuine (it reads as "no description") */
+        simLogN=0;simLog[0]=0;store_send(12,g_controlSequence+1u,2,4,0);txq_flush_blocking();
+        assert(strstr(simLog,"TRAJ_META slot=2 len=0") && !strstr(simLog,"TRAJ_META slot=2 seq="));
         store_reboot();assert(!g_tsDir[2].valid && !g_tsBank.valid);
         return;
     }

@@ -242,7 +242,7 @@ public static class BoardLedger
         Check(Crc32("123456789"u8) == 0xCBF43926u, "CRC-32 of 123456789 must be CBF43926");
         Check(BoardSlot.Parse("TRAJ_SLOT slot=2 valid=0") is { Slot: 2, Valid: false }, "empty slot line");
         Check(BoardSlot.Parse("TRAJ_SLOT slot=31 valid=1 seq=3 nodes=485 duration_ms=60480 q1=-5686 q2=5871 crc=BD3EB746 rows=12") is { Slot: 31, Valid: true, Seq: 3, Nodes: 485, DurationMs: 60480, Q1Cd: -5686, Q2Cd: 5871, Crc: 0xBD3EB746, Rows: 12 }, "valid slot line");
-        // A plan takes its nodes and its description (up to 256 bytes) behind a 24-byte header, in whole 256-byte rows.
+        // A plan takes its nodes and its description (up to 256 bytes) behind a 28-byte header, in whole 256-byte rows.
         Check(RowsFor(485, 0) == 12 && RowsFor(485, 256) == 13 && RowsFor(2048, 0) == 49 && RowsFor(2048, 256) == 50 && RowsFor(2, 0) == 1 && RowsFor(38, 0) == 1 && RowsFor(39, 0) == 2, "rows of a stored plan");
         // Nothing follows the CRC on a slot line (an older host parses it end-anchored); the description is asked for slot by slot.
         foreach (string bad in new[] { "TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746 meta=257", "TRAJ_SLOT slot=1 valid=1 seq=3 nodes=485 duration_ms=60480 q1=0 q2=0 crc=BD3EB746 meta=",

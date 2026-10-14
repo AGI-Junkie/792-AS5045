@@ -13,7 +13,7 @@ CY8CKIT-059（PSoC 5LP，48 MHz）+ 两路 DRV8825；两轴电机后轴装 AS504
 | 遥测与诊断 | 固件可按 5…20 Hz 单独流式发送位置遥测（上位机默认要 10 Hz，界面里可选），停机时先打一行结构化快照；**流式遥测对步进时序和心跳余量的影响还没有在实机上量过**，`TELEM_DIAG max_us` 和 `key_max_gap_ms` 是用来量它的（见 CHANGELOG 2026-10-02 遥测） |
 | 没有的东西 | 独立于固件的实体急停；停止只是让驱动器断电或保持，VMOT 电源需要硬件来切 |
 
-arm2 已对齐 arm1 的反馈功能与剩余闭环缺口见 [ARM2_FEEDBACK.md](docs/ARM2_FEEDBACK.md)。新固件必须配套 proto=5 上位机；不会自动烧录、使能或运动。
+arm2 已对齐 arm1 的反馈功能与剩余闭环缺口见 [ARM2_FEEDBACK.md](docs/ARM2_FEEDBACK.md)。新固件必须配套 proto=6 上位机；不会自动烧录、使能或运动。
 
 图形中断复现与锁存日志说明见 [STOP_DIAG.md](docs/STOP_DIAG.md)。
 

@@ -2195,7 +2195,7 @@ static void store_meta_line(uint8 slot)
     const ts_info_t *in=&g_tsDir[slot];
     const uint8 *m;
     uint16 i, n;
-    if(!in->valid || !in->metaLen) { JLOGF("TRAJ_META slot=%u len=0\r\n",(unsigned)slot); return; }
+    if(!in->valid || !in->metaLen || !ts_meta_ok(slot)) { JLOGF("TRAJ_META slot=%u len=0\r\n",(unsigned)slot); return; }   /* a changed description is not given out as genuine */
     m=ts_record(slot)+TS_REC_HEAD;
     n=(uint16)snprintf(g_dbg,sizeof(g_dbg),"TRAJ_META slot=%u seq=%lu len=%u crc=%08lX hex=",(unsigned)slot,(unsigned long)in->seq,
                        (unsigned)in->metaLen,(unsigned long)ts_crc32(0u,m,in->metaLen));

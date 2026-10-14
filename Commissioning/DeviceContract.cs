@@ -39,7 +39,7 @@ public static class DeviceContract
 
     // Flash archive of finished trajectories (control type 12, load type 13; docs/TRAJ_STORE.md).
     public const int TrajStoreSlots = 32;           // TS_SLOTS
-    public const int TrajRecordHeadBytes = 24;      // TS_REC_HEAD: a stored plan takes ceil((24 + description + 6 x nodes) / 256) flash rows
+    public const int TrajRecordHeadBytes = 28;      // TS_REC_HEAD: a stored plan takes ceil((28 + description + 6 x nodes) / 256) flash rows
 
     // Streamed position telemetry (control type 11): 0 = only the 500 ms status block, otherwise this many TELEM lines a second.
     public const int TelemRateMin = 5;              // TELEM_HZ_MIN

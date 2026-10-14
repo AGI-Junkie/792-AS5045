@@ -15,7 +15,8 @@
  * The records follow it back to back, each starting on a row boundary: a TS_REC_HEAD byte header, the description (metaLen
  * bytes), the nodes, then 0xFF up to the next row.
  *    0 slot u16   2 count u16   4 seq u32   8 durationMs u32   12 dataCrc u32 (node stream)   16 metaLen u16   18 0xFFFF
- *   20 headCrc u32 (bytes 0..19)
+ *   20 metaCrc u32 (the description; checked before it is given out, the bank CRC is only checked at boot)
+ *   24 headCrc u32 (bytes 0..23)
  * Nodes are 6 bytes each, little endian: q1 (cdeg, int16) q2 (cdeg, int16) ms (uint16).  The description (optional) is up to
  * TS_META_MAX opaque bytes the host keeps with the plan; the device never reads it.  A record's seq is the generation of the
  * bank it was first written in: a slot that gets another plan gets a new seq, and seq values never repeat.  `contract` says
@@ -38,7 +39,7 @@
 #define TS_REGION_OFFSET    (0x20000u)           /* second half of the 256 KB flash */
 #define TS_REGION_BYTES     (2u * TS_BANK_BYTES)
 #define TS_NODE_BYTES       (6u)
-#define TS_REC_HEAD         (24u)
+#define TS_REC_HEAD         (28u)
 #define TS_META_MAX         (TS_ROW_BYTES)
 #define TS_MAGIC            (0x534A5254u)        /* "TRJS" */
 #define TS_VERSION          (2u)
@@ -104,6 +105,7 @@ static uint16 ts_rows(const ts_info_t *r) { return TS_REC_ROWS(r->count, r->meta
 static const uint8 *ts_record(uint8 slot) { return ts_flash(ts_bank_offset(g_tsBank.bank) + (uint32)g_tsDir[slot].row * TS_ROW_BYTES); }
 static const uint8 *ts_nodes(uint8 slot) { return ts_record(slot) + TS_REC_HEAD + g_tsDir[slot].metaLen; }
 /* The flash may change after the boot check (a flipped bit): a plan is loaded or copied only while its nodes still match its CRC. */
+static uint8 ts_meta_ok(uint8 slot) { return (uint8)(ts_crc32(0u, ts_record(slot) + TS_REC_HEAD, g_tsDir[slot].metaLen) == ts_get32(ts_record(slot) + 20)); }
 static uint8 ts_nodes_ok(uint8 slot) { return (uint8)(ts_crc32(0u, ts_nodes(slot), (uint32)g_tsDir[slot].count * TS_NODE_BYTES) == g_tsDir[slot].dataCrc); }
 
 /* Is `bank` a complete, committed archive?  `full` also checks the CRC of every used row (at boot; a bank just written was read
@@ -120,7 +122,7 @@ static uint8 ts_check_bank(uint8 bank, uint8 full, uint8 fill)
     for (i = 0u; i < records; i++) {
         const uint8 *h = b + (uint32)row * TS_ROW_BYTES;
         uint16 slot, count, metaLen;
-        if (row > used || ts_crc32(0u, h, 20u) != ts_get32(h + 20)) { return 0u; }
+        if (row > used || ts_crc32(0u, h, 24u) != ts_get32(h + 24)) { return 0u; }
         slot = ts_get16(h); count = ts_get16(h + 2); metaLen = ts_get16(h + 16);
         if (slot >= TS_SLOTS || (seen & (1ul << slot)) || count < 2u || count > TRAJ_CAPACITY || metaLen > TS_META_MAX ||
             (uint32)row + TS_REC_ROWS(count, metaLen) > (uint32)used + 1u) { return 0u; }
@@ -234,7 +236,8 @@ static void ts_job_save(ts_job_t *j, uint8 slot, const traj_node_t *nodes, uint1
     j->mismatch = (uint8)(j->metaLen && planCrc != j->dataCrc);
     memset(j->head, 0xFF, TS_REC_HEAD);
     ts_put16(j->head, slot); ts_put16(j->head + 2, count); ts_put32(j->head + 4, j->gen); ts_put32(j->head + 8, durationMs);
-    ts_put32(j->head + 12, j->dataCrc); ts_put16(j->head + 16, j->metaLen); ts_put32(j->head + 20, ts_crc32(0u, j->head, 20u));
+    ts_put32(j->head + 12, j->dataCrc); ts_put16(j->head + 16, j->metaLen); ts_put32(j->head + 20, ts_crc32(0u, j->meta, j->metaLen));
+    ts_put32(j->head + 24, ts_crc32(0u, j->head, 24u));
     j->records++; j->rows = (uint16)(j->rows + TS_REC_ROWS(count, j->metaLen));
 }
 
