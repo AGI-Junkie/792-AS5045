@@ -503,6 +503,14 @@ public sealed partial class ControlWindow
                 "a finished old writer prevented the new writer from starting");
             window.StopWireWriter();
             Check(window.wireThread is null, "the new writer did not stop");
+            var warmUp = AutomationWarmUp;
+            try {
+                AutomationWarmUp = new TaskCompletionSource().Task;
+                window.ports.SelectedIndex = 0; window.Connect();
+                Check(window.serial is null && window.recording is null && window.state.Text == Lang.T("state.warmingUp"),
+                    "connected before the UI Automation warm-up finished");
+            }
+            finally { AutomationWarmUp = warmUp; }
         }
         finally { release.Set(); blocked.Join(1000); window.StopWireWriter(); window.Close(); Lang.Set(language, false); }
     }

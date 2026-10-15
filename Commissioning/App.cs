@@ -254,6 +254,8 @@ public sealed partial class ControlWindow : Window
     {
         if (wireThread is { IsAlive: true }) { Lang.Text(state, () => Lang.T("state.writerStopping")); return; }
         if (ports.SelectedItem is not string port) { Lang.Text(state, () => Lang.T("state.needPort")); return; }
+        // The warm-up's one expensive layout must not land inside the UI lease (see WarmUpAutomation).
+        if (AutomationWarmUp is { IsCompleted: false }) { Lang.Text(state, () => Lang.T("state.warmingUp")); return; }
         try
         {
             string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "Logs");
