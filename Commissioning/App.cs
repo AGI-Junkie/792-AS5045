@@ -34,6 +34,22 @@ public sealed class App : Application
             }
             catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
         }
+        // The out-of-process UI Automation reader of the desktop-load replay (another program reading this window).
+        int uiaClient = Array.IndexOf(args, "--uia-client");
+        if (uiaClient >= 0 && uiaClient + 2 < args.Length)
+        {
+            var until = Stopwatch.StartNew(); long ms = long.Parse(args[uiaClient + 2]);
+            var counts = new int[3];
+            ControlWindow.UiaClient(new IntPtr(long.Parse(args[uiaClient + 1])), () => until.ElapsedMilliseconds >= ms, counts,
+                () => Console.Out.WriteLine(string.Join(' ', counts)));
+            return 0;
+        }
+        int desktop = Array.IndexOf(args, "--desktop-load-profile");
+        if (desktop >= 0 && desktop + 1 < args.Length)
+        {
+            try { Lang.PersistChanges = false; Lang.Set(false, persist: false); ControlWindow.DesktopLoadProfile(args[desktop + 1]); return 0; }
+            catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
+        }
         // The pure geometry and planning checks alone (a few seconds, no window): quick feedback while changing shapes or timing.
         if (args.Contains("--geometry-self-test"))
         {
@@ -136,6 +152,8 @@ public sealed partial class ControlWindow : Window
             foreach (var change in e.Changes) logCharacters += change.AddedLength - change.RemovedLength;
         };
         BuildLayout();
+        WatchDispatcherOperations();
+        ContentRendered += (_, _) => WarmUpAutomation();
         Lang.Changed += OnLanguageChanged;
         Closed += (_, _) => Lang.Changed -= OnLanguageChanged;
         if (restoreParameters) { xyPreview.RestoreSavedParameters(); xyPreview.RefreshRecentRuns(); }
@@ -259,7 +277,7 @@ public sealed partial class ControlWindow : Window
             Send(0x79); Heartbeat(); Send((byte)'s'); Send((byte)'i');
             Lang.Text(state, () => Lang.T("state.connected"));
             connect.Content = Lang.T("btn.disconnect"); ports.IsEnabled = false; timer.Start(); heartbeatTimer.Start();
-            StartWireWriter();
+            StartWireWriter(); SetLinkPriority(true);
             Append("HOST connected " + port + (usbLink ? " (USB CDC: one copy per byte, one write per frame)" : " (UART)"));
             Append("HOST UI " + Title + "; executable=" + Environment.ProcessPath);
         }
@@ -815,7 +833,7 @@ public sealed partial class ControlWindow : Window
         try { FinishExperiment("disconnected: " + reason()); } catch(Exception ex) { Lang.QueueText(experimentResult, () => Lang.T("fault.saveSummary2") + ex.Message); }
         lastExperimentOutcome = null; trajectoryRanOnce = false;
         try { serial?.Dispose(); } catch { }
-        serial = null;
+        serial = null; SetLinkPriority(false);
         compatible = enabled = homing = stopPending = false;
         pending.Clear(); Lang.Text(state, reason); regularStateText = reason; Lang.Text(inputs, () => Lang.T("fault.inputsInvalid"));
         ShowFeedback(null, () => Lang.T("fault.unplugReason")); errorHistory.Clear(); errorHistory2.Clear(); DrawErrorPlot();
@@ -835,8 +853,13 @@ public sealed partial class ControlWindow : Window
         while (recentLog.Count > 1000) recentLog.Dequeue();
         if (severity < minimumLogLevel) return;
         bool reading = log.IsKeyboardFocusWithin || log.SelectionLength > 0;
-        // Reading Text after every append materializes the whole log on the large-object heap.
-        if (logCharacters > 100000 && !reading) log.Text = log.Text[^50000..];
+        // Reading Text after every append materializes the whole log on the large-object heap.  Reading only defers the trim: a log
+        // left selected for hours grew to megabytes, and a 4 MB box made a UI Automation connection's layout pass 120 ms slower.
+        if (logCharacters > (reading ? 400000 : 100000)) {
+            int cut = logCharacters - 50000, start = log.SelectionStart - cut, length = log.SelectionLength;
+            log.Text = log.Text[cut..];
+            if (reading && start >= 0) log.Select(start, length);
+        }
         log.AppendText(displayed);
         // TextBox.ScrollToEnd forces layout per line; the native viewer queues the scroll.
         if (!reading && log.Template?.FindName("PART_ContentHost", log) is ScrollViewer scroll) scroll.ScrollToEnd();
@@ -871,6 +894,7 @@ public sealed partial class ControlWindow : Window
             heartbeatReport.Append(BackgroundMotionSelfTest()).Append(HeartbeatSchedulingSelfTest()).Append(ExperimentFinishHeartbeatSelfTest()).Append(UsbLinkSelfTest())
                 .Append(WithLeaseRetry(ReferenceIdleReplaySelfTest)).Append(WithLeaseRetry(PreviewInteractionReplaySelfTest))
                 .Append(WithLeaseRetry(UploadReplaySelfTest))
+                .Append(WithLeaseRetry(() => DesktopLoadReplay(Math.Max(1, Environment.ProcessorCount / 2), true, 10)))
                 .Append(WithLeaseRetry(() => ReferenceReplaySelfTest(false, true))).Append(WithLeaseRetry(() => ReferenceReplaySelfTest(true, true)));
         }
         finally

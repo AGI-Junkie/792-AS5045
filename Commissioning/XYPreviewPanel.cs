@@ -258,7 +258,7 @@ public sealed partial class XYPreviewPanel : UserControl
     private readonly TextBox executionInfo = new() { IsReadOnly = true, TextWrapping = TextWrapping.Wrap, Background = Brushes.Transparent, BorderThickness = new Thickness(0), Margin = new Thickness(4) };
     private ExecutionTrajectory? execution;
     private bool trajectorySupported;
-    private readonly Canvas canvas = new() { Background = Brushes.White, ClipToBounds = true, MinHeight=260 };
+    private readonly PlotCanvas canvas = new() { Background = Brushes.White, ClipToBounds = true, MinHeight=260 };
     private readonly TextBox result = new() { IsReadOnly = true, TextWrapping = TextWrapping.Wrap, BorderThickness = new Thickness(0),
         Background = Brushes.Transparent, Margin = new Thickness(4), MinHeight = 75 };
     private readonly TextBlock notice = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4), Foreground = Brushes.DarkSlateGray };
