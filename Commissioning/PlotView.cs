@@ -20,6 +20,21 @@ internal sealed class PlotSeries(string name, double[] x, double[] y, Brush colo
 internal sealed record PlotMark(double X, string Label, Brush Color, bool Labelled = true);
 internal sealed record PlotLine(double Y, string Label, Brush Color);
 
+// A canvas redrawn from scratch (Children.Clear, then new shapes and labels) up to 30 times a second.  UI Automation sees one
+// element with the canvas's own name, not the labels: while any UIA client listens (automation script, screen reader), WPF
+// raises Name/IsEnabled/structure events for every new label after each layout pass (~11 500 per 15 s in the desktop-load replay,
+// UI lease gaps 142-197 ms with the client warmed up, up to 780 ms around its first subscription).
+internal sealed class PlotCanvas : System.Windows.Controls.Canvas
+{
+    protected override System.Windows.Automation.Peers.AutomationPeer OnCreateAutomationPeer() => new Peer(this);
+    private sealed class Peer(PlotCanvas owner) : System.Windows.Automation.Peers.FrameworkElementAutomationPeer(owner)
+    {
+        protected override List<System.Windows.Automation.Peers.AutomationPeer>? GetChildrenCore() => null;
+        protected override System.Windows.Automation.Peers.AutomationControlType GetAutomationControlTypeCore() => System.Windows.Automation.Peers.AutomationControlType.Pane;
+        protected override string GetClassNameCore() => "Canvas";
+    }
+}
+
 // A small time-series chart drawn straight to the screen: axes, grid, lines, event markers, reference lines, a replay
 // cursor with the value of every series at the cursor, and a source note. The chart never says more than its data does.
 internal sealed class PlotView : FrameworkElement

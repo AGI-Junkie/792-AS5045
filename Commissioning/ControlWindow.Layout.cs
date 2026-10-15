@@ -16,7 +16,7 @@ public sealed partial class ControlWindow
     private readonly TextBlock referenceStatus = WorkbenchTheme.Text(Lang.T("status.ref") + Lang.T("status.ref.off"), 12, Brushes.White), rangeStatus = WorkbenchTheme.Text(Lang.T("status.range") + Lang.T("status.range.off"), 12, Brushes.White);
     private readonly TextBox liveValues = new() { IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent, TextWrapping = TextWrapping.Wrap, Text = Lang.T("live.waiting"), FontSize = 12 };
     private readonly TextBox experimentResult = new() { IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent, TextWrapping = TextWrapping.Wrap, Text = Lang.T("live.experimentHint"), FontSize = 12 };
-    private readonly Canvas errorPlot = new() { Background = WorkbenchTheme.Bar, ClipToBounds = true };
+    private readonly PlotCanvas errorPlot = new() { Background = WorkbenchTheme.Bar, ClipToBounds = true };
     private readonly Queue<double> errorHistory = new();
     private readonly Queue<double> errorHistory2 = new();
     private readonly Button readInputs = MakeButton(Lang.T("btn.readInputs"));
@@ -205,7 +205,7 @@ public sealed partial class ControlWindow
         chart.RowDefinitions.Add(new RowDefinition { Height=GridLength.Auto });
         chart.RowDefinitions.Add(new RowDefinition { Height=GridLength.Auto });
         chartTitleBlock=WorkbenchTheme.Text(Lang.T("chart.title"),12,WorkbenchTheme.Sub); chart.Children.Add(chartTitleBlock);
-        Grid.SetRow(errorPlot,1); chart.Children.Add(errorPlot);
+        Grid.SetRow(errorPlot,1); chart.Children.Add(errorPlot); System.Windows.Automation.AutomationProperties.SetLabeledBy(errorPlot, chartTitleBlock);
         chartNoteBlock=WorkbenchTheme.Text(Lang.T("note.chart"),11,WorkbenchTheme.Muted); Grid.SetRow(chartNoteBlock,2); chart.Children.Add(chartNoteBlock);
         var folder = MakeButton(Lang.T("btn.openData")); folderButton = folder; folder.Click += (_,_) => OpenDataFolder();
         foreach (int hz in TelemChoices) telemRateBox.Items.Add(Lang.Bind(new ComboBoxItem { Tag = hz }, ContentControl.ContentProperty, hz == 0 ? "telem.status" : hz == DefaultTelemHz ? "telem.hz10" : hz == DeviceContract.TelemRateMin ? "telem.hz5" : "telem.hz20"));
