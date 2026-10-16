@@ -69,3 +69,7 @@ __pycache__/
 # Local KiCad circuit project
 /circuit/
 dist/
+
+# Thesis build outputs
+/thesis/figures/
+/thesis/Thesis_draft.docx

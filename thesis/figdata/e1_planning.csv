@@ -1,0 +1,26 @@
+family,shape,node_gap_max,dev_max,dev_rms,node_dev_max,nodes,plan_s
+Straight-edged,line,9.97,0.1114,0.0523,0.0253,69,16.58
+Straight-edged,line,9.93,0.1148,0.0449,0.038,106,25.82
+Other curve,figure-8,4.41,0.0479,0.0125,0.0286,485,120.71
+Straight-edged,polygon,9.63,0.0645,0.0207,0.0316,177,42.44
+Other curve,rounded rect.,4.49,0.1207,0.0297,0.0222,179,44.09
+Other curve,spiral,3.49,0.0561,0.0103,0.0292,1007,251.21
+Other curve,spiral,3.89,0.0635,0.0116,0.0272,674,167.98
+Other curve,ellipse,9.1,0.1114,0.0414,0.0272,94,22.94
+Circle,circle,5.25,0.075,0.0309,0.021,109,26.7
+Circle,circle,2.67,0.0332,0.0114,0.0244,214,53.0
+Circle,circle,5.36,0.0837,0.0344,0.0283,107,26.25
+Circle,circle,3.97,0.0527,0.0198,0.0253,144,35.33
+Circle,circle,6.1,0.1064,0.0425,0.0214,94,22.97
+Circle,circle,2.67,0.0332,0.0114,0.0244,214,53.0
+Straight-edged,line,10.93,0.08,0.0305,0.0215,42,10.0
+Straight-edged,rectangle,8.61,0.045,0.0125,0.0267,151,36.13
+Other curve,rounded rect.,4.15,0.127,0.037,0.0275,122,29.87
+Straight-edged,polygon,6.69,0.0396,0.0111,0.0249,137,32.22
+Other curve,figure-8,8.97,0.1361,0.056,0.0316,107,26.09
+Straight-edged,rectangle,7.77,0.0338,0.0113,0.031,134,31.96
+Straight-edged,rectangle,7.77,0.0338,0.0113,0.031,134,31.96
+Circle,circle,4.34,0.075,0.0318,0.0223,83,20.17
+Circle,circle,4.34,0.075,0.0318,0.0223,83,20.17
+Circle,circle,3.8,0.0985,0.0488,0.0256,51,12.12
+Circle,circle,5.28,0.0822,0.032,0.0204,102,24.9
