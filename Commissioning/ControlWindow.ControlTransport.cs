@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 
 namespace TwoLinkCommissioning;
 
@@ -40,6 +40,63 @@ public sealed partial class ControlWindow
     private double pendingHeartbeatGap; // written by the writer, logged by the UI tick
     private double worstLeaseGap;       // max UI dispatcher gap in the current log period
     private long lastLeaseLogAt;
+    // What the dispatcher ran since the last lease, for the gap log line (public hooks; nested operations count twice).
+    private readonly Stack<long> operationStarts = new();
+    private double gapOperationsMs, gapLongestOperation;
+    private System.Windows.Threading.DispatcherPriority gapLongestPriority;
+    private int gapSendOperations;
+    private string worstLeaseDetail = "";
+    private void OnOperationStarted(object? sender, System.Windows.Threading.DispatcherHookEventArgs e) => operationStarts.Push(Stopwatch.GetTimestamp());
+    private void OnOperationCompleted(object? sender, System.Windows.Threading.DispatcherHookEventArgs e)
+    {
+        if (!operationStarts.TryPop(out long started)) return;
+        double ms = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        gapOperationsMs += ms;
+        if (e.Operation.Priority == System.Windows.Threading.DispatcherPriority.Send) gapSendOperations++;
+        if (ms > gapLongestOperation) { gapLongestOperation = ms; gapLongestPriority = e.Operation.Priority; }
+    }
+    private void WatchDispatcherOperations()
+    {
+        Dispatcher.Hooks.OperationStarted += OnOperationStarted;
+        Dispatcher.Hooks.OperationCompleted += OnOperationCompleted;
+        Closed += (_, _) => { Dispatcher.Hooks.OperationStarted -= OnOperationStarted; Dispatcher.Hooks.OperationCompleted -= OnOperationCompleted; };
+    }
+
+    // The first UI Automation client that listens for events (an automation script, a screen reader) makes WPF compile its automation
+    // code and announce every element in one layout pass: 195 ms measured with another program's client.  Pay it once per process at
+    // start-up, before a port can be open, by listening briefly from a background thread.
+    internal static Task? AutomationWarmUp;
+    private void WarmUpAutomation()
+    {
+        if (AutomationWarmUp is not null) return;
+        var handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        AutomationWarmUp = Task.Factory.StartNew(() => {
+            try {
+                var root = System.Windows.Automation.AutomationElement.FromHandle(handle);
+                System.Windows.Automation.Automation.AddStructureChangedEventHandler(root, System.Windows.Automation.TreeScope.Subtree, (_, _) => { });
+                System.Windows.Automation.Automation.AddAutomationPropertyChangedEventHandler(root, System.Windows.Automation.TreeScope.Subtree, (_, _) => { },
+                    System.Windows.Automation.AutomationElement.NameProperty, System.Windows.Automation.AutomationElement.IsEnabledProperty);
+                Dispatcher.Invoke(() => { InvalidateMeasure(); UpdateLayout(); });   // the one expensive layout, with a listener
+            }
+            catch (Exception ex) { Trace.TraceWarning("UI Automation warm-up: " + ex.Message); }   // only a cost moved, never a function
+            // A listener left behind would keep WPF raising events after every layout, the cost this removes.  The host has no other
+            // UI Automation client of its own, so removing all is removing ours, however far the registration got.
+            finally { try { System.Windows.Automation.Automation.RemoveAllEventHandlers(); } catch (Exception ex) { Trace.TraceWarning("UI Automation warm-up: " + ex.Message); } }
+        }, TaskCreationOptions.LongRunning);
+    }
+
+    // While a port is open the UI lease keeps the arm enabled, and normal-priority work in other programs stretched ordinary 10-30 ms
+    // UI jobs towards LeaseStopMs.  The process runs above normal until the port closes; a hung UI still stops the heartbeat.
+    private bool raisedPriority;
+    private void SetLinkPriority(bool open)
+    {
+        try {
+            using var self = Process.GetCurrentProcess();
+            if (open && self.PriorityClass == ProcessPriorityClass.Normal) { self.PriorityClass = ProcessPriorityClass.AboveNormal; raisedPriority = true; }
+            else if (!open && raisedPriority) { raisedPriority = false; if (self.PriorityClass == ProcessPriorityClass.AboveNormal) self.PriorityClass = ProcessPriorityClass.Normal; }
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException) { }
+    }
     // Session totals, reported as one line when the link closes so a saved log always
     // carries the run's worst case without having to scan every 500 ms status block.
     private long sessionHeartbeats, sessionFrames, sessionSlowHeartbeats, sessionSlowLeases;
@@ -95,15 +152,22 @@ public sealed partial class ControlWindow
         // would turn the measurement into its own cause.
         if (previous != 0) {
             double leaseGap = Stopwatch.GetElapsedTime(previous, now).TotalMilliseconds;
-            if (leaseGap > worstLeaseGap) worstLeaseGap = leaseGap;
+            if (leaseGap > worstLeaseGap) {
+                worstLeaseGap = leaseGap;
+                // Which kind of work held the UI: Render = layout/automation events/text services, Input = clicks, timers and the
+                // serial pump, Background = redraws and queued text, Send = UI Automation reads; "outside" = window messages.
+                if (leaseGap > SlowLeaseLogMs) worstLeaseDetail = $" (longest {gapLongestPriority} operation {gapLongestOperation:F0} ms; " +
+                    $"operations {gapOperationsMs:F0} ms, outside {Math.Max(0, leaseGap - gapOperationsMs):F0} ms; Send calls {gapSendOperations})";
+            }
             if (leaseGap > sessionWorstLeaseGap) sessionWorstLeaseGap = leaseGap;
             if (leaseGap > SlowLeaseLogMs) sessionSlowLeases++;
             if (leaseGap > SlowLeaseLogMs && Stopwatch.GetElapsedTime(lastLeaseLogAt, now).TotalMilliseconds >= SlowLeaseLogPeriodMs) {
                 lastLeaseLogAt = now;
-                Append($"HOST UI lease gap max={worstLeaseGap:F0} ms", LogLevel.Warning);
-                worstLeaseGap = 0;
+                Append($"HOST UI lease gap max={worstLeaseGap:F0} ms{worstLeaseDetail}", LogLevel.Warning);
+                worstLeaseGap = 0; worstLeaseDetail = "";
             }
         }
+        gapOperationsMs = gapLongestOperation = 0; gapSendOperations = 0;
         Volatile.Write(ref leaseKeys, CanJog ? keyboardMask | mouseMask : 0);
         // If raw STOP is lost, silence must still trip the firmware deadman. Only
         // resume epoch probes once STATE confirms that motion is disabled.
@@ -439,6 +503,14 @@ public sealed partial class ControlWindow
                 "a finished old writer prevented the new writer from starting");
             window.StopWireWriter();
             Check(window.wireThread is null, "the new writer did not stop");
+            var warmUp = AutomationWarmUp;
+            try {
+                AutomationWarmUp = new TaskCompletionSource().Task;
+                window.ports.SelectedIndex = 0; window.Connect();
+                Check(window.serial is null && window.recording is null && window.state.Text == Lang.T("state.warmingUp"),
+                    "connected before the UI Automation warm-up finished");
+            }
+            finally { AutomationWarmUp = warmUp; }
         }
         finally { release.Set(); blocked.Join(1000); window.StopWireWriter(); window.Close(); Lang.Set(language, false); }
     }

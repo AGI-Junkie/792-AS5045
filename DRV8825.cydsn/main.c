@@ -54,6 +54,16 @@
 #ifndef HW_USB
 #define HW_USB                      (1u) /* USB CDC link on J6: the USBFS macro "UsbCdc" (docs/USB_CDC.md); 1 only while it is in TopDesign */
 #endif
+/* Research options (thesis, Ch. 6), both off in the release build. */
+#ifndef ENC_COMP
+#define ENC_COMP                    (0u) /* 1: remove the measured per-revolution AS5045 error (enc_comp.h) and tighten the PTP/trajectory following check */
+#endif
+#ifndef TEST_DROP
+#define TEST_DROP                   (0u) /* 1: TEST BUILD ONLY - swallow STEP pulses on every second trajectory run (step-loss experiment) */
+#endif
+#if (TEST_DROP != 0u) && (HW_STEP == 0u)
+#error "TEST_DROP drops pulses in step_fire(), which only exists with HW_STEP"
+#endif
 #if (HW_USB != 0u) && (HW_TXDMA != 0u)
 #error "HW_USB does not drive HW_TXDMA yet: the DMA owns the UART transmit queue"
 #endif
@@ -148,7 +158,16 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store32v2-meta6-read1-guards2"
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store32v2-meta6-read1-guards2" FW_VARIANT
+#if (TEST_DROP != 0u) && (ENC_COMP != 0u)
+#define FW_VARIANT                  "-enccomp-TESTDROP"
+#elif (TEST_DROP != 0u)
+#define FW_VARIANT                  "-TESTDROP"
+#elif (ENC_COMP != 0u)
+#define FW_VARIANT                  "-enccomp"
+#else
+#define FW_VARIANT                  ""
+#endif
 
 /* Version of the wire contract in docs/PROTOCOL.md, reported as proto=<n> in the LINK line.  The host
  * refuses to move a machine whose proto differs from DeviceContract.ProtocolVersion, so the build id
@@ -281,6 +300,10 @@ _Static_assert(JOG1_RATE_MAX_USTEP_S <= CFG_RATE_MAX_AXIS1 && JOG2_RATE_MAX_USTE
 /* ------------------ hold deadband, final-position check ----------------- */
 #define CL_DEADBAND_LSB             (4)      /* 0.35 motor deg, 1.6 ustep    */
 #define PTP_FINAL_ERROR_LSB         (228)    /* motion commissioning: about +/-0.50 output deg, not a precision claim */
+/* Following check during PTP and trajectory runs.  With the sensor error removed the largest error seen in 132 recorded
+ * runs was 23 / 33 LSB (arm1 / arm2), so the check can sit near 1.2x that instead of four electrical cycles. */
+#define PTP_FOLLOW1_LSB             (ENC_COMP ? 32 : SLIP_FAIL_LSB)
+#define PTP_FOLLOW2_LSB             (ENC_COMP ? 40 : SLIP_FAIL_LSB)
 
 /* ---------------------------- safety limits ----------------------------- */
 #define SOFT_LIMIT_OUT_DEG10        (900)    /* +/- 90 output degrees        */
@@ -564,6 +587,15 @@ static void as5045_decode(as5045_t *sample, uint32 raw)
 
 static void as5045_read(as5045_t *sample) { as5045_decode(sample, as5045_read_raw()); }
 
+/* The angle used for position: the raw single-turn angle with the sensor's own repeatable error removed.  Each
+ * motor's error is fixed to its magnet, so one table per axis serves every homing (thesis, Section 6.4). */
+#if (ENC_COMP != 0u)
+#include "enc_comp.h"
+static uint16 enc_angle(uint8 axis, uint16 raw) { return (uint16)(((int32)raw + ENC_COMP_LSB[axis][raw] + 4096) % 4096); }
+#else
+#define enc_angle(axis, raw) (raw)
+#endif
+
 #define ST_OK                       (0u)
 #define ST_DO_HIGH                  (1u)
 #define ST_DO_LOW                   (2u)
@@ -707,9 +739,9 @@ static void enc_snapshot(void)
 static uint8 enc_decode_pair(uint32 raw1, uint32 raw2, as5045_t *a, as5045_t *b)
 {
     uint8 v1, v2=0u;
-    as5045_decode(a,raw1);
+    as5045_decode(a,raw1); a->angle=enc_angle(0u,a->angle);
     v1=encoder_state_valid(classify(a));
-    if(ARM2_ENCODER_FEEDBACK) { as5045_decode(b,raw2); v2=encoder_state_valid(classify(b)); }
+    if(ARM2_ENCODER_FEEDBACK) { as5045_decode(b,raw2); b->angle=enc_angle(1u,b->angle); v2=encoder_state_valid(classify(b)); }
     return (uint8)(v1 && (!ARM2_ENCODER_FEEDBACK || v2));
 }
 /* One shared transaction; a bad axis never advances its position.  With arm2 feedback off (the default) it is the
@@ -794,7 +826,7 @@ static uint8 enc_set_origin(void)
         }
         if(!good) { return 0u; }
         for(axis=0u;axis<(ARM2_ENCODER_FEEDBACK ? 2u : 1u);axis++) {
-            as5045_decode(&sample,raw[axis]);
+            as5045_decode(&sample,raw[axis]); sample.angle=enc_angle(axis,sample.angle);
             if(!i) { reference[axis]=sample.angle; }
             sum[axis]+=angle_delta(sample.angle,reference[axis]);
         }
@@ -930,8 +962,19 @@ static void pulse_step_pin(uint32 pinPC, uint8 idleHigh)
  * register would clear the other axis' request before the 12 MHz clock had sampled it. */
 #define STEP_ARM1                   (1u)
 #define STEP_ARM2                   (2u)
+#if (TEST_DROP != 0u)
+/* TEST BUILD ONLY (thesis step-loss experiment).  Every second trajectory RUN, 3 s in, swallows N STEP pulses of one axis
+ * while the step counters still count them: the motor falls N microsteps behind, exactly as after a lost step.
+ * Runs 2,4,6,8,10,12 -> arm1, arm2, arm1, arm2, arm1, arm2 with 8, 8, 16, 16, 32, 32 microsteps (1, 1, 2, 2, 4, 4 full
+ * steps), then the schedule repeats.  Armed in the foreground, consumed here (event ISR); cleared by any stop. */
+static volatile uint8 g_dropAxis; static volatile uint16 g_dropLeft;
+static uint32 g_dropAt; static uint8 g_dropRuns;
+#endif
 static void step_fire(uint8 mask)
 {
+#if (TEST_DROP != 0u)
+    if (g_dropLeft != 0u && (mask & g_dropAxis) != 0u) { mask &= (uint8)~g_dropAxis; g_dropLeft--; }
+#endif
     if ((mask & STEP_ARM1) != 0u) { StepArm1Req_Write(1u); }
     if ((mask & STEP_ARM2) != 0u) { StepArm2Req_Write(1u); }
 }
@@ -1760,6 +1803,9 @@ static void fault_snapshot(const char *reason, uint8 driverFault)
 static void stage_stop(const char *reason, uint8 driverFault)
 {
     evt_cancel();   /* the evidence below must describe a frozen plan */
+#if (TEST_DROP != 0u)
+    g_dropLeft = 0u; g_dropAt = 0u;
+#endif
     fault_snapshot(reason, driverFault);
 #if (USE_DEBUG_UART != 0u)
     if(g_motionEnabled || g_home.phase!=HOME_IDLE || !g_lastStop[0]) {
@@ -2407,6 +2453,9 @@ static uint8 traj_accept(const uint8 *p)
             traj_start(&g_traj,&g_ptp.seg,g_ptp.origin,pos,SU_NOW());
         }
         g_ptp.sinceMs=g_jogMs; g_ptp.active=1u;
+#if (TEST_DROP != 0u)
+        if ((++g_dropRuns & 1u) == 0u) { g_dropAt = g_jogMs + 3000u; if (g_dropAt == 0u) { g_dropAt = 1u; } }
+#endif
     }
     return 1u;
 }
@@ -2710,13 +2759,16 @@ static void ptp_service(void)
     if (HARD_LIMIT_ACTIVE() || ARM1_HOME_ACTIVE() || ARM2_NPN_ACTIVE()) { stage_stop("PTP limit/home sensor",0u); return; }
     if (g_jogMs-g_ptp.sinceMs>600000u || !ptp_counts_in_range(0u,g_arm1.usteps) || !ptp_counts_in_range(1u,g_arm2.usteps)) { stage_stop("PTP time/joint limit",0u); return; }
     if (!g_arm1.hasEnc || g_enc.badStreak || (ARM2_ENCODER_FEEDBACK && (!g_arm2.hasEnc || g_enc2.badStreak))) { return; } /* shared encoder watchdog will latch stop */
-    if ((abs_i32(cmd_lsb()-g_enc.pos)>=SLIP_FAIL_LSB || (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>=SLIP_FAIL_LSB))) { stage_stop("PTP encoder following error",0u); return; }
+    if ((abs_i32(cmd_lsb()-g_enc.pos)>=PTP_FOLLOW1_LSB || (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>=PTP_FOLLOW2_LSB))) { stage_stop("PTP encoder following error",0u); return; }
     if (g_ptp.active==2u) {
         if (g_jogMs-g_ptp.settleMs<HOME_SETTLE_MS) { return; }
         if (!enc_sample() || abs_i32(cmd_lsb()-g_enc.pos)>PTP_FINAL_ERROR_LSB || (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>PTP_FINAL_ERROR_LSB) ||
             g_arm1.usteps!=g_ptp.seg.target[0] || g_arm2.usteps!=g_ptp.seg.target[1]) { stage_stop("PTP final position mismatch",0u); return; }
         g_ptp.active=0u;
         if(g_traj.state==TRAJ_RUNNING) { g_traj.state=TRAJ_DONE; }
+#if (TEST_DROP != 0u)
+        g_dropLeft=0u; g_dropAt=0u;   /* an unfinished drop must not leak into the next PTP or homing */
+#endif
 #if ARM2_ENCODER_FEEDBACK
         JLOGF("PTP done seq=%lu; enabled motor encoders checked; error1_lsb=%ld error2_lsb=%ld final_limit_lsb=%d\r\n",
               (unsigned long)g_ptp.sequence,(long)(cmd_lsb()-g_enc.pos),
@@ -2727,6 +2779,14 @@ static void ptp_service(void)
 #endif
         stage_status(); return;
     }
+#if (TEST_DROP != 0u)
+    if (g_dropAt != 0u && g_traj.state == TRAJ_RUNNING && (int32)(g_jogMs - g_dropAt) >= 0) {
+        static const uint8 usteps[3] = {8u, 16u, 32u};
+        uint8 k = (uint8)((uint8)(g_dropRuns / 2u - 1u) % 6u);
+        g_dropAxis = (k & 1u) ? STEP_ARM2 : STEP_ARM1; g_dropLeft = usteps[k / 2u]; g_dropAt = 0u;
+        JLOGF("TEST_DROP run=%u axis=%u usteps=%u\r\n", (unsigned)g_dropRuns, (unsigned)((k & 1u) + 1u), (unsigned)usteps[k / 2u]);
+    }
+#endif
     if(g_traj.state==TRAJ_RUNNING) {
 #if (HW_EVT != 0u)
         return;   /* ISR owns the plan even after DONE/FAIL; never poll it again in the foreground. */
@@ -2824,8 +2884,8 @@ static uint8 home_set_zero(jog_axis_t *a)
         /* Preserve the latest reading relative to the averaged origin. */
         e->pos = angle_delta(e->lastAngle, mean);
         cmd_reset_axis(e);
-        JLOGF("HOME %s averaged origin: samples=%u raw=%u lsb (motor single-turn)\r\n",
-              a->name, (unsigned)g_home.zeroSamples, (unsigned)mean);
+        JLOGF("HOME %s averaged origin: samples=%u raw=%u lsb (motor single-turn)%s\r\n",
+              a->name, (unsigned)g_home.zeroSamples, (unsigned)mean, ENC_COMP ? " sensor error removed" : "");
     }
     a->usteps = 0;
     a->holding = 0u;

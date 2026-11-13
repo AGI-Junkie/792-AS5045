@@ -34,10 +34,26 @@ public sealed class App : Application
             }
             catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
         }
+        // The out-of-process UI Automation reader of the desktop-load replay (another program reading this window).
+        int uiaClient = Array.IndexOf(args, "--uia-client");
+        if (uiaClient >= 0 && uiaClient + 2 < args.Length)
+        {
+            var until = Stopwatch.StartNew(); long ms = long.Parse(args[uiaClient + 2]);
+            var counts = new int[3];
+            ControlWindow.UiaClient(new IntPtr(long.Parse(args[uiaClient + 1])), () => until.ElapsedMilliseconds >= ms, counts,
+                () => Console.Out.WriteLine(string.Join(' ', counts)));
+            return 0;
+        }
+        int desktop = Array.IndexOf(args, "--desktop-load-profile");
+        if (desktop >= 0 && desktop + 1 < args.Length)
+        {
+            try { Lang.PersistChanges = false; Lang.Set(false, persist: false); ControlWindow.DesktopLoadProfile(args[desktop + 1]); return 0; }
+            catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
+        }
         // The pure geometry and planning checks alone (a few seconds, no window): quick feedback while changing shapes or timing.
         if (args.Contains("--geometry-self-test"))
         {
-            try { Lang.PersistChanges = false; Lang.Set(false, persist: false); PlanarArm.SelfTest(); DrawingTrajectory.SelfTest(); TimedTrajectory.SelfTest(); ExecutionTrajectory.SelfTest(); ReachabilityMask.SelfTest(); ExperimentArchiveTests.SelfTest(); return 0; }
+            try { Lang.PersistChanges = false; Lang.Set(false, persist: false); PlanarArm.SelfTest(); DrawingTrajectory.SelfTest(); TimedTrajectory.SelfTest(); ExecutionTrajectory.SelfTest(); ReachabilityMask.SelfTest(); ExperimentArchiveTests.SelfTest(); ControlWindow.SupplementaryBatchSelfTest(); return 0; }
             catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
         }
         // The experiment table of any folder as a CSV, with the plan/sample alignment check; no window.
@@ -61,8 +77,17 @@ public sealed class App : Application
             File.WriteAllLines(args[contract + 1], DeviceContract.Lines());
             return 0;
         }
+        int batch = Array.IndexOf(args, "--supplementary-batch"), firstRun = 0;
+        if (batch >= 0 && (batch + 2 >= args.Length || !Regex.IsMatch(args[batch + 1], @"^COM[1-9][0-9]{0,2}$") ||
+            !int.TryParse(args[batch + 2], out firstRun) || !ControlWindow.SupplementaryStartValid(firstRun))) return 2;
         Lang.Load();
-        new App().Run(new ControlWindow(restoreParameters: true));
+        var window = new ControlWindow(restoreParameters: true);
+        if (batch >= 0) {
+            EventHandler? start = null;
+            start = async (_, _) => { window.ContentRendered -= start; await window.RunSupplementaryBatch(args[batch + 1], firstRun); };
+            window.ContentRendered += start;
+        }
+        new App().Run(window);
         return 0;
     }
 }
@@ -85,8 +110,8 @@ public sealed partial class ControlWindow : Window
     private readonly XYPreviewPanel xyPreview = new();
     private readonly List<Button> jogButtons = [];
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(40) };
-    // Same priority as stop/key-release input; rendering or a hung UI must still stop motion.
-    private readonly DispatcherTimer heartbeatTimer = new(DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(40) };
+    // Native stop/key-release messages stay responsive under traffic; rendering or a hung UI still stops the heartbeat.
+    private readonly DispatcherHeartbeatTimer heartbeatTimer = new(Dispatcher.CurrentDispatcher) { Interval = TimeSpan.FromMilliseconds(40) };
     private SerialPort? serial;
     private StreamWriter? recording;
     private int logCharacters;
@@ -136,6 +161,8 @@ public sealed partial class ControlWindow : Window
             foreach (var change in e.Changes) logCharacters += change.AddedLength - change.RemovedLength;
         };
         BuildLayout();
+        WatchDispatcherOperations();
+        ContentRendered += (_, _) => WarmUpAutomation();
         Lang.Changed += OnLanguageChanged;
         Closed += (_, _) => Lang.Changed -= OnLanguageChanged;
         if (restoreParameters) { xyPreview.RestoreSavedParameters(); xyPreview.RefreshRecentRuns(); }
@@ -154,6 +181,7 @@ public sealed partial class ControlWindow : Window
             SafeAction(Heartbeat);
         };
         Closing += (_, _) => Disconnect(() => Lang.T("fault.windowClose"));
+        Closed += (_, _) => heartbeatTimer.Dispose();
         RefreshPorts(); UpdateControls();
     }
 
@@ -236,6 +264,8 @@ public sealed partial class ControlWindow : Window
     {
         if (wireThread is { IsAlive: true }) { Lang.Text(state, () => Lang.T("state.writerStopping")); return; }
         if (ports.SelectedItem is not string port) { Lang.Text(state, () => Lang.T("state.needPort")); return; }
+        // The warm-up's one expensive layout must not land inside the UI lease (see WarmUpAutomation).
+        if (AutomationWarmUp is { IsCompleted: false }) { Lang.Text(state, () => Lang.T("state.warmingUp")); return; }
         try
         {
             string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TwoLinkCommissioning", "Logs");
@@ -259,7 +289,7 @@ public sealed partial class ControlWindow : Window
             Send(0x79); Heartbeat(); Send((byte)'s'); Send((byte)'i');
             Lang.Text(state, () => Lang.T("state.connected"));
             connect.Content = Lang.T("btn.disconnect"); ports.IsEnabled = false; timer.Start(); heartbeatTimer.Start();
-            StartWireWriter();
+            StartWireWriter(); SetLinkPriority(true);
             Append("HOST connected " + port + (usbLink ? " (USB CDC: one copy per byte, one write per frame)" : " (UART)"));
             Append("HOST UI " + Title + "; executable=" + Environment.ProcessPath);
         }
@@ -363,6 +393,7 @@ public sealed partial class ControlWindow : Window
     }
     private void HandleLine(string line)
     {
+        ObserveSupplementaryLine(line);
         Append(line);
         var match = StatePattern.Match(line);
         if (match.Success)
@@ -495,7 +526,7 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("STOP:") || line.StartsWith("ENABLE refused:") || line.StartsWith("HOME refused:")) {
             if (!(stopPending && line.Contains("operator stop") && lastStop.Text.Length>0)) Lang.Text(lastStop, () => ExplainFault(line));
             InvalidateManualReferenceFeedback();
-            if (PointBusy) Stop();
+            if (PointBusy) Stop(cancelBatch: !line.StartsWith("STOP: PTP encoder following error", StringComparison.Ordinal));
         }
         else if (line.StartsWith("ENABLE OK:")) Lang.Text(lastStop, () => "");
     }
@@ -678,8 +709,9 @@ public sealed partial class ControlWindow : Window
         lock (wireSync) { foreach (byte b in pointPacket) pointWire.Enqueue(b); }
         Append($"HOST PTP retry seq={pendingPoint} attempt={pointAttempts}/3; identical packet", LogLevel.Warning);
     }
-    private void Stop()
+    private void Stop(bool cancelBatch = true)
     {
+        if (cancelBatch) supplementaryBatch?.Cancel();
         CancelLimitSync(requireState: true);
         lock (wireSync) {
             waitingStopEpoch = framedControl && reportedEpoch != 0;
@@ -791,6 +823,7 @@ public sealed partial class ControlWindow : Window
     private void Disconnect(string reason) => Disconnect(() => reason);
     private void Disconnect(Func<string> reason)
     {
+        supplementaryBatch?.Cancel();
         // Stop the writer before the port closes so it cannot write to a dead handle,
         // then report the session while the capability flags still describe it.
         StopWireWriter();
@@ -815,7 +848,7 @@ public sealed partial class ControlWindow : Window
         try { FinishExperiment("disconnected: " + reason()); } catch(Exception ex) { Lang.QueueText(experimentResult, () => Lang.T("fault.saveSummary2") + ex.Message); }
         lastExperimentOutcome = null; trajectoryRanOnce = false;
         try { serial?.Dispose(); } catch { }
-        serial = null;
+        serial = null; SetLinkPriority(false);
         compatible = enabled = homing = stopPending = false;
         pending.Clear(); Lang.Text(state, reason); regularStateText = reason; Lang.Text(inputs, () => Lang.T("fault.inputsInvalid"));
         ShowFeedback(null, () => Lang.T("fault.unplugReason")); errorHistory.Clear(); errorHistory2.Clear(); DrawErrorPlot();
@@ -835,8 +868,13 @@ public sealed partial class ControlWindow : Window
         while (recentLog.Count > 1000) recentLog.Dequeue();
         if (severity < minimumLogLevel) return;
         bool reading = log.IsKeyboardFocusWithin || log.SelectionLength > 0;
-        // Reading Text after every append materializes the whole log on the large-object heap.
-        if (logCharacters > 100000 && !reading) log.Text = log.Text[^50000..];
+        // Reading Text after every append materializes the whole log on the large-object heap.  Reading only defers the trim: a log
+        // left selected for hours grew to megabytes, and a 4 MB box made a UI Automation connection's layout pass 120 ms slower.
+        if (logCharacters > (reading ? 400000 : 100000)) {
+            int cut = logCharacters - 50000, start = log.SelectionStart - cut, length = log.SelectionLength;
+            log.Text = log.Text[cut..];
+            if (reading && start >= 0) log.Select(start, length);
+        }
         log.AppendText(displayed);
         // TextBox.ScrollToEnd forces layout per line; the native viewer queues the scroll.
         if (!reading && log.Template?.FindName("PART_ContentHost", log) is ScrollViewer scroll) scroll.ScrollToEnd();
@@ -852,6 +890,7 @@ public sealed partial class ControlWindow : Window
         StatusBlockHoldSelfTest();
         FlickerSelfTest();
         LoggingSelfTest();
+        SupplementaryBatchSelfTest();
         DiagnosticsSelfTest();
         BoardLoadIdentitySelfTest();
         StoreSelfTest();
@@ -868,9 +907,10 @@ public sealed partial class ControlWindow : Window
         var heartbeatReport = new StringBuilder();
         try
         {
-            heartbeatReport.Append(BackgroundMotionSelfTest()).Append(HeartbeatSchedulingSelfTest()).Append(ExperimentFinishHeartbeatSelfTest()).Append(UsbLinkSelfTest())
+            heartbeatReport.Append(NativeMessageHeartbeatSelfTest()).Append(BackgroundMotionSelfTest()).Append(HeartbeatSchedulingSelfTest()).Append(ExperimentFinishHeartbeatSelfTest()).Append(UsbLinkSelfTest())
                 .Append(WithLeaseRetry(ReferenceIdleReplaySelfTest)).Append(WithLeaseRetry(PreviewInteractionReplaySelfTest))
                 .Append(WithLeaseRetry(UploadReplaySelfTest))
+                .Append(WithLeaseRetry(() => DesktopLoadReplay(Math.Max(1, Environment.ProcessorCount / 2), true, 10)))
                 .Append(WithLeaseRetry(() => ReferenceReplaySelfTest(false, true))).Append(WithLeaseRetry(() => ReferenceReplaySelfTest(true, true)));
         }
         finally

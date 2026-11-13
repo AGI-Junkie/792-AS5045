@@ -58,6 +58,17 @@ public sealed partial class ControlWindow
         window.RefreshLog();
         Check(window.recentLog.Count == 1000 && !window.log.Text.Contains("HOST retained 0"));
         Check(window.log.Text.Contains("HOST retained 1000"));
+        window.log.Text = new string('x', 400001) + "keep" + Environment.NewLine;   // a selected log still has a ceiling, and keeps the selection
+        window.log.Select(window.log.Text.Length - 4 - Environment.NewLine.Length, 4);
+        window.Append("HOST after the cap");
+        Check(window.log.Text.Length < 60000 && window.log.SelectedText == "keep" && window.log.Text.EndsWith("HOST after the cap" + Environment.NewLine));
+        // A slow UI lease line says what held the dispatcher.
+        window.PublishHeartbeatLease();
+        var frame = new System.Windows.Threading.DispatcherFrame();
+        window.Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, () => { Thread.Sleep(150); frame.Continue = false; });
+        System.Windows.Threading.Dispatcher.PushFrame(frame);
+        window.PublishHeartbeatLease();
+        Check(window.log.Text.Contains("HOST UI lease gap max=") && window.log.Text.Contains("(longest Background operation 1"));
         window.Close();
     }
 }

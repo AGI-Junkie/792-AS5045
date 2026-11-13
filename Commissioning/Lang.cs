@@ -658,6 +658,7 @@ internal static class Lang
         ["inputs.raw"] = ("输入电平（0＝触发）：", "Input levels (0 = active): "),
         ["state.needPort"] = ("请选择 KitProg 的 COM 口", "Select the KitProg COM port first"),
         ["state.writerStopping"] = ("上次连接的发送线程还未退出，请稍后重试连接。", "The previous connection's writer is still stopping. Try connecting again shortly."),
+        ["state.warmingUp"] = ("界面还在完成启动准备，请几秒后再连接。", "The window is still finishing start-up. Connect again in a few seconds."),
         ["state.logSaved"] = ("日志自动保存：", "Log auto-saved: "),
         ["state.connected"] = ("已连接，等待 stage1-v3 / stage2 固件状态；不会自动使能",
             "Connected, waiting for stage1-v3 / stage2 firmware state; will not auto-enable"),
