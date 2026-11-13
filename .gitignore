@@ -69,3 +69,11 @@ __pycache__/
 # Local KiCad circuit project
 /circuit/
 dist/
+
+# Thesis text and build outputs stay out of the repository (analysis scripts and figure data are tracked)
+/thesis/figures/
+/thesis/*.docx
+/thesis/thesis.md
+/thesis/build_docx.js
+/thesis/update_fields.ps1
+/thesis/zotero_*.json

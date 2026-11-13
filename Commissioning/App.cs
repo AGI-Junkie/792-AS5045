@@ -53,7 +53,7 @@ public sealed class App : Application
         // The pure geometry and planning checks alone (a few seconds, no window): quick feedback while changing shapes or timing.
         if (args.Contains("--geometry-self-test"))
         {
-            try { Lang.PersistChanges = false; Lang.Set(false, persist: false); PlanarArm.SelfTest(); DrawingTrajectory.SelfTest(); TimedTrajectory.SelfTest(); ExecutionTrajectory.SelfTest(); ReachabilityMask.SelfTest(); ExperimentArchiveTests.SelfTest(); return 0; }
+            try { Lang.PersistChanges = false; Lang.Set(false, persist: false); PlanarArm.SelfTest(); DrawingTrajectory.SelfTest(); TimedTrajectory.SelfTest(); ExecutionTrajectory.SelfTest(); ReachabilityMask.SelfTest(); ExperimentArchiveTests.SelfTest(); ControlWindow.SupplementaryBatchSelfTest(); return 0; }
             catch (Exception ex) { File.WriteAllText("commissioning-self-test-error.txt", ex.ToString()); return 1; }
         }
         // The experiment table of any folder as a CSV, with the plan/sample alignment check; no window.
@@ -77,8 +77,17 @@ public sealed class App : Application
             File.WriteAllLines(args[contract + 1], DeviceContract.Lines());
             return 0;
         }
+        int batch = Array.IndexOf(args, "--supplementary-batch"), firstRun = 0;
+        if (batch >= 0 && (batch + 2 >= args.Length || !Regex.IsMatch(args[batch + 1], @"^COM[1-9][0-9]{0,2}$") ||
+            !int.TryParse(args[batch + 2], out firstRun) || !ControlWindow.SupplementaryStartValid(firstRun))) return 2;
         Lang.Load();
-        new App().Run(new ControlWindow(restoreParameters: true));
+        var window = new ControlWindow(restoreParameters: true);
+        if (batch >= 0) {
+            EventHandler? start = null;
+            start = async (_, _) => { window.ContentRendered -= start; await window.RunSupplementaryBatch(args[batch + 1], firstRun); };
+            window.ContentRendered += start;
+        }
+        new App().Run(window);
         return 0;
     }
 }
@@ -101,8 +110,8 @@ public sealed partial class ControlWindow : Window
     private readonly XYPreviewPanel xyPreview = new();
     private readonly List<Button> jogButtons = [];
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(40) };
-    // Same priority as stop/key-release input; rendering or a hung UI must still stop motion.
-    private readonly DispatcherTimer heartbeatTimer = new(DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(40) };
+    // Native stop/key-release messages stay responsive under traffic; rendering or a hung UI still stops the heartbeat.
+    private readonly DispatcherHeartbeatTimer heartbeatTimer = new(Dispatcher.CurrentDispatcher) { Interval = TimeSpan.FromMilliseconds(40) };
     private SerialPort? serial;
     private StreamWriter? recording;
     private int logCharacters;
@@ -172,6 +181,7 @@ public sealed partial class ControlWindow : Window
             SafeAction(Heartbeat);
         };
         Closing += (_, _) => Disconnect(() => Lang.T("fault.windowClose"));
+        Closed += (_, _) => heartbeatTimer.Dispose();
         RefreshPorts(); UpdateControls();
     }
 
@@ -383,6 +393,7 @@ public sealed partial class ControlWindow : Window
     }
     private void HandleLine(string line)
     {
+        ObserveSupplementaryLine(line);
         Append(line);
         var match = StatePattern.Match(line);
         if (match.Success)
@@ -515,7 +526,7 @@ public sealed partial class ControlWindow : Window
         else if (line.StartsWith("STOP:") || line.StartsWith("ENABLE refused:") || line.StartsWith("HOME refused:")) {
             if (!(stopPending && line.Contains("operator stop") && lastStop.Text.Length>0)) Lang.Text(lastStop, () => ExplainFault(line));
             InvalidateManualReferenceFeedback();
-            if (PointBusy) Stop();
+            if (PointBusy) Stop(cancelBatch: !line.StartsWith("STOP: PTP encoder following error", StringComparison.Ordinal));
         }
         else if (line.StartsWith("ENABLE OK:")) Lang.Text(lastStop, () => "");
     }
@@ -698,8 +709,9 @@ public sealed partial class ControlWindow : Window
         lock (wireSync) { foreach (byte b in pointPacket) pointWire.Enqueue(b); }
         Append($"HOST PTP retry seq={pendingPoint} attempt={pointAttempts}/3; identical packet", LogLevel.Warning);
     }
-    private void Stop()
+    private void Stop(bool cancelBatch = true)
     {
+        if (cancelBatch) supplementaryBatch?.Cancel();
         CancelLimitSync(requireState: true);
         lock (wireSync) {
             waitingStopEpoch = framedControl && reportedEpoch != 0;
@@ -811,6 +823,7 @@ public sealed partial class ControlWindow : Window
     private void Disconnect(string reason) => Disconnect(() => reason);
     private void Disconnect(Func<string> reason)
     {
+        supplementaryBatch?.Cancel();
         // Stop the writer before the port closes so it cannot write to a dead handle,
         // then report the session while the capability flags still describe it.
         StopWireWriter();
@@ -877,6 +890,7 @@ public sealed partial class ControlWindow : Window
         StatusBlockHoldSelfTest();
         FlickerSelfTest();
         LoggingSelfTest();
+        SupplementaryBatchSelfTest();
         DiagnosticsSelfTest();
         BoardLoadIdentitySelfTest();
         StoreSelfTest();
@@ -893,7 +907,7 @@ public sealed partial class ControlWindow : Window
         var heartbeatReport = new StringBuilder();
         try
         {
-            heartbeatReport.Append(BackgroundMotionSelfTest()).Append(HeartbeatSchedulingSelfTest()).Append(ExperimentFinishHeartbeatSelfTest()).Append(UsbLinkSelfTest())
+            heartbeatReport.Append(NativeMessageHeartbeatSelfTest()).Append(BackgroundMotionSelfTest()).Append(HeartbeatSchedulingSelfTest()).Append(ExperimentFinishHeartbeatSelfTest()).Append(UsbLinkSelfTest())
                 .Append(WithLeaseRetry(ReferenceIdleReplaySelfTest)).Append(WithLeaseRetry(PreviewInteractionReplaySelfTest))
                 .Append(WithLeaseRetry(UploadReplaySelfTest))
                 .Append(WithLeaseRetry(() => DesktopLoadReplay(Math.Max(1, Environment.ProcessorCount / 2), true, 10)))
