@@ -4,13 +4,15 @@
 
 ## 状态
 
+当前代码核对（2026-10-19）：`HW_USB=1`、`HW_TXDMA=0`，协议 proto=6。下表构建与上板结果是此前 USB CDC 交付的记录，不能替代后续完整固件包的验收；本次未连接设备或复测。
+
 | 部分 | 状态 |
 |---|---|
 | 固件链路层（`HW_USB`，默认 1） | 已做；仿真 5 个用例（`usb_tx` / `usb_fallback` / `usb_stall` / `usb_rx` / `usb_link`） |
 | TopDesign：`UsbCdc`（USBUART CDC 宏，USBFS v3.20） | 已放；引脚 Dm=P15[7]、Dp=P15[6] |
 | 时钟 | 已改；Creator 构建 0 错误 0 警告，时序 No Timing Violations |
 | 上位机：认出 USB 口、置 DTR、取消双发和字节间隔（`UsbLink.cs`） | 已做；自检 `USB link`（`--self-test`）通过 |
-| 上板验证 | **全部通过**：插着 J6 时 `link=usb`、能使能、无复位无停机、`key_max_gap_ms=53`（KitProg 时 66–134）；拔掉 J6 后回退 UART（`link=uart`、`ENABLE OK`、无停机）；用 USB 跑完整轨迹无复位无停机；拔掉再插回 J6 自动切回 USB；只接 J6 一根线可供电使用 |
+| 历史上板记录（当时版本） | 插着 J6 时 `link=usb`、能使能、无复位无停机、`key_max_gap_ms=53`（KitProg 时 66–134）；拔掉 J6 后回退 UART（`link=uart`、`ENABLE OK`、无停机）；用 USB 跑完整轨迹无复位无停机；拔掉再插回 J6 自动切回 USB；只接 J6 一根线可供电使用。以上不代表当前全部速度、负载和故障条件通过 |
 
 ## 固件行为
 
@@ -38,7 +40,7 @@ ILO Route 改为 100 kHz 是 USBFS 的硬性要求（Creator 报 `fit.M0031`）�
 ## 风险（上板前要知道）
 
 1. **USB 没连、IMO 没被锁定时精度只有 ±4%**（数据手册，非 USB 模式）。总线、步进脉冲、µs 计时、UART 波特率都会跟着偏。USB 连着且在传 SOF 时是 ±0.25%。KitProg UART 在没有 USB 锁定时可能失配；这是计划里写过的取舍。
-2. 只用 KitProg 线（不插 J6）时，固件的计时精度比以前差。闭环编码器会兜住位置，但时间相关的限值（步频、deadman 的毫秒数）会按比例偏。
+2. 只用 KitProg 线（不插 J6）时，应核对未锁定时钟对计时精度的影响。编码器提供电机侧位置监测和保护，PTP/轨迹没有连续误差纠偏控制律，不能保证“兜住位置”；步频、deadman 等时间相关限值也会随时钟偏差变化。
 3. J6 单线供电（VBUS 经 F1/D2 并入 VTARG）：已在板上验证可用。
 4. 烧录和调试仍然走 J10（KitProg）。
 
@@ -46,7 +48,7 @@ ILO Route 改为 100 kHz 是 USBFS 的硬性要求（Creator 报 `fit.M0031`）�
 
 1. 在 Creator 里构建并烧录（J10）。
 2. 再插 J6：Windows 应出现一个新的 COM 口（“USB 串行设备”）。
-3. 用串口工具以任意波特率打开新 COM 口并置 DTR，发 `s`：应收到完整的 STATE/LINK 行，`LINK` 里 `link=usb`，`proto=4`。
+3. 用串口工具以任意波特率打开新 COM 口并置 DTR，发 `s`：应收到完整的 STATE/LINK 行，当前源码的 `LINK` 应含 `link=usb`、`proto=6`；固件标识须与所选构建包一致。
 4. 关闭该 COM 口：下一次 `s` 走 KitProg 的 COM 口，`link=uart`。
 5. 拔掉 J6、只留 J10：行为应和以前一致；记录此时 `--uart-stress` 的结果。
 6. 观察看门狗：固件不应反复复位（反复出现开机信息即为复位）。

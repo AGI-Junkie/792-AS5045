@@ -148,7 +148,7 @@ public sealed partial class ControlWindow
             Dispatcher.PushFrame(frame);
             longestLease = Math.Max(longestLease, clock.Elapsed.TotalMilliseconds - lastLease);
             // However often they were redrawn, the plots are one automation element each: no per-label events (see PlotCanvas).
-            if (!panel.PlotHidesLabelsFromAutomation() || System.Windows.Automation.Peers.UIElementAutomationPeer.CreatePeerForElement(window.errorPlot).GetChildren() is { Count: > 0 })
+            if (profile is null && (!panel.PlotHidesLabelsFromAutomation() || System.Windows.Automation.Peers.UIElementAutomationPeer.CreatePeerForElement(window.errorPlot)?.GetChildren() is { Count: > 0 }))
                 throw new InvalidOperationException("A redrawn plot exposes its shapes and labels to UI Automation.");
         }
         finally {
@@ -219,7 +219,7 @@ public sealed partial class ControlWindow
     // above-normal priority the host takes while a port is open; with what filled each long gap.
     internal static void DesktopLoadProfile(string output)
     {
-        var report = new StringBuilder();
+        var report = new StringBuilder(NativeMessageHeartbeatSelfTest());
         int n = Environment.ProcessorCount;
         using var self = Process.GetCurrentProcess();
         foreach (var (cpu, uia, external, above) in new[] { (0, false, false, false), (n, false, false, false), (0, true, false, false), (n, true, false, false),
@@ -244,7 +244,7 @@ public sealed partial class XYPreviewPanel
         ClickPreview();
     }
     internal bool PlotHidesLabelsFromAutomation() => canvas.Children.OfType<System.Windows.Controls.TextBlock>().Any() &&
-        System.Windows.Automation.Peers.UIElementAutomationPeer.CreatePeerForElement(canvas).GetChildren() is null or { Count: 0 };
+        System.Windows.Automation.Peers.UIElementAutomationPeer.CreatePeerForElement(canvas) is { } peer && peer.GetChildren() is null or { Count: 0 };
     private void ClickPreview() => previewButton!.RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
     // 检查并预览, then edits of position, speed and shape (circle <-> polygon), each invalidating the plan, between further 检查并预览.
     internal string ReplayDesktopAction(int i)

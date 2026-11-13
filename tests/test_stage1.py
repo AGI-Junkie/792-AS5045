@@ -17,7 +17,7 @@ extra_defs = ''.join('#define %s %s\n' % tuple(a[9:].split('=', 1)) for a in sys
 sys.argv = [a for a in sys.argv if not a.startswith(('--host-plan=', '--host-control=', '--emit-c=', '--sim-mhz=', '--define='))]
 source = (root / 'DRV8825.cydsn/main.c').read_text(encoding='utf-8')
 # main.c includes traj.h; the simulation compiles one file, so put the header's text where the include is.
-for header in ['traj.h', 'trajstore.h', 'hw_ssi.h']:
+for header in ['traj.h', 'trajstore.h', 'hw_ssi.h', 'enc_comp.h']:
     source = source.replace(f'#include "{header}"', (root / 'DRV8825.cydsn' / header).read_text(encoding='utf-8'), 1)
     assert f'#include "{header}"' not in source
 
@@ -3356,6 +3356,19 @@ int main(int argc,char **argv) {
         }
         puts(t);return 0;
     }
+    if(!strcmp(t,"encoder_comp")) {   /* ENC_COMP=1 build: the per-revolution table reaches every angle that feeds a position */
+#if ENC_COMP
+        uint16 a;
+        for(a=0u;a<4096u;a++) assert(enc_angle(0u,a)==(uint16)((a+ENC_COMP_LSB[0][a]+4096)%4096) && enc_angle(1u,a)==(uint16)((a+ENC_COMP_LSB[1][a]+4096)%4096));
+        simAngleOverride=1000;assert(enc_set_origin() && g_enc.lastAngle==enc_angle(0u,1000u) && g_enc.pos==0);
+        simAngleOverride=1010;assert(enc_sample() && g_enc.lastAngle==enc_angle(0u,1010u) && g_enc.pos==angle_delta(enc_angle(0u,1010u),enc_angle(0u,1000u)));
+        assert(PTP_FOLLOW1_LSB<SLIP_FAIL_LSB && PTP_FOLLOW2_LSB<SLIP_FAIL_LSB && strstr(FW_BUILD_ID,"-enccomp"));
+        simAngleOverride=-1;
+#else
+        assert(PTP_FOLLOW1_LSB==SLIP_FAIL_LSB && PTP_FOLLOW2_LSB==SLIP_FAIL_LSB && !strstr(FW_BUILD_ID,"comp") && enc_angle(0u,1234u)==1234u);
+#endif
+        puts(t);return 0;
+    }
     if(!strncmp(t,"encoder_guard_",14)) {
         int32 position=g_enc.pos;uint16 angle=g_enc.lastAngle;
         if(!strcmp(t,"encoder_guard_gap")) simClock+=101u*(SIM_MHZ*1000u);
@@ -3641,7 +3654,7 @@ cases += ['home_from_drawing','home_from_arm2_range','home_long_stop']
 cases += ['home_search_stop','home_search_heartbeat','home_search_limit','home_search_fault','home_release_time_limit']
 cases += ['clock_wraps','clock_ms_wrap','clock_deadman_stall','clock_home_timeout','clock_tx_timeout']
 cases += ['control_'+n for n in ['raw','crc','stale','payload','duplicate','home','home_epoch_ack','replay_deadman','raw_deadman','jog','stop_before_enable','stale_epoch_lease','stale_epoch_no_keys','stale_epoch_home','short_lease','short_crc','short_keys']]
-cases += ['encoder_guard_'+n for n in ['gap','jump','overflow']]
+cases += ['encoder_guard_'+n for n in ['gap','jump','overflow']] + ['encoder_comp']
 if host_control is not None: cases += ['control_host','control_host_single_copy']
 cases += ['home_slow_sensor','home_slow_npn']
 cases += ['hw_uart_'+n for n in ['bytes','boot_discard','message_full','tx_full','stop','overflow','overrun','break','parity','framing']]

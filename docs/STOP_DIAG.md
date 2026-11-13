@@ -1,10 +1,10 @@
-# 图形中断复现：v11 状态分片与停机证据锁存
+# 图形中断诊断与停机证据锁存
 
-配套固件 `stage2-v11-status-slices` / 上位机 `stage2-workbench-v11-status-slices`，协议仍为 proto=4。arm2 反馈默认关闭。没有修改轨迹的 20 ms 超时门槛、运动参数、限位或驱动断电行为。
+当前源码核对（2026-10-19）：固件 `stage2-v11-r5000-slip-mref2-ssififo-upstat1-store32v2-meta6-read1-guards2`，配套上位机版本见 `RELEASE_VERSION`，协议 proto=6，默认双编码器反馈。本页通用流程适用于当前代码；后面的 status-slices/hotpath 复测保留历史版本背景，不作为当前包的验收结论。
 
 ## 复现步骤
 
-1. 自行烧录本包 `firmware.hex`，使用本包 `host/TwoLinkCommissioning.exe` 连接。确认 LINK 显示 `fw=stage2-v11-status-slices`。
+1. 由操作者选择同一构建包的 `firmware.hex` 与完整 `host/`；烧录后连接并核对 LINK 的固件标识、proto=6 和双编码器能力。固定最新入口见 README 的 `out/latest`；不要按历史包名判断当前版本。
 2. 按原流程建立零位，上传并执行同一图形和参数。没有自动执行或额外试探动作。
 3. 再次中断时，先保持连接至少 2 秒，让锁存记录重发。可按总停止；不要立即重启控制板或切断控制板电源，因为锁存保存在 RAM 中。然后报告复现时间即可。
 
@@ -22,20 +22,22 @@
 | elapsed_us / plan_us | 当前段实际累计耗时 / 计划时长，单位微秒 |
 | late_us | 实际耗时超出计划的部分；非轨迹执行时为 0 |
 | done / total | 当前段已发出的协调步数 / 总协调步数，不是实测电机运动 |
-| p1 / p2、err、inputs、hb_age_ms、drv | 同时刻的指令计数、arm1 跟随误差、输入掩码、心跳年龄和驱动故障标志 |
+| p1 / p2、err / err2、e1 / e2、inputs、hb_age_ms、drv | 同时刻的指令计数、电机侧编码器与各自跟随误差、输入掩码、心跳年龄和驱动故障标志；双编码器构建才输出 e2/err2 |
 
 确认时序超限：`reason="trajectory timing overrun"`。数值通常满足 `late_us > 20000`；微秒显示有取整，判定本身使用硬件时钟周期。举例：计划 248000 us、实际 268003 us、late 20003 us，说明该段超过 248 ms + 20 ms 门槛。其他原因仍会记录同一组现场字段。
+
+当前执行器还有两类独立保护：单步迟到超过 1000 µs 的部分延后计划时钟，累计 `traj_slip_us` 超过 5000000 µs 时停止并报 `trajectory rate not sustained`；事件中断发现前台超过 40 ms 未经过时报 `trajectory foreground stalled`。`late_us` 是当前段超时，`traj_lag_max_us` 是发步最大滞后，`traj_slip_us` 是累计伸时，不能混为同一指标。5000 微步/秒是代码上限，不是这些保护已在该速率通过实机验收。
 
 原始 FAULT_SNAPSHOT 同样新增这些耗时字段。第一次打印若被 TX 拥堵丢弃，LAST_STOP 仍保留原现场，后续状态查询可以恢复。已停止后的总停止不覆盖原故障；下一次实际运行发生新停机时替换记录。重新上电/复位会清空记录。
 
 离线检查模拟了“队列满 → 实际触发时序超限 → 状态重发恢复 → 总停止不覆盖 → 再使能运行时无额外输出 → 新故障替换”；不是实机复现结果。
 
-## v11 复测
+## 历史 v11 status-slices 复测方案（proto=4、arm2 反馈当时默认关闭）
 
 原图、原速度和加速度执行三遍；完整通过 idx=40，并完成全部 158 节点。每次开始前按界面完成使能、回零/人工伸直确认、移到起点、上传、执行。上传不会自动执行。
 若再停机，保持串口连接至少 2 秒，不重启控制板，报告大致时间；读取 LAST_STOP 与 TIMING 中的 status_max_us/loop_max_ms，判断是否仍是同一超时。无需安装 arm2 编码器。
 
-## v11-hotpath 复测
+## 历史 v11-hotpath 复测方案
 
 固件 `stage2-v11-hotpath2`（hotpath 加审查修补，见 CHANGELOG），上位机用同目录的 host。烧录后确认 LINK 显示 `fw=stage2-v11-hotpath2`。
 

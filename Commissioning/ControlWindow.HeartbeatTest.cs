@@ -7,6 +7,62 @@ namespace TwoLinkCommissioning;
 
 public sealed partial class ControlWindow
 {
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "PostMessageW", SetLastError = true)]
+    private static extern bool PostHeartbeatTestMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+
+    private static string NativeMessageHeartbeatSelfTest()
+    {
+        var window = new ControlWindow { selfTesting = true, ShowActivated = false, ShowInTaskbar = false, Left = -12000, Top = -12000 };
+        window.heartbeatTimer.Tick -= window.OnHeartbeatTick;
+        window.heartbeatTimer.Interval = TimeSpan.FromMilliseconds(8);
+        var clock = new Stopwatch();
+        var frame = new DispatcherFrame();
+        double last = 0, worst = 0;
+        int beats = 0, messages = 0;
+        bool released = false, releasePosted = false, stopPosted = false;
+        double stopAt = 0, stopLatency = double.PositiveInfinity;
+        window.heartbeatTimer.Tick += (_, _) => {
+            double now = clock.Elapsed.TotalMilliseconds;
+            worst = Math.Max(worst, now - last); last = now; beats++;
+        };
+        const uint message = 0x8504;
+        try {
+            window.Show(); window.UpdateLayout(); window.Activate(); window.stopButton!.Focus();
+            window.keyboardMask = 1; window.pendingPoint = 77;
+            var source = (System.Windows.Interop.HwndSource)PresentationSource.FromVisual(window);
+            source.AddHook((IntPtr hwnd, int msg, IntPtr w, IntPtr l, ref bool handled) => {
+                if (msg != message) return IntPtr.Zero;
+                messages++; handled = true;
+                if (!releasePosted && clock.ElapsedMilliseconds >= 200) {
+                    releasePosted = true;
+                    PostHeartbeatTestMessage(hwnd, 0x101, new IntPtr(0x41), new IntPtr(unchecked((int)0xC01E0001))); // A key-up
+                }
+                if (releasePosted && window.keyboardMask == 0) released = true;
+                if (!stopPosted && clock.ElapsedMilliseconds >= 400) {
+                    stopPosted = true; stopAt = clock.Elapsed.TotalMilliseconds;
+                    PostHeartbeatTestMessage(hwnd, 0x100, new IntPtr(0x1B), new IntPtr(0x00010001)); // Escape key-down
+                }
+                if (stopPosted && window.pendingPoint == 0 && double.IsPositiveInfinity(stopLatency))
+                    stopLatency = clock.Elapsed.TotalMilliseconds - stopAt;
+                // Keep a native message pending: WM_TIMER is delivered only after the message queue empties.
+                if (clock.ElapsedMilliseconds < 1000) {
+                    if (!PostHeartbeatTestMessage(hwnd, message, IntPtr.Zero, IntPtr.Zero))
+                        throw new System.ComponentModel.Win32Exception();
+                } else frame.Continue = false;
+                return IntPtr.Zero;
+            });
+            clock.Start(); window.heartbeatTimer.Start();
+            if (!PostHeartbeatTestMessage(source.Handle, message, IntPtr.Zero, IntPtr.Zero))
+                throw new System.ComponentModel.Win32Exception();
+            Dispatcher.PushFrame(frame);
+            worst = Math.Max(worst, clock.Elapsed.TotalMilliseconds - last);
+            if (beats < 5 || worst >= LeaseStopMs || !released || stopLatency >= KeyStaleMs)
+                throw new InvalidOperationException($"Native message traffic starved heartbeat: {messages} messages, {beats} beats, gap={worst:F1} ms (lease {LeaseStopMs} ms).");
+            return $"Native message traffic: {messages} messages, {beats} UI heartbeat ticks, max gap={worst:F1} ms (<{LeaseStopMs} ms); native key release handled, Escape STOP latency={stopLatency:F1} ms (<{KeyStaleMs} ms). No port opened.\n";
+        }
+        finally { window.heartbeatTimer.Stop(); window.Close(); }
+    }
+
     private static string BackgroundMotionSelfTest()
     {
         var window = new ControlWindow { selfTesting = true };
