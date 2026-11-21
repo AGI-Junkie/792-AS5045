@@ -32,7 +32,10 @@ public sealed partial class ControlWindow
     private bool AtStart(JointPose pose) => supportsTelemetry && ptp is { Active: 0, Referenced: true } && ptp.Sequence >= lastMoveSequence &&
         telemetry is { Referenced: true, Inputs: 0 } && telemetry.Epoch == ptp.Epoch && telemetry.Sequence >= lastMoveSequence &&
         (DateTime.UtcNow-lastTelemetryAt).TotalSeconds < 2 &&
-        telemetry.Steps1 == ExecutionTrajectory.Counts(0,pose) && telemetry.Steps2 == ExecutionTrajectory.Counts(1,pose);
+        Math.Abs(telemetry.Steps1 - ExecutionTrajectory.Counts(0,pose)) <= StartTolerance &&
+        Math.Abs(telemetry.Steps2 - ExecutionTrajectory.Counts(1,pose)) <= StartTolerance;
+    // The firmware's own start check (traj_at_pose) uses the same tolerance.
+    private int StartTolerance => lastFirmwareBuild.Contains("-posloop", StringComparison.Ordinal) ? DeviceContract.ClosedLoopStartTolerance : 0;
     private void HandleTelemetry(string line)
     {
         var sample = TelemetrySample.Parse(line);
@@ -129,6 +132,12 @@ public sealed partial class ControlWindow
         w.TestLine($"TELEM t=10 epoch=4 seq={optionalSeq} ref=1 source=2 p1=0 p2=0 e1=0 err=0 inputs=0 drops=0");
         Check(w.CanPoint && w.telemetry!.Measured2 is null && w.jointValues[4].Text=="—" && !w.manualReferencePending);
         Ready(); Check(w.CanPoint && w.AtStart(new(0,0)) && !w.AtStart(new(1,0)));
+        { // closed-loop firmware lands within its deadband: 0.01 degree on arm1 (2 steps, elbow unchanged) still counts as the start, open loop not
+            string build=w.lastFirmwareBuild; var near=new JointPose(0.01,0.01);
+            w.lastFirmwareBuild="x-posloop"; bool closed=w.AtStart(near) && !w.AtStart(new(1,0));
+            w.lastFirmwareBuild="x"; bool open=!w.AtStart(near);
+            w.lastFirmwareBuild=build; Check(closed && open && ExecutionTrajectory.Counts(0,near)!=0);
+        }
         w.TestLine("STATE fw=stage2-v8 enabled=1 home=0 homed1=1 homed2=1 fault=0 enc=1 dir=1 enc2=0 dir2=1");
         Check(!w.CanPoint && !w.hardwareReady);
         Ready(); w.RequestPoint(new(1,1));

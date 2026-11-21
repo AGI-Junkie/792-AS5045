@@ -2086,25 +2086,38 @@ static uint8 ptp_counts_in_range(uint8 axis, int32 count)
            elbow>=g_jointMinCd[JOINT_ELBOW] && elbow<=g_jointMaxCd[JOINT_ELBOW];
 }
 _Static_assert(ENCODER_CPR * GEAR_RATIO * 225 == 36000 * 1024, "joint_step_allowed: 225/1024 must equal 36000/(ENCODER_CPR*GEAR_RATIO)");
+/* An axis' count for the joint guards.  Open loop, and whenever no closed-loop move runs, it is the step counter.  While
+ * the closed loop runs a move the counter also holds the pulses it sent to make up lost steps, so it runs ahead of the
+ * rotor; the guards then use counter - lag, the measured pose, or a healthy recovery near a bound would be refused
+ * before the arm got there.  (The encoder guards in joint_step_allowed_core are unchanged.) */
+static int32 guard_count(uint8 axis)
+{
+    int32 c = axis ? g_arm2.usteps : g_arm1.usteps;
+#if (POS_LOOP != 0u)
+    if (g_ptp.active) { c -= g_plLag[axis]; }
+#endif
+    return c;
+}
 static uint8 joint_step_allowed_core(const jog_axis_t *a, int8 s, uint8 checkCommandQ2, int32 fallbackElbowCount)
 {
     uint8 axis = (a == &g_arm1) ? 0u : 1u;
+    int32 count = guard_count(axis);
     if(g_home.phase!=HOME_IDLE || !g_directionKnown || !(axis ? g_homed2 : g_homed1)) { return 1u; }
     /* Homed/manual-reference zero survives switching to jog. Permit retreat from
      * outside a bound, but never another outward step (including deceleration). */
     int32 elbow=ptp_angle_from_counts(1u,fallbackElbowCount);
-    int32 nextQ2=ptp_angle_from_counts(0u,g_arm1.usteps+(axis==0u?s:0))+
-                 ptp_angle_from_counts(1u,g_arm2.usteps+(axis==1u?s:0));
+    int32 nextQ2=ptp_angle_from_counts(0u,guard_count(0u)+(axis==0u?s:0))+
+                 ptp_angle_from_counts(1u,guard_count(1u)+(axis==1u?s:0));
     /* Quantized estimates can sit just inside a limit; compare actual counts
      * with the nearest legal pulse boundary before allowing an outward jog. */
-    if(axis==0u && ((s<0 && a->usteps<=g_ptp.origin[0]-ptp_offset(0u,g_jointMaxCd[0])) ||
-                    (s>0 && a->usteps>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[0])))) return 0u;
+    if(axis==0u && ((s<0 && count<=g_ptp.origin[0]-ptp_offset(0u,g_jointMaxCd[0])) ||
+                    (s>0 && count>=g_ptp.origin[0]-ptp_offset(0u,g_jointMinCd[0])))) return 0u;
     /* Match the joint contract's count-to-centidegree rounding, but check the
      * prospective pose so an inward compensation pulse can make room. */
     if(checkCommandQ2 && ((s<0 && nextQ2>g_jointMaxCd[1]) || (s>0 && nextQ2<g_jointMinCd[1]))) return 0u;
     /* The elbow is motor 2's own angle, so its range bounds that motor directly. */
-    if(axis==1u && ((s<0 && a->usteps<=g_ptp.origin[1]-ptp_offset(1u,g_jointMaxCd[JOINT_ELBOW])) ||
-                    (s>0 && a->usteps>=g_ptp.origin[1]-ptp_offset(1u,g_jointMinCd[JOINT_ELBOW])))) return 0u;
+    if(axis==1u && ((s<0 && count<=g_ptp.origin[1]-ptp_offset(1u,g_jointMaxCd[JOINT_ELBOW])) ||
+                    (s>0 && count>=g_ptp.origin[1]-ptp_offset(1u,g_jointMinCd[JOINT_ELBOW])))) return 0u;
     if(dual_ready()) {
         /* 36000 / (ENCODER_CPR * GEAR_RATIO) = 225 / 1024: same truncated quotient, but a shift instead of a 64-bit divide. */
         int32 m1=(int32)(((int64)g_enc.pos-g_enc.softCenter)*(g_enc.incDir==ARM1_LEFT_DIR_LEVEL?1:-1)*225/1024);
@@ -2694,15 +2707,15 @@ static uint8 pulse_axes_try(const int8 step[2])   /* false when a step was refus
     uint8 i, axis, first=0u;
     jog_axis_t *axes[2]; axes[0]=&g_arm1; axes[1]=&g_arm2;
     if(g_ptp.reference && step[0] && step[1]) {
-        int32 q1=ptp_angle_from_counts(0u,g_arm1.usteps+step[0]);
-        int32 q2=q1+ptp_angle_from_counts(1u,g_arm2.usteps+step[1]);
+        int32 q1=ptp_angle_from_counts(0u,guard_count(0u)+step[0]);
+        int32 q2=q1+ptp_angle_from_counts(1u,guard_count(1u)+step[1]);
         if(!joint_range_ok(q1,q2)) { return 0u; }
         /* At a shared q2 bound, move inward first; every pulse still passes the single-axis and measured guards. */
         if(!joint_step_allowed(&g_arm1,step[0])) { first=1u; }
         /* With arm2 feedback off, arm1's hybrid q2 uses the elbow count after
          * a preceding arm2 pulse. Arm2 still sees the current measured arm1. */
-        if(!joint_step_allowed_core(&g_arm1,step[0],0u,g_arm2.usteps+(first?step[1]:0)) ||
-           !joint_step_allowed_core(&g_arm2,step[1],0u,g_arm2.usteps)) { return 0u; }
+        if(!joint_step_allowed_core(&g_arm1,step[0],0u,guard_count(1u)+(first?step[1]:0)) ||
+           !joint_step_allowed_core(&g_arm2,step[1],0u,guard_count(1u))) { return 0u; }
     }
     for(i=0u;i<2u;i++) {
         axis=(uint8)(first^i);
@@ -2864,7 +2877,7 @@ static void ptp_service(void)
     if (!g_motionEnabled || !g_ptp.reference || !g_keysSeen || g_jogMs-g_lastKeyMs>JOG_DEADMAN_MS) { stage_stop("PTP heartbeat/reference lost",0u); return; }
     if (FAULT_ACTIVE()) { stage_stop("PTP nFAULT",1u); return; }
     if (HARD_LIMIT_ACTIVE() || ARM1_HOME_ACTIVE() || ARM2_NPN_ACTIVE()) { stage_stop("PTP limit/home sensor",0u); return; }
-    if (g_jogMs-g_ptp.sinceMs>600000u || !ptp_counts_in_range(0u,g_arm1.usteps) || !ptp_counts_in_range(1u,g_arm2.usteps)) { stage_stop("PTP time/joint limit",0u); return; }
+    if (g_jogMs-g_ptp.sinceMs>600000u || !ptp_counts_in_range(0u,guard_count(0u)) || !ptp_counts_in_range(1u,guard_count(1u))) { stage_stop("PTP time/joint limit",0u); return; }
     if (!g_arm1.hasEnc || g_enc.badStreak || (ARM2_ENCODER_FEEDBACK && (!g_arm2.hasEnc || g_enc2.badStreak))) { return; } /* shared encoder watchdog will latch stop */
 #if (POS_LOOP == 0u)
     if ((abs_i32(cmd_lsb()-g_enc.pos)>=PTP_FOLLOW1_LSB || (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>=PTP_FOLLOW2_LSB))) { stage_stop("PTP encoder following error",0u); return; }

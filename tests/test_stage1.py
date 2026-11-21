@@ -963,6 +963,23 @@ static void ptp_test(const char *t) {
 #endif
         return;
     }
+    if(!strcmp(t,"ptp_posloop_limit")) {
+#if POS_LOOP
+        /* The target sits exactly on arm1's joint bound and the motor stalls on the way: the counter (with the recovery
+         * pulses) reaches the bound before the rotor does, so the guards must judge the measured pose, or the move is
+         * refused ~70 steps short of a legal target. */
+        int s1=simStep1; int32 want1=start1-ptp_offset(0,200);
+        g_jointMaxCd[0]=200;
+        ptp_send(1,epoch,200,200,200,0);assert(g_ptp.active==1);
+        for(i=0;i<150;i++)cycle(1); simStall=1; for(i=0;i<100;i++)cycle(1); simStall=0;
+        for(i=0;i<20000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
+        txq_flush_blocking();
+        if(!g_motionEnabled)fprintf(stderr,"%s\n",g_lastStop);
+        assert(g_motionEnabled&&!g_ptp.active&&strstr(simLog,"POSLOOP done"));
+        assert(abs_i32(simStep1-s1-(want1-start1))<=POS_DEADBAND_USTEP);
+#endif
+        return;
+    }
     if(!strcmp(t,"ptp_posloop_track")) {
 #if POS_LOOP
         /* Motor 1 never moves.  The corrections pile into cmd - encoder faster than the reference runs away, so the
@@ -3841,7 +3858,7 @@ OPEN_LOOP_ONLY = {'ptp_success','ptp_reverse','ptp_duplicate','ptp_busy','ptp_ho
     'dual_ptp_follow'}   # pokes the open-loop foreground following check directly
 posloop_cases = ['traj_posloop_runs','traj_posloop_drop','ptp_posloop_track',
                  'ptp_posloop_axis1','ptp_posloop_drop','ptp_posloop_hold','ptp_posloop_dual',
-                 'ptp_posloop_many','ptp_posloop_stalls','ptp_posloop_cap']
+                 'ptp_posloop_many','ptp_posloop_stalls','ptp_posloop_cap','ptp_posloop_limit']
 if host_plan is not None: posloop_cases += ['traj_posloop_host']
 posloop_cases += [c for c in ptp_cases if c not in OPEN_LOOP_ONLY]
 if len(sys.argv)>1:
