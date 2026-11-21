@@ -2076,16 +2076,6 @@ static int32 ptp_angle_from_counts(uint8 axis, int32 count)
     scaled=(int64)steps*36000;
     return (int32)(scaled>=0 ? (scaled+revolution/2)/revolution : -((-scaled+revolution/2)/revolution));
 }
-static uint8 ptp_counts_in_range(uint8 axis, int32 count)
-{
-    int32 q1=ptp_angle_from_counts(0u,axis==0u?count:g_arm1.usteps);
-    int32 q2=q1+ptp_angle_from_counts(1u,axis==1u?count:g_arm2.usteps);
-    int32 value=axis==0u ? q1 : q2;
-    int32 elbow=q2-q1;
-    return value>=g_jointMinCd[axis] && value<=g_jointMaxCd[axis] &&
-           elbow>=g_jointMinCd[JOINT_ELBOW] && elbow<=g_jointMaxCd[JOINT_ELBOW];
-}
-_Static_assert(ENCODER_CPR * GEAR_RATIO * 225 == 36000 * 1024, "joint_step_allowed: 225/1024 must equal 36000/(ENCODER_CPR*GEAR_RATIO)");
 /* An axis' count for the joint guards.  Open loop, and whenever no closed-loop move runs, it is the step counter.  While
  * the closed loop runs a move the counter also holds the pulses it sent to make up lost steps, so it runs ahead of the
  * rotor; the guards then use counter - lag, the measured pose, or a healthy recovery near a bound would be refused
@@ -2098,6 +2088,17 @@ static int32 guard_count(uint8 axis)
 #endif
     return c;
 }
+static uint8 ptp_counts_in_range(uint8 axis, int32 count)
+{
+    /* the other axis by guard_count() too: during a closed-loop move the raw counter runs ahead by the recovery pulses */
+    int32 q1=ptp_angle_from_counts(0u,axis==0u?count:guard_count(0u));
+    int32 q2=q1+ptp_angle_from_counts(1u,axis==1u?count:guard_count(1u));
+    int32 value=axis==0u ? q1 : q2;
+    int32 elbow=q2-q1;
+    return value>=g_jointMinCd[axis] && value<=g_jointMaxCd[axis] &&
+           elbow>=g_jointMinCd[JOINT_ELBOW] && elbow<=g_jointMaxCd[JOINT_ELBOW];
+}
+_Static_assert(ENCODER_CPR * GEAR_RATIO * 225 == 36000 * 1024, "joint_step_allowed: 225/1024 must equal 36000/(ENCODER_CPR*GEAR_RATIO)");
 static uint8 joint_step_allowed_core(const jog_axis_t *a, int8 s, uint8 checkCommandQ2, int32 fallbackElbowCount)
 {
     uint8 axis = (a == &g_arm1) ? 0u : 1u;
@@ -2130,7 +2131,7 @@ static uint8 joint_step_allowed_core(const jog_axis_t *a, int8 s, uint8 checkCom
 }
 static uint8 joint_step_allowed(const jog_axis_t *a, int8 s)
 {
-    return joint_step_allowed_core(a,s,1u,g_arm2.usteps);
+    return joint_step_allowed_core(a,s,1u,guard_count(1u));   /* = g_arm2.usteps unless a closed-loop move runs */
 }
 static void traj_status(void)
 {
