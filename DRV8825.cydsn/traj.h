@@ -156,14 +156,18 @@ static void traj_segment(const traj_t *t, dda_t *seg, const int32 origin[2], con
     dda_start(seg, to, from);
 }
 
-/* Start at node 1 (node 0 is where the machine already stands, at `pos`); `now` is the SysTick count. */
+/* Start at node 1 (node 0 is where the machine already stands, at `pos`); `now` is the SysTick count.
+ * Unused in the POS_LOOP build, whose RUN starts pl_start() (posloop.h) instead. */
+static void traj_start(traj_t *t, dda_t *seg, const int32 origin[2], const int32 pos[2], uint32 now) __attribute__((unused));
 static void traj_start(traj_t *t, dda_t *seg, const int32 origin[2], const int32 pos[2], uint32 now)
 {
     t->state = TRAJ_RUNNING; t->index = 1u; t->elapsedCy = 0u; t->clock = now; t->lastStep = now; t->slipCy = 0u;
     traj_segment(t, seg, origin, pos);
 }
 
-typedef enum { TRAJ_POLL_IDLE = 0, TRAJ_POLL_STEP, TRAJ_POLL_DONE, TRAJ_POLL_OVERRUN, TRAJ_POLL_UNSUSTAINED } traj_poll_t;
+/* TRACKING and UNSETTLED come only from the closed-loop executor (posloop.h). */
+typedef enum { TRAJ_POLL_IDLE = 0, TRAJ_POLL_STEP, TRAJ_POLL_DONE, TRAJ_POLL_OVERRUN, TRAJ_POLL_UNSUSTAINED,
+               TRAJ_POLL_TRACKING, TRAJ_POLL_UNSETTLED } traj_poll_t;
 
 /* Advance a running plan to `now`.  Call as often as the foreground allows; each call does at most one thing:
  *   STEP     one DDA event is due: step[i] says which axes pulse and which way.  The caller pulses them.

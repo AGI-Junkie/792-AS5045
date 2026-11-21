@@ -61,6 +61,9 @@
 #ifndef TEST_DROP
 #define TEST_DROP                   (0u) /* 1: TEST BUILD ONLY - swallow STEP pulses on every second trajectory run (step-loss experiment) */
 #endif
+#ifndef POS_LOOP
+#define POS_LOOP                    (1u) /* 1: trajectory RUN and PTP moves are position-controlled from both encoders (posloop.h, docs/POSITION_LOOP.md); 0: the open-loop DDA executor */
+#endif
 #if (TEST_DROP != 0u) && (HW_STEP == 0u)
 #error "TEST_DROP drops pulses in step_fire(), which only exists with HW_STEP"
 #endif
@@ -158,7 +161,15 @@
 #define ARM2_ENCODER_FEEDBACK       (1u) /* Enable only after the encoder/magnet is fixed and commissioned. */
 #endif
 
-#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store32v2-meta6-read1-guards2" FW_VARIANT
+#define FW_BUILD_ID                 "stage2-v11-r5000-slip-mref2-ssififo-upstat1-store32v2-meta6-read1-guards2" FW_LOOP FW_VARIANT
+#if (POS_LOOP != 0u) && ((HW_EVT == 0u) || (ARM2_ENCODER_FEEDBACK == 0u))
+#error "POS_LOOP runs in the EvtTimer interrupt and needs both encoders (HW_EVT=1, ARM2_ENCODER_FEEDBACK=1)"
+#endif
+#if (POS_LOOP != 0u)
+#define FW_LOOP                     "-posloop"   /* before FW_VARIANT: the supplementary batch matches the build id's end */
+#else
+#define FW_LOOP                     ""
+#endif
 #if (TEST_DROP != 0u) && (ENC_COMP != 0u)
 #define FW_VARIANT                  "-enccomp-TESTDROP"
 #elif (TEST_DROP != 0u)
@@ -1526,6 +1537,30 @@ static uint32 motion_min(uint32 a, uint32 b) { return a < b ? a : b; }
 #define TRAJ_LATE_SOFT_US 1000u
 #define TRAJ_SLIP_MAX_MS 5000u
 #include "traj.h"
+#if (POS_LOOP != 0u)
+/* First bench guesses, not tuned values (docs/POSITION_LOOP.md says how to tune them). */
+#define POS_TICK_US          (100u)    /* EvtTimer period while the loop runs: pulse-time resolution */
+#define POS_CTRL_US          (1000u)   /* control period = encoder sample period (JOG_ENC_SAMPLE_US) */
+#define POS_KP_PER_S         (30)      /* steps/s of correction per step of error: ~5 Hz loop, far below the 1 ms sample delay */
+#define POS_CORR_MAX         (1000)    /* largest correction on top of the feedforward, steps/s (20% of the rate cap) */
+#define POS_CORR_ACCEL       (20000u)  /* how fast the correction may change, steps/s^2 */
+#define POS_RATE_MAX         ((int32)TRAJ_BURST_RATE_MAX)
+#define POS_DEADBAND_USTEP   (2)       /* CL_DEADBAND_LSB (4 LSB = 1.6 usteps), rounded up */
+#define POS_TRACK_MAX_USTEP  (128)     /* SLIP_FAIL_LSB (328 LSB) in microsteps: the same line the open-loop check stops at */
+#define POS_SETTLE_MS        (20u)     /* both axes in the deadband this long = arrived */
+#define POS_HOLD_MAX_MS      (1000u)   /* not arrived this long after the plan's end = stop */
+#define POS_SENSOR_DELAY_US  (AS5045_DELAY_US)
+#include "posloop.h"
+static pl_t g_pl;
+static volatile int32 g_plLag[2];   /* cmd - encoder per axis in steps, foreground writes, event ISR reads */
+/* An encoder-frame difference (LSB) as microsteps in the axis' own direction, rounded to the nearest step: truncation
+ * would hide up to a step (2.56 LSB) of error from the loop. */
+static int32 pl_lsb_to_axis(int8 encSign, int32 lsb)
+{
+    int64 x = (int64)lsb * USTEPS_PER_REV;
+    return encSign * (int32)((x + (x < 0 ? -ENCODER_CPR / 2 : ENCODER_CPR / 2)) / ENCODER_CPR);
+}
+#endif
 static const uint8 *ts_flash(uint32 offset) { return (const uint8 *)(CYDEV_FLASH_BASE + offset); }
 #include "trajstore.h"
 
@@ -2450,7 +2485,12 @@ static uint8 traj_accept(const uint8 *p)
         {
             int32 pos[2];
             pos[0]=g_arm1.usteps; pos[1]=g_arm2.usteps;
+#if (POS_LOOP != 0u)
+            g_plLag[0]=g_plLag[1]=0;   /* the start check above allows a little; the first sample sets it */
+            pl_start(&g_traj,&g_pl,g_ptp.origin,pos,SU_NOW());
+#else
             traj_start(&g_traj,&g_ptp.seg,g_ptp.origin,pos,SU_NOW());
+#endif
         }
         g_ptp.sinceMs=g_jogMs; g_ptp.active=1u;
 #if (TEST_DROP != 0u)
@@ -2544,6 +2584,18 @@ static void ptp_accept(void)
         g_ptp.ramp.c=g_ptp.ramp.c0;
     }
     g_ptp.periodUs=g_ptp.ramp.c; g_ptp.active=1u;
+#if (POS_LOOP != 0u)
+    {
+        /* Closed loop: the same move as a trapezoidal reference in time, stepped and corrected by the event interrupt. */
+        int32 from[2];
+        uint32 accel=PTP_ACCEL;
+        for(i=0u;i<2u;i++) if(g_ptp.seg.distance[i]) { accel=motion_min(accel,g_motionAccel[i]); }
+        from[0]=axes[0]->usteps; from[1]=axes[1]->usteps;
+        g_plLag[0]=g_plLag[1]=0;
+        pl_ptp_start(&g_pl,from,g_ptp.seg.target,rate,accel,SU_NOW());
+        evt_start();
+    }
+#endif
     JLOGF("PTP accepted seq=%lu target1=%ld target2=%ld rate=%u\r\n",(unsigned long)seq,(long)g_ptp.seg.target[0],(long)g_ptp.seg.target[1],(unsigned)rate);
     stage_status();
 }
@@ -2703,6 +2755,20 @@ CY_ISR(evt_isr)
     (void)EvtTimer_ReadStatusRegister();        /* clears the interrupt */
     if (g_evtRunning == 0u) { return; }
     if (SU_ELAPSED(g_fgPassAt) > TRAJ_FOREGROUND_MAX_MS * 1000u * SU_CY_PER_US) { evt_fail("trajectory foreground stalled"); return; }
+#if (POS_LOOP != 0u)
+    {
+        int32 cmd[2], lag[2];
+        cmd[0] = g_arm1.usteps; cmd[1] = g_arm2.usteps; lag[0] = g_plLag[0]; lag[1] = g_plLag[1];
+        switch (pl_poll(&g_traj, &g_pl, g_ptp.origin, cmd, lag, started, step)) {
+        case TRAJ_POLL_TRACKING:  evt_fail("closed-loop tracking error"); return;
+        case TRAJ_POLL_UNSETTLED: evt_fail("closed-loop hold did not settle"); return;
+        case TRAJ_POLL_STEP:      if (pulse_axes_try(step) == 0u) { evt_fail("trajectory pulse blocked"); return; } break;
+        case TRAJ_POLL_DONE:      g_ptp.active = 2u; g_ptp.settleMs = g_jogMs; g_evtRunning = 0u; return;
+        default: break;
+        }
+        evt_arm_cy(POS_TICK_US * SU_CY_PER_US);
+    }
+#else
     switch (traj_poll(&g_traj, &g_ptp.seg, g_ptp.origin, started, step)) {
     case TRAJ_POLL_OVERRUN:     evt_fail("trajectory timing overrun"); return;
     case TRAJ_POLL_UNSUSTAINED: evt_fail("trajectory rate not sustained"); return;
@@ -2711,6 +2777,7 @@ CY_ISR(evt_isr)
     default: break;
     }
     evt_arm_cy(traj_wait_cy(&g_traj, &g_ptp.seg, SU_NOW()));
+#endif
     cost = SU_ELAPSED(started);
     if (cost > g_evtMaxCy) { g_evtMaxCy = cost; }
     g_evtBusyCy += cost; g_evtEvents++;
@@ -2752,7 +2819,15 @@ static void ptp_service(void)
 {
     if (!g_ptp.active) { return; }
 #if (HW_EVT != 0u)
-    if (g_evtStop != 0) { const char *why = g_evtStop; g_evtStop = 0; stage_stop(why, FAULT_ACTIVE()); return; }
+    if (g_evtStop != 0) {
+        const char *why = g_evtStop; g_evtStop = 0;
+#if (POS_LOOP != 0u)
+        JLOGF("POSLOOP stop: err1=%ld err2=%ld peak1=%ld peak2=%ld v1=%ld v2=%ld lag1=%ld lag2=%ld hold=%u usteps\r\n",
+              (long)g_pl.err[0],(long)g_pl.err[1],(long)g_pl.errPeak[0],(long)g_pl.errPeak[1],
+              (long)g_pl.vcmd[0],(long)g_pl.vcmd[1],(long)g_plLag[0],(long)g_plLag[1],(unsigned)g_pl.holding);
+#endif
+        stage_stop(why, FAULT_ACTIVE()); return;
+    }
 #endif
     if (!g_motionEnabled || !g_ptp.reference || !g_keysSeen || g_jogMs-g_lastKeyMs>JOG_DEADMAN_MS) { stage_stop("PTP heartbeat/reference lost",0u); return; }
     if (FAULT_ACTIVE()) { stage_stop("PTP nFAULT",1u); return; }
@@ -2762,8 +2837,32 @@ static void ptp_service(void)
     if ((abs_i32(cmd_lsb()-g_enc.pos)>=PTP_FOLLOW1_LSB || (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>=PTP_FOLLOW2_LSB))) { stage_stop("PTP encoder following error",0u); return; }
     if (g_ptp.active==2u) {
         if (g_jogMs-g_ptp.settleMs<HOME_SETTLE_MS) { return; }
+#if (POS_LOOP != 0u)
+        {
+            /* Closed loop: the step counters may differ from the plan by the steps the loop added back, so arrival is
+             * judged on the measured position.  Then the counters are re-based on it: counter = target when the pose is
+             * inside the deadband (the loop's own definition of arrived, and what the next RUN's exact start check needs),
+             * else the measured pose; command = measured (as the jog hold does), so the joint limits see the real pose. */
+            int32 miss1, miss2;
+            if (!enc_sample()) { stage_stop("PTP final position mismatch",0u); return; }
+            miss1=g_pl.to[0]-(g_arm1.usteps-pl_lsb_to_axis(jog_enc_sign(&g_arm1,1),cmd_lsb()-g_enc.pos));
+            miss2=g_pl.to[1]-(g_arm2.usteps-pl_lsb_to_axis(jog_enc_sign(&g_arm2,1),g_enc2.cmdLsbX100/100-g_enc2.pos));
+            if (abs_i32(usteps_to_lsb(miss1))>PTP_FINAL_ERROR_LSB || abs_i32(usteps_to_lsb(miss2))>PTP_FINAL_ERROR_LSB) {
+                stage_stop("PTP final position mismatch",0u); return;
+            }
+            /* miss = target - measured; peak = largest |ref - measured| of the run; slip = counter - target, the steps
+             * the motor lost (and the loop made up) on the way */
+            JLOGF("POSLOOP done: miss1=%ld miss2=%ld peak1=%ld peak2=%ld slip1=%ld slip2=%ld usteps\r\n",
+                  (long)miss1,(long)miss2,(long)g_pl.errPeak[0],(long)g_pl.errPeak[1],
+                  (long)(g_arm1.usteps-g_pl.to[0]),(long)(g_arm2.usteps-g_pl.to[1]));
+            g_arm1.usteps=g_pl.to[0]-(abs_i32(miss1)<=POS_DEADBAND_USTEP ? 0 : miss1);
+            g_arm2.usteps=g_pl.to[1]-(abs_i32(miss2)<=POS_DEADBAND_USTEP ? 0 : miss2);
+            cmd_reset_axis(&g_enc); cmd_reset_axis(&g_enc2);
+        }
+#else
         if (!enc_sample() || abs_i32(cmd_lsb()-g_enc.pos)>PTP_FINAL_ERROR_LSB || (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>PTP_FINAL_ERROR_LSB) ||
             g_arm1.usteps!=g_ptp.seg.target[0] || g_arm2.usteps!=g_ptp.seg.target[1]) { stage_stop("PTP final position mismatch",0u); return; }
+#endif
         g_ptp.active=0u;
         if(g_traj.state==TRAJ_RUNNING) { g_traj.state=TRAJ_DONE; }
 #if (TEST_DROP != 0u)
@@ -2786,6 +2885,9 @@ static void ptp_service(void)
         g_dropAxis = (k & 1u) ? STEP_ARM2 : STEP_ARM1; g_dropLeft = usteps[k / 2u]; g_dropAt = 0u;
         JLOGF("TEST_DROP run=%u axis=%u usteps=%u\r\n", (unsigned)g_dropRuns, (unsigned)((k & 1u) + 1u), (unsigned)usteps[k / 2u]);
     }
+#endif
+#if (POS_LOOP != 0u)
+    return;   /* closed loop: the event interrupt owns every PTP move and trajectory until DONE or a stop */
 #endif
     if(g_traj.state==TRAJ_RUNNING) {
 #if (HW_EVT != 0u)
@@ -3329,7 +3431,7 @@ static uint8 jog_slot_free(uint32 us)
     if (g_ptp.active==1u) {
         uint32 period, since;
 #if (HW_EVT != 0u)
-        if(g_traj.state==TRAJ_RUNNING) { return 1u; } /* ISR pulses need no foreground slot; keep its memo private. */
+        if(g_traj.state==TRAJ_RUNNING || POS_LOOP) { return 1u; } /* ISR pulses need no foreground slot; keep its memo private. */
 #endif
         if(g_traj.state==TRAJ_RUNNING) { traj_next_due(&g_traj,&g_ptp.seg,SU_NOW(),&since,&period); }
         else { period=g_ptp.periodUs*SU_CY_PER_US; since=SU_ELAPSED(g_ptp.lastStep); }
@@ -3879,6 +3981,14 @@ static void encoder_after_sample(uint8 sampleOk)
             }
         }
     }
+#if (POS_LOOP != 0u)
+    if (sampleOk != 0u)
+    {
+        /* commanded - measured at the frame's start, turned from encoder LSB into the axis' step direction */
+        g_plLag[0] = pl_lsb_to_axis(jog_enc_sign(&g_arm1, 1), g_enc.snapLsbX100 / 100 - g_enc.pos);
+        g_plLag[1] = pl_lsb_to_axis(jog_enc_sign(&g_arm2, 1), g_enc2.snapLsbX100 / 100 - g_enc2.pos);
+    }
+#endif
     if ((g_motionEnabled != 0u) && (g_home.phase == HOME_IDLE))
     {
         if(!g_enc.badStreak) { jog_slip_check(&g_arm1); }
