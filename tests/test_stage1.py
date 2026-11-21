@@ -910,6 +910,13 @@ static void limits_test(const char *t) {
     g_enc.pos=g_arm1SoftCenter-out_deg10_to_lsb(1000);cmd_reset_to_measured();g_arm1.want=-1;
     jog_axis_tick(&g_arm1);assert(g_arm1.moving==-1 && !g_enc.trackingLost);
 }
+/* Where the counters must stand after a move: exactly on the target open loop; within the deadband closed loop, whose
+ * counters are re-based on the measured pose and keep its residual. */
+#if POS_LOOP
+#define SIM_AT(have, want) (abs_i32((have)-(want))<=POS_DEADBAND_USTEP)
+#else
+#define SIM_AT(have, want) ((have)==(want))
+#endif
 static void ptp_test(const char *t) {
     unsigned i,p1,p2; int32 start1,start2; uint32 epoch;
     int16 target1=125,target2=-250;
@@ -922,6 +929,68 @@ static void ptp_test(const char *t) {
     for(i=0;i<250000&&g_home.phase!=HOME_IDLE&&g_motionEnabled;i++)cycle(1);
     assert(g_homed1&&g_homed2&&g_ptp.reference);cycle(1);sim_keys(0);
     start1=g_arm1.usteps;start2=g_arm2.usteps;p1=simPulse1;p2=simPulse2;epoch=g_ptp.epoch;
+    if(!strcmp(t,"ptp_posloop_many")) {
+#if POS_LOOP
+        /* 100 small moves in a row (q1 = q2 = k centidegrees, 1.8 steps each, inside the deadband): every arrival
+         * re-bases the counters, and the residuals must not pile up - the counters keep telling where the rotor is. */
+        int s1=simStep1; unsigned k;
+        for(k=1;k<=100;k++) {
+            ptp_send(k,epoch,(int16)k,(int16)k,200,0);assert(g_ptp.active==1);
+            for(i=0;i<5000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
+            assert(g_motionEnabled&&!g_ptp.active);
+        }
+        printf("posloop %s counter=%ld rotor=%ld want=%ld\n",t,(long)(g_arm1.usteps-start1),(long)(simStep1-s1),(long)-ptp_offset(0,100));fflush(stdout);
+        assert(abs_i32((g_arm1.usteps-start1)-(simStep1-s1))<=1);                 /* counter = rotor */
+        assert(abs_i32((simStep1-s1)+ptp_offset(0,100))<=POS_DEADBAND_USTEP);   /* and the rotor is at the last target */
+#endif
+        return;
+    }
+    if(!strcmp(t,"ptp_posloop_stalls")) {
+#if POS_LOOP
+        /* A long slow move with five 100 ms stalls 500 ms apart: every loss is made up, so command - encoder keeps growing
+         * (well past the 328 LSB open-loop following line) while the tracking stays healthy - no stop. */
+        int s1=simStep1; unsigned n;
+        int32 want1=start1-ptp_offset(0,1500);
+        ptp_send(1,epoch,1500,1500,200,0);assert(g_ptp.active==1);
+        for(n=0;n<5;n++) { for(i=0;i<400;i++)cycle(1); simStall=1; for(i=0;i<80;i++)cycle(1); simStall=0; }
+        for(i=0;i<40000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
+        txq_flush_blocking();
+        if(!g_motionEnabled)fprintf(stderr,"%s\n",simLog);
+        printf("posloop %s dist1=%ld pulses1=%u peak1=%ld\n",t,(long)abs_i32(want1-start1),simPulse1-p1,(long)g_pl.errPeak[0]);fflush(stdout);
+        assert(g_motionEnabled&&!g_ptp.active&&strstr(simLog,"POSLOOP done"));
+        assert(usteps_to_lsb((int32)(simPulse1-p1)-abs_i32(want1-start1))>SLIP_FAIL_LSB); /* the old guard would have stopped */
+        assert(abs_i32(simStep1-s1-(want1-start1))<=POS_DEADBAND_USTEP);
+#endif
+        return;
+    }
+    if(!strcmp(t,"ptp_posloop_track")) {
+#if POS_LOOP
+        /* Motor 1 never moves.  The corrections pile into cmd - encoder faster than the reference runs away, so the
+         * following guard (lag growth since tracking was healthy) usually fires before the 128-step tracking line;
+         * either way the stage stops, and before the corrections reach far. */
+        simStall=1;
+        ptp_send(1,epoch,200,200,200,0);assert(g_ptp.active==1);
+        for(i=0;i<20000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
+        assert_stopped();
+        assert(strstr(g_lastStop,"closed-loop following error")||strstr(g_lastStop,"closed-loop tracking error"));
+        assert(simPulse1-p1<=2u*POS_TRACK_MAX_USTEP);
+#endif
+        return;
+    }
+    if(!strcmp(t,"ptp_posloop_cap")) {
+#if POS_LOOP
+        /* The operator capped arm1 at 200 steps/s: a correction after a stall may not push past it. */
+        int s1=simStep1; int32 vmax=0, want1=start1-ptp_offset(0,200);
+        g_motionRate[0]=200u;
+        ptp_send(1,epoch,200,200,200,0);assert(g_ptp.active==1);
+        for(i=0;i<150;i++)cycle(1); simStall=1; for(i=0;i<100;i++)cycle(1); simStall=0;
+        for(i=0;i<20000&&g_ptp.active&&g_motionEnabled;i++) { cycle(1); if(abs_i32(g_pl.vcmd[0])>vmax)vmax=abs_i32(g_pl.vcmd[0]); }
+        printf("posloop %s vmax1=%ld\n",t,(long)vmax);fflush(stdout);
+        assert(g_motionEnabled&&!g_ptp.active&&vmax<=200);
+        assert(abs_i32(simStep1-s1-(want1-start1))<=POS_DEADBAND_USTEP);
+#endif
+        return;
+    }
     if(!strncmp(t,"ptp_posloop_",12)) {
 #if POS_LOOP
         /* Closed-loop PTP.  axis1: arm1 alone (q2 = q1 keeps the elbow still), slow.  drop: the same, motor 1 stalls
@@ -939,12 +1008,14 @@ static void ptp_test(const char *t) {
         txq_flush_blocking();
         if(!g_motionEnabled)fprintf(stderr,"%s\n",simLog);
         assert(g_motionEnabled&&!g_ptp.active&&g_ptp.reference&&strstr(simLog,"POSLOOP done")&&strstr(simLog,"PTP done seq=1"));
-        assert(g_arm1.usteps==want1&&g_arm2.usteps==want2);   /* arrived inside the deadband: counters on the target */
+        /* arrived inside the deadband; the counters are on the measured pose, residual kept */
+        assert(abs_i32(g_arm1.usteps-want1)<=POS_DEADBAND_USTEP&&abs_i32(g_arm2.usteps-want2)<=POS_DEADBAND_USTEP);
         assert(abs_i32(simStep1-s1-(want1-start1))<=POS_DEADBAND_USTEP && abs_i32(simStep2-s2-(want2-start2))<=POS_DEADBAND_USTEP);
         printf("posloop %s dist1=%ld pulses1=%u pulses2=%u peak1=%ld\n",t,(long)abs_i32(want1-start1),simPulse1-p1,simPulse2-p2,(long)g_pl.errPeak[0]);fflush(stdout);
         if(!dual) assert(simPulse2==p2);                                          /* the elbow never moved */
-        /* exact pulse count, no overshoot; the fixture runs the interrupt in coarse chunks, so a few steps of lag show up */
-        if(!strcmp(t,"ptp_posloop_axis1")) assert(simPulse1-p1==(unsigned)abs_i32(want1-start1) && g_pl.errPeak[0]<=2*POS_DEADBAND_USTEP);
+        /* pulses = distance to within the deadband (an error that never leaves the band is not corrected, by design, and
+         * stays in the counters as the residual); the tracking error stays inside the band all the way */
+        if(!strcmp(t,"ptp_posloop_axis1")) assert(abs_i32((int32)(simPulse1-p1)-abs_i32(want1-start1))<=POS_DEADBAND_USTEP && g_pl.errPeak[0]<=POS_DEADBAND_USTEP);
         if(!strcmp(t,"ptp_posloop_drop")||!strcmp(t,"ptp_posloop_hold")) assert(simPulse1-p1>=(unsigned)abs_i32(want1-start1)+5u);
 #endif
         return;
@@ -981,10 +1052,11 @@ static void ptp_test(const char *t) {
             assert(simDriverSwitches==switches); // Completion and protective stops retain driver power.
         }
         if(!strcmp(t,"ptp_fast_stall")) {
-            assert_stopped();txq_flush_blocking();assert(strstr(simLog,"PTP encoder following error"));return;
+            assert_stopped();txq_flush_blocking();
+            assert(strstr(simLog,POS_LOOP ? "closed-loop following error" : "PTP encoder following error"));return;
         }
         assert(g_motionEnabled&&!g_ptp.active&&g_ptp.reference);
-        assert(g_jogMs-started<30000 /* coarse 1 ms fixture plus dual SSI reads, not pulse scheduler throughput */ && g_arm1.usteps==start1-ptp_offset(0,-1437) && g_arm2.usteps==start2-ptp_offset(1,2904-(-1437)));
+        assert(g_jogMs-started<30000 /* coarse 1 ms fixture plus dual SSI reads, not pulse scheduler throughput */ && SIM_AT(g_arm1.usteps,start1-ptp_offset(0,-1437)) && SIM_AT(g_arm2.usteps,start2-ptp_offset(1,2904-(-1437))));
         jog_handle_byte(JOG_CMD_STOP);assert_stopped();
         assert(simDriverSwitches==switches+6u && simPins[PIN_EN1] && simPins[PIN_EN2]);
         puts("PTP 600: power stable through completion; operator STOP releases both drivers");return;
@@ -1334,7 +1406,7 @@ static void traj_test(const char *t) {
         if(!strcmp(t,"traj_host_plan_offset"))simEncoderBias=67; /* persistent field-like residual through approach, upload and drawing */
         ptp_send(seq,g_ptp.epoch,nodes[0].q1,nodes[0].q2,200,0);
         for(i=0;i<200000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
-        assert(g_motionEnabled&&!g_ptp.active&&g_arm1.usteps==origin1-ptp_offset(0,nodes[0].q1));
+        assert(g_motionEnabled&&!g_ptp.active&&SIM_AT(g_arm1.usteps,origin1-ptp_offset(0,nodes[0].q1)));
         p1=simPulse1;p2=simPulse2;traj_send(2,++seq,nodes[0].q1,nodes[0].q2,count);
         for(i=1;i<count;i++) {
             if(!strcmp(t,"traj_host_plan_rx_retry")&&i==16)traj_rx_fault("traj_rx_retry");
@@ -1355,20 +1427,20 @@ static void traj_test(const char *t) {
 #else
         assert(simBoundaryChecks==count-1u);   /* the hook sits in the open-loop executor */
 #endif
-        assert(g_arm1.usteps==origin1-ptp_offset(0,nodes[count-1].q1));
-        assert(g_arm2.usteps==origin2-ptp_offset(1,nodes[count-1].q2-nodes[count-1].q1));
+        assert(SIM_AT(g_arm1.usteps,origin1-ptp_offset(0,nodes[count-1].q1)));
+        assert(SIM_AT(g_arm2.usteps,origin2-ptp_offset(1,nodes[count-1].q2-nodes[count-1].q1)));
         if(!strcmp(t,"traj_host_plan_offset"))assert(abs_i32(cmd_lsb()-g_enc.pos)>=66&&abs_i32(cmd_lsb()-g_enc.pos)<=68&&g_ptp.reference);
         if(!strcmp(t,"traj_host_plan")) { /* repeat: the finished plan survives the move back to its start and runs again on a fresh sequence */
             uint32 lastRun=seq;
             ptp_send(++seq,g_ptp.epoch,nodes[0].q1,nodes[0].q2,200,0);
             for(i=0;i<200000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
-            assert(g_motionEnabled&&!g_ptp.active&&g_traj.state==4&&g_traj.count==count&&g_arm1.usteps==origin1-ptp_offset(0,nodes[0].q1));
+            assert(g_motionEnabled&&!g_ptp.active&&g_traj.state==4&&g_traj.count==count&&SIM_AT(g_arm1.usteps,origin1-ptp_offset(0,nodes[0].q1)));
             traj_send(4,lastRun,0,0,0);assert(!g_ptp.active&&g_traj.state==4); /* the old RUN sequence is stale, not a replay */
             traj_send(4,++seq,0,0,0);assert(g_ptp.active&&g_traj.state==3);
             for(i=0;i<650000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
             assert(g_motionEnabled&&!g_ptp.active&&g_traj.state==4&&g_traj.index==count);
-            assert(g_arm1.usteps==origin1-ptp_offset(0,nodes[count-1].q1));
-            assert(g_arm2.usteps==origin2-ptp_offset(1,nodes[count-1].q2-nodes[count-1].q1));
+            assert(SIM_AT(g_arm1.usteps,origin1-ptp_offset(0,nodes[count-1].q1)));
+            assert(SIM_AT(g_arm2.usteps,origin2-ptp_offset(1,nodes[count-1].q2-nodes[count-1].q1)));
         }
         return;
     }
@@ -1467,15 +1539,14 @@ static void traj_test(const char *t) {
     if(!strncmp(t,"traj_posloop_",13)) {
 #if POS_LOOP
         /* The same 4-node out-and-back plan, position-controlled.  drop: motor 1 stalls 100 ms mid-run, so its pulses are
-         * lost; the loop must see the lag on the encoder and add the steps back.  track: motor 1 never moves again. */
-        int drop=!strcmp(t,"traj_posloop_drop"), track=!strcmp(t,"traj_posloop_track");
+         * lost; the loop must see the lag on the encoder and add the steps back.  (A motor that never moves is
+         * ptp_posloop_track: this plan swings only 36 steps, inside the 128-step tracking line.) */
+        int drop=!strcmp(t,"traj_posloop_drop");
         int s1=simStep1, s2=simStep2;   /* the simulated rotors: where the motors really are */
         /* inside the first node, well before the turn-around, so the loop has to make the lost steps up */
         if(drop) { for(i=0;i<30&&g_motionEnabled&&g_ptp.active;i++)cycle(1); simStall=1; for(i=0;i<70;i++)cycle(1); simStall=0; }
-        if(track) simStall=1;
         for(i=0;i<3000&&g_motionEnabled&&g_ptp.active;i++)cycle(1);
         txq_flush_blocking();
-        if(track) { assert(!g_motionEnabled && (strstr(g_lastStop,"closed-loop tracking")||strstr(g_lastStop,"following error"))); return; }
         if(!g_motionEnabled)fprintf(stderr,"%s\n",simLog);
         assert(g_motionEnabled&&!g_ptp.active&&g_traj.state==4&&strstr(simLog,"POSLOOP done"));
         /* arrived on the measured pose, counters re-based on it */
@@ -1550,7 +1621,7 @@ static void manual_test(const char *t) {
     ptp_send(2,g_ptp.epoch,20,30,200,0);assert(g_ptp.active);
     for(i=0;i<5000&&g_ptp.active&&g_motionEnabled;i++)cycle(1);
     assert(g_motionEnabled&&!g_ptp.active&&g_ptp.reference);
-    assert(g_arm1.usteps==12345-ptp_offset(0,20)&&g_arm2.usteps==-23456-ptp_offset(1,10));
+    assert(SIM_AT(g_arm1.usteps,12345-ptp_offset(0,20))&&SIM_AT(g_arm2.usteps,-23456-ptp_offset(1,10)));
 }
 /* ---- fuzz: random events against the firmware's own loop pieces.  After every simulated millisecond the machine
  * must be coherent (one mode at a time, nothing runs while disabled, a reference implies homed axes, ...) and
@@ -1611,8 +1682,15 @@ static void fuzz_run(unsigned n) {
         }
         /* Whatever the motor does (including a stall), the arm1 following error stays bounded while the firmware is still
          * enabled: either it is small, or the firmware has already stopped. */
-        if(g_motionEnabled && g_directionKnown && g_arm1.hasEnc && !g_enc.badStreak)
+        if(g_motionEnabled && g_directionKnown && g_arm1.hasEnc && !g_enc.badStreak) {
+#if POS_LOOP
+            /* closed loop: recovered steps legitimately stay in cmd - encoder until arrival; what must stay bounded is
+             * its growth since tracking was last healthy (25 steps = the 64 LSB margin) */
+            if(g_ptp.active) FZ(abs_i32(g_plLag[0]-g_pl.lagBase[0]) < POS_TRACK_MAX_USTEP+25);
+            else
+#endif
             FZ(abs_i32(cmd_lsb()-g_enc.pos) < SLIP_FAIL_LSB+64);
+        }
         FZ(g_ptp.epoch>=epoch && g_controlSequence>=cseq);
         fuzz_invariants();
         fuzz_observe();
@@ -3759,9 +3837,11 @@ OPEN_LOOP_ONLY = {'ptp_success','ptp_reverse','ptp_duplicate','ptp_busy','ptp_ho
     'ptp_final_positive','ptp_final_negative','ptp_final_boundary','ptp_final_over_limit','ptp_final_following',
     'ptp_final_counts','traj_rx_retry','traj_rx_ready_retry','traj_rx_repeated','traj_success','traj_duplicate',
     'traj_uart_run','traj_evt_runs','traj_isr_done','traj_isr_slot','traj_status_cost','traj_schedule',
-    'traj_host_plan','traj_manual_plan','traj_host_plan_offset','traj_host_plan_rx_retry'}
-posloop_cases = ['traj_posloop_runs','traj_posloop_drop','traj_posloop_track',
-                 'ptp_posloop_axis1','ptp_posloop_drop','ptp_posloop_hold','ptp_posloop_dual']
+    'traj_host_plan','traj_manual_plan','traj_host_plan_offset','traj_host_plan_rx_retry',
+    'dual_ptp_follow'}   # pokes the open-loop foreground following check directly
+posloop_cases = ['traj_posloop_runs','traj_posloop_drop','ptp_posloop_track',
+                 'ptp_posloop_axis1','ptp_posloop_drop','ptp_posloop_hold','ptp_posloop_dual',
+                 'ptp_posloop_many','ptp_posloop_stalls','ptp_posloop_cap']
 if host_plan is not None: posloop_cases += ['traj_posloop_host']
 posloop_cases += [c for c in ptp_cases if c not in OPEN_LOOP_ONLY]
 if len(sys.argv)>1:

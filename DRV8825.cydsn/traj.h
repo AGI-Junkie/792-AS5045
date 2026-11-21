@@ -165,9 +165,9 @@ static void traj_start(traj_t *t, dda_t *seg, const int32 origin[2], const int32
     traj_segment(t, seg, origin, pos);
 }
 
-/* TRACKING and UNSETTLED come only from the closed-loop executor (posloop.h). */
+/* TRACKING, FOLLOWING and UNSETTLED come only from the closed-loop executor (posloop.h). */
 typedef enum { TRAJ_POLL_IDLE = 0, TRAJ_POLL_STEP, TRAJ_POLL_DONE, TRAJ_POLL_OVERRUN, TRAJ_POLL_UNSUSTAINED,
-               TRAJ_POLL_TRACKING, TRAJ_POLL_UNSETTLED } traj_poll_t;
+               TRAJ_POLL_TRACKING, TRAJ_POLL_FOLLOWING, TRAJ_POLL_UNSETTLED } traj_poll_t;
 
 /* Advance a running plan to `now`.  Call as often as the foreground allows; each call does at most one thing:
  *   STEP     one DDA event is due: step[i] says which axes pulse and which way.  The caller pulses them.

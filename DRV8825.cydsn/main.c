@@ -2416,6 +2416,18 @@ static void store_accept(const uint8 *p)
 }
 /* Fill g_traj from a slot through the same checks an upload gets, against the CURRENT joint ranges and speeds, so a
  * plan saved under other settings is refused instead of run.  A good CRC proves the bytes are intact, nothing more. */
+/* The counters stand at pose (q1,q2): exactly in the open-loop build; within the deadband in the closed-loop build,
+ * whose counters are re-based on the measured pose after each move and so keep its residual error. */
+static uint8 traj_at_pose(int16 q1, int16 q2)
+{
+    int32 d1=g_arm1.usteps-(g_ptp.origin[0]-ptp_offset(0u,q1));
+    int32 d2=g_arm2.usteps-(g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,q1,q2)));
+#if (POS_LOOP != 0u)
+    return (uint8)(abs_i32(d1)<=POS_DEADBAND_USTEP && abs_i32(d2)<=POS_DEADBAND_USTEP);
+#else
+    return (uint8)(d1==0 && d2==0);
+#endif
+}
 static uint8 store_load(uint16 slot)
 {
     ts_info_t in;
@@ -2426,7 +2438,7 @@ static uint8 store_load(uint16 slot)
     if(slot>=TS_SLOTS || !TS_LINKED()) { JLOG("PTP refused: archive slot\r\n"); return 0u; }
     in=g_tsDir[slot];
     if(!in.valid || !ts_nodes_ok((uint8)slot)) { JLOG("PTP refused: archive slot empty or damaged\r\n"); return 0u; }
-    if(g_arm1.usteps!=g_ptp.origin[0]-ptp_offset(0u,in.q1) || g_arm2.usteps!=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,in.q1,in.q2))) {
+    if(!traj_at_pose(in.q1,in.q2)) {
         JLOG("PTP refused: move to trajectory start first\r\n"); return 0u;
     }
     for(i=0u;i<2u;i++) {
@@ -2455,7 +2467,7 @@ static uint8 traj_accept(const uint8 *p)
     q[0]=(int16)ptp_u16(p+9); q[1]=(int16)ptp_u16(p+11);
     if (p[0]==2u) {
         if(value<2u || value>TRAJ_CAPACITY) { JLOG("PTP refused: trajectory capacity\r\n"); return 0u; }
-        if(g_arm1.usteps!=g_ptp.origin[0]-ptp_offset(0u,q[0]) || g_arm2.usteps!=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,q[0],q[1]))) {
+        if(!traj_at_pose(q[0],q[1])) {
             JLOG("PTP refused: move to trajectory start first\r\n"); return 0u;
         }
         traj_begin(&g_traj,q[0],q[1],value);
@@ -2478,16 +2490,17 @@ static uint8 traj_accept(const uint8 *p)
         /* TRAJ_DONE = the held plan already ran once; the nodes are intact, so a fresh RUN (new sequence) repeats it */
         if(p[0]!=4u || q[0]!=0 || q[1]!=0 || value!=0u || !traj_runnable(&g_traj) ||
            ptp_u32(p+1)!=g_ptp.sequence+1u ||
-           g_arm1.usteps!=g_ptp.origin[0]-ptp_offset(0u,g_traj.nodes[0].q1) ||
-           g_arm2.usteps!=g_ptp.origin[1]-ptp_offset(1u,ptp_axis_angle_cd(1u,g_traj.nodes[0].q1,g_traj.nodes[0].q2))) {
+           !traj_at_pose(g_traj.nodes[0].q1,g_traj.nodes[0].q2)) {
             JLOG("PTP refused: trajectory incomplete/start position\r\n"); return 0u;
         }
         {
             int32 pos[2];
             pos[0]=g_arm1.usteps; pos[1]=g_arm2.usteps;
 #if (POS_LOOP != 0u)
-            g_plLag[0]=g_plLag[1]=0;   /* the start check above allows a little; the first sample sets it */
-            pl_start(&g_traj,&g_pl,g_ptp.origin,pos,SU_NOW());
+            uint32 caps[2];
+            caps[0]=motion_min(TRAJ_RATE_MAX,g_motionRate[0]); caps[1]=motion_min(TRAJ_RATE_MAX,g_motionRate[1]);
+            g_plLag[0]=g_plLag[1]=0;   /* the counters were re-based on the measurement; the first sample sets it */
+            pl_start(&g_traj,&g_pl,g_ptp.origin,pos,caps,SU_NOW());
 #else
             traj_start(&g_traj,&g_ptp.seg,g_ptp.origin,pos,SU_NOW());
 #endif
@@ -2588,11 +2601,12 @@ static void ptp_accept(void)
     {
         /* Closed loop: the same move as a trapezoidal reference in time, stepped and corrected by the event interrupt. */
         int32 from[2];
-        uint32 accel=PTP_ACCEL;
+        uint32 accel=PTP_ACCEL, caps[2];
         for(i=0u;i<2u;i++) if(g_ptp.seg.distance[i]) { accel=motion_min(accel,g_motionAccel[i]); }
         from[0]=axes[0]->usteps; from[1]=axes[1]->usteps;
         g_plLag[0]=g_plLag[1]=0;
-        pl_ptp_start(&g_pl,from,g_ptp.seg.target,rate,accel,SU_NOW());
+        caps[0]=motion_min(PTP_RATE_MAX,g_motionRate[0]); caps[1]=motion_min(PTP_RATE_MAX,g_motionRate[1]);
+        pl_ptp_start(&g_pl,from,g_ptp.seg.target,rate,accel,caps,SU_NOW());
         evt_start();
     }
 #endif
@@ -2761,6 +2775,7 @@ CY_ISR(evt_isr)
         cmd[0] = g_arm1.usteps; cmd[1] = g_arm2.usteps; lag[0] = g_plLag[0]; lag[1] = g_plLag[1];
         switch (pl_poll(&g_traj, &g_pl, g_ptp.origin, cmd, lag, started, step)) {
         case TRAJ_POLL_TRACKING:  evt_fail("closed-loop tracking error"); return;
+        case TRAJ_POLL_FOLLOWING: evt_fail("closed-loop following error: steps lost faster than recovered"); return;
         case TRAJ_POLL_UNSETTLED: evt_fail("closed-loop hold did not settle"); return;
         case TRAJ_POLL_STEP:      if (pulse_axes_try(step) == 0u) { evt_fail("trajectory pulse blocked"); return; } break;
         case TRAJ_POLL_DONE:      g_ptp.active = 2u; g_ptp.settleMs = g_jogMs; g_evtRunning = 0u; return;
@@ -2815,6 +2830,23 @@ static void evt_cancel(void)
 #define FG_PASS_MARK()              ((void)0)
 #endif
 
+#if (POS_LOOP != 0u)
+/* Put axis a's step counter on its measured pose by whole steps, and shift the encoder-frame command by the same
+ * steps.  The command keeps its exact relation to the encoder, so only the sub-step residual remains as lag: nothing is
+ * rounded away, and many arrivals in a row cannot drift (re-anchoring the command on the measurement would round once
+ * per arrival). */
+static void pl_rebase_axis(jog_axis_t *a, enc_t *e)
+{
+    int8 k = jog_enc_sign(a, 1);
+    int32 lag = pl_lsb_to_axis(k, e->cmdLsbX100 / 100 - e->pos);   /* counter - measured, steps */
+#if (HW_SSI != 0u)
+    if(g_encFlight) { g_encFlight=0u; ssi_abort(); }   /* its snapshot predates the shift */
+#endif
+    a->usteps -= lag;
+    e->cmdUsteps -= k * lag; e->lastCmd -= k * lag;
+    e->cmdLsbX100 -= (int32)k * lag * LSB_PER_USTEP_X100;
+}
+#endif
 static void ptp_service(void)
 {
     if (!g_ptp.active) { return; }
@@ -2834,15 +2866,21 @@ static void ptp_service(void)
     if (HARD_LIMIT_ACTIVE() || ARM1_HOME_ACTIVE() || ARM2_NPN_ACTIVE()) { stage_stop("PTP limit/home sensor",0u); return; }
     if (g_jogMs-g_ptp.sinceMs>600000u || !ptp_counts_in_range(0u,g_arm1.usteps) || !ptp_counts_in_range(1u,g_arm2.usteps)) { stage_stop("PTP time/joint limit",0u); return; }
     if (!g_arm1.hasEnc || g_enc.badStreak || (ARM2_ENCODER_FEEDBACK && (!g_arm2.hasEnc || g_enc2.badStreak))) { return; } /* shared encoder watchdog will latch stop */
+#if (POS_LOOP == 0u)
     if ((abs_i32(cmd_lsb()-g_enc.pos)>=PTP_FOLLOW1_LSB || (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>=PTP_FOLLOW2_LSB))) { stage_stop("PTP encoder following error",0u); return; }
+#endif
+    /* Closed loop: command - encoder also holds every step the loop made up, so it grows with each recovered loss and
+     * a fixed limit on it would stop healthy runs.  The interrupt checks instead |reference - measured| and the growth
+     * of command - encoder since tracking was last healthy (pl_poll), and a hold that does not settle; arrival is
+     * checked on the measurement below. */
     if (g_ptp.active==2u) {
         if (g_jogMs-g_ptp.settleMs<HOME_SETTLE_MS) { return; }
 #if (POS_LOOP != 0u)
         {
             /* Closed loop: the step counters may differ from the plan by the steps the loop added back, so arrival is
-             * judged on the measured position.  Then the counters are re-based on it: counter = target when the pose is
-             * inside the deadband (the loop's own definition of arrived, and what the next RUN's exact start check needs),
-             * else the measured pose; command = measured (as the jog hold does), so the joint limits see the real pose. */
+             * judged on the measured position.  Then the counters are re-based on it (pl_rebase_axis): counter =
+             * measured pose, the residual kept.  Never the target: a residual inside the deadband would vanish from the
+             * mapping and many small moves could drift unseen; the next move starts from the real pose instead. */
             int32 miss1, miss2;
             if (!enc_sample()) { stage_stop("PTP final position mismatch",0u); return; }
             miss1=g_pl.to[0]-(g_arm1.usteps-pl_lsb_to_axis(jog_enc_sign(&g_arm1,1),cmd_lsb()-g_enc.pos));
@@ -2855,9 +2893,7 @@ static void ptp_service(void)
             JLOGF("POSLOOP done: miss1=%ld miss2=%ld peak1=%ld peak2=%ld slip1=%ld slip2=%ld usteps\r\n",
                   (long)miss1,(long)miss2,(long)g_pl.errPeak[0],(long)g_pl.errPeak[1],
                   (long)(g_arm1.usteps-g_pl.to[0]),(long)(g_arm2.usteps-g_pl.to[1]));
-            g_arm1.usteps=g_pl.to[0]-(abs_i32(miss1)<=POS_DEADBAND_USTEP ? 0 : miss1);
-            g_arm2.usteps=g_pl.to[1]-(abs_i32(miss2)<=POS_DEADBAND_USTEP ? 0 : miss2);
-            cmd_reset_axis(&g_enc); cmd_reset_axis(&g_enc2);
+            pl_rebase_axis(&g_arm1,&g_enc); pl_rebase_axis(&g_arm2,&g_enc2);
         }
 #else
         if (!enc_sample() || abs_i32(cmd_lsb()-g_enc.pos)>PTP_FINAL_ERROR_LSB || (ARM2_ENCODER_FEEDBACK && abs_i32(g_enc2.cmdLsbX100/100-g_enc2.pos)>PTP_FINAL_ERROR_LSB) ||

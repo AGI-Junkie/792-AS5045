@@ -60,6 +60,8 @@ typedef struct {
     uint32 ctrlCy, holdCy, calmCy;
     uint8 holding, ptp;
     uint8 fixing[2];        /* hysteresis: correcting since |err| left the deadband, until err reaches 0 */
+    int32 rateMax[2];       /* per-axis cap on the pulsed rate, feedforward plus correction: the configured maximum */
+    int32 lagBase[2];       /* lag (cmd - encoder) when tracking was last healthy: the steps already won back */
     /* PTP time law on the longer axis: distance (steps), top rate (steps/s), acceleration (steps/s^2), ramp and total
      * time (us); elapsed counts cycles in 64 bits because a slow long move outlasts the 89 s a uint32 holds at 48 MHz. */
     int32 dist; uint32 rate, accel, rampUs, totalUs;
@@ -86,10 +88,19 @@ static void pl_segment(const traj_t *t, pl_t *pl, const int32 origin[2])
     }
 }
 
-/* Trajectory RUN: start at node 1; `pos` is where the machine stands (node 0), `now` the SysTick count. */
-static void pl_start(traj_t *t, pl_t *pl, const int32 origin[2], const int32 pos[2], uint32 now)
+/* Keep each axis' cap within what the accumulator is sized for. */
+static void pl_caps(pl_t *pl, const uint32 rateMax[2])
+{
+    pl->rateMax[0] = (int32)(rateMax[0] < (uint32)POS_RATE_MAX ? rateMax[0] : (uint32)POS_RATE_MAX);
+    pl->rateMax[1] = (int32)(rateMax[1] < (uint32)POS_RATE_MAX ? rateMax[1] : (uint32)POS_RATE_MAX);
+}
+
+/* Trajectory RUN: start at node 1; `pos` is where the machine stands (node 0), `now` the SysTick count, rateMax the
+ * per-axis cap (steps/s) the correction may not push past. */
+static void pl_start(traj_t *t, pl_t *pl, const int32 origin[2], const int32 pos[2], const uint32 rateMax[2], uint32 now)
 {
     memset(pl, 0, sizeof(*pl));
+    pl_caps(pl, rateMax);
     pl->to[0] = pos[0]; pl->to[1] = pos[1]; pl->clock = now;
     t->state = TRAJ_RUNNING; t->index = 1u; t->elapsedCy = 0u; t->clock = now; t->lastStep = now; t->slipCy = 0u;
     pl_segment(t, pl, origin);
@@ -98,10 +109,12 @@ static void pl_start(traj_t *t, pl_t *pl, const int32 origin[2], const int32 pos
 /* PTP move from `from` to `to` (steps), at most `rate` steps/s and `accel` steps/s^2 on the longer axis.
  * Trapezoid: T = D/R + R/A; when D < R^2/A there is no cruise and the top rate drops to sqrt(A*D) (the same formula
  * then gives the triangle's time). */
-static void pl_ptp_start(pl_t *pl, const int32 from[2], const int32 to[2], uint32 rate, uint32 accel, uint32 now)
+static void pl_ptp_start(pl_t *pl, const int32 from[2], const int32 to[2], uint32 rate, uint32 accel,
+                         const uint32 rateMax[2], uint32 now)
 {
     uint8 i;
     memset(pl, 0, sizeof(*pl));
+    pl_caps(pl, rateMax);
     pl->ptp = 1u; pl->clock = now;
     for (i = 0u; i < 2u; i++) {
         pl->from[i] = from[i]; pl->to[i] = to[i];
@@ -138,7 +151,7 @@ static void pl_control(pl_t *pl, uint8 i, int32 e)
     else if (e == 0) { pl->fixing[i] = 0u; }
     want = pl->fixing[i] ? pl_clamp(e * POS_KP_PER_S, POS_CORR_MAX) : 0;
     pl->vcorr[i] += pl_clamp(want - pl->vcorr[i], PL_CORR_STEP);
-    v = pl_clamp(pl->vff[i] + pl->vcorr[i], POS_RATE_MAX);
+    v = pl_clamp(pl->vff[i] + pl->vcorr[i], pl->rateMax[i]);   /* the operator's per-axis maximum holds for corrections too */
     /* No backward step while the reference moves forward (and vice versa): wait for it instead of chattering the
      * direction pin on encoder noise or gearbox play. */
     if ((pl->vff[i] > 0 && v < 0) || (pl->vff[i] < 0 && v > 0)) { v = 0; }
@@ -191,6 +204,11 @@ static traj_poll_t pl_poll(traj_t *t, pl_t *pl, const int32 origin[2], const int
             if (abs_i32(e) > POS_TRACK_MAX_USTEP) { return TRAJ_POLL_TRACKING; }
             pl_control(pl, i, e);
             if (abs_i32(e) > POS_DEADBAND_USTEP || pl->fixing[i]) { calm = 0u; }   /* arrived = in the band, nothing still correcting */
+            /* Recovered steps stay in cmd - encoder for good, so that alone says nothing; but lag that keeps growing while
+             * tracking is unhealthy means steps are being lost faster than the loop wins them back (a stalled motor taking
+             * the corrections too).  Healthy tracking moves the baseline, so every loss the loop made up is forgiven. */
+            else { pl->lagBase[i] = lag[i]; }
+            if (abs_i32(lag[i] - pl->lagBase[i]) > POS_TRACK_MAX_USTEP) { return TRAJ_POLL_FOLLOWING; }
         }
         if (pl->holding) {
             pl->calmCy = calm ? pl->calmCy + PL_CTRL_CY : 0u;
@@ -198,11 +216,14 @@ static traj_poll_t pl_poll(traj_t *t, pl_t *pl, const int32 origin[2], const int
             if (pl->holdCy > POS_HOLD_MAX_MS * 1000u * SU_CY_PER_US) { return TRAJ_POLL_UNSETTLED; }
         }
     }
-    if (dt > PL_CTRL_CY) { dt = PL_CTRL_CY; }   /* a stalled interrupt does not turn into a burst of steps */
     for (i = 0u; i < 2u; i++) {
-        int32 v = pl->vcmd[i];
+        int32 v = pl->vcmd[i], add;
         if ((v > 0 && pl->acc[i] < 0) || (v < 0 && pl->acc[i] > 0)) { pl->acc[i] = 0; }  /* fresh phase on reversal */
-        pl->acc[i] = pl_clamp(pl->acc[i] + v * (int32)dt, 2 * (int32)PL_CY_PER_S);
+        /* A late interrupt keeps its time (up to two steps owed), so lateness does not quietly become lag the loop
+         * must win back - with the rate at the operator's cap there is no headroom to win it back.  A longer stall owes
+         * at most two steps, never a burst; v * dt is only formed where it cannot overflow. */
+        add = (v == 0) ? 0 : (dt > 2u * PL_CY_PER_S / (uint32)abs_i32(v)) ? (v > 0 ? 2 : -2) * (int32)PL_CY_PER_S : v * (int32)dt;
+        pl->acc[i] = pl_clamp(pl->acc[i] + add, 2 * (int32)PL_CY_PER_S);
         step[i] = 0;
         if (pl->acc[i] >= (int32)PL_CY_PER_S) { pl->acc[i] -= (int32)PL_CY_PER_S; step[i] = 1; any = 1u; }
         else if (pl->acc[i] <= -(int32)PL_CY_PER_S) { pl->acc[i] += (int32)PL_CY_PER_S; step[i] = -1; any = 1u; }
