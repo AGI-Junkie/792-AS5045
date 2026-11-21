@@ -31,6 +31,10 @@ public static class DeviceContract
     public const int PlanAccelMax = 3000;           // PTP_ACCEL, TRAJ_ACCEL_MAX
     public const int HomeSlowRate = 400;            // HOME_SLOW_RATE_USTEP_S
 
+    // Closed-loop firmware (build id "-posloop") arrives within this many steps of the target and keeps that residual in its
+    // counters, so "at the trajectory start" accepts it; open-loop firmware still lands exactly.
+    public const int ClosedLoopStartTolerance = 2;  // POS_DEADBAND_USTEP
+
     // Trajectory upload.
     public const int TrajCapacity = 2048;           // TRAJ_CAPACITY
     public const int TrajNodeMinMs = 50;            // TRAJ_NODE_MIN_MS
